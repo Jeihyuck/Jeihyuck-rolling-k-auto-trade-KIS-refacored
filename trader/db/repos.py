@@ -4823,6 +4823,7 @@ class OrdersRepo:
         response_json: dict | None,
         submitted_at: datetime | None,
         acked_at: datetime | None,
+        _conn: Any = None,
     ) -> str:
         db_url = str(self.engine.url)
         safe_request_json = json_sanitize(request_json or {})
@@ -4841,7 +4842,8 @@ class OrdersRepo:
             broker_order_id = kis_odno or client_order_key
         account_id = get_account_key(env=env)
 
-        with self.engine.begin() as conn:
+        from contextlib import nullcontext
+        with (nullcontext(_conn) if _conn is not None else self.engine.begin()) as conn:
             trading_epoch_id = active_trading_epoch_id(
                 conn, env=env, account_id=account_id, required=trading_epoch_enforced()
             )

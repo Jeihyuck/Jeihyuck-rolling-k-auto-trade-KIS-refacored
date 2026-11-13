@@ -5,6 +5,7 @@ import hashlib
 import logging
 import os
 import time
+from contextlib import nullcontext
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 from typing import Any
@@ -506,7 +507,7 @@ def _broker_execution_price(response_json: dict) -> float | None:
 
 def _verified_order_sell_average_from_ccld_fills(
     *, fills_repo: FillsRepo, source_order: dict, env: str,
-    confirmed_cumulative_qty: int,
+    confirmed_cumulative_qty: int, _conn=None,
 ) -> float | None:
     """Compute cumulative average only from exact attributed KIS executions.
 
@@ -517,7 +518,7 @@ def _verified_order_sell_average_from_ccld_fills(
     if not order_id or confirmed_cumulative_qty <= 0:
         return None
     schema = schema_for_engine(fills_repo.engine)
-    with fills_repo.engine.connect() as conn:
+    with (nullcontext(_conn) if _conn is not None else fills_repo.engine.connect()) as conn:
         rows = conn.execute(sa.select(schema.fills).where(sa.and_(
             schema.fills.c.env == env,
             schema.fills.c.order_id == uuid_value_for_url(str(fills_repo.engine.url), order_id),
@@ -2052,32 +2053,42 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                     scope=kr_scope,
                 ):
                     raise RuntimeError("KR_RECONCILE_SOURCE_SCOPE_PREWRITE_REJECTED")
-        orders_repo.upsert_reconciled_order(
-            env=env,
-            run_id=reconcile_run_id,
-            strategy=strategy,
-            sid=1,
-            mode=1,
-            code=code,
-            market=market,
-            side=side,
-            ord_type=str(_first_value(row, ["ord_dvsn_cd", "ord_type"]) or "RECONCILED"),
-            qty=qty,
-            limit_price=price,
-            stage="RECONCILE",
-            client_order_key=client_order_key,
-            kis_odno=kis_odno,
-            status=status,
-            request_json=request_json,
-            response_json={
-                **source_response,
-                **broker_row,
-                "source_order_id": (source_order or {}).get("order_id"),
-                "source_client_order_key": (source_order or {}).get("client_order_key"),
-            },
-            submitted_at=order_time,
-            acked_at=order_time,
-        )
+        # Exact priced SELLs commit the broker status with their economic projection.
+        preview_qty = (_to_int(_first_value(row, ["ccld_qty", "tot_ccld_qty", "filled_qty"]))
+                       if cumulative_sell_evidence is None else int(cumulative_sell_evidence["qty"]))
+        preview_price = (_to_float(_first_value(row, ["ccld_prc", "avg_prvs", "filled_price"]))
+                         if cumulative_sell_evidence is None else float(cumulative_sell_evidence["avg_price"]))
+        preview_id = _first_value(row, ["ccld_no", "trade_id", "exec_id"])
+        defer_sell_order = bool(isinstance(engine, sa.engine.Engine) and side == "SELL" and source_order
+                                and preview_qty and preview_price is not None
+                                and (preview_id or cumulative_sell_evidence is not None))
+        if not defer_sell_order:
+            orders_repo.upsert_reconciled_order(
+                env=env,
+                run_id=reconcile_run_id,
+                strategy=strategy,
+                sid=1,
+                mode=1,
+                code=code,
+                market=market,
+                side=side,
+                ord_type=str(_first_value(row, ["ord_dvsn_cd", "ord_type"]) or "RECONCILED"),
+                qty=qty,
+                limit_price=price,
+                stage="RECONCILE",
+                client_order_key=client_order_key,
+                kis_odno=kis_odno,
+                status=status,
+                request_json=request_json,
+                response_json={
+                    **source_response,
+                    **broker_row,
+                    "source_order_id": (source_order or {}).get("order_id"),
+                    "source_client_order_key": (source_order or {}).get("client_order_key"),
+                },
+                submitted_at=order_time,
+                acked_at=order_time,
+            )
         order_count += 1
 
         filled_qty = _to_int(_first_value(row, ["ccld_qty", "tot_ccld_qty", "filled_qty"]))
@@ -2206,8 +2217,9 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
             request_json=request_json,
             filled_qty=filled_qty, filled_price=filled_price,
         )
+        defer_native_sell_claim = bool(isinstance(engine, sa.engine.Engine) and side == "SELL" and source_order and filled_qty and filled_price is not None and next_confirmed_qty > 0)
         observation_error = None
-        if not atomic_writer_active and not defer_priced_buy_claim:
+        if not atomic_writer_active and not defer_priced_buy_claim and not defer_native_sell_claim:
             observation_error = _record_execution_claim_observation(
                 orders_repo=orders_repo,
                 source_order=source_order,
@@ -2224,7 +2236,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                 )
         execution_meta_update = request_json.get("execution_meta_update")
         execution_action = str(request_json.get("semantic_action") or "").strip()
-        if side == "SELL" and source_order and execution_action and isinstance(execution_meta_update, dict):
+        if side == "SELL" and source_order and execution_action and isinstance(execution_meta_update, dict) and not defer_native_sell_claim:
             try:
                 _project_pb1_exit_stage_truth(
                     orders_repo=orders_repo,
@@ -2294,7 +2306,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                 and request_json.get("enforce_entry_contract") is True
                 and (incremental_daily_qty > 0 or atomic_writer_active)
             )
-            if not signed_native_buy:
+            if not signed_native_buy and not defer_native_sell_claim:
                 fills_repo.upsert_fill(**native_fill_kwargs)
             # KIS cumulative BUY average is the *whole order* average, not
             # the price of the incremental shares. Preserve broker notional.
@@ -2551,7 +2563,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                     and filled_price is not None and filled_price > 0
                 ):
                     verified_cumulative_sell_price = float(filled_price)
-                elif verified_cumulative_sell_price is None and isinstance(getattr(fills_repo, "engine", None), sa.engine.Engine):
+                elif verified_cumulative_sell_price is None and not defer_native_sell_claim and isinstance(getattr(fills_repo, "engine", None), sa.engine.Engine):
                     # For multiple partial executions, derive the weighted
                     # average from exact order-linked persisted broker fills.
                     # Test/diagnostic repositories without an engine cannot
@@ -2560,10 +2572,115 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                         fills_repo=fills_repo, source_order=source_order,
                         env=env, confirmed_cumulative_qty=next_confirmed_qty,
                     )
+            def _save_sell_order(conn):
+                sell_applied_ids = set(applied_fill_ids)
+                if trade_id:
+                    sell_applied_ids.add(trade_id)
+                orders_repo.upsert_reconciled_order(
+                    env=env,
+                    run_id=reconcile_run_id,
+                    strategy=str((source_order or {}).get("strategy") or strategy),
+                    sid=int((source_order or {}).get("sid") or 1),
+                    mode=int((source_order or {}).get("mode") or 1),
+                    code=code,
+                    market=(source_order or {}).get("market") or market,
+                    side=side,
+                    ord_type=str(_first_value(row, ["ord_dvsn_cd", "ord_type"]) or "RECONCILED"),
+                    qty=qty,
+                    limit_price=price,
+                    stage=str((source_order or {}).get("stage") or "RECONCILE"),
+                    client_order_key=client_order_key,
+                    kis_odno=kis_odno,
+                    status=status,
+                    request_json=request_json,
+                    response_json={
+                        **source_response,
+                        **broker_row,
+                        "confirmed_fill_qty": next_confirmed_qty,
+                        "confirmed_fill_notional": next_confirmed_notional,
+                        "confirmed_fill_price": (
+                            float(cumulative_sell_evidence["avg_price"])
+                            if cumulative_sell_evidence else source_response.get("confirmed_fill_price")
+                        ),
+                        "broker_cumulative_evidence_type": (
+                            "KIS_ORDER_CUMULATIVE_EXECUTION"
+                            if cumulative_sell_evidence else source_response.get("broker_cumulative_evidence_type")
+                        ),
+                        "applied_broker_fill_ids": sorted(sell_applied_ids),
+                        "source_order_id": (source_order or {}).get("order_id"),
+                        "source_client_order_key": (source_order or {}).get("client_order_key"),
+                    },
+                    submitted_at=(source_order or {}).get("submitted_at") or order_time,
+                    acked_at=(source_order or {}).get("acked_at") or order_time,
+                    _conn=conn,
+                )
+            def _lock_sell_order_watermark(conn):
+                table = schema_for_engine(engine).orders
+                current = conn.execute(
+                    sa.select(table.c.response_json).where(
+                        table.c.order_id == uuid_value_for_url(str(engine.url), str(source_order.get("order_id") or ""))
+                    ).with_for_update()
+                ).one_or_none()
+                if current is None:
+                    raise RuntimeError("KR_NATIVE_SELL_SOURCE_ORDER_MISSING")
+                current_response = _json_dict(current[0])
+                fields = ("confirmed_fill_qty", "confirmed_fill_notional", "applied_broker_fill_ids")
+                if any(current_response.get(k) != source_response.get(k) for k in fields):
+                    raise RuntimeError("KR_NATIVE_SELL_STALE_ORDER_RETRY")
             if side == "SELL" and source_order and (
-                incremental_daily_qty > 0 or verified_cumulative_sell_price is not None
+                incremental_daily_qty > 0 or verified_cumulative_sell_price is not None or defer_native_sell_claim
             ):
                 def _legacy_sell_apply():
+                    if not defer_native_sell_claim:
+                        return _apply_sell_position()
+                    if not (getattr(fills_repo, "engine", None) is engine and getattr(positions_repo, "engine", None) is engine):
+                        raise RuntimeError("KR_NATIVE_SELL_SHARED_DB_REQUIRED")
+                    with fills_repo.engine.begin() as conn:
+                        _lock_sell_order_watermark(conn)
+                        fills_repo.upsert_fill(**native_fill_kwargs, _conn=conn)
+                        result = _apply_sell_position(conn)
+                        _apply_sell_claim(conn)
+                        _save_sell_order(conn)
+                        return result
+
+                def _apply_sell_claim(conn):
+                    cancelled = status in {"CANCELLED", "CANCELED", "CANCEL"}
+                    try:
+                        snapshot = orders_repo.record_execution_claim_for_order(
+                            str(source_order.get("client_order_key") or ""),
+                            state=("CANCELLED" if cancelled else
+                                   "FILLED" if next_confirmed_qty >= int(source_order.get("qty") or qty or 0)
+                                   else "PARTIALLY_FILLED"),
+                            cumulative_filled_qty=(broker_cumulative_qty if cancelled else next_confirmed_qty),
+                            authoritative=(broker_cumulative_qty is not None if cancelled else True), _conn=conn,
+                        )
+                    except LookupError:
+                        return
+                    claim_state = str(getattr(snapshot, "action_state", "") or "").upper()
+                    if not getattr(snapshot, "active_attempt_id", None) and claim_state in {"RETRYABLE", "PARTIALLY_SATISFIED", "SATISFIED"}:
+                        fields = {}
+                        if claim_state == "SATISFIED" and isinstance(execution_meta_update, dict):
+                            fields.update(execution_meta_update)
+                        stage_name = str(request_json.get("profit_capture_stage") or "").lower()
+                        if stage_name in {"tp1", "tp2", "tp3"}:
+                            fields[f"kr_{stage_name}_pending"] = False
+                        if fields:
+                            positions_repo.update_position_fields(
+                                env=env, strategy=str(source_order.get("strategy") or strategy),
+                                sid=int(source_order.get("sid") or 1), mode=int(source_order.get("mode") or 1),
+                                code=code, fields={"position_meta": fields},
+                                position_cycle_id=str(source_order.get("position_cycle_id") or ""),
+                                portfolio_epoch_id=str(source_order.get("portfolio_epoch_id") or "") or None, _conn=conn,
+                            )
+
+                def _apply_sell_position(conn=None):
+                    sell_price = verified_cumulative_sell_price
+                    if sell_price is None and conn is not None:
+                        sell_price = _verified_order_sell_average_from_ccld_fills(
+                            fills_repo=fills_repo, source_order=source_order, env=env,
+                            confirmed_cumulative_qty=next_confirmed_qty, _conn=conn,
+                        )
+                    kwargs = {} if conn is None else {"_conn": conn}
                     return positions_repo.reconcile_sell_execution(
                         env=env,
                         strategy=str(source_order.get("strategy") or strategy),
@@ -2572,7 +2689,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                         code=code,
                         market=source_order.get("market") or market,
                         confirmed_cumulative_qty=next_confirmed_qty,
-                        fill_price=verified_cumulative_sell_price,
+                        fill_price=sell_price,
                         filled_at=order_time,
                         position_cycle_id=str(source_order.get("position_cycle_id") or ""),
                         portfolio_epoch_id=str(source_order.get("portfolio_epoch_id") or "") or None,
@@ -2583,12 +2700,21 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                         # the only authority permitted to supersede a historic
                         # manually entered provisional MTS execution price.
                         native_original_order_price_proof=(cumulative_sell_evidence is not None),
+                        **kwargs,
                     )
 
                 if atomic_observation is not None and atomic_release is not None:
                     from trader.settlement.kr_cutover import route_kr_settlement
 
                     def _atomic_sell_apply(conn, _obs, _decision):
+                        _lock_sell_order_watermark(conn)
+                        fills_repo.upsert_fill(**native_fill_kwargs, _conn=conn)
+                        sell_price = verified_cumulative_sell_price
+                        if sell_price is None:
+                            sell_price = _verified_order_sell_average_from_ccld_fills(
+                                fills_repo=fills_repo, source_order=source_order, env=env,
+                                confirmed_cumulative_qty=next_confirmed_qty, _conn=conn,
+                            )
                         claim_snapshot = orders_repo.record_execution_claim_for_order(
                             str(source_order.get("client_order_key") or ""),
                             state=(
@@ -2636,7 +2762,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                             code=code,
                             market=source_order.get("market") or market,
                             confirmed_cumulative_qty=next_confirmed_qty,
-                            fill_price=verified_cumulative_sell_price,
+                            fill_price=sell_price,
                             filled_at=order_time,
                             position_cycle_id=str(source_order.get("position_cycle_id") or ""),
                             portfolio_epoch_id=str(source_order.get("portfolio_epoch_id") or "") or None,
@@ -2646,6 +2772,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                             native_original_order_price_proof=(cumulative_sell_evidence is not None),
                             _conn=conn,
                         )
+                        _save_sell_order(conn)
 
                     route_result = route_kr_settlement(
                         engine=engine,
@@ -2678,43 +2805,8 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                 # Persist actual KIS notional even if qty was already confirmed
                 # by a prior holdings-only observation (price-only recovery).
                 # Keep the historical strategy/position provenance unchanged.
-                orders_repo.upsert_reconciled_order(
-                    env=env,
-                    run_id=reconcile_run_id,
-                    strategy=str((source_order or {}).get("strategy") or strategy),
-                    sid=int((source_order or {}).get("sid") or 1),
-                    mode=int((source_order or {}).get("mode") or 1),
-                    code=code,
-                    market=(source_order or {}).get("market") or market,
-                    side=side,
-                    ord_type=str(_first_value(row, ["ord_dvsn_cd", "ord_type"]) or "RECONCILED"),
-                    qty=qty,
-                    limit_price=price,
-                    stage=str((source_order or {}).get("stage") or "RECONCILE"),
-                    client_order_key=client_order_key,
-                    kis_odno=kis_odno,
-                    status=status,
-                    request_json=request_json,
-                    response_json={
-                        **source_response,
-                        **broker_row,
-                        "confirmed_fill_qty": next_confirmed_qty,
-                        "confirmed_fill_notional": next_confirmed_notional,
-                        "confirmed_fill_price": (
-                            float(cumulative_sell_evidence["avg_price"])
-                            if cumulative_sell_evidence else source_response.get("confirmed_fill_price")
-                        ),
-                        "broker_cumulative_evidence_type": (
-                            "KIS_ORDER_CUMULATIVE_EXECUTION"
-                            if cumulative_sell_evidence else source_response.get("broker_cumulative_evidence_type")
-                        ),
-                        "applied_broker_fill_ids": sorted(applied_fill_ids),
-                        "source_order_id": (source_order or {}).get("order_id"),
-                        "source_client_order_key": (source_order or {}).get("client_order_key"),
-                    },
-                    submitted_at=(source_order or {}).get("submitted_at") or order_time,
-                    acked_at=(source_order or {}).get("acked_at") or order_time,
-                )
+                if not defer_native_sell_claim:
+                    _save_sell_order(None)
             # Do not advance KR US-standard TP on ACK/holdings inference.
             # Only the exact native KIS daily-ccld original order, with matching
             # date, side, symbol, ODNO and durable stage claim, is stage truth.
