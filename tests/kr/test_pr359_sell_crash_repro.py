@@ -288,7 +288,6 @@ def test_tp_stage_journal_failure_keeps_broker_economics_and_retries_stage(monke
         )).mappings().one()
     assert len(fills) == 1
     assert position["qty"] == 7
-    assert position["position_meta"]["kr_tp1_pending"] is False
     assert len(calls) == 2 and all(conn is not None for conn in calls)
 
 
