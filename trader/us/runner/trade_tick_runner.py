@@ -3208,7 +3208,11 @@ def run_trade_tick(
                 allow_new_symbols = True
                 logger.warning("[US_ENTRY][CRASH_REBOUND_LIMIT] exposure_multiplier=%s max_new_positions=%s prep_reason=%s", market_state_overlay.get("exposure_multiplier"), market_state_overlay.get("effective_max_new_positions"), prep_reason)
         existing_sell_symbols = {str(i.get("symbol") or "").upper().strip() for i in exit_intents if str(i.get("side") or "").upper() == "SELL"}
-        profit_capture_intents = build_profit_capture_intents(current_positions, market_state_overlay, existing_sell_symbols, now=now, trade_date=trade_date)
+        profit_capture_intents = build_profit_capture_intents(
+            current_positions, market_state_overlay, existing_sell_symbols,
+            now=now, trade_date=trade_date,
+            defer_pending_until_claim=(real_order_mode and not offline),
+        )
         if profit_capture_intents:
             exit_intents.extend(profit_capture_intents)
     except Exception as _market_state_exc:
