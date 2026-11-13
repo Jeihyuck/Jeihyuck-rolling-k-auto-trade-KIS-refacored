@@ -1,5 +1,7 @@
 """Exercise the real signed PB1 BUY reconciliation crash/replay path."""
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
+from threading import Barrier
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -9,6 +11,7 @@ import sqlalchemy as sa
 import trader.reconcile_kis as rk
 from trader.account_state import get_account_key
 from trader.db.repos import OrdersRepo, PositionsRepo, PortfolioEpochsRepo
+from tests.kr.test_pr359_sell_crash_repro import isolated_engine
 from trader.db.schema import schema_for_engine
 from trader.run_context import RunContext
 from tests.kr.test_kr_20261006_execution_convergence import _db
@@ -98,7 +101,8 @@ def _buy_row(code, odno):
     }
 
 
-def test_signed_buy_fill_and_position_rollback_then_replay_once(monkeypatch):
+@pytest.mark.parametrize("failure_point", ["position", "claim", "order"])
+def test_signed_buy_fill_and_position_rollback_then_replay_once(monkeypatch, failure_point):
     engine = _db()
     schema = schema_for_engine(engine)
     code, odno, key = "251970", "0000041001", "pr359-signed-buy-crash"
@@ -114,11 +118,16 @@ def test_signed_buy_fill_and_position_rollback_then_replay_once(monkeypatch):
     monkeypatch.setattr(rk, "_execution_claim_integrity_reason", lambda *a, **k: None)
 
     def crash(*args, **kwargs):
-        raise RuntimeError("INJECTED_BUY_POSITION_FAILURE")
+        raise RuntimeError("INJECTED_BUY_TRANSACTION_FAILURE")
 
     with monkeypatch.context() as failures:
-        failures.setattr(PositionsRepo, "apply_fill", crash)
-        with pytest.raises(RuntimeError, match="INJECTED_BUY_POSITION_FAILURE"):
+        if failure_point == "position":
+            failures.setattr(PositionsRepo, "apply_fill", crash)
+        elif failure_point == "claim":
+            failures.setattr(OrdersRepo, "record_execution_claim_for_order", crash)
+        else:
+            failures.setattr(OrdersRepo, "upsert_reconciled_order", crash)
+        with pytest.raises(RuntimeError, match="INJECTED_BUY_TRANSACTION_FAILURE"):
             rk.reconcile_today(
                 engine=engine, kis=kis, ctx=ctx, trade_date=date(2026, 10, 22),
             )
@@ -176,3 +185,75 @@ def _json_dict(value):
         import json
         return json.loads(value)
     return {}
+
+
+def test_concurrent_signed_buy_reconciliation_rejects_stale_watermark_and_applies_once(
+    monkeypatch, isolated_engine,
+):
+    engine = isolated_engine
+    if engine.dialect.name != "postgresql":
+        pytest.skip("row-level FOR UPDATE concurrency is PostgreSQL-only")
+    code, odno, key = "251970", "0000041002", "pr359-signed-buy-concurrent"
+    order_id, cycle = _signed_buy_order(engine, code=code, odno=odno, key=key)
+    row = _buy_row(code, odno)
+    monkeypatch.setattr(rk, "_execution_claim_integrity_reason", lambda *a, **k: None)
+    barrier = Barrier(2)
+    original_lookup = OrdersRepo.get_order_by_kis_odno_scoped
+
+    def synchronized_lookup(self, *args, **kwargs):
+        result = original_lookup(self, *args, **kwargs)
+        if result and str(result.get("order_id") or "") == order_id:
+            barrier.wait(timeout=15)
+        return result
+
+    monkeypatch.setattr(OrdersRepo, "get_order_by_kis_odno_scoped", synchronized_lookup)
+
+    def reconcile_once():
+        ctx = RunContext(
+            run_id=None, env="practice", strategy="pb1_pullback_close",
+            started_at=datetime(2026, 10, 22, 15, 18, tzinfo=ZoneInfo("Asia/Seoul")),
+            dry_run=True,
+        )
+        return rk.reconcile_today(
+            engine=engine, kis=KISBuyDailyReplay(row), ctx=ctx,
+            trade_date=date(2026, 10, 22),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(reconcile_once) for _ in range(2)]
+        outcomes = []
+        for future in futures:
+            try:
+                outcomes.append(("ok", future.result(timeout=30)))
+            except Exception as exc:
+                outcomes.append(("error", str(exc)))
+    monkeypatch.setattr(OrdersRepo, "get_order_by_kis_odno_scoped", original_lookup)
+    assert sum(kind == "ok" for kind, _ in outcomes) == 1, outcomes
+    assert sum(
+        kind == "error" and "KR_NATIVE_BUY_STALE_ORDER_RETRY" in str(value)
+        for kind, value in outcomes
+    ) == 1, outcomes
+
+    ctx = RunContext(
+        run_id=None, env="practice", strategy="pb1_pullback_close",
+        started_at=datetime(2026, 10, 22, 15, 18, tzinfo=ZoneInfo("Asia/Seoul")),
+        dry_run=True,
+    )
+    rk.reconcile_today(
+        engine=engine, kis=KISBuyDailyReplay(row), ctx=ctx,
+        trade_date=date(2026, 10, 22),
+    )
+    schema = schema_for_engine(engine)
+    with engine.connect() as conn:
+        fills = conn.execute(sa.select(schema.fills).where(
+            schema.fills.c.order_id == order_id
+        )).mappings().all()
+        position = conn.execute(sa.select(schema.positions).where(
+            schema.positions.c.position_cycle_id == cycle
+        )).mappings().one()
+        order = conn.execute(sa.select(schema.orders).where(
+            schema.orders.c.order_id == order_id
+        )).mappings().one()
+    assert len(fills) == 1
+    assert position["qty"] == 10
+    assert int(_json_dict(order["response_json"])["confirmed_fill_qty"]) == 10
