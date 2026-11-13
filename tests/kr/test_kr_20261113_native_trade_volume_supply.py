@@ -27,6 +27,10 @@ class Resp:
 
 def _broker(monkeypatch, rows, *, allowed=True):
     monkeypatch.setattr(kw, "now_kst", lambda: NOW)
+    # Quote receipt and decision clock must refer to the SAME synthetic KST instant.
+    # The implementation samples time.time(); do not let current CI wall time
+    # make a valid historical fixture appear stale or future-dated.
+    monkeypatch.setattr(kw.time, "time", lambda: NOW.timestamp())
     monkeypatch.setattr(kw, "get_kis_gate", lambda: SimpleNamespace(
         wait_until_allowed=lambda *_a, **_k: allowed
     ))
