@@ -3609,7 +3609,10 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
             conn.exec_driver_sql(Path(
                 "migrations/0056_us_execution_authority_reservations.sql"
             ).read_text())
-        raw_account = "practice:ten-symbol-concurrency-integration"
+        # Each parameter is a separate simulated brokerage account. Prior
+        # tests leave active reservations by design, and production correctly
+        # counts the same account's reservations across different epochs.
+        raw_account = f"practice:ten-symbol-concurrency-integration-{int(multiple_unresolved)}"
         account_fingerprint = hashlib.sha256(raw_account.encode()).hexdigest()
         monkeypatch.setattr(
             account_state, "get_account_key", lambda **_kw: raw_account,
