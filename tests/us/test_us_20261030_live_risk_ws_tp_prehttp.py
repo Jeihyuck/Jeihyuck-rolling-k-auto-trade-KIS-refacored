@@ -940,8 +940,9 @@ def test_pg_us353_cross_day_open_tp_fences_new_claim_reservation(
     not os.getenv("PBCORE_TEST_POSTGRES_URL"),
     reason="disposable PostgreSQL acceptance URL unavailable",
 )
+@pytest.mark.parametrize("claim_commit_failure", [False, True])
 def test_pg_us353_standard_tp_native_partial_cancel_commits_claim_stage_together(
-    pg_engine, monkeypatch,
+    pg_engine, monkeypatch, claim_commit_failure,
 ):
     """Native KIS-shaped US_STANDARD SELL 5 -> fill 2 -> cancel remaining 3.
 
@@ -1018,6 +1019,18 @@ def test_pg_us353_standard_tp_native_partial_cancel_commits_claim_stage_together
         "remaining_qty_present": True, "broker_open_qty": 0,
         "broker_open_qty_present": True, "avg_price": 101.5,
     }
+    if claim_commit_failure:
+        real_claim_write = repos.record_execution_action_observation_by_key
+
+        def fail_only_terminal_claim(*args, **kwargs):
+            if kwargs.get("state") == "CANCELLED" and kwargs.get("_conn") is not None:
+                raise RuntimeError("injected_terminal_claim_transaction_failure")
+            return real_claim_write(*args, **kwargs)
+
+        monkeypatch.setattr(
+            repos, "record_execution_action_observation_by_key",
+            fail_only_terminal_claim,
+        )
     result = repos.apply_broker_order_observation(
         trade_date=trade_date, client_order_key=key,
         raw_order_no=order_no, canonical_order_no="39951",
@@ -1025,6 +1038,22 @@ def test_pg_us353_standard_tp_native_partial_cancel_commits_claim_stage_together
         remaining_qty=3, broker_status="CANCELLED",
         evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL", raw_row=broker_row,
     )
+    if claim_commit_failure:
+        assert result["status"] == "RECONCILE_UPDATE_FAILED", result
+        assert result["retry_order"] is False
+        assert result["entry_fence"] is True
+        with pg_engine.connect() as conn:
+            protected_order = conn.execute(text("""
+                SELECT status FROM us_orders
+                 WHERE trade_date=:td AND client_order_key=:key
+            """), {"td": trade_date, "key": key}).scalar_one()
+        assert protected_order != "CANCELLED"
+        protected_stage = repos.load_us_profit_capture_state(
+            trade_date, ["GILD"], {"GILD": cycle},
+        )["GILD"]
+        assert protected_stage["tp1_pending"] is True
+        assert ledger.get(identity).active_attempt_id == attempt
+        return
     assert result["status"] == "OK", result
     assert result["authoritative"] is True
     assert result["order_status"] == "CANCELLED"
