@@ -3693,25 +3693,37 @@ def run_trade_tick(
         entry_degraded_reason = "DAILY_NOTIONAL_UNAVAILABLE"
         logger.error("[US_ENTRY][BLOCK] reason=DAILY_NOTIONAL_UNAVAILABLE error=%s", daily_notional_load_error)
     elif reconcile_entry_block or not entry_can_proceed:
-        # Opening BUY suppression is intentional 09:30-10:00 ET policy,
-        # not execution/liveness failure. Every other failed guard remains
-        # degraded until its own original evidence proves otherwise.
-        opening_policy_only = bool(
+        # Only an *identified* buy-only policy (opening window or the
+        # authoritative session/PREP reason) is expected. Real entry, sell,
+        # fill and reconcile failures remain degraded regardless of regime.
+        from trader.us.runner.status_contract import is_policy_entry_block_reason
+        _upstream_policy_reason = str(entry_block_reason or "").strip()
+        _upstream_policy_only = (
+            not entry_permission_before_opening
+            and is_policy_entry_block_reason(_upstream_policy_reason)
+        )
+        _opening_policy_only = (
             opening_buy_blocked and entry_permission_before_opening
-            and not reconcile_entry_block
-            and session_entry_allowed is not False and bool(exit_can_proceed)
+            and str(entry_block_reason or "").strip().lower() in {"", "ok", "none"}
+            and session_entry_allowed is not False
+        )
+        policy_only = bool(
+            (_upstream_policy_only or _opening_policy_only)
+            and not reconcile_entry_block and bool(exit_can_proceed)
             and not recon.get("block_new_entry", False)
             and bool(balance_circuit.get("entry_can_proceed", False))
             and bool(daily_notional_available)
             and not fills_contract_error and not fills_temp_error
             and not locals().get("_early_pilot_stream_incomplete", False)
-            and str(entry_block_reason or "").strip().lower() in {"", "ok", "none"}
             and not locals().get("system_invariant_failure")
         )
-        if opening_policy_only:
+        if policy_only:
             entry_degraded = False
             entry_degraded_reason = ""
-            entry_policy_block_reason = "OPENING_30MIN_BUY_BLOCK"
+            entry_policy_block_reason = (
+                _upstream_policy_reason if _upstream_policy_only
+                else "OPENING_30MIN_BUY_BLOCK"
+            )
             logger.info("[US_ENTRY][POLICY_BLOCKED] session=%s tick=%s reason=%s liveness=OK",
                         session, tick_index, entry_policy_block_reason)
         else:
