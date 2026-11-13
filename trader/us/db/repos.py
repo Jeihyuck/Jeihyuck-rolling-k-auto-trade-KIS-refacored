@@ -3484,7 +3484,10 @@ def mark_us_profit_capture_stage(
             epoch_id = _active_us_epoch(conn)
             params = {"td":td,"symbol":sym,"lifecycle":lifecycle,"stage":stg,"status":stage_status,
                       "key":order_key,"raw":broker_order_no,"canonical":normalize_us_order_no(broker_order_no),
-                      "requested":int(qty or meta.get(f"{stg}_qty") or 0),
+                      # The row records the economic stage target, not the
+                      # quantity of this particular retry. On a new trading
+                      # date there is no older row for GREATEST to preserve.
+                      "requested":max(int(qty or 0), int(meta.get(f"{stg}_qty") or 0)),
                       "filled":int(meta.get(f"{stg}_filled_qty") or 0),
                       "state":_json_param(normalized)}
             if epoch_id:

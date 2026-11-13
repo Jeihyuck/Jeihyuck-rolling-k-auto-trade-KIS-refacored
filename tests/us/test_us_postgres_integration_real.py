@@ -3446,6 +3446,8 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
         "fixture-ten-symbol-exit-epoch-on"
         if paper_profile else "fixture-ten-symbol-exit-epoch"
     )
+    if multiple_unresolved:
+        epoch += "-multiple"
     symbols = ["ABBV", "AMGN", "DHR", "HCA", "KO",
                "KR", "MCK", "PFE", "PG", "TMO"]
     blocked = {"KO", "KR", "TMO"} if multiple_unresolved else {"KO"}
@@ -3562,7 +3564,7 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
         assert intent["source_entry_contract_sha256"] == (
             positions[sym]["meta"]["entry_exit_contract_sha256"]
         )
-    if paper_profile:
+    if paper_profile or multiple_unresolved:
         # The legacy-off parameter ran earlier against the same PG fixture.
         # Distinct test sessions must not reuse its date-scoped SELL client
         # keys; otherwise the operational router correctly deduplicates all
@@ -3570,7 +3572,8 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
         for candidate in signals:
             if candidate.get("side") == "SELL":
                 candidate["client_order_key"] = (
-                    "ci-paper-on-" + str(candidate["client_order_key"])
+                    f"ci-{int(paper_profile)}-{int(multiple_unresolved)}-"
+                    + str(candidate["client_order_key"])
                 )
     routed = route_exit_orders_immediately(
         signals, buy_daily_notional=0, position_count=10,
