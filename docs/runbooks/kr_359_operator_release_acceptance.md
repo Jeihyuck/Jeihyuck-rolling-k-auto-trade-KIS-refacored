@@ -26,6 +26,15 @@ order/position repair. #358 is **test-only** and must never be merged.
   were empty. Do **not** infer this is safe or unsafe to repair without
   transaction-specific original KIS evidence.
 
+### Pre-migration signed-contract audit (READ-ONLY)
+
+The live database contained **930 signed PB1 BUY source orders with zero
+malformed hashes or request-to-order scope mismatches**. Of four ACTIVE/OPEN
+signed positions, **zero** had malformed signed source metadata. Five older
+positions with status CLOSED and qty=0 lacked an exit-plan SHA in their old
+entry metadata; those remain historical evidence debt, never automatic
+backfill targets. The #359 release audit reports this split explicitly.
+
 ## Gate A: isolated code & native DB CI
 
 Review the branch's CI, including the KR full acceptance and actual PostgreSQL
