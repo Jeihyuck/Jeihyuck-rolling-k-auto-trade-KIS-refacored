@@ -60,6 +60,9 @@ def classify_skip(reason: str, *, proof: dict | None = None) -> tuple[str, str]:
 def summarize_buy_skips(records: list[dict[str, Any]], *,
                         trade_date: str, max_rows: int | None = None) -> dict:
     counts = Counter()
+    quote_sources = Counter()
+    entry_styles = Counter()
+    volume_evidence_categories = Counter()
     grouped = defaultdict(lambda: {"events": 0, "runs": set(), "reasons": Counter()})
     unique_evaluations = set()
     event_ids = set()
@@ -104,6 +107,11 @@ def summarize_buy_skips(records: list[dict[str, Any]], *,
         proof = features.get("volume_proof")
         if not isinstance(proof, dict):
             proof = payload.get("volume_proof")
+        if not isinstance(proof, dict):
+            proof = {}
+        quote_sources[str(proof.get("quote_source") or "UNRECORDED")] += 1
+        entry_styles[str(features.get("entry_style_selected") or "UNRECORDED")] += 1
+        volume_evidence_categories[str(proof.get("failure_category") or "UNRECORDED")] += 1
         for reason in reasons:
             category, label = classify_skip(reason, proof=proof)
             counts[(category, label, reason)] += 1
@@ -128,6 +136,9 @@ def summarize_buy_skips(records: list[dict[str, Any]], *,
         "unique_run_code_pairs": len(unique_evaluations),
         "unique_run_ids": len(distinct_runs),
         "by_stage": dict(sorted(different_stages.items())),
+        "quote_source_occurrences": dict(sorted(quote_sources.items())),
+        "entry_style_occurrences": dict(sorted(entry_styles.items())),
+        "volume_proof_category_occurrences": dict(sorted(volume_evidence_categories.items())),
         "by_category_reason_occurrences": dict(sorted(categories.items())),
         "by_reason": [
             {"category": category, "group": label,
