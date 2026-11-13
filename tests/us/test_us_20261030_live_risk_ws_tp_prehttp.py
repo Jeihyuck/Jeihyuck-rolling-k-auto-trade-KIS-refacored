@@ -1095,6 +1095,75 @@ def test_pg_us353_standard_tp_native_partial_cancel_commits_claim_stage_together
     retry_key = key + "_RETRY"
     retry_attempt = attempt + "_RETRY"
     retry_meta = {**meta, "submit_attempt_id": retry_attempt}
+    if not retry_next_day and not abort_retry_before_http and not repeat_partial:
+        # Exercise the unmocked order router and durable PG gates through a
+        # KIS-shaped test broker. No real broker/network request is made.
+        from datetime import datetime, timezone
+        from trader.us.execution import order_router
+        from trader.us import config as us_config
+        retry_identity = SemanticActionIdentity(
+            env="practice", account_id=account, market="US", trading_epoch_id=epoch,
+            strategy_owner="US_STANDARD", lifecycle_id=cycle, action="TP1",
+            trade_date=date.fromisoformat(retry_date),
+        )
+        monkeypatch.setenv("WSL_RUN_MARKET", "")
+        monkeypatch.setenv("US_ATOMIC_CLAIM_OUTBOX_ENABLED", "0")
+        monkeypatch.setenv("US_ACCOUNT_RESERVATION_MODE", "OFF")
+        monkeypatch.setenv("US_RECONCILE_WORKER_MODE", "LEGACY")
+        monkeypatch.setattr(order_router, "resolve_dry_run_for_us_order", lambda: False)
+        monkeypatch.setattr(order_router, "canonical_order_risk_check", lambda *_a, **_kw: None)
+        monkeypatch.setattr(order_router, "enrich_sell_exchange", lambda *_a, **_kw: "NYSE")
+        monkeypatch.setattr(order_router, "_semantic_action_identity", lambda *_a, **_kw: retry_identity)
+        monkeypatch.setattr(order_router, "_get_broker_position", lambda *_a, **_kw: {
+            "symbol": "GILD", "qty": 12, "orderable_qty": 12,
+            "currency": "USD", "avg_price": 90,
+        })
+        monkeypatch.setattr(us_config, "assert_us_paper_order_allowed", lambda: None)
+        monkeypatch.setattr(repos, "claim_execution_action", ledger.acquire)
+        monkeypatch.setattr(repos, "record_execution_action_observation", ledger.record_observation)
+        monkeypatch.setattr(repos, "release_execution_action_before_submit", ledger.release_before_submit)
+
+        class NativeTestBroker:
+            def __init__(self):
+                self.callback = None
+                self.submissions = []
+            def set_before_order_http(self, callback):
+                self.callback = callback
+            def clear_before_order_http(self):
+                self.callback = None
+            def get_us_price(self, *_args):
+                return {"_quote_quality": "FRESH", "_quote_source": "KIS_LIVE",
+                        "_quote_asof_epoch": time.time(), "output": {"last": "102"}}
+            def place_us_sell_order(self, symbol, exchange, qty, price):
+                assert self.callback is not None
+                self.callback()
+                self.submissions.append((symbol, qty))
+                return {"ok": True, "order_no": "0000039953"}
+        monkeypatch.setattr(order_router, "NativeKisUSClient", NativeTestBroker)
+        broker = NativeTestBroker()
+        retry_meta.update({
+            "reason": "TAKE_PROFIT_TP1", "profit_capture_stage_target_qty": 5,
+            "profit_capture_stage_filled_qty": 2, "profit_capture_sell_fraction": .25,
+            "profit_capture_runner_min_remain_pct": .4, "tp_threshold_fraction": .03,
+            "last_profit_capture_at": datetime.now(timezone.utc).isoformat(),
+        })
+        result = order_router.route_order({
+            "trade_date": retry_date, "symbol": "GILD", "exchange": "NYSE",
+            "side": "SELL", "qty": 3, "limit_price": 102, "notional_usd": 306,
+            "strategy_owner": "US_STANDARD", "client_order_key": retry_key,
+            "submit_attempt_id": retry_attempt, "position_lifecycle_id": cycle,
+            "reason": "TAKE_PROFIT_TP1", "meta": retry_meta,
+        }, kis_client=broker, current_position_symbols={"GILD"})
+        assert result.get("status") == "ACK", result
+        assert broker.submissions == [("GILD", 3)]
+        with pg_engine.connect() as conn:
+            retry_order = conn.execute(text("""
+                SELECT qty_requested, meta FROM us_orders
+                 WHERE client_order_key=:key AND trading_epoch_id=:epoch
+            """), {"key": retry_key, "epoch": epoch}).mappings().one()
+        assert int(retry_order["qty_requested"]) == 3
+        assert retry_order["meta"]["source_entry_contract_sha256"] == meta["source_entry_contract_sha256"]
+        return
     assert repos.save_order_intent({
         "trade_date": retry_date, "symbol": "GILD", "exchange": "NYSE",
         "side": "SELL", "qty": 3, "limit_price": 102, "notional_usd": 306,
