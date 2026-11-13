@@ -10,7 +10,6 @@ import trader.reconcile_kis as rk
 from trader.account_state import get_account_key
 from trader.db.repos import OrdersRepo, PositionsRepo, PortfolioEpochsRepo
 from trader.db.schema import schema_for_engine
-from trader.db.trading_epoch import active_trading_epoch_id
 from trader.run_context import RunContext
 from tests.kr.test_kr_20261006_execution_convergence import _db
 
@@ -40,8 +39,6 @@ def _signed_buy_order(engine, *, code, odno, key):
         env=env, account_id=account, sid=1, mode=1,
         strategy="pb1_pullback_close",
     )
-    with engine.connect() as conn:
-        epoch = active_trading_epoch_id(conn, env=env, account_id=account, required=True)
     cycle = str(uuid4())
     plan = {
         "entry_style_selected": "ENTRY_PULLBACK",
@@ -80,7 +77,7 @@ def _signed_buy_order(engine, *, code, odno, key):
             submitted_at=order_time,
             acked_at=order_time,
         ))
-    return str(order_id), cycle, str(portfolio), str(epoch)
+    return str(order_id), cycle
 
 
 def _buy_row(code, odno):
@@ -105,7 +102,7 @@ def test_signed_buy_fill_and_position_rollback_then_replay_once(monkeypatch):
     engine = _db()
     schema = schema_for_engine(engine)
     code, odno, key = "251970", "0000041001", "pr359-signed-buy-crash"
-    order_id, cycle, portfolio, epoch = _signed_buy_order(
+    order_id, cycle = _signed_buy_order(
         engine, code=code, odno=odno, key=key,
     )
     kis = KISBuyDailyReplay(_buy_row(code, odno))
