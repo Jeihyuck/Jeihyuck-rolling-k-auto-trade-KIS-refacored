@@ -7899,6 +7899,10 @@ class PositionsRepo:
                         "parent_entry_contract_sha256": request_json.get("parent_entry_contract_sha256"),
                         "source_buy_order_id": str(order_id),
                         "source_buy_client_order_key": request_json.get("client_order_key"),
+                        # Mutable ADD provenance, distinct from the original
+                        # root BUY fields frozen by migration 0063.
+                        "last_buy_order_id": str(order_id),
+                        "last_buy_client_order_key": request_json.get("client_order_key"),
                     })
                     logger.info(
                         "[KR_POSITION][ENTRY_CONTRACT_BOUND] code=%s order_id=%s cycle=%s contract_sha=%s",
@@ -8096,6 +8100,8 @@ class PositionsRepo:
                         "entry_contract_sha256",
                         "entry_contract_version",
                         "entry_exit_plan_sha256",
+                        "source_buy_order_id",
+                        "source_buy_client_order_key",
                         "entry_reason",
                         "entry_style_selected",
                         "entry_decision_family",
