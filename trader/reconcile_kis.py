@@ -2813,7 +2813,16 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                         and str(source_order.get("trading_epoch_id") or "") == tp_contract.get("trading_epoch_id")
                         and str(source_order.get("strategy") or "") == "pb1_pullback_close"
                     ):
-                        raise RuntimeError("KR_TP_KIS_ORIGINAL_ORDER_PROOF_MISMATCH")
+                        reason = "KR_TP_KIS_ORIGINAL_ORDER_PROOF_MISMATCH"
+                        execution_claim_observation_failures.append({
+                            "client_order_key": str(source_order.get("client_order_key") or ""),
+                            "error": reason,
+                        })
+                        logger.error(
+                            "[KR_PROFIT_PARITY][KIS_PROOF_FAIL_CLOSED] code=%s stage=%s reason=%s",
+                            code, tp_stage, reason,
+                        )
+                        return False
                     tp_update = observe_broker_stage(
                         engine=engine, contract=tp_contract,
                         account_id=_tp_account_key(env=env, kis=kis),
@@ -2829,18 +2838,39 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                         _conn=conn,
                     )
                     if not tp_update.accepted:
-                        raise RuntimeError("KR_TP_STAGE_BROKER_PROOF_NOT_STORED:" + tp_update.reason)
+                        reason = "KR_TP_STAGE_BROKER_PROOF_NOT_STORED:" + tp_update.reason
+                        execution_claim_observation_failures.append({
+                            "client_order_key": str(source_order.get("client_order_key") or ""),
+                            "error": reason,
+                        })
+                        logger.error(
+                            "[KR_PROFIT_PARITY][KIS_PROOF_FAIL_CLOSED] code=%s stage=%s reason=%s",
+                            code, tp_stage, reason,
+                        )
+                        return False
                     logger.info(
                         "[KR_PROFIT_PARITY][KIS_PROVEN_STAGE] code=%s stage=%s "
                         "status=%s cumulative=%s order=%s",
                         code, tp_stage, tp_update.status, next_confirmed_qty, original_odno,
                     )
+                    return True
+                except Exception as exc:
+                    reason = "KR_TP_STAGE_OBSERVATION_FAILED:" + type(exc).__name__
+                    execution_claim_observation_failures.append({
+                        "client_order_key": str(source_order.get("client_order_key") or ""),
+                        "error": reason,
+                    })
+                    logger.exception(
+                        "[KR_PROFIT_PARITY][KIS_PROOF_FAIL_CLOSED] code=%s stage=%s reason=%s",
+                        code, tp_stage, reason,
+                    )
+                    return False
 
                 def _apply_sell_claim(conn):
                     # TP stage proof is part of the same transaction as native
                     # SELL fill, position, execution claim and order watermark.
                     # A journal failure must roll back the economic projection.
-                    _apply_kr_tp_stage_journal(conn)
+                    tp_stage_accepted = _apply_kr_tp_stage_journal(conn)
                     cancelled = status in {"CANCELLED", "CANCELED", "CANCEL"}
                     try:
                         snapshot = orders_repo.record_execution_claim_for_order(
@@ -2856,10 +2886,14 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                     claim_state = str(getattr(snapshot, "action_state", "") or "").upper()
                     if not getattr(snapshot, "active_attempt_id", None) and claim_state in {"RETRYABLE", "PARTIALLY_SATISFIED", "SATISFIED"}:
                         fields = {}
-                        if claim_state == "SATISFIED" and isinstance(execution_meta_update, dict):
+                        if (
+                            claim_state == "SATISFIED"
+                            and isinstance(execution_meta_update, dict)
+                            and tp_stage_accepted is not False
+                        ):
                             fields.update(execution_meta_update)
                         stage_name = str(request_json.get("profit_capture_stage") or "").lower()
-                        if stage_name in {"tp1", "tp2", "tp3"}:
+                        if stage_name in {"tp1", "tp2", "tp3"} and tp_stage_accepted is not False:
                             fields[f"kr_{stage_name}_pending"] = False
                         if fields:
                             positions_repo.update_position_fields(
@@ -2907,7 +2941,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                         _lock_sell_order_watermark(conn)
                         if native_fill_kwargs is not None:
                             fills_repo.upsert_fill(**native_fill_kwargs, _conn=conn)
-                        _apply_kr_tp_stage_journal(conn)
+                        tp_stage_accepted = _apply_kr_tp_stage_journal(conn)
                         sell_price = verified_cumulative_sell_price
                         if sell_price is None:
                             sell_price = _verified_order_sell_average_from_ccld_fills(
@@ -2932,14 +2966,17 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                             and claim_state in {"RETRYABLE", "PARTIALLY_SATISFIED", "SATISFIED"}
                         ):
                             atomic_meta_fields: dict[str, Any] = {}
-                            if claim_state == "SATISFIED":
+                            if claim_state == "SATISFIED" and tp_stage_accepted is not False:
                                 execution_meta_update = request_json.get("execution_meta_update")
                                 if isinstance(execution_meta_update, dict):
                                     atomic_meta_fields.update(execution_meta_update)
                             profit_capture_stage = str(
                                 request_json.get("profit_capture_stage") or ""
                             ).lower()
-                            if profit_capture_stage in {"tp1", "tp2", "tp3"}:
+                            if (
+                                profit_capture_stage in {"tp1", "tp2", "tp3"}
+                                and tp_stage_accepted is not False
+                            ):
                                 atomic_meta_fields[f"kr_{profit_capture_stage}_pending"] = False
                             if atomic_meta_fields:
                                 positions_repo.update_position_fields(
