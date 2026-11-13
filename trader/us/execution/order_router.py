@@ -555,6 +555,30 @@ def _assert_tp_post_quote_submit_authority(
         _check_stage4()
     if context is not None and not context.broker_submit_allowed():
         raise KisUSPreSubmitError("US_TICK_AUTHORITY_EXPIRED_BEFORE_HTTP")
+    # The KIS quote GET may overlap a late correction to a previous TP fill.
+    # Re-read the exact stage and claim *after* that I/O, not merely before
+    # it. A superseded fill makes the claim UNCERTAIN and fences this POST.
+    meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+    if side == "SELL" and meta.get("tp_pending_deferred_to_claim") is True:
+        try:
+            from trader.us.db.repos import verify_us_tp_claim_stage_at_http_boundary
+            from trader.us.profit_capture import tp_stage_lifecycle_from_order_proof
+            cycle = tp_stage_lifecycle_from_order_proof(
+                str(intent.get("position_lifecycle_id") or meta.get("position_lifecycle_id") or ""),
+                meta, client_order_key=client_order_key,
+            )
+            if not verify_us_tp_claim_stage_at_http_boundary(
+                trade_date=str(intent.get("trade_date") or ""), symbol=symbol,
+                stage=str(meta.get("profit_capture_stage") or ""),
+                position_lifecycle_id=cycle, client_order_key=client_order_key,
+                attempt_id=attempt_id, action_key=str(meta.get("execution_action_key") or ""),
+            ):
+                raise RuntimeError("TP_STAGE_OR_CLAIM_CHANGED_DURING_QUOTE")
+        except Exception as exc:
+            raise KisUSPreSubmitError("US_TP_STAGE_CLAIM_FENCED_AFTER_QUOTE") from exc
+        _check_stage4()
+        if context is not None and not context.broker_submit_allowed():
+            raise KisUSPreSubmitError("US_TICK_AUTHORITY_EXPIRED_BEFORE_HTTP")
     decision_ok, decision_reason = _tp_decision_fresh_for_native_http(
         intent, max_age_sec=max_decision_age_sec,
     )

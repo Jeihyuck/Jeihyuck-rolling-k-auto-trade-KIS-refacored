@@ -176,6 +176,49 @@ def test_native_kis_post_uses_valid_final_tp_authority_once(monkeypatch):
     assert client._before_order_http is None
 
 
+@pytest.mark.parametrize("still_valid", [False, True])
+def test_native_post_rechecks_partial_tp_claim_after_quote(monkeypatch, still_valid):
+    """A late fill during quote GET fences the actual native POST callback."""
+    import requests
+    from trader.us.db import repos
+    from trader.us.execution import kis_us_client as client_module
+    monkeypatch.setenv("US_RECONCILE_WORKER_MODE", "LEGACY")
+    monkeypatch.setenv("US_ACCOUNT_RESERVATION_MODE", "OFF")
+    checks, posts = [], []
+    def check(**kwargs):
+        checks.append(kwargs)
+        return still_valid
+    monkeypatch.setattr(repos, "verify_us_tp_claim_stage_at_http_boundary", check)
+    class StubResponse:
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"rt_cd": "0"}
+    monkeypatch.setattr(requests, "post", lambda *a, **kw: (posts.append(1) or StubResponse()))
+    monkeypatch.setattr(client_module, "record_kis_http_call", lambda *_a, **_kw: None)
+    intent = _tp()
+    intent.update(trade_date="2026-11-13", position_lifecycle_id="buy-cycle")
+    intent["meta"].update(tp_pending_deferred_to_claim=True,
+                          execution_action_key="same-action")
+    client = _stub_native_transport()
+    client.set_before_order_http(lambda: _assert_tp_post_quote_submit_authority(
+        intent, _quote(), account_env="practice", context=None, account_authority=None,
+        attempt_id="hca-exact-attempt", client_order_key=intent["client_order_key"],
+        strategy_owner="US_STANDARD", symbol="HCA", side="SELL", qty=3,
+        max_decision_age_sec=30,
+    ))
+    if still_valid:
+        assert client._post("/uapi/overseas-stock/v1/trading/order", headers={}, body={})["rt_cd"] == "0"
+        assert posts == [1]
+    else:
+        with pytest.raises(KisUSPreSubmitError, match="US_TP_STAGE_CLAIM_FENCED_AFTER_QUOTE"):
+            client._post("/uapi/overseas-stock/v1/trading/order", headers={}, body={})
+        assert posts == []
+    assert len(checks) == 1
+    assert checks[0]["action_key"] == "same-action"
+    assert checks[0]["position_lifecycle_id"] == "buy-cycle"
+
+
 def test_native_post_rechecks_tick_budget_after_callback(monkeypatch):
     """No HTTP when authoritative DB checks consume the remaining deadline."""
     import requests
