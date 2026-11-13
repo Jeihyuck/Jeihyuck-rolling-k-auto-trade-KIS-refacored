@@ -172,3 +172,19 @@ def test_limit_plus_one_marks_partial_not_exact_limit():
     assert report["event_count"] == 2
     assert report["truncated"] is True
     assert report["truncated_after_events"] == 2
+
+
+def test_provenance_summary_uses_actual_payload_without_claiming_live_broker_verification():
+    record = _skip("219130", "KR_VOLUME_PROOF_KIS_EXCHANGE_QUOTE_TIME_MISSING")
+    record["payload_json"] = {
+        "features": {
+            "entry_style_selected": "ENTRY_MOMENTUM",
+            "volume_proof": {"quote_source": "KIS_WEBSOCKET",
+                             "failure_category": "DATA_UNVERIFIED"},
+        },
+    }
+    result = summarize_buy_skips([record], trade_date="2026-11-13")
+    assert result["quote_source_occurrences"] == {"KIS_WEBSOCKET": 1}
+    assert result["entry_style_occurrences"] == {"ENTRY_MOMENTUM": 1}
+    assert result["volume_proof_category_occurrences"] == {"DATA_UNVERIFIED": 1}
+    assert result["broker_holdings_verified"] is False
