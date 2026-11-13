@@ -1173,36 +1173,38 @@ def _promote_open_buy_orders_from_holdings(
             )
 
             def _apply_promoted_buy_position(*, _conn=None):
-                    kwargs = dict(
-                        env=env,
-                        strategy=strategy,
-                        sid=int(order.get("sid") or 1),
-                        mode=int(order.get("mode") or 1),
-                        code=code,
-                        market=order.get("market"),
-                        side="BUY",
-                        qty=incremental_fill_qty,
-                        price=float(fill_price or 0.0),
-                        fee=0.0,
-                        tax=0.0,
-                        filled_at=tick_ts,
-                        entry_meta_json=request_json.get("entry_meta") or {},
-                        entry_exit_plan=request_json.get("entry_exit_plan") or {},
-                        portfolio_epoch_id=str(order.get("portfolio_epoch_id") or "") or None,
-                        position_cycle_id=str(order.get("position_cycle_id") or "") or None,
-                        order_id=str(order.get("order_id") or "") or None,
-                        buy_application_cumulative_qty=confirmed_fill_qty,
-                    )
-                    if _conn is not None:
-                        kwargs["_conn"] = _conn
-                    return positions_repo.apply_fill(**kwargs)
+                kwargs = dict(
+                    env=env,
+                    strategy=strategy,
+                    sid=int(order.get("sid") or 1),
+                    mode=int(order.get("mode") or 1),
+                    code=code,
+                    market=order.get("market"),
+                    side="BUY",
+                    qty=incremental_fill_qty,
+                    price=float(fill_price or 0.0),
+                    fee=0.0,
+                    tax=0.0,
+                    filled_at=tick_ts,
+                    entry_meta_json=request_json.get("entry_meta") or {},
+                    entry_exit_plan=request_json.get("entry_exit_plan") or {},
+                    portfolio_epoch_id=str(order.get("portfolio_epoch_id") or "") or None,
+                    position_cycle_id=str(order.get("position_cycle_id") or "") or None,
+                    order_id=str(order.get("order_id") or "") or None,
+                    buy_application_cumulative_qty=confirmed_fill_qty,
+                )
+                if _conn is not None:
+                    kwargs["_conn"] = _conn
+                return positions_repo.apply_fill(**kwargs)
             # Both records must commit or roll back together on the actual
             # production repository path, never on a fake broker endpoint.
             atomic_buy = bool(
-                side == "BUY" and positions_repo is not None
-                and getattr(fills_repo, "engine", None) is not None
-                and getattr(fills_repo, "engine", None) is getattr(positions_repo, "engine", None)
-                and getattr(fills_repo, "engine", None) is getattr(orders_repo, "engine", None)
+                side == "BUY"
+                and isinstance(fills_repo, FillsRepo)
+                and isinstance(positions_repo, PositionsRepo)
+                and isinstance(orders_repo, OrdersRepo)
+                and fills_repo.engine is positions_repo.engine
+                and fills_repo.engine is orders_repo.engine
             )
             if atomic_buy:
                 with fills_repo.engine.begin() as conn:
