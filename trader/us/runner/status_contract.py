@@ -50,6 +50,11 @@ _POLICY_ENTRY_BLOCK_REASONS = {
 }
 
 
+def is_policy_entry_block_reason(reason: str | None) -> bool:
+    """Explicit, documented BUY-only restriction; never an execution fault."""
+    return str(reason or "").strip().lower() in _POLICY_ENTRY_BLOCK_REASONS
+
+
 _ORDER_PERMISSION_SELL_BLOCK_REASONS = frozenset({
     "us_live_trading_disabled", "live_trading_flag_disabled",
     "disable_live_trading_enabled", "disable_real_trading_enabled",
