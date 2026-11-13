@@ -62,3 +62,35 @@ def test_max_rows_is_explicitly_truncation_marked():
     report = summarize_buy_skips([_skip("005930", "NO_SIGNAL")],
                                  trade_date="2026-11-13", max_rows=1)
     assert report["truncated"]
+
+
+def test_kst_query_boundaries_are_utc_attested_not_midnight_naive():
+    from datetime import date
+    from scripts.kr_entry_funnel_audit import report_for_date
+
+    class FakeResult:
+        def mappings(self):
+            return []
+
+    class FakeConnection:
+        def execute(self, statement, params):
+            assert "r.env = 'practice'" in str(statement)
+            assert "r.strategy = 'pb1_pullback_close'" in str(statement)
+            assert params["start_at"].isoformat() == "2026-11-12T15:00:00+00:00"
+            assert params["stop_at"].isoformat() == "2026-11-13T15:00:00+00:00"
+            return FakeResult()
+
+    class FakeContext:
+        def __enter__(self):
+            return FakeConnection()
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeEngine:
+        def connect(self):
+            return FakeContext()
+
+    report = report_for_date(day=date(2026, 11, 13), engine=FakeEngine())
+    assert report["event_count"] == 0
+    assert report["query_scope"]["environment"] == "practice"
+    assert report["broker_holdings_verified"] is False
