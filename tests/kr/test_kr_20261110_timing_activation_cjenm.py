@@ -342,6 +342,10 @@ def test_native_kis_api_envelope_to_observer_to_ready_proof_contract(tmp_path, m
     client._headers = lambda *args, **kwargs: {}
     client._safe_request = _request
     client.get_price_snapshot = lambda *args, **kwargs: {
+        "source": "KIS_REST_INQUIRE_PRICE",
+        "source_identity": "AUTHENTICATED_REST_REQUEST_BOUND",
+        "requested_symbol": "035760",
+        "received_at": observed.timestamp(),
         "raw": {"stck_bsop_date": "20261110",
                 "stck_cntg_hour": "093450",
                 "wghn_avrg_stck_prc": "95.5"},
