@@ -1,6 +1,4 @@
 """Pure offline acceptance checks for the operator's SELECT-only KR audit."""
-from copy import deepcopy
-
 from scripts.kr_release_acceptance_readonly import (
     TRIGGERS,
     evaluate_readiness,
