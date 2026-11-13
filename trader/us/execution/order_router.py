@@ -3335,6 +3335,7 @@ def route_order(
             # when KIS HTTP was provably never reached. Never clear PENDING
             # when Claim release/journal proof failed or the order is unknown.
             tp_stage = str((intent.get("meta") or {}).get("profit_capture_stage") or "").lower()
+            _tp_pre_io_stage_released = False
             if (not requires_reconcile and side == "SELL"
                     and tp_stage in {"tp1", "tp2", "tp3"}):
                 try:
@@ -3359,6 +3360,7 @@ def route_order(
                             "action=RECONCILE_ONLY", symbol_upper, tp_stage,
                         )
                     else:
+                        _tp_pre_io_stage_released = True
                         logger.warning(
                             "[US_PROFIT_CAPTURE][PRE_IO_ABORT_RELEASED] symbol=%s stage=%s "
                             "action=REEVALUATE_NEXT_TICK", symbol_upper, tp_stage,
@@ -3387,6 +3389,7 @@ def route_order(
                 "retry_order": not requires_reconcile and not terminal_pre_io_intent,
                 "fresh_signal_required": terminal_pre_io_intent,
                 "requires_reconcile": requires_reconcile,
+                "tp_stage_released_pre_io": _tp_pre_io_stage_released,
                 "intent": intent,
             }
         # KIS API 자체 실패 → REJECT (SELL no-balance after ACK is reconciliatory, not fatal)
