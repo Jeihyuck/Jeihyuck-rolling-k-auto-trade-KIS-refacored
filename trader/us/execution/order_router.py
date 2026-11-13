@@ -2782,15 +2782,71 @@ def route_order(
         append_order_event("BROKER_SUBMIT_STARTED", intent, context=context,
                            require_db=_require_native_submit_journal)
     except Exception as exc:
+        # No native KIS order call is reachable when STARTED journaling fails.
+        # Still, a TP stage may already have been reserved after Claim.
+        # Persist an exact pre-I/O abort before attempting the Claim release;
+        # if either proof fails, leave that stage PENDING for AM/Close audit.
+        _journal_abort_saved = False
+        _claim_released = False
+        _tp_released = False
+        try:
+            append_order_event(
+                "BROKER_SUBMIT_ABORTED_PRE_IO", intent, context=context,
+                broker_status="DURABLE_STARTED_JOURNAL_FAILED_BEFORE_HTTP",
+                require_db=side == "BUY" and _native_kis,
+            )
+            _journal_abort_saved = True
+        except Exception:
+            logger.exception(
+                "[US_ORDER][STARTED_JOURNAL_ABORT_PROOF_FAILED] action_key=%s",
+                claim.action_key,
+            )
         try:
             from trader.us.db.repos import release_execution_action_before_submit
             release_execution_action_before_submit(
                 claim_identity, attempt_id=intent["submit_attempt_id"],
             )
+            _claim_released = True
         except Exception:
             logger.exception("[US_ORDER][EXECUTION_CLAIM][PRE_SUBMIT_RELEASE_FAILED] action_key=%s", claim.action_key)
-        logger.critical("[US_ORDER][JOURNAL_FAILED] broker_submit=blocked error=%s", exc)
-        return {"status": "ORDER_DISABLED_DURABLE_LEDGER_UNAVAILABLE", "reason": "durable_journal_write_failed", "broker_submit": False, "retry_order": False, "intent": intent}
+        if (_journal_abort_saved and _claim_released and side == "SELL"
+                and (intent.get("meta") or {}).get("tp_claim_stage_reserved") is True):
+            try:
+                from trader.us.db.repos import release_us_profit_capture_pre_http_abort
+                from trader.us.profit_capture import tp_stage_lifecycle_from_order_proof
+                _tp_cycle = tp_stage_lifecycle_from_order_proof(
+                    str(intent.get("position_lifecycle_id") or ""),
+                    intent.get("meta"), client_order_key=str(order_key or ""),
+                )
+                _tp_released = release_us_profit_capture_pre_http_abort(
+                    trade_date=str(trade_date), symbol=symbol_upper,
+                    stage=str((intent.get("meta") or {}).get("profit_capture_stage") or ""),
+                    position_lifecycle_id=_tp_cycle,
+                    client_order_key=str(order_key or ""),
+                )
+            except Exception:
+                logger.exception("[US_PROFIT_CAPTURE][STARTED_JOURNAL_TP_RELEASE_FAILED]")
+        _tp_needs_proof = (
+            side == "SELL"
+            and (intent.get("meta") or {}).get("tp_claim_stage_reserved") is True
+            and not _tp_released
+        )
+        logger.critical(
+            "[US_ORDER][JOURNAL_FAILED] broker_submit=blocked error_type=%s "
+            "abort_saved=%d claim_released=%d tp_released=%d",
+            type(exc).__name__, int(_journal_abort_saved),
+            int(_claim_released), int(_tp_released),
+        )
+        return {
+            "status": "ORDER_DISABLED_DURABLE_LEDGER_UNAVAILABLE",
+            "reason": "durable_journal_write_failed", "broker_submit": False,
+            "retry_order": False,
+            "requires_reconcile": (
+                not _journal_abort_saved or not _claim_released or _tp_needs_proof
+            ),
+            "tp_stage_released_pre_io": _tp_released,
+            "intent": intent,
+        }
     if context is not None and not context.broker_submit_allowed():
         abort_journal_error = None
         try:
