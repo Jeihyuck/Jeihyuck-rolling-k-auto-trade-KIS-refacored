@@ -51,6 +51,8 @@ def public_quote_evidence(quote: dict, *, requested_code: str, origin: str) -> d
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--code", required=True, help="6-digit KR symbol only")
+    parser.add_argument("--require-native-row", action="store_true",
+                        help="exit 3 unless KIS time-itemconclusion provides one source-bound native trade row")
     args = parser.parse_args()
     code = args.code.strip()
     if not (len(code) == 6 and code.isascii() and code.isdecimal()):
@@ -68,16 +70,30 @@ def main() -> None:
         raise RuntimeError("READONLY_PROBE_REQUIRES_PRACTICE_ACCOUNT")
     ws_first = kis.get_price_snapshot(code, market="J")
     fresh_rest = kis.get_kr_native_quote_readonly(code)
+    # This is the actual #355 fallback endpoint, distinct from inquire-price.
+    # Both requests are read-only; an empty/out-of-session result is NOT proof.
+    native_trade_row = kis.get_kr_entry_native_trade_quote(code)
+    native_row_attested = bool(
+        native_trade_row.get("source") == "KIS_REST_TIME_ITEMCONCLUSION"
+        and native_trade_row.get("source_identity") == "AUTHENTICATED_REST_REQUEST_BOUND"
+        and native_trade_row.get("requested_symbol") == code
+        and native_trade_row.get("quote_source_contract") == "SAME_OUTPUT2_EXECUTION_ROW"
+    )
     result = {
         "trade_date_kst": datetime.now(KST).date().isoformat(),
         "checked_at_utc": datetime.now(timezone.utc).isoformat(),
         "broker_order_calls": 0,
+        "same_row_native_trade_status": "ATTESTED_REQUEST_BOUND" if native_row_attested else "NOT_ATTESTED",
         "probes": [
             public_quote_evidence(ws_first, requested_code=code, origin="WS_FIRST_OR_CACHE"),
             public_quote_evidence(fresh_rest, requested_code=code, origin="INDEPENDENT_NATIVE_REST_GET"),
+            public_quote_evidence(native_trade_row, requested_code=code,
+                                  origin="INDEPENDENT_TIME_ITEMCONCLUSION_OUTPUT2"),
         ],
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
+    if args.require_native_row and not native_row_attested:
+        raise SystemExit(3)
 
 
 if __name__ == "__main__":
