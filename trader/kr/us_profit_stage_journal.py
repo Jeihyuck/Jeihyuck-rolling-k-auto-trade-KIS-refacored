@@ -288,7 +288,10 @@ def observe_broker_stage(
         # temporarily unavailable stage row must not abort the outer transaction
         # that persists broker-proven fills and position quantity.
         transaction = _conn.begin_nested() if _conn is not None else engine.begin()
-        with transaction as conn:
+        with transaction as transaction_scope:
+            # NestedTransaction.__enter__ returns a savepoint object, NOT a
+            # Connection. All SQL must use the caller's shared Connection.
+            conn = _conn if _conn is not None else transaction_scope
             key = _key(contract, stage)
             raw = conn.execute(
                 sa.select(table.c.payload).where(table.c.job_key == key)
