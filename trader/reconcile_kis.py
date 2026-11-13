@@ -2087,12 +2087,28 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                 )
             )
         )
+        preview_buy_applied_ids = set(source_response.get("applied_broker_fill_ids") or [])
+        preview_buy_previous_notional = _to_float(
+            source_response.get("confirmed_fill_notional")
+        ) or 0.0
+        if cumulative_buy_evidence is not None:
+            preview_buy_new_evidence = bool(
+                preview_cumulative_qty is not None
+                and preview_cumulative_qty > preview_previous_qty
+            ) or bool(
+                _to_float(cumulative_buy_evidence.get("notional")) is not None
+                and float(cumulative_buy_evidence["notional"]) > preview_buy_previous_notional
+            )
+        else:
+            preview_buy_new_evidence = bool(
+                preview_id and str(preview_id) not in preview_buy_applied_ids
+            )
         defer_signed_buy_order = bool(
             isinstance(engine, sa.engine.Engine)
             and side == "BUY" and source_order
             and request_json.get("enforce_entry_contract") is True
             and preview_buy_price is not None
-            and (preview_id or cumulative_buy_evidence is not None)
+            and preview_buy_new_evidence
         )
         if not (defer_sell_order or defer_signed_buy_order):
             orders_repo.upsert_reconciled_order(
