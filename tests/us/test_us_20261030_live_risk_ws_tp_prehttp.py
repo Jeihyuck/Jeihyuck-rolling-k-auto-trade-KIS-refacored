@@ -468,6 +468,26 @@ def test_pg_proven_same_attempt_pre_io_abort_releases_only_locked_tp(
 
 
 
+def test_us353_memory_tp_abort_without_durable_claim_never_releases(monkeypatch):
+    """No engine means no authoritative PRE_IO evidence; fail closed."""
+    repos.reset_memory_stores()
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
+    td, cycle, key = "2026-11-13", "US353_MEMORY_CYCLE", "US353_MEMORY_TP1"
+    repos.mark_us_profit_capture_stage(
+        td, "GILD", "tp1", position_lifecycle_id=cycle,
+        order_key=key, qty=2, status="PENDING",
+    )
+    assert not repos.release_us_profit_capture_pre_http_abort(
+        trade_date=td, symbol="GILD", stage="tp1",
+        position_lifecycle_id=cycle, client_order_key=key,
+    )
+    state = repos.load_us_profit_capture_state(
+        td, ["GILD"], {"GILD": cycle},
+    )["GILD"]
+    assert state["tp1_pending"] is True
+    repos.reset_memory_stores()
+
+
 @pytest.mark.skipif(
     not os.getenv("PBCORE_TEST_POSTGRES_URL"),
     reason="disposable PostgreSQL acceptance URL unavailable",
