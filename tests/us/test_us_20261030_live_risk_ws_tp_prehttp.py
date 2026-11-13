@@ -934,3 +934,118 @@ def test_pg_us353_cross_day_open_tp_fences_new_claim_reservation(
         "PENDING" if prior_status == "PENDING" else "DONE"
     )
     assert rows[0]["client_order_key"] == old_key
+
+
+@pytest.mark.skipif(
+    not os.getenv("PBCORE_TEST_POSTGRES_URL"),
+    reason="disposable PostgreSQL acceptance URL unavailable",
+)
+def test_pg_us353_standard_tp_native_partial_cancel_commits_claim_stage_together(
+    pg_engine, monkeypatch,
+):
+    """Native KIS-shaped US_STANDARD SELL 5 -> fill 2 -> cancel remaining 3.
+
+    Only the exact original TP stage and Claim are terminalized. Never
+    authorize a second broker POST from a cancel without KIS source proof.
+    TQQQ Infinite is not involved; migrated PostgreSQL is disposable CI.
+    """
+    from datetime import date
+    from sqlalchemy import text
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.execution_state import SemanticActionIdentity
+    from trader.us.db.execution_claim_schema import (
+        us_execution_attempts, us_execution_claims,
+    )
+    import json
+
+    repos.reset_memory_stores()
+    trade_date, epoch = "2026-10-29", "pg-us353-standard-cancel-epoch"
+    account, cycle = "pg-us353-standard-cancel-account", "GILD_US353_TP_CYCLE"
+    key, attempt = "US_PC_2026-10-29_GILD_GILD_US353_TP_CYCLE_TAKE_PROFIT_TP1", "GILD_US353_CANCEL_ATTEMPT"
+    order_no = "0000039951"
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("NULLIM_US_SETTLEMENT_ACTIVATE", "0")
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda _conn=None, **_kw: epoch)
+    monkeypatch.setattr(repos, "_us_execution_claim_scope", lambda: {
+        "env": "practice", "account_id": account,
+        "market": "US", "trading_epoch_id": epoch,
+    })
+    ledger = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts,
+    )
+    monkeypatch.setattr(repos, "_execution_claim_repo", lambda: ledger)
+    identity = SemanticActionIdentity(
+        env="practice", account_id=account, market="US",
+        trading_epoch_id=epoch, strategy_owner="US_STANDARD",
+        lifecycle_id=cycle, action="TP1",
+        trade_date=date.fromisoformat(trade_date),
+    )
+    assert ledger.acquire(
+        identity, attempt_id=attempt, requested_qty=5, client_order_key=key,
+    ).acquired
+    ledger.record_observation(
+        identity, attempt_id=attempt, state="UNRESOLVED",
+        cumulative_filled_qty=None, authoritative=False,
+    )
+    repos.mark_us_profit_capture_stage(
+        trade_date, "GILD", "tp1", position_lifecycle_id=cycle,
+        order_key=key, qty=5, status="PENDING",
+    )
+    meta = {
+        "execution_action_key": identity.action_key,
+        "submit_attempt_id": attempt, "strategy_owner": "US_STANDARD",
+        "profit_capture_stage": "tp1", "position_lifecycle_id": cycle,
+        "tp_pending_deferred_to_claim": True,
+        "broker_account_hash": account, "trading_epoch_id": epoch,
+    }
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO us_orders(
+                trade_date, client_order_key, symbol, exchange, side,
+                qty_requested, qty_filled, order_no, status, env,
+                trading_epoch_id, meta
+            ) VALUES (:td,:key,'GILD','NYSE','SELL',5,0,:order_no,'ACK',
+                      'practice',:epoch,CAST(:meta AS jsonb))
+        """), {
+            "td": trade_date, "key": key, "order_no": order_no,
+            "epoch": epoch, "meta": json.dumps(meta),
+        })
+    broker_row = {
+        "order_no": order_no, "symbol": "GILD", "side": "SELL",
+        "status": "CANCELLED", "requested_qty": 5,
+        "requested_qty_present": True, "filled_qty": 2,
+        "filled_qty_present": True, "remaining_qty": 0,
+        "remaining_qty_present": True, "broker_open_qty": 0,
+        "broker_open_qty_present": True, "avg_price": 101.5,
+    }
+    result = repos.apply_broker_order_observation(
+        trade_date=trade_date, client_order_key=key,
+        raw_order_no=order_no, canonical_order_no="39951",
+        symbol="GILD", side="SELL", requested_qty=5, filled_qty=2,
+        remaining_qty=3, broker_status="CANCELLED",
+        evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL", raw_row=broker_row,
+    )
+    assert result["status"] == "OK", result
+    assert result["authoritative"] is True
+    assert result["order_status"] == "CANCELLED"
+    claim = ledger.get(identity)
+    assert claim.action_state == "PARTIALLY_SATISFIED"
+    assert claim.cumulative_filled_qty == 2
+    assert claim.remaining_target_qty == 3
+    assert claim.active_attempt_id is None
+    stage = repos.load_us_profit_capture_state(
+        trade_date, ["GILD"], {"GILD": cycle},
+    )["GILD"]
+    assert stage["tp1_pending"] is False
+    assert stage["tp1_done"] is False
+    assert int(stage["meta"]["tp1_filled_qty"]) == 2
+    assert stage["tp1_order_key"] == key
+    with pg_engine.connect() as conn:
+        order = conn.execute(text("""
+            SELECT status, qty_filled, meta
+            FROM us_orders WHERE trade_date=:td AND client_order_key=:key
+        """), {"td": trade_date, "key": key}).mappings().one()
+    assert order["status"] == "CANCELLED"
+    assert order["qty_filled"] == 2
+    assert int(order["meta"]["semantic_action_remaining_qty"]) == 3
+    assert int(order["meta"]["broker_open_qty"]) == 0
