@@ -513,3 +513,180 @@ def test_pg_tp1_ack_is_immune_to_late_pre_http_abort(pg_engine):
 def test_tp_router_status_requires_complete_pre_http_proof(router, expected):
     from trader.us.runner.trade_tick_runner import _profit_capture_router_status
     assert _profit_capture_router_status(router) == expected
+
+
+@pytest.mark.skipif(
+    not os.getenv("PBCORE_TEST_POSTGRES_URL"),
+    reason="disposable PostgreSQL acceptance URL unavailable",
+)
+def test_pg_tp_claim_reservation_rearms_only_unsent_intent(pg_engine, monkeypatch):
+    """Real migrated PG: old risk BLOCKED intent -> fresh Claim -> TP -> HTTP gate."""
+    from datetime import date, datetime, timezone
+    from uuid import uuid4
+    from sqlalchemy import text
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.execution_state import SemanticActionIdentity
+    from trader.us.db.execution_claim_schema import (
+        us_execution_attempts, us_execution_claims,
+    )
+    td, epoch, account = "2026-10-29", "pg-us353-rearm-epoch", "pg-us353-rearm-account"
+    sym, cycle, key, prior, attempt = (
+        "REGTP", "rearm-buy-cycle", "US_PC_2026-10-29_REGTP_rearm-buy-cycle_TAKE_PROFIT_TP1",
+        "preclaim-blocked", "claimed-now",
+    )
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda _bind=None, **_kw: epoch)
+    monkeypatch.setattr(repos, "_us_execution_claim_scope", lambda: {
+        "env": "practice", "account_id": account, "market": "US",
+        "trading_epoch_id": epoch,
+    })
+    old_meta = {
+        "strategy_owner": "US_STANDARD", "position_lifecycle_id": cycle,
+        "profit_capture_stage": "tp1", "submit_attempt_id": prior,
+        "tp_pending_deferred_to_claim": True, "source_entry_contract_sha256": "signed-v2",
+    }
+    assert repos.save_order_intent({
+        "trade_date": td, "symbol": sym, "side": "SELL", "qty": 3,
+        "limit_price": 101, "notional_usd": 303, "client_order_key": key,
+        "meta": old_meta, "strategy_owner": "US_STANDARD",
+    }, trade_date=td)
+    repos.mark_order_intent_blocked(key, reason="risk_gate_preclaim_blocked")
+    with pg_engine.connect() as conn:
+        assert conn.execute(text(
+            "SELECT status FROM us_order_intents WHERE client_order_key=:key"
+        ), {"key": key}).scalar_one() == "BLOCKED"
+        assert conn.execute(text(
+            "SELECT COUNT(*) FROM us_profit_capture_lifecycle WHERE symbol=:symbol"
+        ), {"symbol": sym}).scalar_one() == 0
+
+    claim_repo = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts,
+    )
+    identity = SemanticActionIdentity(
+        env="practice", account_id=account, market="US",
+        trading_epoch_id=epoch, strategy_owner="US_STANDARD",
+        lifecycle_id=cycle, action="TAKE_PROFIT_TP1",
+        trade_date=date.fromisoformat(td),
+    )
+    assert claim_repo.acquire(
+        identity, attempt_id=attempt, requested_qty=3,
+        client_order_key=key,
+    ).acquired
+    new_meta = {
+        **old_meta, "submit_attempt_id": attempt,
+        "last_profit_capture_at": datetime.now(timezone.utc).isoformat(),
+    }
+    args = {
+        "trade_date": td, "symbol": sym, "stage": "tp1",
+        "position_lifecycle_id": cycle, "client_order_key": key,
+        "attempt_id": attempt, "action_key": identity.action_key,
+    }
+    assert repos.reserve_us_profit_capture_stage_after_claim(
+        **args, qty=3, notional_usd=315, limit_price_usd=105,
+        intent_meta=new_meta,
+    )
+    assert not repos.reserve_us_profit_capture_stage_after_claim(
+        **args, qty=3, notional_usd=315, limit_price_usd=105,
+        intent_meta=new_meta,
+    ), "second concurrent Claim must never reserve an existing TP"
+    with pg_engine.connect() as conn:
+        intent = conn.execute(text(
+            "SELECT status,qty,limit_price_usd,notional_usd,meta "
+            "FROM us_order_intents WHERE client_order_key=:key"
+        ), {"key": key}).mappings().one()
+        assert intent["status"] == "PENDING"
+        assert intent["qty"] == 3
+        assert float(intent["limit_price_usd"]) == 105
+        assert intent["meta"]["submit_attempt_id"] == attempt
+        assert intent["meta"]["source_entry_contract_sha256"] == "signed-v2"
+    assert not repos.verify_us_tp_claim_stage_at_http_boundary(**args), (
+        "a Claim without a durable STARTED event cannot cross HTTP"
+    )
+
+    def event(kind, suffix):
+        return {
+            "event_id": str(uuid4()), "trade_date": td, "event_type": kind,
+            "event_timestamp": datetime.now(timezone.utc).isoformat(),
+            "session": "am", "session_run_id": "pg-us353-native",
+            "tick_id": "pg-us353-native-tick", "trading_epoch_id": epoch,
+            "client_order_key": key, "submit_attempt_id": attempt,
+            "symbol": sym, "side": "SELL", "requested_qty": 3,
+            "raw_broker_order_no": None, "canonical_broker_order_no": None,
+            "position_lifecycle_id": cycle, "profit_capture_stage": "tp1",
+            "cumulative_filled_qty": 0,
+            "payload": {"strategy_owner": "US_STANDARD"},
+            "idempotency_key": "pg-us353-"+suffix,
+        }
+    assert repos.append_us_order_event(event("BROKER_SUBMIT_STARTED", "started"))
+    assert repos.verify_us_tp_claim_stage_at_http_boundary(**args)
+    assert not repos.verify_us_tp_claim_stage_at_http_boundary({
+        **args, "attempt_id": "different_attempt",
+    }), "another writer cannot submit against our stage/Claim"
+
+    # Actual broker-possible evidence must never authorize a second POST.
+    assert repos.append_us_order_event(event("BROKER_SUBMIT_RESULT_UNKNOWN", "unknown"))
+    assert not repos.verify_us_tp_claim_stage_at_http_boundary(**args)
+    assert not repos.release_us_profit_capture_pre_http_abort(
+        trade_date=td, symbol=sym, stage="tp1",
+        position_lifecycle_id=cycle, client_order_key=key,
+    )
+
+
+@pytest.mark.skipif(
+    not os.getenv("PBCORE_TEST_POSTGRES_URL"),
+    reason="disposable PostgreSQL acceptance URL unavailable",
+)
+def test_pg_tp_claim_reservation_rejects_wrong_scope_or_contract(pg_engine, monkeypatch):
+    from datetime import date
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.execution_state import SemanticActionIdentity
+    from trader.us.db.execution_claim_schema import (
+        us_execution_attempts, us_execution_claims,
+    )
+    td, epoch, account = "2026-10-29", "pg-us353-foreign-epoch", "pg-us353-account"
+    sym, cycle, key, attempt = "SCOPE", "cycle-scope", "US_PC_scope_TP1", "scope-attempt"
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda _bind=None, **_kw: epoch)
+    monkeypatch.setattr(repos, "_us_execution_claim_scope", lambda: {
+        "env": "practice", "account_id": account, "market": "US",
+        "trading_epoch_id": epoch,
+    })
+    old_meta = {
+        "strategy_owner": "US_STANDARD", "position_lifecycle_id": cycle,
+        "source_entry_contract_sha256": "signed-old",
+        "profit_capture_stage": "tp1", "submit_attempt_id": "old-preclaim",
+        "tp_pending_deferred_to_claim": True,
+    }
+    assert repos.save_order_intent({
+        "trade_date": td, "symbol": sym, "side": "SELL", "qty": 2,
+        "limit_price": 100, "notional_usd": 200,
+        "client_order_key": key, "meta": old_meta,
+    }, trade_date=td)
+    repos.mark_order_intent_blocked(key, reason="no_broker_submission")
+    claim_repo = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts,
+    )
+    identity = SemanticActionIdentity(
+        env="practice", account_id=account, market="US",
+        trading_epoch_id=epoch, strategy_owner="US_STANDARD",
+        lifecycle_id=cycle, action="TAKE_PROFIT_TP1",
+        trade_date=date.fromisoformat(td),
+    )
+    assert claim_repo.acquire(
+        identity, attempt_id=attempt, requested_qty=2, client_order_key=key,
+    ).acquired
+    args = {
+        "trade_date": td, "symbol": sym, "stage": "tp1",
+        "position_lifecycle_id": cycle, "client_order_key": key,
+        "attempt_id": attempt, "action_key": identity.action_key,
+        "qty": 2, "notional_usd": 204, "limit_price_usd": 102,
+    }
+    assert not repos.reserve_us_profit_capture_stage_after_claim(
+        **args, intent_meta={**old_meta, "submit_attempt_id": attempt,
+                             "source_entry_contract_sha256": "signed-different"},
+    )
+    monkeypatch.setattr(repos, "_us_execution_claim_scope", lambda: {
+        "env": "practice", "account_id": "other-account",
+        "market": "US", "trading_epoch_id": epoch,
+    })
+    assert not repos.reserve_us_profit_capture_stage_after_claim(
+        **args, intent_meta={**old_meta, "submit_attempt_id": attempt},
+    )
