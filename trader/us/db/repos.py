@@ -3606,10 +3606,15 @@ def reserve_us_profit_capture_stage_after_claim(
                AND position_lifecycle_id=:cycle AND stage=:stage
                AND trading_epoch_id=:epoch
         """), params).mappings().one_or_none()
-        return bool(
+        if not (
             saved and str(saved["stage_status"]) == "PENDING"
             and str(saved["client_order_key"] or "") == key
-        )
+        ):
+            # A conflict with an older epoch's unique TP row or a stale
+            # lifecycle must ROLLBACK the intent rearm too, not commit a
+            # half-updated attempt and continue to KIS.
+            raise RuntimeError("US_TP_CLAIM_STAGE_ATOMIC_READBACK_FAILED")
+        return True
 
 
 def verify_us_tp_claim_stage_at_http_boundary(
