@@ -2789,72 +2789,73 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                     tp_stage = str(request_json.get("kr_us_tp_stage") or "").upper()
                     if not tp_contract or not tp_stage:
                         return
-                    from datetime import date as _tp_date
-                    from trader.account_state import get_account_key as _tp_account_key
-                    from trader.kr.us_profit_stage_journal import observe_broker_stage
-                    from trader.kr.us_standard_profit_parity import verified_contract
-
-                    original_trade_date = _tp_date.fromisoformat(
-                        str(request_json.get("kr_us_tp_trade_date") or "")
-                    )
-                    source_odno = str(
-                        source_order.get("kis_odno") or source_order.get("broker_order_id") or ""
-                    ).lstrip("0") or "0"
-                    original_odno = str(row.get("odno") or "").lstrip("0") or "0"
-                    if not (
-                        verified_contract(tp_contract)
-                        and str(tp_contract.get("activation_mode")) == "ACTIVE_PRACTICE"
-                        and str(row.get("sll_buy_dvsn_cd") or "") == "01"
-                        and str(row.get("pdno") or "").zfill(6) == str(code).zfill(6)
-                        and str(row.get("ord_dt") or "") == original_trade_date.strftime("%Y%m%d")
-                        and source_odno != "0" and source_odno == original_odno
-                        and str(row.get("cncl_yn") or "N").upper() == "N"
-                        and str(source_order.get("position_cycle_id") or "") == tp_contract.get("position_cycle_id")
-                        and str(source_order.get("trading_epoch_id") or "") == tp_contract.get("trading_epoch_id")
-                        and str(source_order.get("strategy") or "") == "pb1_pullback_close"
-                    ):
-                        reason = "KR_TP_KIS_ORIGINAL_ORDER_PROOF_MISMATCH"
-                        execution_claim_observation_failures.append({
-                            "client_order_key": str(source_order.get("client_order_key") or ""),
-                            "error": reason,
-                        })
-                        logger.error(
-                            "[KR_PROFIT_PARITY][KIS_PROOF_FAIL_CLOSED] code=%s stage=%s reason=%s",
-                            code, tp_stage, reason,
+                    try:
+                        from datetime import date as _tp_date
+                        from trader.account_state import get_account_key as _tp_account_key
+                        from trader.kr.us_profit_stage_journal import observe_broker_stage
+                        from trader.kr.us_standard_profit_parity import verified_contract
+    
+                        original_trade_date = _tp_date.fromisoformat(
+                            str(request_json.get("kr_us_tp_trade_date") or "")
                         )
-                        return False
-                    tp_update = observe_broker_stage(
-                        engine=engine, contract=tp_contract,
-                        account_id=_tp_account_key(env=env, kis=kis),
-                        trading_epoch_id=str(source_order.get("trading_epoch_id") or ""),
-                        position_cycle_id=str(source_order.get("position_cycle_id") or ""),
-                        code=str(code).zfill(6), stage=tp_stage,
-                        client_order_key=str(source_order.get("client_order_key") or ""),
-                        broker_odno=str(row.get("odno") or ""),
-                        cumulative_filled_qty=int(next_confirmed_qty or 0),
-                        broker_order_accepted=True,
-                        broker_fill_source="KIS_DAILY_CCLD_VERIFIED",
-                        source_trade_date=original_trade_date,
-                        _conn=conn,
-                    )
-                    if not tp_update.accepted:
-                        reason = "KR_TP_STAGE_BROKER_PROOF_NOT_STORED:" + tp_update.reason
-                        execution_claim_observation_failures.append({
-                            "client_order_key": str(source_order.get("client_order_key") or ""),
-                            "error": reason,
-                        })
-                        logger.error(
-                            "[KR_PROFIT_PARITY][KIS_PROOF_FAIL_CLOSED] code=%s stage=%s reason=%s",
-                            code, tp_stage, reason,
+                        source_odno = str(
+                            source_order.get("kis_odno") or source_order.get("broker_order_id") or ""
+                        ).lstrip("0") or "0"
+                        original_odno = str(row.get("odno") or "").lstrip("0") or "0"
+                        if not (
+                            verified_contract(tp_contract)
+                            and str(tp_contract.get("activation_mode")) == "ACTIVE_PRACTICE"
+                            and str(row.get("sll_buy_dvsn_cd") or "") == "01"
+                            and str(row.get("pdno") or "").zfill(6) == str(code).zfill(6)
+                            and str(row.get("ord_dt") or "") == original_trade_date.strftime("%Y%m%d")
+                            and source_odno != "0" and source_odno == original_odno
+                            and str(row.get("cncl_yn") or "N").upper() == "N"
+                            and str(source_order.get("position_cycle_id") or "") == tp_contract.get("position_cycle_id")
+                            and str(source_order.get("trading_epoch_id") or "") == tp_contract.get("trading_epoch_id")
+                            and str(source_order.get("strategy") or "") == "pb1_pullback_close"
+                        ):
+                            reason = "KR_TP_KIS_ORIGINAL_ORDER_PROOF_MISMATCH"
+                            execution_claim_observation_failures.append({
+                                "client_order_key": str(source_order.get("client_order_key") or ""),
+                                "error": reason,
+                            })
+                            logger.error(
+                                "[KR_PROFIT_PARITY][KIS_PROOF_FAIL_CLOSED] code=%s stage=%s reason=%s",
+                                code, tp_stage, reason,
+                            )
+                            return False
+                        tp_update = observe_broker_stage(
+                            engine=engine, contract=tp_contract,
+                            account_id=_tp_account_key(env=env, kis=kis),
+                            trading_epoch_id=str(source_order.get("trading_epoch_id") or ""),
+                            position_cycle_id=str(source_order.get("position_cycle_id") or ""),
+                            code=str(code).zfill(6), stage=tp_stage,
+                            client_order_key=str(source_order.get("client_order_key") or ""),
+                            broker_odno=str(row.get("odno") or ""),
+                            cumulative_filled_qty=int(next_confirmed_qty or 0),
+                            broker_order_accepted=True,
+                            broker_fill_source="KIS_DAILY_CCLD_VERIFIED",
+                            source_trade_date=original_trade_date,
+                            _conn=conn,
                         )
-                        return False
-                    logger.info(
-                        "[KR_PROFIT_PARITY][KIS_PROVEN_STAGE] code=%s stage=%s "
-                        "status=%s cumulative=%s order=%s",
-                        code, tp_stage, tp_update.status, next_confirmed_qty, original_odno,
-                    )
-                    return True
-                except Exception as exc:
+                        if not tp_update.accepted:
+                            reason = "KR_TP_STAGE_BROKER_PROOF_NOT_STORED:" + tp_update.reason
+                            execution_claim_observation_failures.append({
+                                "client_order_key": str(source_order.get("client_order_key") or ""),
+                                "error": reason,
+                            })
+                            logger.error(
+                                "[KR_PROFIT_PARITY][KIS_PROOF_FAIL_CLOSED] code=%s stage=%s reason=%s",
+                                code, tp_stage, reason,
+                            )
+                            return False
+                        logger.info(
+                            "[KR_PROFIT_PARITY][KIS_PROVEN_STAGE] code=%s stage=%s "
+                            "status=%s cumulative=%s order=%s",
+                            code, tp_stage, tp_update.status, next_confirmed_qty, original_odno,
+                        )
+                        return True
+                    except Exception as exc:
                     reason = "KR_TP_STAGE_OBSERVATION_FAILED:" + type(exc).__name__
                     execution_claim_observation_failures.append({
                         "client_order_key": str(source_order.get("client_order_key") or ""),
