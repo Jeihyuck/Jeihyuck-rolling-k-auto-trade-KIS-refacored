@@ -3714,21 +3714,10 @@ def release_us_profit_capture_pre_http_abort(
 
     engine = _get_engine_or_none()
     if engine is None:
-        state = load_us_profit_capture_state(
-            trade_date, [sym], {sym: lifecycle},
-        ).get(sym, {})
-        if (str(state.get(f"{stg}_order_key") or "") != order_key
-                or not state.get(f"{stg}_pending")
-                or state.get(f"{stg}_done")
-                or str((state.get("meta") or {}).get("last_status") or "") not in {"PENDING", "SUBMITTED"}
-                or state.get(f"{stg}_broker_order_no")):
-            return False
-        mark_us_profit_capture_stage(
-            trade_date, sym, stg, order_key=order_key,
-            position_lifecycle_id=lifecycle, status="FAILED",
-            evidence_type="BROKER_SUBMIT_ABORTED_PRE_IO",
-        )
-        return True
+        # An in-memory TP stage cannot certify a durable broker PRE_IO
+        # abort, exact Attempt or Claim. Fail closed rather than fabricating
+        # a release while the ledger is unavailable.
+        return False
 
     with engine.begin() as conn:
         epoch_id = _active_us_epoch(conn)
