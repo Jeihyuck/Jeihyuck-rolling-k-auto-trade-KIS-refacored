@@ -81,6 +81,24 @@ def test_old_unknown_attempt_does_not_create_new_r_key():
     mark.assert_not_called()
 
 
+def test_unverified_tp_stage_does_not_suppress_other_symbol():
+    positions = [
+        {**POSITION, "symbol": "KO", "position_lifecycle_id": "ko-cycle"},
+        dict(POSITION),
+    ]
+    states = {"KO": {"tp1_pending": True}, "HCA": {}}
+    from decimal import Decimal
+    with patch("trader.us.profit_capture.authoritative_broker_avg",
+               return_value=(Decimal("100"), {"broker_avg_price_source": "kis_pchs_avg_pric"})):
+        with patch("trader.us.db.repos.mark_us_profit_capture_stage"):
+            out = build_profit_capture_intents(
+                positions, {"profit_capture_enabled": True}, now=NOW, trade_date=DATE,
+                profit_capture_state=states, defer_pending_until_claim=True,
+            )
+    assert [intent["symbol"] for intent in out] == ["HCA"]
+    assert out[0]["meta"]["tp_pending_deferred_to_claim"] is True
+
+
 def test_proven_pre_http_abort_can_create_new_attempt():
     state = {
         "meta": {
