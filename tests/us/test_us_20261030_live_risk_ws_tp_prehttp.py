@@ -533,10 +533,12 @@ def test_pg_us353_native_tp_claim_reserve_http_gate_and_exact_abort(
         "tp_pending_deferred_to_claim": True,
     }
     assert repos.reserve_us_profit_capture_stage_after_claim(
-        **args, qty=5, notional_usd=500, intent_meta=claim_meta,
+        **args, qty=5, notional_usd=500, limit_price_usd=100,
+        intent_meta=claim_meta,
     )
     assert not repos.reserve_us_profit_capture_stage_after_claim(
-        **args, qty=5, notional_usd=500, intent_meta=claim_meta,
+        **args, qty=5, notional_usd=500, limit_price_usd=100,
+        intent_meta=claim_meta,
     ), "the same TP stage cannot be reserved twice"
     assert not repos.verify_us_tp_claim_stage_at_http_boundary(**args)
 
