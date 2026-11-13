@@ -2283,7 +2283,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
             side == "SELL" and source_order and execution_action
             and isinstance(execution_meta_update, dict)
             and not defer_native_sell_claim
-            and not (request_json.get("kr_us_tp_contract") and request_json.get("kr_us_tp_stage"))
+            and not (request_json.get("kr_us_tp_contract") or request_json.get("kr_us_tp_stage"))
         ):
             try:
                 _project_pb1_exit_stage_truth(
@@ -2827,8 +2827,19 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                 def _apply_kr_tp_stage_journal(conn):
                     tp_contract = request_json.get("kr_us_tp_contract")
                     tp_stage = str(request_json.get("kr_us_tp_stage") or "").upper()
+                    if not tp_contract and not tp_stage:
+                        return None
                     if not tp_contract or not tp_stage:
-                        return
+                        reason = "KR_TP_STAGE_CONTRACT_INCOMPLETE"
+                        execution_claim_observation_failures.append({
+                            "client_order_key": str(source_order.get("client_order_key") or ""),
+                            "error": reason,
+                        })
+                        logger.error(
+                            "[KR_PROFIT_PARITY][KIS_PROOF_FAIL_CLOSED] code=%s stage=%s reason=%s",
+                            code, tp_stage or "UNKNOWN", reason,
+                        )
+                        return False
                     try:
                         from datetime import date as _tp_date
                         from trader.account_state import get_account_key as _tp_account_key
