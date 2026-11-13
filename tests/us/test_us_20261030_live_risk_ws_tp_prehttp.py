@@ -828,3 +828,109 @@ def test_pg_tp_claim_reservation_rejects_wrong_scope_or_contract(pg_engine, monk
     assert not repos.reserve_us_profit_capture_stage_after_claim(
         **args, intent_meta={**old_meta, "submit_attempt_id": attempt},
     )
+
+
+@pytest.mark.skipif(
+    not os.getenv("PBCORE_TEST_POSTGRES_URL"),
+    reason="disposable PostgreSQL acceptance URL unavailable",
+)
+@pytest.mark.parametrize("prior_status", ["PENDING", "FILLED"])
+def test_pg_us353_cross_day_open_tp_fences_new_claim_reservation(
+    pg_engine, monkeypatch, prior_status,
+):
+    """An older pending/filled TP cannot be recreated in the same BUY cycle.
+
+    Exact native KIS terminal recovery is a separate path.  A fresh-session
+    Claim alone does not give a new attempt authority over that old stage.
+    Uses migrated PostgreSQL, never live KIS or operating tables.
+    """
+    from datetime import date
+    from sqlalchemy import text
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.execution_state import SemanticActionIdentity
+    from trader.us.db.execution_claim_schema import (
+        us_execution_attempts, us_execution_claims,
+    )
+
+    repos.reset_memory_stores()
+    suffix = prior_status.lower()
+    epoch = "pg-us353-cross-day-" + suffix
+    account = "pg-us353-cross-day-account"
+    cycle = "GILD_US353_CROSS_DAY_" + suffix
+    old_key = "US353_PREVIOUS_TP1_" + suffix
+    new_key = "US353_NEXT_TP1_" + suffix
+    prior_date, next_date = "2026-10-28", "2026-10-29"
+    attempt = "US353_NEXT_ATTEMPT_" + suffix
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda _bind=None, **_kw: epoch)
+    monkeypatch.setattr(repos, "_us_execution_claim_scope", lambda: {
+        "env": "practice", "account_id": account, "market": "US",
+        "trading_epoch_id": epoch,
+    })
+    previous_kwargs = dict(
+        position_lifecycle_id=cycle, order_key=old_key, qty=5,
+    )
+    if prior_status == "FILLED":
+        previous_kwargs.update(
+            status="FILLED", filled_qty=5,
+            evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        )
+    else:
+        previous_kwargs["status"] = "PENDING"
+    repos.mark_us_profit_capture_stage(
+        prior_date, "GILD", "tp1", **previous_kwargs,
+    )
+    assert repos.save_order_intent({
+        "trade_date": next_date, "symbol": "GILD", "exchange": "NYSE",
+        "side": "SELL", "qty": 5, "limit_price": 101,
+        "notional_usd": 505, "strategy_owner": "US_STANDARD",
+        "client_order_key": new_key, "submit_attempt_id": attempt,
+        "position_lifecycle_id": cycle,
+        "meta": {
+            "strategy_owner": "US_STANDARD",
+            "submit_attempt_id": attempt,
+            "position_lifecycle_id": cycle,
+            "profit_capture_stage": "tp1",
+            "tp_pending_deferred_to_claim": True,
+        },
+    }, trade_date=next_date)
+    identity = SemanticActionIdentity(
+        env="practice", account_id=account, market="US",
+        trading_epoch_id=epoch, strategy_owner="US_STANDARD",
+        lifecycle_id=cycle, action="TP1",
+        trade_date=date.fromisoformat(next_date),
+    )
+    claims = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts,
+    )
+    assert claims.acquire(
+        identity, attempt_id=attempt, requested_qty=5,
+        client_order_key=new_key,
+    ).acquired
+    assert not repos.reserve_us_profit_capture_stage_after_claim(
+        trade_date=next_date, symbol="GILD", stage="tp1",
+        position_lifecycle_id=cycle, client_order_key=new_key,
+        attempt_id=attempt, action_key=identity.action_key, qty=5,
+        notional_usd=505, limit_price_usd=101,
+        intent_meta={
+            "strategy_owner": "US_STANDARD",
+            "submit_attempt_id": attempt,
+            "position_lifecycle_id": cycle,
+            "profit_capture_stage": "tp1",
+            "tp_pending_deferred_to_claim": True,
+        },
+    ), "an unresolved/filled earlier-session TP must not authorize another SELL"
+    with pg_engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT trade_date, stage_status, client_order_key
+              FROM us_profit_capture_lifecycle
+             WHERE symbol='GILD' AND stage='tp1'
+               AND position_lifecycle_id=:cycle AND trading_epoch_id=:epoch
+             ORDER BY trade_date
+        """), {"cycle": cycle, "epoch": epoch}).mappings().all()
+    assert len(rows) == 1
+    assert str(rows[0]["trade_date"]) == prior_date
+    assert rows[0]["stage_status"] == (
+        "PENDING" if prior_status == "PENDING" else "DONE"
+    )
+    assert rows[0]["client_order_key"] == old_key
