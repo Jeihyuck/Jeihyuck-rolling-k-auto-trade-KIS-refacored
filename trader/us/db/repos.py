@@ -3494,10 +3494,28 @@ def reserve_us_profit_capture_stage_after_claim(
             "qty": int(qty),
             "fresh_meta": _json_param(intent_meta or {}),
         }
-        # Serializes the absent-row case as well as an existing reservation.
+        # Serialize one economic TP stage across trading dates, not just
+        # today's row. Otherwise a new-session Claim could reserve a second
+        # SELL while yesterday's exact stage still has a live PENDING order.
         conn.execute(text("""
             SELECT pg_advisory_xact_lock(hashtextextended(:identity,0))
-        """), {"identity": "|".join((str(epoch), str(trade_date), sym, cycle, stg))})
+        """), {"identity": "|".join((str(epoch), sym, cycle, stg))})
+        historical = conn.execute(text("""
+            SELECT stage_status, cumulative_filled_qty
+              FROM us_profit_capture_lifecycle
+             WHERE trade_date < :td AND symbol=:sym AND stage=:stage
+               AND position_lifecycle_id=:cycle AND trading_epoch_id=:epoch
+             FOR UPDATE
+        """), params).mappings().all()
+        if any(
+            str(previous.get("stage_status") or "") in {"PENDING", "DONE"}
+            or int(previous.get("cumulative_filled_qty") or 0) > 0
+            for previous in historical
+        ):
+            # Do not infer that an overnight broker order has terminated.
+            # Certified partial-cancel remainders need a separate native-KIS
+            # order/Claim terminal proof and cannot bypass this safety fence.
+            return False
         stage_row = conn.execute(text("""
             SELECT stage_status, client_order_key, cumulative_filled_qty
               FROM us_profit_capture_lifecycle
