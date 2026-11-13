@@ -187,6 +187,58 @@ ln -sfn "$(realpath --relative-to="$(dirname "$LATEST_LINK")" "$NULLIM_SESSION_L
       echo "[KR_CLOSE][SETTLEMENT_REPORT][DEGRADED] postclose_rc=$cross_date_rc action=PRESERVE_TRADE_RC_NO_SELL_RETRY"
     fi
   fi
+  # One bounded read-only contract audit after CLOSE; never retries or repairs
+  # a historical KIS order and never changes the trading child's result.
+  if [[ "${KR_CONTRACT_AUDIT_AFTER_CLOSE:-1}" == "1" && "$rc" -ne 124 && "$rc" -ne 137 ]]; then
+    KR_CONTRACT_AUDIT_TIMEOUT_SEC="${KR_CONTRACT_AUDIT_TIMEOUT_SEC:-45}"
+    if ! [[ "$KR_CONTRACT_AUDIT_TIMEOUT_SEC" =~ ^[0-9]+$ ]] || (( KR_CONTRACT_AUDIT_TIMEOUT_SEC < 5 || KR_CONTRACT_AUDIT_TIMEOUT_SEC > 90 )); then
+      KR_CONTRACT_AUDIT_TIMEOUT_SEC=45
+    fi
+    audit_file="runtime/health/kr-contract-audit-${TODAY_KST}.json"
+    mkdir -p runtime/health
+    export KR_CONTRACT_AUDIT_RUN_ID="KR-CLOSE-$(date -u +%Y%m%dT%H%M%S%N)-$BASHPID"
+    audit_marker="runtime/health/kr-contract-audit-run-${TODAY_KST}.json"
+    printf '{"audit_run_id":"%s","trade_date_kst":"%s","status":"STARTED"}\n' "$KR_CONTRACT_AUDIT_RUN_ID" "$TODAY_KST" > "${audit_marker}.tmp.$BASHPID"
+    mv -f -- "${audit_marker}.tmp.$BASHPID" "$audit_marker"
+    # A retry must never email a prior success after today's timeout/crash.
+    rm -f -- "$audit_file"
+    echo "[KR_CONTRACT_AUDIT][AFTER_CLOSE_START] run_id=$KR_CONTRACT_AUDIT_RUN_ID timeout_sec=$KR_CONTRACT_AUDIT_TIMEOUT_SEC output=$audit_file"
+    set +e
+    timeout --kill-after=5s "${KR_CONTRACT_AUDIT_TIMEOUT_SEC}s" \
+      env NO_TRADE=1 DRY_RUN=1 DISABLE_REAL_TRADING=1 \
+      python -m scripts.kr_buy_sell_contract_audit --env "$STRATEGY_ENV" --output "$audit_file"
+    audit_rc=$?
+    set -e
+    if [[ "$audit_rc" -eq 0 && ! -s "$audit_file" ]]; then audit_rc=2; fi
+    if [[ "$audit_rc" -eq 0 ]]; then audit_marker_status="COMPLETED"; else audit_marker_status="FAILED"; fi
+    printf '{"audit_run_id":"%s","trade_date_kst":"%s","status":"%s"}\n' "$KR_CONTRACT_AUDIT_RUN_ID" "$TODAY_KST" "$audit_marker_status" > "${audit_marker}.tmp.$BASHPID"
+    mv -f -- "${audit_marker}.tmp.$BASHPID" "$audit_marker"
+    echo "[KR_CONTRACT_AUDIT][AFTER_CLOSE_DONE] run_id=$KR_CONTRACT_AUDIT_RUN_ID rc=$audit_rc status=$audit_marker_status report=$audit_file"
+    if [[ "$audit_rc" -ne 0 ]]; then
+      # The child may have been SIGKILLed before emitting a JSON report.
+      # Persist a fresh, explicit failed status using an atomic file replace.
+      python - "$audit_file" "$KR_CONTRACT_AUDIT_RUN_ID" "$TODAY_KST" "$audit_rc" <<'PY_KR_CONTRACT_AUDIT_FAIL'
+import json, os, sys
+from datetime import datetime, timezone
+from pathlib import Path
+path = Path(sys.argv[1]); run_id, trade_date, rc = sys.argv[2:]
+payload = {"version": "KR_BUY_SELL_READONLY_AUDIT_V2",
+           "audit_run_id": run_id, "trade_date_kst": trade_date,
+           "generated_utc": datetime.now(timezone.utc).isoformat(),
+           "audit_status": "AUDIT_FAILED", "status": "AUDIT_FAILED",
+           "child_exit_code": int(rc), "account": "REDACTED",
+           "orders_submitted": 0, "recovery_applied": False}
+tmp = path.with_name(path.name + ".tmp." + str(os.getpid()))
+tmp.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
+tmp.replace(path)
+PY_KR_CONTRACT_AUDIT_FAIL
+      echo "[KR_CONTRACT_AUDIT][REPORT_FAILURE] run_id=$KR_CONTRACT_AUDIT_RUN_ID audit_rc=$audit_rc trade_rc=$rc action=REPORT_ONLY_NO_ORDER"
+      if [[ "$rc" -eq 0 ]]; then
+        export NULLIM_SESSION_FINAL_STATUS=OK_WITH_WARNINGS
+        export NULLIM_SESSION_FINAL_REASON=KR_CONTRACT_AUDIT_FAILED
+      fi
+    fi
+  fi
   echo "[KR_CLOSE][EXIT] ts=$(date -Is) exit_code=$rc"
   exit $rc
 } >> "$LOG_FILE" 2>&1

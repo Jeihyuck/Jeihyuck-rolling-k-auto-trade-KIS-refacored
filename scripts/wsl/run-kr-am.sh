@@ -142,6 +142,32 @@ LATEST_LINK="runtime/logs/kr/wsl-kr-am.latest.log"
 ln -sfn "$(realpath --relative-to="$(dirname "$LATEST_LINK")" "$NULLIM_SESSION_LOG")" "$LATEST_LINK"
 {
   echo "[KR_AM][START] ts=$(date -Is) env=$STRATEGY_ENV kis_env=$KIS_ENV session=$PB1_SESSION"
+  # Read-only last CLOSE debt summary before AM. No historical reconcile here.
+  # A prior-date snapshot is explicitly labelled: not today's live proof.
+  if [[ "${KR_CONTRACT_AUDIT_AM_SUMMARY:-1}" == "1" ]]; then
+    python - "${TODAY_KST}" <<'PY_KR_AM_DEBT'
+import json, sys
+from pathlib import Path
+today = sys.argv[1]
+path = next((p for p in sorted(Path("runtime/health").glob(
+    "kr-contract-audit-????-??-??.json"), reverse=True)
+    if p.stem[-10:] < today), None)
+if path is None:
+    print("[KR_CONTRACT_AUDIT][AM_PRIOR] status=NOT_AVAILABLE source=NONE")
+else:
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+        summary = report.get("recurrence") or {}
+        status = report.get("audit_status") or report.get("status") or "UNKNOWN"
+        print("[KR_CONTRACT_AUDIT][AM_PRIOR] status=%s source=%s "
+              "new_issues=%s existing_issues=%s generated=%s data_is_prior_day=1" % (
+                  status, path.name, summary.get("new_unresolved_issue_count", "UNKNOWN"),
+                  summary.get("existing_unresolved_issue_count", "UNKNOWN"),
+                  report.get("generated_utc") or "UNKNOWN"))
+    except (OSError, ValueError, TypeError):
+        print("[KR_CONTRACT_AUDIT][AM_PRIOR] status=AUDIT_FILE_UNREADABLE source=%s" % path.name)
+PY_KR_AM_DEBT
+  fi
   kr_pb1_opening_observer_start "$LOG_DIR" "$TODAY_KST"
   echo "[KR_AM][HISTORICAL_RECOVERY][CONFIG] flag=${KR_HISTORICAL_RECOVERY_ONCE_ENABLED-<default-on>} effective=${KR_HISTORICAL_RECOVERY_ONCE_ENABLED-1}"
   if [[ "$STRATEGY_ENV" == "practice" && "$KIS_ENV" == "practice" && "${KR_HISTORICAL_RECOVERY_ONCE_ENABLED-1}" != "1" ]]; then
