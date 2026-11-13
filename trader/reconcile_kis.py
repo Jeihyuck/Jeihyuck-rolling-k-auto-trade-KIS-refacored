@@ -2092,12 +2092,15 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
             source_response.get("confirmed_fill_notional")
         ) or 0.0
         if cumulative_buy_evidence is not None:
+            preview_buy_evidence_id = str(cumulative_buy_evidence.get("evidence_id") or "")
             preview_buy_new_evidence = bool(
                 preview_cumulative_qty is not None
                 and preview_cumulative_qty > preview_previous_qty
             ) or bool(
                 _to_float(cumulative_buy_evidence.get("notional")) is not None
                 and float(cumulative_buy_evidence["notional"]) > preview_buy_previous_notional
+            ) or bool(
+                preview_buy_evidence_id and preview_buy_evidence_id not in preview_buy_applied_ids
             )
         else:
             preview_buy_new_evidence = bool(
@@ -2362,12 +2365,16 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
             # physical transaction. The order-row lock rejects stale concurrent
             # KIS snapshots before any economic write.
             buy_notional_delta = next_confirmed_notional - previous_confirmed_notional
+            buy_fill_identity_new = bool(
+                trade_id and str(trade_id) not in applied_fill_ids
+            )
             signed_native_buy = bool(
                 side == "BUY" and source_order
                 and request_json.get("enforce_entry_contract") is True
                 and (
                     incremental_daily_qty > 0
                     or buy_notional_delta > 0
+                    or buy_fill_identity_new
                     or atomic_writer_active
                 )
             )
@@ -2464,6 +2471,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                 and (
                     incremental_daily_qty > 0
                     or buy_notional_delta > 0
+                    or buy_fill_identity_new
                     or atomic_writer_active
                 )
             ):
