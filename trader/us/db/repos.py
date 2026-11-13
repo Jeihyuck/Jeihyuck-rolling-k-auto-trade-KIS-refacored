@@ -3505,6 +3505,69 @@ def release_us_profit_capture_pre_http_abort(
         if (not row or str(row["stage_status"]) != "PENDING"
                 or int(row.get("cumulative_filled_qty") or 0) != 0):
             return False
+        # The stage row alone is NOT proof of a never-submitted order. Check
+        # durable journal and execution Claim in the SAME PG transaction
+        # before changing this stage. Missing events/attempts are UNKNOWN.
+        if not epoch_id:
+            return False
+        events = conn.execute(text("""
+            SELECT event_type, submit_attempt_id
+              FROM us_order_events
+             WHERE trade_date=:td AND client_order_key=:key
+               AND symbol=:sym AND side='SELL' AND profit_capture_stage=:stage
+               AND trading_epoch_id=:epoch
+        """), params).mappings().all()
+        abort_types = {
+            "BROKER_SUBMIT_ABORTED_PRE_IO",
+            "BROKER_SUBMIT_ABORTED_BEFORE_BOUNDARY",
+        }
+        abort_ids = {
+            str(e.get("submit_attempt_id") or "").strip()
+            for e in events if str(e.get("event_type") or "") in abort_types
+        }
+        if (not events or "" in abort_ids or len(abort_ids) != 1):
+            return False
+        attempt_id = next(iter(abort_ids))
+        # A started attempt without its own durable abort, or ANY broker
+        # ACK/possible/terminal event, disproves safe pre-HTTP release.
+        if any(
+            not str(e.get("submit_attempt_id") or "").strip()
+            or (
+                str(e.get("event_type") or "") not in
+                (abort_types | {"BROKER_SUBMIT_STARTED"})
+            )
+            or (
+                str(e.get("submit_attempt_id") or "") != attempt_id
+            )
+            for e in events
+        ):
+            return False
+        attempt = conn.execute(text("""
+            SELECT a.attempt_state, a.authoritative,
+                   c.action_state, c.active_attempt_id
+              FROM us_execution_attempts a
+              JOIN us_execution_claims c ON c.action_key=a.action_key
+             WHERE a.attempt_id=:attempt AND a.client_order_key=:key
+               AND c.trade_date=:td AND c.trading_epoch_id=:epoch
+               AND c.env='practice' AND c.market='US'
+               AND c.strategy_owner='US_STANDARD'
+             FOR UPDATE OF c
+        """), {**params, "attempt": attempt_id}).mappings().all()
+        if (len(attempt) != 1
+                or str(attempt[0].get("attempt_state") or "") != "ABANDONED_PRE_SUBMIT"
+                or attempt[0].get("authoritative") is not True
+                or str(attempt[0].get("action_state") or "") != "OPEN"
+                or attempt[0].get("active_attempt_id")):
+            return False
+        # Even a terminal order row requires independent broker evidence;
+        # an order row with this key contradicts the PRE_IO-only certificate.
+        if conn.execute(text("""
+            SELECT 1 FROM us_orders
+             WHERE trade_date=:td AND client_order_key=:key
+               AND symbol=:sym AND side='SELL'
+               AND trading_epoch_id=:epoch LIMIT 1
+        """), params).scalar_one_or_none() is not None:
+            return False
         current = load_us_profit_capture_state(
             trade_date, [sym], {sym: lifecycle}, _conn=conn,
         ).get(sym, {})
