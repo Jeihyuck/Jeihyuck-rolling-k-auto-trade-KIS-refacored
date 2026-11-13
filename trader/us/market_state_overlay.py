@@ -1237,7 +1237,23 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
                         )
                         break
                     order_key = base_order_key if not prior_order_keys else f"{base_order_key}_R{len(prior_order_keys) + 1}"
+                    # A native intent-only rejection has no TP stage to
+                    # reserve its order key. Reusing that key on the next
+                    # evaluation would collide with the old immutable
+                    # us_order_intents row and stale submit_attempt_id.
+                    # Bind a fresh key to this one decision/attempt instead.
+                    # The semantic Claim and later TP row still serialize
+                    # all requests for the SAME economic TP stage; this is
+                    # not a second authorization to POST an unresolved SELL.
+                    native_tp_attempt_id = None
+                    if defer_pending_until_claim and not p.get("legacy_nine_decision_only_provisional"):
+                        from uuid import uuid4
+                        native_tp_attempt_id = str(uuid4())
+                        order_key = f"{order_key}_A{native_tp_attempt_id.replace('-', '')[:16]}"
                     pending_intent = ({"symbol": sym, "side": "SELL", "strategy_owner": "US_STANDARD", "qty": qty, "quantity": qty, "limit_price": price, "notional_usd": qty * price, "reason": reason, "client_order_key": order_key, "position_lifecycle_id": lifecycle, **({"partial_exit_allowed": contract_partial_exit_allowed} if contract_sha is not None else {}), "meta": {"reason": reason, "profit_capture_stage": stage, "position_lifecycle_id": lifecycle, "broker_avg_price": str(broker_avg), **avg_provenance, "return_rate_at_decision": str(return_rate), "tp_threshold_fraction": str(threshold), "profit_capture_sell_fraction": str(sell_pct), "profit_capture_runner_min_remain_pct": str(local_runner_min), "profit_capture_stage_target_qty": stage_target_qty, "profit_capture_stage_filled_qty": stage_filled_qty, "profit_capture_decision_holding_qty": q, "runner_remaining_pct": (q - qty) / q, "market_state": overlay.get("market_state"), "last_profit_capture_at": (now or datetime.now(timezone.utc)).isoformat(), "source_entry_contract_sha256": contract_sha, "source_entry_contract_version": entry_contract.get("version") if contract_sha else None, "exit_rule_source": ("ENTRY_EXIT_CONTRACT_V3" if entry_contract.get("version") == "us_entry_exit_contract_v3" else "ENTRY_EXIT_CONTRACT_V2") if contract_sha else "LEGACY_GLOBAL_TP", "partial_exit_scope": "PROFIT_CAPTURE_STAGE" if contract_sha else "LEGACY_GLOBAL_TP", **({"partial_exit_allowed": contract_partial_exit_allowed} if contract_partial_exit_allowed is not None else {})}})
+                    if native_tp_attempt_id:
+                        pending_intent["submit_attempt_id"] = native_tp_attempt_id
+                        pending_intent["meta"]["submit_attempt_id"] = native_tp_attempt_id
                     if trade_date:
                         if p.get("legacy_nine_decision_only_provisional") is True:
                             # Original nine V2 positions were stripped of
