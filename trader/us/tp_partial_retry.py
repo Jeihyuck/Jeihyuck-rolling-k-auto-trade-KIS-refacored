@@ -5,6 +5,8 @@ rows. This function does not query KIS or grant authority by itself.
 """
 from __future__ import annotations
 
+from trader.us.utils.order_no import normalize_us_order_no
+
 
 def _raw_qty(raw, names):
     for name in names:
@@ -36,6 +38,7 @@ def proven_partial_tp_remainder(*, claim, current_attempt, prior_attempts,
             return False
         total = 0
         used = set()
+        broker_orders = set()
         for attempt in prior_attempts:
             key = str(attempt.get("client_order_key") or "")
             if not key or key in used or not attempt.get("authoritative"):
@@ -60,6 +63,13 @@ def proven_partial_tp_remainder(*, claim, current_attempt, prior_attempts,
             raw = meta.get("broker_raw_row") or {}
             requested = int(attempt["requested_qty"])
             executed = int(attempt["cumulative_filled_qty"])
+            broker_order = normalize_us_order_no(order.get("order_no"))
+            raw_order = next((raw.get(field) for field in ("order_no", "odno", "ODNO")
+                              if raw.get(field) not in (None, "")), None)
+            if (not broker_order or broker_order in broker_orders
+                    or (raw_order is not None and normalize_us_order_no(raw_order) != broker_order)):
+                return False
+            broker_orders.add(broker_order)
             if (attempt.get("attempt_state") not in {"CANCELLED_PARTIAL_FILL", "CANCELLED_ZERO_FILL"}
                     or not 0 <= executed < requested
                     or (attempt["attempt_state"] == "CANCELLED_ZERO_FILL") != (executed == 0)

@@ -61,6 +61,27 @@ def test_retry_after_proven_abort_preserves_original_partial_fill():
     assert not proven_partial_tp_remainder(**evidence)
 
 
+def test_same_broker_order_cannot_be_counted_as_two_attempts():
+    evidence = proof()
+    second_attempt = {**evidence["prior_attempts"][0], "client_order_key": "second",
+                      "attempt_id": "second-attempt", "requested_qty": 3,
+                      "cumulative_filled_qty": 1}
+    second_order = deepcopy(evidence["prior_orders"][0])
+    second_order.update(client_order_key="second", order_no="000123", qty_requested=3,
+                        qty_filled=1)
+    second_order["meta"]["submit_attempt_id"] = "second-attempt"
+    second_order["meta"]["broker_raw_row"].update(requested_qty=3, filled_qty=1)
+    evidence["prior_attempts"].append(second_attempt)
+    evidence["prior_orders"].append(second_order)
+    evidence["claim"]["filled_qty_before_attempt"] = 3
+    evidence["stage"]["cumulative_filled_qty"] = 3
+    evidence["current_attempt"]["requested_qty"] = 2
+    evidence["qty"] = 2
+    assert not proven_partial_tp_remainder(**evidence)
+    second_order["order_no"] = "124"
+    assert proven_partial_tp_remainder(**evidence)
+
+
 @pytest.mark.parametrize("change", [
     lambda p: p["prior_attempts"][0].update(authoritative=False),
     lambda p: p["prior_attempts"][0].update(attempt_state="UNRESOLVED"),
