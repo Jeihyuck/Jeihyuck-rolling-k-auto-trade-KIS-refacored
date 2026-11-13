@@ -1145,6 +1145,7 @@ def test_pg_us353_standard_tp_native_partial_cancel_commits_claim_stage_together
             "reason": "TAKE_PROFIT_TP1", "profit_capture_stage_target_qty": 5,
             "profit_capture_stage_filled_qty": 2, "profit_capture_sell_fraction": .25,
             "profit_capture_runner_min_remain_pct": .4, "tp_threshold_fraction": .03,
+            "return_rate_at_decision": str(102 / 90 - 1),
             "last_profit_capture_at": datetime.now(timezone.utc).isoformat(),
         })
         result = order_router.route_order({
