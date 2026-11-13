@@ -5,6 +5,7 @@ import hashlib
 import logging
 import os
 import time
+from contextlib import nullcontext
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 from typing import Any
@@ -176,6 +177,7 @@ def _record_execution_claim_observation(
     broker_status: str,
     cumulative_filled_qty: int | None,
     requested_qty: int | None,
+    _conn: Any = None,
 ) -> str | None:
     if not source_order:
         return None
@@ -202,11 +204,18 @@ def _record_execution_claim_observation(
     else:
         claim_state = "UNRESOLVED"
     try:
-        orders_repo.record_execution_claim_for_order(
-            str(source_order.get("client_order_key") or ""),
+        claim_kwargs = dict(
             state=claim_state,
             cumulative_filled_qty=filled_qty,
             authoritative=authoritative,
+        )
+        # Preserve legacy call contract while sharing the physical settlement
+        # transaction only when a real connection has been supplied.
+        if _conn is not None:
+            claim_kwargs["_conn"] = _conn
+        orders_repo.record_execution_claim_for_order(
+            str(source_order.get("client_order_key") or ""),
+            **claim_kwargs,
         )
     except LookupError:
         return None
@@ -506,7 +515,7 @@ def _broker_execution_price(response_json: dict) -> float | None:
 
 def _verified_order_sell_average_from_ccld_fills(
     *, fills_repo: FillsRepo, source_order: dict, env: str,
-    confirmed_cumulative_qty: int,
+    confirmed_cumulative_qty: int, _conn=None,
 ) -> float | None:
     """Compute cumulative average only from exact attributed KIS executions.
 
@@ -517,7 +526,7 @@ def _verified_order_sell_average_from_ccld_fills(
     if not order_id or confirmed_cumulative_qty <= 0:
         return None
     schema = schema_for_engine(fills_repo.engine)
-    with fills_repo.engine.connect() as conn:
+    with (nullcontext(_conn) if _conn is not None else fills_repo.engine.connect()) as conn:
         rows = conn.execute(sa.select(schema.fills).where(sa.and_(
             schema.fills.c.env == env,
             schema.fills.c.order_id == uuid_value_for_url(str(fills_repo.engine.url), order_id),
@@ -1126,7 +1135,7 @@ def _promote_open_buy_orders_from_holdings(
             )
 
         if incremental_fill_qty > 0 and next_status in {"PARTIAL_FILLED", "FILLED"} and fill_price is not None:
-            fills_repo.upsert_fill(
+            fill_kwargs = dict(
                 env=env,
                 run_id=ctx_run_id,
                 order_id=str(order.get("order_id") or "") or None,
@@ -1171,12 +1180,9 @@ def _promote_open_buy_orders_from_holdings(
                     "entry_ts": order_time.isoformat() if hasattr(order_time, "isoformat") else str(order_time),
                 },
             )
-            if side == "BUY" and positions_repo is not None:
-                # This is the production lifecycle bridge PR133 previously
-                # skipped in tests by calling PositionsRepo.apply_fill directly.
-                # Bind the broker-proven quantity to the exact BUY order lifecycle
-                # before restore_missing_from_holdings can create an IMPORTED cycle.
-                positions_repo.apply_fill(
+
+            def _apply_promoted_buy_position(*, _conn=None):
+                kwargs = dict(
                     env=env,
                     strategy=strategy,
                     sid=int(order.get("sid") or 1),
@@ -1196,6 +1202,28 @@ def _promote_open_buy_orders_from_holdings(
                     order_id=str(order.get("order_id") or "") or None,
                     buy_application_cumulative_qty=confirmed_fill_qty,
                 )
+                if _conn is not None:
+                    kwargs["_conn"] = _conn
+                return positions_repo.apply_fill(**kwargs)
+            # Both records must commit or roll back together on the actual
+            # production repository path, never on a fake broker endpoint.
+            atomic_buy = bool(
+                side == "BUY"
+                and isinstance(fills_repo, FillsRepo)
+                and isinstance(positions_repo, PositionsRepo)
+                and isinstance(orders_repo, OrdersRepo)
+                and fills_repo.engine is positions_repo.engine
+                and fills_repo.engine is orders_repo.engine
+            )
+            if atomic_buy:
+                with fills_repo.engine.begin() as conn:
+                    fills_repo.upsert_fill(**fill_kwargs, _conn=conn)
+                    _apply_promoted_buy_position(_conn=conn)
+            else:
+                fills_repo.upsert_fill(**fill_kwargs)
+                if side == "BUY" and positions_repo is not None:
+                    _apply_promoted_buy_position()
+            if side == "BUY" and positions_repo is not None:
                 logger.warning(
                     "[RECONCILE][BUY_POSITION_APPLY] code=%s incremental_qty=%s cumulative_qty=%s cycle=%s epoch=%s source=kis_holdings_fallback",
                     code,
@@ -2033,32 +2061,80 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                     scope=kr_scope,
                 ):
                     raise RuntimeError("KR_RECONCILE_SOURCE_SCOPE_PREWRITE_REJECTED")
-        orders_repo.upsert_reconciled_order(
-            env=env,
-            run_id=reconcile_run_id,
-            strategy=strategy,
-            sid=1,
-            mode=1,
-            code=code,
-            market=market,
-            side=side,
-            ord_type=str(_first_value(row, ["ord_dvsn_cd", "ord_type"]) or "RECONCILED"),
-            qty=qty,
-            limit_price=price,
-            stage="RECONCILE",
-            client_order_key=client_order_key,
-            kis_odno=kis_odno,
-            status=status,
-            request_json=request_json,
-            response_json={
-                **source_response,
-                **broker_row,
-                "source_order_id": (source_order or {}).get("order_id"),
-                "source_client_order_key": (source_order or {}).get("client_order_key"),
-            },
-            submitted_at=order_time,
-            acked_at=order_time,
+        # Exact priced SELLs commit the broker status with their economic projection.
+        preview_qty = (_to_int(_first_value(row, ["ccld_qty", "tot_ccld_qty", "filled_qty"]))
+                       if cumulative_sell_evidence is None else int(cumulative_sell_evidence["qty"]))
+        preview_price = (_to_float(_first_value(row, ["ccld_prc", "avg_prvs", "filled_price"]))
+                         if cumulative_sell_evidence is None else float(cumulative_sell_evidence["avg_price"]))
+        preview_id = _first_value(row, ["ccld_no", "trade_id", "exec_id"])
+        preview_buy_price = (
+            float(cumulative_buy_evidence["avg_price"])
+            if cumulative_buy_evidence is not None else preview_price
         )
+        preview_cumulative_qty = _to_int(
+            _first_value(row, ["tot_ccld_qty", "cumulative_filled_qty"])
+        )
+        preview_previous_qty = max(
+            0, _to_int(source_response.get("confirmed_fill_qty")) or 0
+        )
+        defer_sell_order = bool(
+            isinstance(engine, sa.engine.Engine) and side == "SELL" and source_order
+            and preview_qty and preview_price is not None
+            and (preview_id or cumulative_sell_evidence is not None)
+        )
+        preview_buy_applied_ids = set(source_response.get("applied_broker_fill_ids") or [])
+        preview_buy_previous_notional = _to_float(
+            source_response.get("confirmed_fill_notional")
+        ) or 0.0
+        if cumulative_buy_evidence is not None:
+            preview_buy_evidence_id = str(cumulative_buy_evidence.get("evidence_id") or "")
+            preview_buy_new_evidence = bool(
+                preview_cumulative_qty is not None
+                and preview_cumulative_qty > preview_previous_qty
+            ) or bool(
+                _to_float(cumulative_buy_evidence.get("notional")) is not None
+                and float(cumulative_buy_evidence["notional"]) > preview_buy_previous_notional
+            ) or bool(
+                preview_buy_evidence_id and preview_buy_evidence_id not in preview_buy_applied_ids
+            )
+        else:
+            preview_buy_new_evidence = bool(
+                preview_id and str(preview_id) not in preview_buy_applied_ids
+            )
+        defer_signed_buy_order = bool(
+            isinstance(engine, sa.engine.Engine)
+            and side == "BUY" and source_order
+            and request_json.get("enforce_entry_contract") is True
+            and preview_buy_price is not None
+            and preview_buy_new_evidence
+        )
+        if not (defer_sell_order or defer_signed_buy_order):
+            orders_repo.upsert_reconciled_order(
+                env=env,
+                run_id=reconcile_run_id,
+                strategy=strategy,
+                sid=1,
+                mode=1,
+                code=code,
+                market=market,
+                side=side,
+                ord_type=str(_first_value(row, ["ord_dvsn_cd", "ord_type"]) or "RECONCILED"),
+                qty=qty,
+                limit_price=price,
+                stage="RECONCILE",
+                client_order_key=client_order_key,
+                kis_odno=kis_odno,
+                status=status,
+                request_json=request_json,
+                response_json={
+                    **source_response,
+                    **broker_row,
+                    "source_order_id": (source_order or {}).get("order_id"),
+                    "source_client_order_key": (source_order or {}).get("client_order_key"),
+                },
+                submitted_at=order_time,
+                acked_at=order_time,
+            )
         order_count += 1
 
         filled_qty = _to_int(_first_value(row, ["ccld_qty", "tot_ccld_qty", "filled_qty"]))
@@ -2187,8 +2263,12 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
             request_json=request_json,
             filled_qty=filled_qty, filled_price=filled_price,
         )
+        defer_native_sell_claim = bool(
+            isinstance(engine, sa.engine.Engine) and side == "SELL" and source_order
+            and filled_qty and filled_price is not None and next_confirmed_qty > 0
+        )
         observation_error = None
-        if not atomic_writer_active and not defer_priced_buy_claim:
+        if not atomic_writer_active and not defer_priced_buy_claim and not defer_native_sell_claim:
             observation_error = _record_execution_claim_observation(
                 orders_repo=orders_repo,
                 source_order=source_order,
@@ -2205,7 +2285,12 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                 )
         execution_meta_update = request_json.get("execution_meta_update")
         execution_action = str(request_json.get("semantic_action") or "").strip()
-        if side == "SELL" and source_order and execution_action and isinstance(execution_meta_update, dict):
+        if (
+            side == "SELL" and source_order and execution_action
+            and isinstance(execution_meta_update, dict)
+            and not defer_native_sell_claim
+            and not (request_json.get("kr_us_tp_contract") or request_json.get("kr_us_tp_stage"))
+        ):
             try:
                 _project_pb1_exit_stage_truth(
                     orders_repo=orders_repo,
@@ -2227,8 +2312,9 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                         "error": f"stage_projection:{type(exc).__name__}",
                     }
                 )
+        native_fill_kwargs = None
         if filled_qty and filled_price is not None and side != "UNKNOWN":
-            fills_repo.upsert_fill(
+            native_fill_kwargs = dict(
                 env=env,
                 run_id=reconcile_run_id,
                 order_id=str((source_order or {}).get("order_id") or "") or None,
@@ -2267,60 +2353,248 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                     ),
                 },
             )
-            # KIS cumulative BUY average is the *whole order* average, not
-            # the price of the incremental shares. Preserve broker notional.
+            # Signed PB1 BUY fill, position, claim and order watermark are one
+            # physical transaction. The order-row lock rejects stale concurrent
+            # KIS snapshots before any economic write.
+            buy_notional_delta = next_confirmed_notional - previous_confirmed_notional
+            buy_fill_identity_new = bool(
+                trade_id and str(trade_id) not in applied_fill_ids
+            )
+            signed_native_buy = bool(
+                side == "BUY" and source_order
+                and request_json.get("enforce_entry_contract") is True
+                and (
+                    incremental_daily_qty > 0
+                    or buy_notional_delta > 0
+                    or buy_fill_identity_new
+                    or atomic_writer_active
+                )
+            )
+            buy_claim_applied = False
+            is_pyramid_add = bool(
+                str((source_order or {}).get("stage") or "").upper() == "PB1-ADD"
+                or str(request_json.get("entry_reason") or "").upper() == "ENTRY_PYRAMID"
+            )
+            requested_buy_qty = int((source_order or {}).get("qty") or qty or 0)
+
+            def _save_buy_order(conn):
+                buy_applied_ids = set(applied_fill_ids)
+                if trade_id:
+                    buy_applied_ids.add(trade_id)
+                confirmed_average = (
+                    float(next_confirmed_notional) / float(next_confirmed_qty)
+                    if next_confirmed_qty > 0 and next_confirmed_notional > 0
+                    else source_response.get("confirmed_fill_price")
+                )
+                orders_repo.upsert_reconciled_order(
+                    env=env,
+                    run_id=reconcile_run_id,
+                    strategy=str((source_order or {}).get("strategy") or strategy),
+                    sid=int((source_order or {}).get("sid") or 1),
+                    mode=int((source_order or {}).get("mode") or 1),
+                    code=code,
+                    market=(source_order or {}).get("market") or market,
+                    side="BUY",
+                    ord_type=str(_first_value(row, ["ord_dvsn_cd", "ord_type"]) or "RECONCILED"),
+                    qty=qty,
+                    limit_price=price,
+                    stage=str((source_order or {}).get("stage") or "RECONCILE"),
+                    client_order_key=client_order_key,
+                    kis_odno=kis_odno,
+                    status=status,
+                    request_json=request_json,
+                    response_json={
+                        **source_response,
+                        **broker_row,
+                        "confirmed_fill_qty": next_confirmed_qty,
+                        "confirmed_fill_notional": next_confirmed_notional,
+                        "confirmed_fill_price": confirmed_average,
+                        "broker_cumulative_evidence_type": (
+                            "KIS_ORDER_CUMULATIVE_EXECUTION"
+                            if cumulative_buy_evidence
+                            else source_response.get("broker_cumulative_evidence_type")
+                        ),
+                        "applied_broker_fill_ids": sorted(buy_applied_ids),
+                        "source_order_id": (source_order or {}).get("order_id"),
+                        "source_client_order_key": (source_order or {}).get("client_order_key"),
+                    },
+                    submitted_at=(source_order or {}).get("submitted_at") or order_time,
+                    acked_at=(source_order or {}).get("acked_at") or order_time,
+                    _conn=conn,
+                )
+
+            def _lock_buy_order_watermark(conn):
+                table = schema_for_engine(engine).orders
+                current = conn.execute(
+                    sa.select(table.c.status, table.c.response_json).where(
+                        table.c.order_id == uuid_value_for_url(
+                            str(engine.url), str(source_order.get("order_id") or "")
+                        )
+                    ).with_for_update()
+                ).one_or_none()
+                if current is None:
+                    raise RuntimeError("KR_NATIVE_BUY_SOURCE_ORDER_MISSING")
+                current_status = str(current[0] or "").upper()
+                current_response = _json_dict(current[1])
+                fields = ("confirmed_fill_qty", "confirmed_fill_notional", "applied_broker_fill_ids")
+                if (
+                    current_status != str(source_order.get("status") or "").upper()
+                    or any(current_response.get(k) != source_response.get(k) for k in fields)
+                ):
+                    raise RuntimeError("KR_NATIVE_BUY_STALE_ORDER_RETRY")
+
+            if not signed_native_buy and not defer_native_sell_claim and native_fill_kwargs is not None:
+                fills_repo.upsert_fill(**native_fill_kwargs)
+
+            # KIS cumulative BUY average is the whole-order average. Convert
+            # only the newly proven notional delta into the incremental price.
             buy_delta_price = float(filled_price)
             if cumulative_buy_evidence is not None and incremental_daily_qty > 0:
-                economic_delta = next_confirmed_notional - previous_confirmed_notional
-                if economic_delta <= 0 or (previous_confirmed_qty > 0 and previous_confirmed_notional <= 0):
+                if buy_notional_delta <= 0 or (
+                    previous_confirmed_qty > 0 and previous_confirmed_notional <= 0
+                ):
                     raise RuntimeError("KR_BUY_CUMULATIVE_NOTIONAL_WATERMARK_MISSING")
-                buy_delta_price = economic_delta / float(incremental_daily_qty)
+                buy_delta_price = buy_notional_delta / float(incremental_daily_qty)
+
             if (
                 side == "BUY"
                 and source_order
                 and request_json.get("enforce_entry_contract") is True
-                and (incremental_daily_qty > 0 or atomic_writer_active)
+                and (
+                    incremental_daily_qty > 0
+                    or buy_notional_delta > 0
+                    or buy_fill_identity_new
+                    or atomic_writer_active
+                )
             ):
                 def _legacy_buy_apply():
-                    return positions_repo.apply_fill(
-                        env=env,
-                        strategy=str(source_order.get("strategy") or strategy),
-                        sid=int(source_order.get("sid") or 1),
-                        mode=int(source_order.get("mode") or 1),
-                        code=code,
-                        market=source_order.get("market") or market,
-                        side="BUY",
-                        qty=incremental_daily_qty,
-                        price=float(buy_delta_price),
-                        fee=0.0,
-                        tax=0.0,
-                        filled_at=order_time,
-                        entry_meta_json=request_json.get("entry_meta") or _json_dict(source_order.get("entry_meta_json")),
-                        entry_exit_plan=request_json.get("entry_exit_plan") or {},
-                        portfolio_epoch_id=str(source_order.get("portfolio_epoch_id") or "") or None,
-                        position_cycle_id=str(source_order.get("position_cycle_id") or "") or None,
-                        order_id=str(source_order.get("order_id") or "") or None,
-                        # Bind the exact current KIS cumulative watermark to
-                        # the pre-order holding baseline. Prevents 91 confirmed
-                        # shares being added atop an unproven phantom 22-share
-                        # DB position while retaining valid partial 20→91.
-                        buy_application_cumulative_qty=(
-                            next_confirmed_qty if cumulative_buy_evidence is not None else None
-                        ),
-                        buy_application_previous_confirmed_qty=(
-                            previous_confirmed_qty if cumulative_buy_evidence is not None else None
-                        ),
-                        buy_cost_delta_override=(
-                            next_confirmed_notional - previous_confirmed_notional
-                            if cumulative_buy_evidence is not None else None
-                        ),
-                    )
+                    nonlocal buy_claim_applied
+
+                    def _apply_buy_position(*, _conn=None):
+                        kwargs = dict(
+                            env=env,
+                            strategy=str(source_order.get("strategy") or strategy),
+                            sid=int(source_order.get("sid") or 1),
+                            mode=int(source_order.get("mode") or 1),
+                            code=code,
+                            market=source_order.get("market") or market,
+                            side="BUY",
+                            qty=incremental_daily_qty,
+                            price=float(buy_delta_price),
+                            fee=0.0,
+                            tax=0.0,
+                            filled_at=order_time,
+                            entry_meta_json=request_json.get("entry_meta") or _json_dict(source_order.get("entry_meta_json")),
+                            entry_exit_plan=request_json.get("entry_exit_plan") or {},
+                            portfolio_epoch_id=str(source_order.get("portfolio_epoch_id") or "") or None,
+                            position_cycle_id=str(source_order.get("position_cycle_id") or "") or None,
+                            order_id=str(source_order.get("order_id") or "") or None,
+                            buy_application_cumulative_qty=(
+                                next_confirmed_qty if cumulative_buy_evidence is not None else None
+                            ),
+                            buy_application_previous_confirmed_qty=(
+                                previous_confirmed_qty if cumulative_buy_evidence is not None else None
+                            ),
+                            buy_cost_delta_override=(
+                                buy_notional_delta if cumulative_buy_evidence is not None else None
+                            ),
+                        )
+                        if _conn is not None:
+                            kwargs["_conn"] = _conn
+                        return positions_repo.apply_fill(**kwargs)
+
+                    if not (
+                        isinstance(fills_repo, FillsRepo)
+                        and isinstance(positions_repo, PositionsRepo)
+                        and fills_repo.engine is positions_repo.engine
+                        and fills_repo.engine is engine
+                    ):
+                        if kr_scope is not None:
+                            raise RuntimeError("KR_NATIVE_BUY_SHARED_DB_REQUIRED")
+                        logger.warning(
+                            "[KR][NATIVE_BUY][NONATOMIC_ADAPTER] code=%s reason=NO_SHARED_REPOS",
+                            code,
+                        )
+                        if native_fill_kwargs is not None:
+                            fills_repo.upsert_fill(**native_fill_kwargs)
+                        result = _apply_buy_position()
+                        if defer_priced_buy_claim or atomic_writer_active:
+                            observation_error = _record_execution_claim_observation(
+                                orders_repo=orders_repo, source_order=source_order,
+                                broker_status=status, cumulative_filled_qty=claim_filled_qty,
+                                requested_qty=_to_int((source_order or {}).get("qty")) or qty,
+                            )
+                            if observation_error:
+                                raise RuntimeError(
+                                    "KR_NATIVE_BUY_CLAIM_UPDATE_FAILED:" + observation_error
+                                )
+                            buy_claim_applied = True
+                        _save_buy_order(None)
+                        return result
+
+                    with fills_repo.engine.begin() as conn:
+                        _lock_buy_order_watermark(conn)
+                        if native_fill_kwargs is not None:
+                            fills_repo.upsert_fill(**native_fill_kwargs, _conn=conn)
+                        result = _apply_buy_position(_conn=conn)
+                        if defer_priced_buy_claim or atomic_writer_active:
+                            observation_error = _record_execution_claim_observation(
+                                orders_repo=orders_repo,
+                                source_order=source_order,
+                                broker_status=status,
+                                cumulative_filled_qty=claim_filled_qty,
+                                requested_qty=_to_int((source_order or {}).get("qty")) or qty,
+                                _conn=conn,
+                            )
+                            if observation_error:
+                                raise RuntimeError(
+                                    "KR_NATIVE_BUY_CLAIM_UPDATE_FAILED:" + observation_error
+                                )
+                            buy_claim_applied = True
+                        if (
+                            is_pyramid_add
+                            and next_confirmed_qty >= requested_buy_qty > 0
+                        ):
+                            stage_avg_fill_price = (
+                                next_confirmed_notional / float(next_confirmed_qty)
+                                if next_confirmed_notional > 0 and next_confirmed_qty > 0
+                                else float(filled_price or 0.0)
+                            )
+                            if not positions_repo.mark_pyramid_add_fill(
+                                env=env,
+                                strategy=str(source_order.get("strategy") or strategy),
+                                sid=int(source_order.get("sid") or 1),
+                                mode=int(source_order.get("mode") or 1),
+                                code=code,
+                                position_cycle_id=str(source_order.get("position_cycle_id") or ""),
+                                portfolio_epoch_id=str(source_order.get("portfolio_epoch_id") or "") or None,
+                                target_level=int(request_json.get("level") or 0),
+                                client_order_key=client_order_key,
+                                filled_qty=next_confirmed_qty,
+                                requested_qty=requested_buy_qty,
+                                fill_price=float(stage_avg_fill_price or 0.0),
+                                filled_at=order_time,
+                                pre_order_avg_buy_price=_to_float(request_json.get("pre_order_avg_buy_price")),
+                                pre_order_stop_price=_to_float(request_json.get("pre_order_stop_price")),
+                                _conn=conn,
+                            ):
+                                raise RuntimeError("KR_PYRAMID_ADD_STAGE_WRITE_FAILED")
+                        _save_buy_order(conn)
+                        return result
 
                 atomic_buy_applied = False
                 if atomic_observation is not None and atomic_release is not None:
                     from trader.settlement.kr_cutover import route_kr_settlement
 
                     def _atomic_buy_apply(conn, _obs, decision):
+                        if (
+                            not isinstance(fills_repo, FillsRepo)
+                            or fills_repo.engine is not engine
+                        ):
+                            raise RuntimeError("KR_NATIVE_BUY_WRITER_SHARED_DB_REQUIRED")
+                        _lock_buy_order_watermark(conn)
+                        if native_fill_kwargs is not None:
+                            fills_repo.upsert_fill(**native_fill_kwargs, _conn=conn)
                         if decision.qty_delta > 0 or decision.notional_delta != 0:
                             positions_repo.apply_fill(
                                 env=env,
@@ -2383,7 +2657,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                                 if cumulative_atomic_notional > 0 and decision.cumulative_qty > 0
                                 else float(filled_price or 0.0)
                             )
-                            positions_repo.mark_pyramid_add_fill(
+                            if not positions_repo.mark_pyramid_add_fill(
                                 env=env,
                                 strategy=str(source_order.get("strategy") or strategy),
                                 sid=int(source_order.get("sid") or 1),
@@ -2400,7 +2674,9 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                                 pre_order_avg_buy_price=_to_float(request_json.get("pre_order_avg_buy_price")),
                                 pre_order_stop_price=_to_float(request_json.get("pre_order_stop_price")),
                                 _conn=conn,
-                            )
+                            ):
+                                raise RuntimeError("KR_PYRAMID_ADD_STAGE_WRITE_FAILED")
+                        _save_buy_order(conn)
 
                     route_result = route_kr_settlement(
                         engine=engine,
@@ -2431,41 +2707,9 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                     source_order.get("position_cycle_id"),
                     source_order.get("portfolio_epoch_id"),
                 )
-                is_pyramid_add = bool(
-                    str((source_order or {}).get("stage") or "").upper() == "PB1-ADD"
-                    or str(request_json.get("entry_reason") or "").upper() == "ENTRY_PYRAMID"
-                )
-                requested_buy_qty = int((source_order or {}).get("qty") or qty or 0)
-                if (
-                    is_pyramid_add
-                    and next_confirmed_qty >= requested_buy_qty > 0
-                    and not atomic_buy_applied
-                ):
-                    stage_avg_fill_price = (
-                        next_confirmed_notional / float(next_confirmed_qty)
-                        if next_confirmed_notional > 0 and next_confirmed_qty > 0
-                        else float(filled_price or 0.0)
-                    )
-                    positions_repo.mark_pyramid_add_fill(
-                        env=env,
-                        strategy=str(source_order.get("strategy") or strategy),
-                        sid=int(source_order.get("sid") or 1),
-                        mode=int(source_order.get("mode") or 1),
-                        code=code,
-                        position_cycle_id=str(source_order.get("position_cycle_id") or ""),
-                        portfolio_epoch_id=str(source_order.get("portfolio_epoch_id") or "") or None,
-                        target_level=int(request_json.get("level") or 0),
-                        client_order_key=client_order_key,
-                        filled_qty=next_confirmed_qty,
-                        requested_qty=requested_buy_qty,
-                        fill_price=float(stage_avg_fill_price or 0.0),
-                        filled_at=order_time,
-                        pre_order_avg_buy_price=_to_float(request_json.get("pre_order_avg_buy_price")),
-                        pre_order_stop_price=_to_float(request_json.get("pre_order_stop_price")),
-                    )
-            if defer_priced_buy_claim:
-                # Reached only after native fill persistence and the
-                # original BUY's position application have both succeeded.
+            if defer_priced_buy_claim and not buy_claim_applied:
+                # Price-only replay or a non-production adapter reaches this
+                # path only after its economic evidence has been persisted.
                 observation_error = _record_execution_claim_observation(
                     orders_repo=orders_repo,
                     source_order=source_order,
@@ -2500,7 +2744,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                     and filled_price is not None and filled_price > 0
                 ):
                     verified_cumulative_sell_price = float(filled_price)
-                elif verified_cumulative_sell_price is None and isinstance(getattr(fills_repo, "engine", None), sa.engine.Engine):
+                elif verified_cumulative_sell_price is None and not defer_native_sell_claim and isinstance(getattr(fills_repo, "engine", None), sa.engine.Engine):
                     # For multiple partial executions, derive the weighted
                     # average from exact order-linked persisted broker fills.
                     # Test/diagnostic repositories without an engine cannot
@@ -2509,10 +2753,223 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                         fills_repo=fills_repo, source_order=source_order,
                         env=env, confirmed_cumulative_qty=next_confirmed_qty,
                     )
+            def _save_sell_order(conn):
+                sell_applied_ids = set(applied_fill_ids)
+                if trade_id:
+                    sell_applied_ids.add(trade_id)
+                orders_repo.upsert_reconciled_order(
+                    env=env,
+                    run_id=reconcile_run_id,
+                    strategy=str((source_order or {}).get("strategy") or strategy),
+                    sid=int((source_order or {}).get("sid") or 1),
+                    mode=int((source_order or {}).get("mode") or 1),
+                    code=code,
+                    market=(source_order or {}).get("market") or market,
+                    side=side,
+                    ord_type=str(_first_value(row, ["ord_dvsn_cd", "ord_type"]) or "RECONCILED"),
+                    qty=qty,
+                    limit_price=price,
+                    stage=str((source_order or {}).get("stage") or "RECONCILE"),
+                    client_order_key=client_order_key,
+                    kis_odno=kis_odno,
+                    status=status,
+                    request_json=request_json,
+                    response_json={
+                        **source_response,
+                        **broker_row,
+                        "confirmed_fill_qty": next_confirmed_qty,
+                        "confirmed_fill_notional": next_confirmed_notional,
+                        "confirmed_fill_price": (
+                            float(next_confirmed_notional) / float(next_confirmed_qty)
+                            if next_confirmed_qty > 0 and next_confirmed_notional > 0
+                            else source_response.get("confirmed_fill_price")
+                        ),
+                        "broker_cumulative_evidence_type": (
+                            "KIS_ORDER_CUMULATIVE_EXECUTION"
+                            if cumulative_sell_evidence else source_response.get("broker_cumulative_evidence_type")
+                        ),
+                        "applied_broker_fill_ids": sorted(sell_applied_ids),
+                        "source_order_id": (source_order or {}).get("order_id"),
+                        "source_client_order_key": (source_order or {}).get("client_order_key"),
+                    },
+                    submitted_at=(source_order or {}).get("submitted_at") or order_time,
+                    acked_at=(source_order or {}).get("acked_at") or order_time,
+                    _conn=conn,
+                )
+            def _lock_sell_order_watermark(conn):
+                table = schema_for_engine(engine).orders
+                current = conn.execute(
+                    sa.select(table.c.status, table.c.response_json).where(
+                        table.c.order_id == uuid_value_for_url(str(engine.url), str(source_order.get("order_id") or ""))
+                    ).with_for_update()
+                ).one_or_none()
+                if current is None:
+                    raise RuntimeError("KR_NATIVE_SELL_SOURCE_ORDER_MISSING")
+                current_status = str(current[0] or "").upper()
+                current_response = _json_dict(current[1])
+                fields = ("confirmed_fill_qty", "confirmed_fill_notional", "applied_broker_fill_ids")
+                if (
+                    current_status != str(source_order.get("status") or "").upper()
+                    or any(current_response.get(k) != source_response.get(k) for k in fields)
+                ):
+                    raise RuntimeError("KR_NATIVE_SELL_STALE_ORDER_RETRY")
             if side == "SELL" and source_order and (
-                incremental_daily_qty > 0 or verified_cumulative_sell_price is not None
+                incremental_daily_qty > 0 or verified_cumulative_sell_price is not None or defer_native_sell_claim
             ):
                 def _legacy_sell_apply():
+                    if not defer_native_sell_claim:
+                        return _apply_sell_position()
+                    if not (getattr(fills_repo, "engine", None) is engine and getattr(positions_repo, "engine", None) is engine):
+                        raise RuntimeError("KR_NATIVE_SELL_SHARED_DB_REQUIRED")
+                    with fills_repo.engine.begin() as conn:
+                        _lock_sell_order_watermark(conn)
+                        if native_fill_kwargs is not None:
+                            fills_repo.upsert_fill(**native_fill_kwargs, _conn=conn)
+                        result = _apply_sell_position(conn)
+                        _apply_sell_claim(conn)
+                        _save_sell_order(conn)
+                        return result
+
+                def _apply_kr_tp_stage_journal(conn):
+                    tp_contract = request_json.get("kr_us_tp_contract")
+                    tp_stage = str(request_json.get("kr_us_tp_stage") or "").upper()
+                    if not tp_contract and not tp_stage:
+                        return None
+                    if not tp_contract or not tp_stage:
+                        reason = "KR_TP_STAGE_CONTRACT_INCOMPLETE"
+                        execution_claim_observation_failures.append({
+                            "client_order_key": str(source_order.get("client_order_key") or ""),
+                            "error": reason,
+                        })
+                        logger.error(
+                            "[KR_PROFIT_PARITY][KIS_PROOF_FAIL_CLOSED] code=%s stage=%s reason=%s",
+                            code, tp_stage or "UNKNOWN", reason,
+                        )
+                        return False
+                    try:
+                        from datetime import date as _tp_date
+                        from trader.account_state import get_account_key as _tp_account_key
+                        from trader.kr.us_profit_stage_journal import observe_broker_stage
+                        from trader.kr.us_standard_profit_parity import verified_contract
+    
+                        original_trade_date = _tp_date.fromisoformat(
+                            str(request_json.get("kr_us_tp_trade_date") or "")
+                        )
+                        source_odno = str(
+                            source_order.get("kis_odno") or source_order.get("broker_order_id") or ""
+                        ).lstrip("0") or "0"
+                        original_odno = str(row.get("odno") or "").lstrip("0") or "0"
+                        if not (
+                            verified_contract(tp_contract)
+                            and str(tp_contract.get("activation_mode")) == "ACTIVE_PRACTICE"
+                            and str(row.get("sll_buy_dvsn_cd") or "") == "01"
+                            and str(row.get("pdno") or "").zfill(6) == str(code).zfill(6)
+                            and str(row.get("ord_dt") or "") == original_trade_date.strftime("%Y%m%d")
+                            and source_odno != "0" and source_odno == original_odno
+                            and str(row.get("cncl_yn") or "N").upper() == "N"
+                            and str(source_order.get("position_cycle_id") or "") == tp_contract.get("position_cycle_id")
+                            and str(source_order.get("trading_epoch_id") or "") == tp_contract.get("trading_epoch_id")
+                            and str(source_order.get("strategy") or "") == "pb1_pullback_close"
+                        ):
+                            reason = "KR_TP_KIS_ORIGINAL_ORDER_PROOF_MISMATCH"
+                            execution_claim_observation_failures.append({
+                                "client_order_key": str(source_order.get("client_order_key") or ""),
+                                "error": reason,
+                            })
+                            logger.error(
+                                "[KR_PROFIT_PARITY][KIS_PROOF_FAIL_CLOSED] code=%s stage=%s reason=%s",
+                                code, tp_stage, reason,
+                            )
+                            return False
+                        tp_update = observe_broker_stage(
+                            engine=engine, contract=tp_contract,
+                            account_id=_tp_account_key(env=env, kis=kis),
+                            trading_epoch_id=str(source_order.get("trading_epoch_id") or ""),
+                            position_cycle_id=str(source_order.get("position_cycle_id") or ""),
+                            code=str(code).zfill(6), stage=tp_stage,
+                            client_order_key=str(source_order.get("client_order_key") or ""),
+                            broker_odno=str(row.get("odno") or ""),
+                            cumulative_filled_qty=int(next_confirmed_qty or 0),
+                            broker_order_accepted=True,
+                            broker_fill_source="KIS_DAILY_CCLD_VERIFIED",
+                            source_trade_date=original_trade_date,
+                            _conn=conn,
+                        )
+                        if not tp_update.accepted:
+                            reason = "KR_TP_STAGE_BROKER_PROOF_NOT_STORED:" + tp_update.reason
+                            execution_claim_observation_failures.append({
+                                "client_order_key": str(source_order.get("client_order_key") or ""),
+                                "error": reason,
+                            })
+                            logger.error(
+                                "[KR_PROFIT_PARITY][KIS_PROOF_FAIL_CLOSED] code=%s stage=%s reason=%s",
+                                code, tp_stage, reason,
+                            )
+                            return False
+                        logger.info(
+                            "[KR_PROFIT_PARITY][KIS_PROVEN_STAGE] code=%s stage=%s "
+                            "status=%s cumulative=%s order=%s",
+                            code, tp_stage, tp_update.status, next_confirmed_qty, original_odno,
+                        )
+                        return True
+                    except Exception as exc:
+                        reason = "KR_TP_STAGE_OBSERVATION_FAILED:" + type(exc).__name__
+                        execution_claim_observation_failures.append({
+                            "client_order_key": str(source_order.get("client_order_key") or ""),
+                            "error": reason,
+                        })
+                        logger.exception(
+                            "[KR_PROFIT_PARITY][KIS_PROOF_FAIL_CLOSED] code=%s stage=%s reason=%s",
+                            code, tp_stage, reason,
+                        )
+                        return False
+
+                def _apply_sell_claim(conn):
+                    # TP stage proof is part of the same transaction as native
+                    # SELL fill, position, execution claim and order watermark.
+                    # A journal failure must roll back the economic projection.
+                    tp_stage_accepted = _apply_kr_tp_stage_journal(conn)
+                    cancelled = status in {"CANCELLED", "CANCELED", "CANCEL"}
+                    try:
+                        snapshot = orders_repo.record_execution_claim_for_order(
+                            str(source_order.get("client_order_key") or ""),
+                            state=("CANCELLED" if cancelled else
+                                   "FILLED" if next_confirmed_qty >= int(source_order.get("qty") or qty or 0)
+                                   else "PARTIALLY_FILLED"),
+                            cumulative_filled_qty=(broker_cumulative_qty if cancelled else next_confirmed_qty),
+                            authoritative=(broker_cumulative_qty is not None if cancelled else True), _conn=conn,
+                        )
+                    except LookupError:
+                        return
+                    claim_state = str(getattr(snapshot, "action_state", "") or "").upper()
+                    if not getattr(snapshot, "active_attempt_id", None) and claim_state in {"RETRYABLE", "PARTIALLY_SATISFIED", "SATISFIED"}:
+                        fields = {}
+                        if (
+                            claim_state == "SATISFIED"
+                            and isinstance(execution_meta_update, dict)
+                            and tp_stage_accepted is not False
+                        ):
+                            fields.update(execution_meta_update)
+                        stage_name = str(request_json.get("profit_capture_stage") or "").lower()
+                        if stage_name in {"tp1", "tp2", "tp3"} and tp_stage_accepted is not False:
+                            fields[f"kr_{stage_name}_pending"] = False
+                        if fields:
+                            positions_repo.update_position_fields(
+                                env=env, strategy=str(source_order.get("strategy") or strategy),
+                                sid=int(source_order.get("sid") or 1), mode=int(source_order.get("mode") or 1),
+                                code=code, fields={"position_meta": fields},
+                                position_cycle_id=str(source_order.get("position_cycle_id") or ""),
+                                portfolio_epoch_id=str(source_order.get("portfolio_epoch_id") or "") or None, _conn=conn,
+                            )
+
+                def _apply_sell_position(conn=None):
+                    sell_price = verified_cumulative_sell_price
+                    if sell_price is None and conn is not None:
+                        sell_price = _verified_order_sell_average_from_ccld_fills(
+                            fills_repo=fills_repo, source_order=source_order, env=env,
+                            confirmed_cumulative_qty=next_confirmed_qty, _conn=conn,
+                        )
+                    kwargs = {} if conn is None else {"_conn": conn}
                     return positions_repo.reconcile_sell_execution(
                         env=env,
                         strategy=str(source_order.get("strategy") or strategy),
@@ -2521,7 +2978,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                         code=code,
                         market=source_order.get("market") or market,
                         confirmed_cumulative_qty=next_confirmed_qty,
-                        fill_price=verified_cumulative_sell_price,
+                        fill_price=sell_price,
                         filled_at=order_time,
                         position_cycle_id=str(source_order.get("position_cycle_id") or ""),
                         portfolio_epoch_id=str(source_order.get("portfolio_epoch_id") or "") or None,
@@ -2532,12 +2989,23 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                         # the only authority permitted to supersede a historic
                         # manually entered provisional MTS execution price.
                         native_original_order_price_proof=(cumulative_sell_evidence is not None),
+                        **kwargs,
                     )
 
                 if atomic_observation is not None and atomic_release is not None:
                     from trader.settlement.kr_cutover import route_kr_settlement
 
                     def _atomic_sell_apply(conn, _obs, _decision):
+                        _lock_sell_order_watermark(conn)
+                        if native_fill_kwargs is not None:
+                            fills_repo.upsert_fill(**native_fill_kwargs, _conn=conn)
+                        tp_stage_accepted = _apply_kr_tp_stage_journal(conn)
+                        sell_price = verified_cumulative_sell_price
+                        if sell_price is None:
+                            sell_price = _verified_order_sell_average_from_ccld_fills(
+                                fills_repo=fills_repo, source_order=source_order, env=env,
+                                confirmed_cumulative_qty=next_confirmed_qty, _conn=conn,
+                            )
                         claim_snapshot = orders_repo.record_execution_claim_for_order(
                             str(source_order.get("client_order_key") or ""),
                             state=(
@@ -2556,14 +3024,17 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                             and claim_state in {"RETRYABLE", "PARTIALLY_SATISFIED", "SATISFIED"}
                         ):
                             atomic_meta_fields: dict[str, Any] = {}
-                            if claim_state == "SATISFIED":
+                            if claim_state == "SATISFIED" and tp_stage_accepted is not False:
                                 execution_meta_update = request_json.get("execution_meta_update")
                                 if isinstance(execution_meta_update, dict):
                                     atomic_meta_fields.update(execution_meta_update)
                             profit_capture_stage = str(
                                 request_json.get("profit_capture_stage") or ""
                             ).lower()
-                            if profit_capture_stage in {"tp1", "tp2", "tp3"}:
+                            if (
+                                profit_capture_stage in {"tp1", "tp2", "tp3"}
+                                and tp_stage_accepted is not False
+                            ):
                                 atomic_meta_fields[f"kr_{profit_capture_stage}_pending"] = False
                             if atomic_meta_fields:
                                 positions_repo.update_position_fields(
@@ -2585,7 +3056,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                             code=code,
                             market=source_order.get("market") or market,
                             confirmed_cumulative_qty=next_confirmed_qty,
-                            fill_price=verified_cumulative_sell_price,
+                            fill_price=sell_price,
                             filled_at=order_time,
                             position_cycle_id=str(source_order.get("position_cycle_id") or ""),
                             portfolio_epoch_id=str(source_order.get("portfolio_epoch_id") or "") or None,
@@ -2595,6 +3066,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                             native_original_order_price_proof=(cumulative_sell_evidence is not None),
                             _conn=conn,
                         )
+                        _save_sell_order(conn)
 
                     route_result = route_kr_settlement(
                         engine=engine,
@@ -2627,49 +3099,27 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                 # Persist actual KIS notional even if qty was already confirmed
                 # by a prior holdings-only observation (price-only recovery).
                 # Keep the historical strategy/position provenance unchanged.
-                orders_repo.upsert_reconciled_order(
-                    env=env,
-                    run_id=reconcile_run_id,
-                    strategy=str((source_order or {}).get("strategy") or strategy),
-                    sid=int((source_order or {}).get("sid") or 1),
-                    mode=int((source_order or {}).get("mode") or 1),
-                    code=code,
-                    market=(source_order or {}).get("market") or market,
-                    side=side,
-                    ord_type=str(_first_value(row, ["ord_dvsn_cd", "ord_type"]) or "RECONCILED"),
-                    qty=qty,
-                    limit_price=price,
-                    stage=str((source_order or {}).get("stage") or "RECONCILE"),
-                    client_order_key=client_order_key,
-                    kis_odno=kis_odno,
-                    status=status,
-                    request_json=request_json,
-                    response_json={
-                        **source_response,
-                        **broker_row,
-                        "confirmed_fill_qty": next_confirmed_qty,
-                        "confirmed_fill_notional": next_confirmed_notional,
-                        "confirmed_fill_price": (
-                            float(cumulative_sell_evidence["avg_price"])
-                            if cumulative_sell_evidence else source_response.get("confirmed_fill_price")
-                        ),
-                        "broker_cumulative_evidence_type": (
-                            "KIS_ORDER_CUMULATIVE_EXECUTION"
-                            if cumulative_sell_evidence else source_response.get("broker_cumulative_evidence_type")
-                        ),
-                        "applied_broker_fill_ids": sorted(applied_fill_ids),
-                        "source_order_id": (source_order or {}).get("order_id"),
-                        "source_client_order_key": (source_order or {}).get("client_order_key"),
-                    },
-                    submitted_at=(source_order or {}).get("submitted_at") or order_time,
-                    acked_at=(source_order or {}).get("acked_at") or order_time,
-                )
+                if not defer_native_sell_claim:
+                    _save_sell_order(None)
             # Do not advance KR US-standard TP on ACK/holdings inference.
             # Only the exact native KIS daily-ccld original order, with matching
             # date, side, symbol, ODNO and durable stage claim, is stage truth.
             tp_contract = request_json.get("kr_us_tp_contract")
             tp_stage = str(request_json.get("kr_us_tp_stage") or "").upper()
-            if side == "SELL" and source_order and tp_contract and tp_stage:
+            if (
+                side == "SELL" and source_order and not defer_native_sell_claim
+                and bool(tp_contract) != bool(tp_stage)
+            ):
+                reason = "KR_TP_STAGE_CONTRACT_INCOMPLETE"
+                execution_claim_observation_failures.append({
+                    "client_order_key": str(source_order.get("client_order_key") or ""),
+                    "error": reason,
+                })
+                logger.error(
+                    "[KR_PROFIT_PARITY][KIS_PROOF_FAIL_CLOSED] code=%s stage=%s reason=%s",
+                    code, tp_stage or "UNKNOWN", reason,
+                )
+            if side == "SELL" and source_order and tp_contract and tp_stage and not defer_native_sell_claim:
                 try:
                     from datetime import date as _tp_date
                     from trader.account_state import get_account_key as _tp_account_key
@@ -2715,6 +3165,16 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                         "status=%s cumulative=%s order=%s",
                         code, tp_stage, tp_update.status, next_confirmed_qty, original_odno,
                     )
+                    if execution_action and isinstance(execution_meta_update, dict):
+                        _project_pb1_exit_stage_truth(
+                            orders_repo=orders_repo,
+                            positions_repo=positions_repo,
+                            env=env,
+                            code=code,
+                            strategy=str(source_order.get("strategy") or strategy),
+                            source_order=source_order,
+                            request_json=request_json,
+                        )
                 except Exception as tp_err:
                     logger.exception(
                         "[KR_PROFIT_PARITY][KIS_PROOF_FAIL_CLOSED] code=%s stage=%s "

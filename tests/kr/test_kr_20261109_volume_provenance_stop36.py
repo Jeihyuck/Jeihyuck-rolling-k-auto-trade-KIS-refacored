@@ -54,6 +54,9 @@ def test_explicitly_invalid_primary_volume_cannot_be_hidden_by_raw_cache():
 
 def test_valid_raw_volume_fallback_is_audited():
     proof = _proof(snapshot={
+        "source": "KIS_REST_INQUIRE_PRICE",
+        "source_identity": "AUTHENTICATED_REST_REQUEST_BOUND",
+        "requested_symbol": "005930", "received_at": NOW.timestamp(),
         "raw": {"acml_vol": 1500, "stck_cntg_hour": "095900"},
     })
     assert proof["confirmation_state"] == "VERIFIED"

@@ -2609,7 +2609,7 @@ class KisAPI:
         
         raise RuntimeError(f"invalid last price 0 for {code}")
 
-    def get_price_quote(self, code: str, *, diag_mode: bool = False, attempts: int = 2, retry_cap: int | None = None) -> dict:
+    def get_price_quote(self, code: str, *, diag_mode: bool = False, attempts: int = 2, retry_cap: int | None = None, native_rest_only: bool = False) -> dict:
         """
         inquire-price 래퍼: 현재가와 최우선 호가를 dict로 반환.
 
@@ -2621,27 +2621,29 @@ class KisAPI:
         if not c:
             return {}
 
-        # Primary market-data source: KIS WebSocket. Subscription is lazy and
-        # uses the existing App Key/Secret to obtain approval_key automatically.
-        ws_service = get_kis_ws_price_service()
-        ws_service.subscribe_kr(c)
-        ws_max_age = _env_float("KIS_WS_FRESH_MAX_AGE_SEC_KR", 5.0)
-        ws_wait = _env_float("KIS_WS_INITIAL_WAIT_SEC", 0.35)
-        ws_quote = ws_service.get_fresh_quote("KR", c, max_age_sec=ws_max_age)
-        if ws_quote is None and ws_wait > 0:
-            ws_quote = ws_service.wait_for_fresh_quote(
-                "KR", c, max_age_sec=ws_max_age, wait_sec=ws_wait
-            )
-        if ws_quote:
-            logger.debug(
-                "[KIS_WS][PRICE_HIT] market=KR code=%s age_sec=%.3f",
-                c, float(ws_quote.get("age_sec") or 0.0),
-            )
-            return ws_quote
+        # Normal trading remains WS-first. A manual read-only source probe
+        # must bypass BOTH WS and stale REST cache to inspect one genuine KIS
+        # inquire-price response. Never enable this in the BUY/SELL hot path.
+        if not native_rest_only:
+            ws_service = get_kis_ws_price_service()
+            ws_service.subscribe_kr(c)
+            ws_max_age = _env_float("KIS_WS_FRESH_MAX_AGE_SEC_KR", 5.0)
+            ws_wait = _env_float("KIS_WS_INITIAL_WAIT_SEC", 0.35)
+            ws_quote = ws_service.get_fresh_quote("KR", c, max_age_sec=ws_max_age)
+            if ws_quote is None and ws_wait > 0:
+                ws_quote = ws_service.wait_for_fresh_quote(
+                    "KR", c, max_age_sec=ws_max_age, wait_sec=ws_wait
+                )
+            if ws_quote:
+                logger.debug(
+                    "[KIS_WS][PRICE_HIT] market=KR code=%s age_sec=%.3f",
+                    c, float(ws_quote.get("age_sec") or 0.0),
+                )
+                return ws_quote
 
-        # REST/cache fallback.
+        # Never report a cached quote as an independent native REST result.
         cache_key = ("inquire-price", c)
-        cached = price_cache.get(cache_key)
+        cached = price_cache.get(cache_key) if not native_rest_only else None
         if cached:
             return cached
 
@@ -2770,10 +2772,148 @@ class KisAPI:
         quote: dict = {**raw_output}
         quote.setdefault("stck_prpr", last_price)
         quote.setdefault("prpr", last_price)
-        quote.update({"last": last_price, "bid": bid_price, "ask": ask_price, "raw": raw_output})
-        # 캐시 set
-        price_cache.set(cache_key, quote, PRICE_SNAPSHOT_TTL_SEC)
+        # The requested symbol is authenticated by the KIS inquiry endpoint,
+        # not a symbol/date returned inside the native output. Keep the two
+        # forms of evidence distinct; do not claim a native trade date.
+        quote.update({
+            "last": last_price, "bid": bid_price, "ask": ask_price,
+            "raw": raw_output, "source": "KIS_REST_INQUIRE_PRICE",
+            "source_identity": "AUTHENTICATED_REST_REQUEST_BOUND",
+            "requested_symbol": c, "market": "KR",
+            "received_at": time.time(),  # local receipt metadata, not exchange clock
+        })
+        # A one-shot native REST probe must not modify normal WS/REST caches.
+        if not native_rest_only:
+            price_cache.set(cache_key, quote, PRICE_SNAPSHOT_TTL_SEC)
         return quote
+
+    def get_kr_entry_native_trade_quote(self, code: str) -> dict:
+        """Bounded, uncached native KR trade proof for PB1 practice BUY only.
+
+        FHPST01060000 returns each trade's exchange HHMMSS, executed price
+        and *cumulative* volume together in output2. Never splice a price,
+        clock or volume from the ordinary WS/price-cache response. This is
+        used only after the normal PB1 volume quote lacks proof; it does not
+        alter protective SELL, KR Infinite or any other strategy owner.
+        No network request is made on a disabled gate or outside KR session.
+        """
+        c = safe_strip(code).lstrip("A")
+        if (str(self.env).lower() != "practice"
+                or len(c) != 6 or not c.isascii() or not c.isdigit()):
+            return {}
+        now = now_kst()
+        if not (9 <= now.hour < 16) or not (
+            (now.hour > 9 or now.minute >= 0)
+            and (now.hour < 15 or now.minute <= 5)
+        ):
+            return {}
+        deadline = getattr(self, "_kr_stage_deadline", None)
+        if deadline is not None and deadline - time.monotonic() < 4.0:
+            logger.info("[KR][NATIVE_VOLUME_PROOF][SKIP] code=%s reason=stage_deadline", c)
+            return {}
+        # A distinct read-only KIS endpoint, sharing existing rate gate and
+        # KisAPI limiter. One wrapper invocation per eligible code per tick;
+        # HTTP-level automatic retry remains subject to _safe_request policy.
+        if not get_kis_gate().wait_until_allowed(
+            "inquire-time-itemconclusion", max_wait_sec=0.05,
+        ):
+            logger.info("[KR][NATIVE_VOLUME_PROOF][SKIP] code=%s reason=rate_gate", c)
+            return {}
+        try:
+            url = (
+                f"{normalize_base_url(API_BASE_URL)}"
+                "/uapi/domestic-stock/v1/quotations/inquire-time-itemconclusion"
+            )
+            params = {
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_INPUT_ISCD": c,
+                "FID_INPUT_HOUR_1": now.strftime("%H%M%S"),
+            }
+            with self._concurrency_sem:
+                self._limiter.wait("price-quote")
+                resp = self._safe_request(
+                    "GET", url, headers=self._headers("FHPST01060000"),
+                    params=params, timeout=(1.5, 2.0),
+                    endpoint="inquire_price",
+                )
+            body = resp.json()
+            if (resp.status_code != 200 or not isinstance(body, dict)
+                    or str(body.get("rt_cd")) != "0"):
+                return {}
+            rows = body.get("output2")
+            if not isinstance(rows, list):
+                return {}
+            # output1 is a DIFFERENT summary: never mix its acml_vol with
+            # output2 exchange times. A single output2 trade row is atomic.
+            valid = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                clock = str(row.get("stck_cntg_hour") or "").strip()
+                if not (len(clock) == 6 and clock.isdigit()):
+                    continue
+                try:
+                    ts = datetime.strptime(clock, "%H%M%S").time()
+                    amount = float(row.get("acml_vol") or 0)
+                    last = float(row.get("stck_pbpr") or row.get("stck_prpr") or 0)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if not (amount > 0 and last > 0 and
+                        math.isfinite(amount) and math.isfinite(last)):
+                    continue
+                explicit_day = row.get("stck_bsop_date")
+                if explicit_day is not None and str(explicit_day).replace("-", "") != now.strftime("%Y%m%d"):
+                    continue
+                returned_code = str(row.get("stck_shrn_iscd") or row.get("pdno") or "").strip().lstrip("A")
+                if returned_code and returned_code.zfill(6) != c:
+                    continue
+                valid.append((ts, row, amount, last, explicit_day))
+            if not valid:
+                return {}
+            ts, row, volume, last, explicit_day = max(valid, key=lambda item: item[0])
+            if not (now.time().replace(tzinfo=None) >= ts):
+                # Exchange timestamp cannot be later than the request clock.
+                return {}
+            # Do not claim a native trade DATE if KIS did not return one.
+            quote = {
+                "source": "KIS_REST_TIME_ITEMCONCLUSION",
+                "source_identity": "AUTHENTICATED_REST_REQUEST_BOUND",
+                "requested_symbol": c,
+                "stck_cntg_hour": row["stck_cntg_hour"],
+                "acml_vol": volume, "last": last, "stck_prpr": last,
+                "received_at": time.time(), "market": "KR",
+                "raw": dict(row),
+                "quote_source_contract": "SAME_OUTPUT2_EXECUTION_ROW",
+            }
+            if explicit_day is not None:
+                quote["stck_bsop_date"] = explicit_day
+            logger.info(
+                "[KR][NATIVE_VOLUME_PROOF][SOURCE] code=%s source=FHPST01060000 "
+                "clock=%s accumulated_vol=%.0f date_native=%s",
+                c, row["stck_cntg_hour"], volume, int(explicit_day is not None),
+            )
+            return quote
+        except Exception as exc:
+            logger.warning(
+                "[KR][NATIVE_VOLUME_PROOF][UNAVAILABLE] code=%s error_type=%s "
+                "action=FAIL_CLOSED_NO_ORDER",
+                c, type(exc).__name__,
+            )
+            return {}
+
+    def get_kr_native_quote_readonly(self, code: str) -> dict:
+        """One-shot native KR inquire-price GET for operator source diagnosis.
+
+        Never called from PB1 ticks, exits, BUY sizing or the minute observer.
+        This is an independent API response, NOT a license to merge fields from
+        incompatible quote times or bypass exchange-time/volume proof.
+        """
+        c = safe_strip(code).lstrip("A")
+        if len(c) != 6 or not c.isascii() or not c.isdigit():
+            raise ValueError("KR_READONLY_QUOTE_PROBE_INVALID_CODE")
+        return self.get_price_quote(
+            c, diag_mode=True, attempts=1, retry_cap=1, native_rest_only=True,
+        )
 
     def get_price_only(self, code: str, *, attempts: int = 2) -> dict:
         try:

@@ -10,5 +10,5 @@ check "KR_FALLBACK_REPAIR" "rg -q 'REPAIRED|mirror_kr_prep_artifacts|legacy' '$R
 check "US_PERMISSION_RESOLVER" "rg -q 'resolve_us_order_permissions' '$ROOT/trader/us' '$ROOT/scripts/wsl/run-us-am.sh' '$ROOT/scripts/wsl/run-us-afternoon.sh'"
 check "KR_TRADER_BLOCKED" "rg -q 'LEGACY_SCRIPT_NOT_ALLOWED_FOR_SCHEDULER' '$ROOT/scripts/wsl/run-kr-trader.sh'"
 check "DB_TIMEOUT_ENVS" "rg -q 'DB_LOCK_TIMEOUT_MS.*DB_STATEMENT_TIMEOUT_MS.*DB_IDLE_IN_TX_SESSION_TIMEOUT_MS|DB_IDLE_IN_TX_SESSION_TIMEOUT_MS' '$ROOT/trader/db/engine.py' '$ROOT/scripts/wsl'"
-check "ORDER_LOOKUP_FAIL_OPEN" "rg -q 'PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT' '$ROOT/trader' '$ROOT/scripts/wsl'"
+check "ORDER_LOOKUP_FAIL_CLOSED" "rg -q 'LOOKUP_FAIL_OPEN_REJECTED' '$ROOT/trader/db/repos.py'"
 exit $([[ $fail -eq 0 ]] && echo 0 || echo 2)

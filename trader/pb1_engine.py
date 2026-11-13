@@ -2974,6 +2974,7 @@ class PB1Engine:
         self._tick_price_cache: dict[tuple[str, str], dict[str, Any]] = {}
         self._tick_price_cache_hits = 0
         self._tick_price_api_calls = 0
+        self._tick_native_volume_quote_calls = 0
         self._warning_counts: Counter[str] = Counter()
         self._tick_warning_counts: Counter[str] = Counter()
         self._tick_db_cache: dict[str, Any] = {}
@@ -3808,6 +3809,77 @@ class PB1Engine:
             "cooldown_source": resolved_source,
             "final_cooldown_policy": final_cooldown_policy,
         }
+
+    def _retry_kr_native_volume_proof(
+        self, *, cf: CandidateFeature, bars: Any, daily_meta: dict | None,
+        entry_style: str, trigger_ok: bool, trigger_info: dict | None,
+        initial_proof: dict,
+    ) -> dict:
+        """One independent, source-bound KIS proof retry for PB1 stock BUY.
+
+        First quote remains authoritative unless a complete native trade
+        response independently passes the SAME volume proof contract.
+        Never merge a clock with a separate quote's volume or timestamp.
+        Calls are bounded to 4/tick and the first 130s of the execution.
+        """
+        proof = dict(initial_proof)
+        eligible_reason = str(proof.get("failure_reason") or "") in {
+            "kis_cumulative_volume_missing",
+            "kis_exchange_quote_time_missing",
+            "kis_exchange_quote_stale_or_future",
+            "kis_quote_source_unverified",
+            "kis_quote_receipt_stale_or_future",
+        }
+        reader = getattr(getattr(self, "kis", None),
+                         "get_kr_entry_native_trade_quote", None)
+        count = int(getattr(self, "_tick_native_volume_quote_calls", 0) or 0)
+        elapsed = time.monotonic() - float(
+            getattr(self, "_tick_start_time", time.monotonic())
+        )
+        if not (eligible_reason
+                and str(getattr(self, "env", "")).lower() == "practice"
+                and str(getattr(self, "STRATEGY_NAME", "")) == "pb1_pullback_close"
+                and _is_kr_stock_code(cf.code)
+                and str(entry_style).upper() in {"ENTRY_MOMENTUM", "ENTRY_BREAKOUT"}
+                and callable(reader)
+                and count < 4 and elapsed < 130.0):
+            return proof
+        self._tick_native_volume_quote_calls = count + 1
+        initial_reason = str(proof.get("failure_reason"))
+        try:
+            quote = reader(str(cf.code).zfill(6))
+        except Exception as exc:
+            logger.warning(
+                "[KR][BUY][NATIVE_VOLUME_PROOF][UNAVAILABLE] code=%s type=%s no_order=1",
+                cf.code, type(exc).__name__,
+            )
+            quote = {}
+        if isinstance(quote, dict) and quote:
+            native = build_kr_volume_proof(
+                bars=bars, snapshot=quote, trade_date=self._trade_date,
+                observed_at=now_kst(), code=str(cf.code).zfill(6),
+                market=str(cf.market), entry_style=entry_style,
+                trigger_ok=bool(trigger_ok),
+                trigger_info=trigger_info if isinstance(trigger_info, dict) else {},
+                price_above_vwap=cf.features.get("above_vwap"),
+                daily_source=str((daily_meta or {}).get("source") or "UNKNOWN"),
+            )
+            if native.get("confirmation_state") == "VERIFIED":
+                native["initial_quote_evidence_failure"] = initial_reason
+                native["independent_native_trade_row"] = True
+                proof = native
+            else:
+                proof["independent_native_retry_reason"] = str(
+                    native.get("failure_reason") or "UNKNOWN"
+                )
+        logger.info(
+            "[KR][BUY][NATIVE_VOLUME_PROOF] code=%s initial=%s "
+            "final_state=%s final_source=%s retry_calls=%s",
+            cf.code, initial_reason,
+            proof.get("confirmation_state"), proof.get("quote_source"),
+            self._tick_native_volume_quote_calls,
+        )
+        return proof
 
     def _get_price_snapshot_cached(self, code: str, market: str = "J") -> dict:
         norm_code = str(code).zfill(6)
@@ -5796,17 +5868,33 @@ class PB1Engine:
                 context={"code": cf.code, "mode": "ENFORCE", "approved": False},
             )
         if _timing_eligible and _timing_mode in {"SHADOW", "ENFORCE"}:
+            _timing_now = now_kst()
             _timing = evaluate_proof_for_candidate(
                 env=self.env,
                 account_scope=get_account_key(env=self.env),
                 code=str(cf.code).zfill(6),
-                now=now_kst(),
+                now=_timing_now,
                 style=_timing_style,
                 setup_ok=bool((cf.features or {}).get("setup_ok", cf.setup_ok)),
                 trigger_ok=bool((cf.features or {}).get("trigger_ok")),
                 pivot=(cf.features or {}).get("pivot"),
                 order_price=float(order_price or 0.0),
             )
+            # Preserve the actual pre-submit timing verdict in the existing
+            # candidate evaluation/ORDER_SKIP payload for later read-only audits.
+            # This does not authorize trades or alter owner strategy thresholds.
+            if isinstance(getattr(cf, "features", None), dict):
+                cf.features["entry_timing_evidence"] = {
+                    "evaluated_at_kst": _timing_now.isoformat(),
+                    "mode": _timing_mode,
+                    "approved": os.getenv("KR_PB1_ENTRY_TIMING_APPROVED", "0") == "1",
+                    "state": str(_timing.get("state") or "UNKNOWN"),
+                    "reason": str(_timing.get("reason") or "UNRECORDED"),
+                    "latest_bar_ts": _timing.get("latest_bar_ts"),
+                    "max_entry_price": _timing.get("max_entry_price"),
+                    "submitted_reference_price": float(order_price or 0),
+                    "is_order_authorization": False,
+                }
             logger.info(
                 "[KR][ENTRY][PRICE_AWARE_TIMING] code=%s style=%s mode=%s state=%s "
                 "reason=%s max_price=%s enforced=%s source=COMPLETED_KIS_1M",
@@ -5818,6 +5906,17 @@ class PB1Engine:
             )
             if (_timing_mode == "ENFORCE"
                     and os.getenv("KR_PB1_ENTRY_TIMING_APPROVED", "0") == "1"):
+                # MARKET orders cannot enforce a minute-proof maximum BUY
+                # price. Explicit KIS 00 and PB1 LIMIT are the only supported
+                # bounded paths; never treat a reference price as a limit.
+                if str(order_type or "").strip().upper() not in {"LIMIT", "00"}:
+                    return UnifiedGateDecision(
+                        ok=False,
+                        reason_codes=["KR_ENTRY_TIMING_PRICE_CAP_UNENFORCEABLE_ORDER_TYPE"],
+                        blocking_stage="pre_submit_timing",
+                        context={"code": cf.code, "order_type": str(order_type),
+                                 "timing_state": _timing.get("state")},
+                    )
                 _max_price = _timing.get("max_entry_price")
                 if (_timing.get("state") != "READY_SHADOW"
                         or _max_price is None
@@ -17388,6 +17487,7 @@ class PB1Engine:
         self._tick_price_cache = {}
         self._tick_price_cache_hits = 0
         self._tick_price_api_calls = 0
+        self._tick_native_volume_quote_calls = 0
         self._tick_remaining_sec: float | None = None  # [2026-04-30] non-critical DB skip용
         self._tick_start_time: float = time.monotonic()
         logger.info("[PB1][PRICE_CACHE][TICK_INIT]")
@@ -20066,6 +20166,11 @@ class PB1Engine:
                             trigger_info=trigger_info if isinstance(trigger_info, dict) else {},
                             price_above_vwap=cf.features.get("above_vwap"),
                             daily_source=str((meta or {}).get("source") or "UNKNOWN"),
+                        )
+                        proof = self._retry_kr_native_volume_proof(
+                            cf=cf, bars=df, daily_meta=meta,
+                            entry_style=selected_style, trigger_ok=bool(trigger_ok),
+                            trigger_info=trigger_info, initial_proof=proof,
                         )
                         cf.features["volume_proof"] = proof
                         logger.info(

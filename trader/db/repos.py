@@ -3443,8 +3443,15 @@ class OrdersRepo:
         op_name: str,
         fail_open: bool | None = None,
     ) -> list[dict]:
-        if fail_open is None:
-            fail_open = _resolve_lookup_fail_open()
+        if fail_open:
+            logger.error(
+                "[ORDERS][LOOKUP_FAIL_OPEN_REJECTED] op=%s",
+                op_name,
+            )
+        # Order state is part of the execution safety boundary. Never allow a
+        # caller or practice-mode environment flag to convert DB failure into
+        # an empty order set.
+        fail_open = False
 
         self._last_read_fail_open_op = None
         try:
@@ -4114,10 +4121,15 @@ class OrdersRepo:
             conditions.append(self._schema.orders.c.created_at >= cutoff)
         
         stmt = select(self._schema.orders).where(and_(*conditions))
+        if fail_open:
+            logger.error(
+                "[ORDERS][LOOKUP_FAIL_OPEN_REJECTED] op=orders.get_open_orders env=%s",
+                env,
+            )
         return self._read_mappings_with_guard(
             stmt,
             op_name="orders.get_open_orders",
-            fail_open=(_resolve_lookup_fail_open(env) if fail_open is None else bool(fail_open)),
+            fail_open=False,
         )
 
     def has_open_order_for_code(
@@ -4146,6 +4158,7 @@ class OrdersRepo:
                 side=side,
                 trade_date=trade_date,
                 include_stale=False,
+                fail_open=False,
             )
         )
 
@@ -4209,7 +4222,7 @@ class OrdersRepo:
         rows = self._read_mappings_with_guard(
             stmt,
             op_name="orders.has_client_order_key",
-            fail_open=None,
+            fail_open=False,
         )
         return bool(rows)
 
@@ -4217,14 +4230,11 @@ class OrdersRepo:
         stmt = select(self._schema.orders).where(
             and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key)
         )
-        rows = _safe_repo_read(
-            self.engine,
+        rows = self._read_mappings_with_guard(
             stmt,
             op_name="orders.get_order_by_client_order_key",
-            fail_open=_resolve_lookup_fail_open(),
+            fail_open=False,
         )
-        if not rows:
-            self._last_read_fail_open_op = "orders.get_order_by_client_order_key" if not rows else None
         return rows[0] if rows else None
 
     def list_orders_by_client_order_keys(
@@ -4432,7 +4442,7 @@ class OrdersRepo:
         rows = self._read_mappings_with_guard(
             stmt,
             op_name="orders.has_blocking_order_today",
-            fail_open=_resolve_lookup_fail_open(env),
+            fail_open=False,
         )
         if rows:
             return True, rows[0]
@@ -4506,10 +4516,15 @@ class OrdersRepo:
         if status_exclude:
             conditions.append(self._schema.orders.c.status.not_in(list(status_exclude)))
         stmt = select(self._schema.orders).where(and_(*conditions))
+        if fail_open:
+            logger.error(
+                "[ORDERS][LOOKUP_FAIL_OPEN_REJECTED] op=orders.list_today_orders env=%s",
+                env,
+            )
         return self._read_mappings_with_guard(
             stmt,
             op_name="orders.list_today_orders",
-            fail_open=_resolve_lookup_fail_open(env) if fail_open is None else fail_open,
+            fail_open=False,
         )
 
     def list_today_buy_orders(
@@ -4542,7 +4557,7 @@ class OrdersRepo:
         return self._read_mappings_with_guard(
             stmt,
             op_name="orders.list_today_buy_orders",
-            fail_open=None,
+            fail_open=False,
         )
 
     def has_today_buy_orders(
@@ -4595,7 +4610,7 @@ class OrdersRepo:
         return self._read_mappings_with_guard(
             stmt,
             op_name="orders.list_today_sell_orders",
-            fail_open=None,
+            fail_open=False,
         )
 
     def has_today_sell_for_code(
@@ -4675,7 +4690,7 @@ class OrdersRepo:
         schema = schema_for_engine(self.engine)
         stmt = select(schema.job_checkpoints.c.payload).where(schema.job_checkpoints.c.job_key == job_key)
         self._last_read_fail_open_op = None
-        fail_open = _order_lookup_fail_open_default()
+        fail_open = False
         rows, read_fail_open = safe_read_mappings(
             self.engine,
             stmt,
@@ -4729,17 +4744,11 @@ class OrdersRepo:
             )
             return completed
         except (OperationalError, DBAPIError, SATimeoutError, StatementError) as exc:
-            fail_open = _order_lookup_fail_open_default()
             logger.exception(
-                "[DB][READ][FAIL] op=orders.has_today_session_marker fail_open=%s err_type=%s err=%s",
-                int(bool(fail_open)),
+                "[DB][READ][FAIL] op=orders.has_today_session_marker fail_open=0 err_type=%s err=%s",
                 type(exc).__name__,
                 exc,
             )
-            if fail_open:
-                self._last_read_fail_open_op = "orders.has_today_session_marker"
-                logger.warning("[DB][READ][FAIL_OPEN] op=orders.has_today_session_marker -> returning False")
-                return False
             raise
 
     def has_today_am_session_marker(self, env: str, trade_date: date | datetime | str | None = None) -> bool:
@@ -4786,7 +4795,7 @@ class OrdersRepo:
         return self._read_mappings_with_guard(
             stmt,
             op_name="orders.list_orders_in_window",
-            fail_open=None,
+            fail_open=False,
         )
 
     def _kr_broker_trade_day_expr(self):
@@ -4823,6 +4832,7 @@ class OrdersRepo:
         response_json: dict | None,
         submitted_at: datetime | None,
         acked_at: datetime | None,
+        _conn: Any = None,
     ) -> str:
         db_url = str(self.engine.url)
         safe_request_json = json_sanitize(request_json or {})
@@ -4841,7 +4851,8 @@ class OrdersRepo:
             broker_order_id = kis_odno or client_order_key
         account_id = get_account_key(env=env)
 
-        with self.engine.begin() as conn:
+        from contextlib import nullcontext
+        with (nullcontext(_conn) if _conn is not None else self.engine.begin()) as conn:
             trading_epoch_id = active_trading_epoch_id(
                 conn, env=env, account_id=account_id, required=trading_epoch_enforced()
             )
@@ -5283,7 +5294,7 @@ class OrdersRepo:
             .order_by(self._schema.orders.c.created_at.desc())
             .limit(lookback_n)
         )
-        rows = self._read_mappings_with_guard(stmt, op_name="orders_latest_buy_entry_exit_plan", fail_open=True)
+        rows = self._read_mappings_with_guard(stmt, op_name="orders_latest_buy_entry_exit_plan", fail_open=False)
         for row in rows or []:
             request_json = (row or {}).get("request_json") or {}
             if isinstance(request_json, str):
@@ -5346,8 +5357,11 @@ class FillsRepo:
         op_name: str,
         fail_open: bool | None = None,
     ) -> list[dict]:
-        if fail_open is None:
-            fail_open = _resolve_fill_fail_open()
+        if fail_open:
+            logger.error("[FILLS][LOOKUP_FAIL_OPEN_REJECTED] op=%s", op_name)
+        # A missing fill row is not equivalent to a failed fill read. Never
+        # let an outage erase broker execution evidence from the decision path.
+        fail_open = False
         self._last_read_fail_open_op = None
         try:
             rows, fail_open_triggered = safe_read_mappings(
@@ -5410,7 +5424,7 @@ class FillsRepo:
         if code:
             conditions.append(self._schema.fills.c.code == str(code).zfill(6))
         stmt = select(self._schema.fills).where(and_(*conditions)).order_by(filled_at_expr.desc())
-        fail_open = _resolve_lookup_fail_open(env)
+        fail_open = False
         try:
             return self._read_mappings_with_guard(
                 stmt,
@@ -5477,7 +5491,7 @@ class FillsRepo:
         return self._read_mappings_with_guard(
             stmt,
             op_name="fills.list_fills_in_window",
-            fail_open=_resolve_fill_fail_open(),
+            fail_open=False,
         )
 
     def list_latest_buy_fills_by_codes(self, env: str, codes: Iterable[str]) -> dict[str, dict]:
@@ -5504,7 +5518,7 @@ class FillsRepo:
         rows = self._read_mappings_with_guard(
             stmt,
             op_name="fills.list_latest_buy_fills_by_codes",
-            fail_open=_resolve_fill_fail_open(),
+            fail_open=False,
         )
         for row in rows:
             item = dict(row)
@@ -5565,7 +5579,7 @@ class FillsRepo:
         )
         latest: dict[str, dict] = {}
         for row in self._read_mappings_with_guard(stmt, op_name="fills.list_latest_buy_fills_by_cycles",
-                                                   fail_open=_resolve_fill_fail_open()):
+                                                   fail_open=False):
             item = dict(row)
             code = str(item.get("code") or "").zfill(6)
             if code not in latest:
@@ -5593,14 +5607,16 @@ class FillsRepo:
         position_cycle_id: str | None = None,
         portfolio_epoch_id: str | None = None,
         trading_epoch_id: str | None = None,
+        _conn: Any = None,
     ) -> str:
         db_url = str(self.engine.url)
         broker_fill_id = trade_id or None
         safe_raw_json = json_sanitize(raw_json or {})
         if run_id:
             self.ensure_run_exists(run_id)
+        from contextlib import nullcontext
         if order_id is not None:
-            with self.engine.begin() as conn:
+            with (nullcontext(_conn) if _conn is not None else self.engine.begin()) as conn:
                 provenance = conn.execute(select(
                     self._schema.orders.c.position_cycle_id,
                     self._schema.orders.c.portfolio_epoch_id,
@@ -5621,14 +5637,15 @@ class FillsRepo:
                 portfolio_epoch_id = portfolio_epoch_id or provenance.get("portfolio_epoch_id")
                 trading_epoch_id = trading_epoch_id or provenance.get("trading_epoch_id")
         active_epoch_id = active_trading_epoch_id(
-            self.engine, env=env, account_id=get_account_key(env=env), required=trading_epoch_enforced()
+            _conn if _conn is not None else self.engine,
+            env=env, account_id=get_account_key(env=env), required=trading_epoch_enforced()
         )
         if trading_epoch_id is None:
             trading_epoch_id = active_epoch_id
         elif active_epoch_id is not None and str(trading_epoch_id or "") != str(active_epoch_id):
             raise RuntimeError("KR_FILL_TRADING_EPOCH_MISMATCH")
         if active_epoch_id is not None and portfolio_epoch_id is not None:
-            with self.engine.begin() as conn:
+            with (nullcontext(_conn) if _conn is not None else self.engine.begin()) as conn:
                 _assert_portfolio_epoch_binding(
                     conn,
                     self._schema,
@@ -5725,7 +5742,7 @@ class FillsRepo:
             # allow only sub-won decimal/float rounding, NOT a 1-KRW change.
             if abs(supplied_notional - new_exact_amount) > Decimal("0.50"):
                 raise RuntimeError("KR_CUMULATIVE_FILL_SAME_QTY_NOTIONAL_CONFLICT")
-        with self.engine.begin() as conn:
+        with (nullcontext(_conn) if _conn is not None else self.engine.begin()) as conn:
             if active_epoch_id is not None:
                 collision_conditions = [
                     self._schema.fills.c[col] == payload[col]
@@ -5897,7 +5914,9 @@ class FillsRepo:
             .order_by(self._schema.fills.c.filled_at.desc(), self._schema.fills.c.created_at.desc())
             .limit(lookback_n)
         )
-        rows, _ = safe_read_mappings(self.engine, stmt, op_name="fills_latest_buy_entry_exit_plan", fail_open=True)
+        rows = self._read_mappings_with_guard(
+            stmt, op_name="fills_latest_buy_entry_exit_plan", fail_open=False,
+        )
         for row in rows or []:
             raw_json = (row or {}).get("raw_json") or {}
             if isinstance(raw_json, str):
@@ -6891,7 +6910,7 @@ class PositionsRepo:
             self.engine,
             stmt,
             op_name="positions._get_position_row",
-            fail_open=_resolve_position_fail_open(),
+            fail_open=False,
         )
         return rows[0] if rows else None
 
@@ -6910,7 +6929,7 @@ class PositionsRepo:
             self.engine,
             stmt,
             op_name="positions.list_positions",
-            fail_open=_resolve_position_fail_open(),
+            fail_open=False,
         )
 
     def list_active_positions_for_exit(self, env: str, strategy: str) -> list[dict]:
@@ -6965,7 +6984,7 @@ class PositionsRepo:
             self.engine,
             stmt,
             op_name="positions.get_position",
-            fail_open=_resolve_position_fail_open(),
+            fail_open=False,
         )
         return rows[0] if rows else None
 
@@ -7122,7 +7141,7 @@ class PositionsRepo:
             self.engine,
             stmt,
             op_name="positions.list_positions_by_codes",
-            fail_open=_resolve_position_fail_open(),
+            fail_open=False,
         )
 
     def close_positions(self, *, env: str, strategy: str, codes: list[str]) -> int:
@@ -7213,6 +7232,38 @@ class PositionsRepo:
                 select(self._schema.positions).where(and_(*conditions))
             ).mappings().first()
             existing_row = dict(existing) if existing else {}
+            # 2026-11-12: stop accidental frozen source-plan/hash rewrites at the
+            # repository boundary. The PostgreSQL trigger is the final guard
+            # against direct SQL and racing writers. Mutable execution metadata
+            # (trail, partial TP, applied fill watermark) is deliberately exempt.
+            if existing_row and existing_row.get("strategy") == "pb1_pullback_close":
+                frozen_entry = existing_row.get("entry_meta_json") or {}
+                frozen_plan = existing_row.get("entry_exit_plan_json") or {}
+                if isinstance(frozen_entry, dict) and len(str(
+                    frozen_entry.get("entry_contract_sha256") or ""
+                )) == 64:
+                    if ("entry_exit_plan_json" in values
+                            and values["entry_exit_plan_json"] != frozen_plan):
+                        raise RuntimeError(
+                            "KR_ORIGINAL_CONTRACT_IMMUTABLE:entry_exit_plan_json"
+                        )
+                    incoming = values.get("entry_meta_json")
+                    if isinstance(incoming, dict):
+                        frozen_keys = (
+                            "entry_contract_sha256", "entry_contract_version",
+                            "entry_exit_plan_sha256", "source_buy_order_id",
+                            "source_buy_client_order_key",
+                            "entry_reason", "entry_style_selected",
+                            "entry_decision_family", "entry_rule_version",
+                            "entry_thesis", "trade_horizon", "exit_policy_family",
+                            "eod_action", "force_eod_close", "initial_stop_price",
+                            "initial_risk_r", "policy_source", "policy_version",
+                        )
+                        for key in frozen_keys:
+                            if key in incoming and incoming[key] != frozen_entry.get(key):
+                                raise RuntimeError(
+                                    f"KR_ORIGINAL_CONTRACT_IMMUTABLE:entry_meta_json.{key}"
+                                )
             # Frozen BUY plan owns the exit family. Diagnostics, stale copies
             # and reconciliation must not overwrite the protected policy field.
             # Import/legacy rows without a source-contract hash are unaffected.
@@ -7246,7 +7297,7 @@ class PositionsRepo:
             )
             conn.execute(stmt)
         except Exception as exc:
-            if _conn is not None:
+            if _conn is not None or str(exc).startswith("KR_ORIGINAL_CONTRACT_IMMUTABLE:"):
                 raise
             if fail_soft:
                 logger.warning(
@@ -7848,6 +7899,10 @@ class PositionsRepo:
                         "parent_entry_contract_sha256": request_json.get("parent_entry_contract_sha256"),
                         "source_buy_order_id": str(order_id),
                         "source_buy_client_order_key": request_json.get("client_order_key"),
+                        # Mutable ADD provenance, distinct from the original
+                        # root BUY fields frozen by migration 0063.
+                        "last_buy_order_id": str(order_id),
+                        "last_buy_client_order_key": request_json.get("client_order_key"),
                     })
                     logger.info(
                         "[KR_POSITION][ENTRY_CONTRACT_BOUND] code=%s order_id=%s cycle=%s contract_sha=%s",
@@ -8045,6 +8100,8 @@ class PositionsRepo:
                         "entry_contract_sha256",
                         "entry_contract_version",
                         "entry_exit_plan_sha256",
+                        "source_buy_order_id",
+                        "source_buy_client_order_key",
                         "entry_reason",
                         "entry_style_selected",
                         "entry_decision_family",

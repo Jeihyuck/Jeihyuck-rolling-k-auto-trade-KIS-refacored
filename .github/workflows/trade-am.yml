@@ -75,7 +75,6 @@ env:
   KRX_DB_READ_FAIL_OPEN: "1"
   KRX_RECONCILE_FAIL_OPEN: "1"
 
-  PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT: "1"
   PB1_FAIL_OPEN_ON_POSITION_LOOKUP_TIMEOUT: "1"
   PB1_FAIL_OPEN_ON_FILL_LOOKUP_TIMEOUT: "1"
   PB1_FAIL_OPEN_ON_LEDGER_LOOKUP_TIMEOUT: "1"
@@ -898,7 +897,6 @@ jobs:
           DB_LOCK_TIMEOUT_MS: "5000"
           DB_STATEMENT_TIMEOUT_MS: "15000"
           DB_IDLE_IN_TX_SESSION_TIMEOUT_MS: "15000"
-          PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT: "1"
           ORDER_ALLOWED: ${{ steps.order_mode_guard.outputs.order_allowed }}
           PB1_COMPUTE_ONLY: ${{ steps.trading_day_guard.outputs.is_trading_day != '1' && '1' || '0' }}
           PB1_ORDER_BLOCK_REASON: ${{ steps.order_mode_guard.outputs.reason }}

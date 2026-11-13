@@ -48,6 +48,8 @@ def _install_order_response_merge_guard() -> None:
 
     @functools.wraps(original)
     def _merged_upsert(self, *args, **kwargs):
+        from contextlib import nullcontext
+        shared_conn = kwargs.get("_conn")
         env = str(kwargs.get("env") or "")
         kis_odno = str(kwargs.get("kis_odno") or "").strip()
         client_order_key = str(kwargs.get("client_order_key") or "").strip()
@@ -58,7 +60,7 @@ def _install_order_response_merge_guard() -> None:
             # response_json merely because KIS recycled its numeric ODNO.
             existing = None
             if client_order_key:
-                with self.engine.connect() as conn:
+                with (nullcontext(shared_conn) if shared_conn is not None else self.engine.connect()) as conn:
                     existing = conn.execute(
                         sa.select(schema.orders)
                         .where(sa.and_(
@@ -67,6 +69,8 @@ def _install_order_response_merge_guard() -> None:
                         )).limit(1)
                     ).mappings().first()
             if existing is None and kis_odno:
+                if shared_conn is not None:
+                    raise RuntimeError("KR_RECONCILE_SHARED_ORDER_SOURCE_NOT_FOUND")
                 submitted = kwargs.get("submitted_at") or kwargs.get("acked_at")
                 if submitted is not None:
                     from datetime import datetime
@@ -96,6 +100,8 @@ def _install_order_response_merge_guard() -> None:
             if existing is not None:
                 existing_response = base._json_dict(existing.get("response_json"))
         except Exception as exc:
+            if shared_conn is not None:
+                raise
             logger.warning(
                 "[KR_BROKER_TRUTH][ORDER_RESPONSE_MERGE][READ_FAIL] kis_odno=%s err_type=%s err=%s",
                 kis_odno,

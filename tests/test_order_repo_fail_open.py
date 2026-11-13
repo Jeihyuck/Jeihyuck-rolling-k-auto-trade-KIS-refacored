@@ -48,15 +48,17 @@ class _FakeEngine:
         DBAPIError("SELECT 1", {}, Exception("dbapi timeout")),
     ],
 )
-def test_read_mappings_with_guard_fail_open_returns_empty(exc) -> None:
+def test_read_mappings_with_guard_rejects_fail_open_override(exc) -> None:
     repo = OrdersRepo.__new__(OrdersRepo)
     repo.engine = _FakeEngine(exc)
     repo._last_read_fail_open_op = None
 
-    rows = repo._read_mappings_with_guard(object(), op_name="orders.get_open_orders", fail_open=True)
+    with pytest.raises(type(exc)):
+        repo._read_mappings_with_guard(
+            object(), op_name="orders.get_open_orders", fail_open=True,
+        )
 
-    assert rows == []
-    assert repo.consume_fail_open_marker("orders.get_open_orders") is True
+    assert repo.consume_fail_open_marker("orders.get_open_orders") is False
 
 
 @pytest.mark.parametrize(

@@ -194,3 +194,39 @@ def test_runner_final_never_unlocks_on_corrupt_partial_fill_proof(stage_db, corr
     assert not rejected.accepted
     assert rejected.status == "BLOCK"
     assert load_frozen_stage_states(**stage_db)["RUNNER_FINAL"]["status"] == "NOT_TRIGGERED"
+
+
+def test_broker_stage_uses_shared_connection_savepoint_and_outer_commit(stage_db):
+    """P1 regression: savepoint is not a Connection; commit proof with outer tx."""
+    args = stage_db
+    assert reserve(args, "TP1", 7, "savepoint-tp1").accepted
+    engine = args["engine"]
+    with engine.begin() as conn:
+        observed = observe_broker_stage(
+            **args, stage="TP1", client_order_key="savepoint-tp1",
+            broker_odno="SP-ODNO1", cumulative_filled_qty=7,
+            broker_order_accepted=True,
+            broker_fill_source="KIS_DAILY_CCLD_VERIFIED",
+            source_trade_date=DAY, _conn=conn,
+        )
+        assert observed.accepted, observed.reason
+        assert observed.status == "FILLED"
+    assert load_frozen_stage_states(**args)["TP1"]["status"] == "FILLED"
+
+
+def test_broker_stage_shared_connection_rolls_back_with_outer_transaction(stage_db):
+    """A rolled-back economic settlement cannot leave TP journal FILLED."""
+    args = stage_db
+    assert reserve(args, "TP1", 7, "rollback-tp1").accepted
+    with pytest.raises(RuntimeError, match="INJECTED_OUTER_ROLLBACK"):
+        with args["engine"].begin() as conn:
+            observed = observe_broker_stage(
+                **args, stage="TP1", client_order_key="rollback-tp1",
+                broker_odno="SP-ODNO2", cumulative_filled_qty=7,
+                broker_order_accepted=True,
+                broker_fill_source="KIS_DAILY_CCLD_VERIFIED",
+                source_trade_date=DAY, _conn=conn,
+            )
+            assert observed.accepted, observed.reason
+            raise RuntimeError("INJECTED_OUTER_ROLLBACK")
+    assert load_frozen_stage_states(**args)["TP1"]["status"] == "PENDING"

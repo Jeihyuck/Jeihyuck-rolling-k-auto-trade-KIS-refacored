@@ -257,6 +257,7 @@ def observe_broker_stage(
     stage: str, client_order_key: str, broker_odno: str,
     cumulative_filled_qty: int, broker_order_accepted: bool,
     broker_fill_source: str, source_trade_date: date,
+    _conn: Any = None,
 ) -> StageJournalResult:
     """Idempotent cumulative KIS fill update for an exact claimed TP order.
 
@@ -282,7 +283,15 @@ def observe_broker_stage(
         return StageJournalResult(False, "BLOCK", str(exc))
     table = schema_for_engine(engine).job_checkpoints
     try:
-        with engine.begin() as conn:
+        # When participating in a broker settlement transaction, isolate
+        # auxiliary stage-journal failures with a savepoint. A missing or
+        # temporarily unavailable stage row must not abort the outer transaction
+        # that persists broker-proven fills and position quantity.
+        transaction = _conn.begin_nested() if _conn is not None else engine.begin()
+        with transaction as transaction_scope:
+            # NestedTransaction.__enter__ returns a savepoint object, NOT a
+            # Connection. All SQL must use the caller's shared Connection.
+            conn = _conn if _conn is not None else transaction_scope
             key = _key(contract, stage)
             raw = conn.execute(
                 sa.select(table.c.payload).where(table.c.job_key == key)
