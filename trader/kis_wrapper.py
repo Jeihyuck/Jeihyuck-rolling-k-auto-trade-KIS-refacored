@@ -2772,7 +2772,16 @@ class KisAPI:
         quote: dict = {**raw_output}
         quote.setdefault("stck_prpr", last_price)
         quote.setdefault("prpr", last_price)
-        quote.update({"last": last_price, "bid": bid_price, "ask": ask_price, "raw": raw_output})
+        # The requested symbol is authenticated by the KIS inquiry endpoint,
+        # not a symbol/date returned inside the native output. Keep the two
+        # forms of evidence distinct; do not claim a native trade date.
+        quote.update({
+            "last": last_price, "bid": bid_price, "ask": ask_price,
+            "raw": raw_output, "source": "KIS_REST_INQUIRE_PRICE",
+            "source_identity": "AUTHENTICATED_REST_REQUEST_BOUND",
+            "requested_symbol": c, "market": "KR",
+            "received_at": time.time(),  # local receipt metadata, not exchange clock
+        })
         # A one-shot native REST probe must not modify normal WS/REST caches.
         if not native_rest_only:
             price_cache.set(cache_key, quote, PRICE_SNAPSHOT_TTL_SEC)
