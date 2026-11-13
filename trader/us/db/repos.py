@@ -3453,7 +3453,8 @@ def mark_us_profit_capture_stage(
 def reserve_us_profit_capture_stage_after_claim(
     *, trade_date: str, symbol: str, stage: str, position_lifecycle_id: str,
     client_order_key: str, attempt_id: str, action_key: str, qty: int,
-    notional_usd: float,
+    notional_usd: float, limit_price_usd: float | None = None,
+    intent_meta: dict | None = None,
 ) -> bool:
     """Atomically reserve a native US_STANDARD TP only AFTER its Claim exists.
 
@@ -3488,6 +3489,10 @@ def reserve_us_profit_capture_stage_after_claim(
             "cycle": cycle, "key": key, "attempt": attempt,
             "action": action, "epoch": str(epoch),
             "account": scope["account_id"],
+            "price": float(limit_price_usd or 0),
+            "notional": float(notional_usd or 0),
+            "qty": int(qty),
+            "fresh_meta": _json_param(intent_meta or {}),
         }
         # Serializes the absent-row case as well as an existing reservation.
         conn.execute(text("""
@@ -3528,13 +3533,12 @@ def reserve_us_profit_capture_stage_after_claim(
                 or int(claim[0].get("requested_qty") or 0) < int(qty)):
             return False
         row = conn.execute(text("""
-            SELECT status, meta, symbol, side FROM us_order_intents
+            SELECT status,meta,qty,limit_price_usd,notional_usd FROM us_order_intents
              WHERE trade_date=:td AND client_order_key=:key
                AND symbol=:sym AND side='SELL' AND trading_epoch_id=:epoch
              FOR UPDATE
         """), params).mappings().one_or_none()
-        if (row is None or str(row.get("status") or "") not in {"PENDING", "SUBMITTED"}
-                or str(_parse_json_meta(row.get("meta")).get("submit_attempt_id") or "") != attempt):
+        if row is None or str(row.get("status") or "") not in {"PENDING", "BLOCKED"}:
             return False
         if conn.execute(text("""
             SELECT 1 FROM us_orders WHERE trade_date=:td
@@ -3542,10 +3546,52 @@ def reserve_us_profit_capture_stage_after_claim(
         """), params).scalar_one_or_none() is not None:
             return False
         events = conn.execute(text("""
-            SELECT event_type FROM us_order_events WHERE trade_date=:td
-               AND client_order_key=:key AND trading_epoch_id=:epoch
-        """), params).scalars().all()
-        if any(str(event) not in {"BROKER_CLAIM_PREPARED"} for event in events):
+            SELECT event_type,submit_attempt_id FROM us_order_events
+             WHERE trade_date=:td AND client_order_key=:key
+               AND trading_epoch_id=:epoch
+        """), params).mappings().all()
+        if any(
+            str(event.get("submit_attempt_id") or "") != attempt
+            or str(event.get("event_type") or "") != "BROKER_CLAIM_PREPARED"
+            for event in events
+        ):
+            return False
+        old_meta = _parse_json_meta(row.get("meta"))
+        current_meta = dict(intent_meta or {})
+        if (str(current_meta.get("submit_attempt_id") or "") != attempt
+                or current_meta.get("tp_pending_deferred_to_claim") is not True):
+            return False
+        for field in (
+            "source_entry_contract_sha256", "position_lifecycle_id",
+            "portfolio_epoch_id", "position_cycle_id", "broker_account_hash",
+        ):
+            old, current = old_meta.get(field), current_meta.get(field)
+            if old not in (None, "") and current not in (None, "") and str(old) != str(current):
+                return False
+        previous = str(old_meta.get("submit_attempt_id") or "")
+        if previous != attempt or str(row.get("status") or "") == "BLOCKED":
+            # A repeated, deterministic TP key from an intent-only risk/price
+            # rejection may be rearmed ONLY when the old attempt never
+            # acquired a Claim or journaled possible broker submission.
+            # No other attempt under this key may exist, even terminal.
+            old_attempt = conn.execute(text("""
+                SELECT 1 FROM us_execution_attempts
+                 WHERE client_order_key=:key AND attempt_id<>:attempt LIMIT 1
+            """), params).scalar_one_or_none()
+            if old_attempt is not None:
+                return False
+            updated = conn.execute(text("""
+                UPDATE us_order_intents SET status='PENDING',
+                    qty=:qty, limit_price_usd=:price, notional_usd=:notional,
+                    meta=CAST(:fresh_meta AS jsonb)
+                 WHERE trade_date=:td AND client_order_key=:key
+                   AND symbol=:sym AND side='SELL'
+                   AND trading_epoch_id=:epoch
+                   AND status IN ('PENDING','BLOCKED')
+            """), params)
+            if updated.rowcount != 1:
+                return False
+        elif int(row.get("qty") or 0) != int(qty):
             return False
         mark_us_profit_capture_stage(
             str(trade_date), sym, stg, order_key=key,
