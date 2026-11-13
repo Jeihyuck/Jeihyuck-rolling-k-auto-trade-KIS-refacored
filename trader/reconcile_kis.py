@@ -3100,6 +3100,19 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
             # date, side, symbol, ODNO and durable stage claim, is stage truth.
             tp_contract = request_json.get("kr_us_tp_contract")
             tp_stage = str(request_json.get("kr_us_tp_stage") or "").upper()
+            if (
+                side == "SELL" and source_order and not defer_native_sell_claim
+                and bool(tp_contract) != bool(tp_stage)
+            ):
+                reason = "KR_TP_STAGE_CONTRACT_INCOMPLETE"
+                execution_claim_observation_failures.append({
+                    "client_order_key": str(source_order.get("client_order_key") or ""),
+                    "error": reason,
+                })
+                logger.error(
+                    "[KR_PROFIT_PARITY][KIS_PROOF_FAIL_CLOSED] code=%s stage=%s reason=%s",
+                    code, tp_stage or "UNKNOWN", reason,
+                )
             if side == "SELL" and source_order and tp_contract and tp_stage and not defer_native_sell_claim:
                 try:
                     from datetime import date as _tp_date
