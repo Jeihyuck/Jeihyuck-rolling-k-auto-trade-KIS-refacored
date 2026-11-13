@@ -5818,6 +5818,17 @@ class PB1Engine:
             )
             if (_timing_mode == "ENFORCE"
                     and os.getenv("KR_PB1_ENTRY_TIMING_APPROVED", "0") == "1"):
+                # MARKET orders cannot enforce a minute-proof maximum BUY
+                # price. Explicit KIS 00 and PB1 LIMIT are the only supported
+                # bounded paths; never treat a reference price as a limit.
+                if str(order_type or "").strip().upper() not in {"LIMIT", "00"}:
+                    return UnifiedGateDecision(
+                        ok=False,
+                        reason_codes=["KR_ENTRY_TIMING_PRICE_CAP_UNENFORCEABLE_ORDER_TYPE"],
+                        blocking_stage="pre_submit_timing",
+                        context={"code": cf.code, "order_type": str(order_type),
+                                 "timing_state": _timing.get("state")},
+                    )
                 _max_price = _timing.get("max_entry_price")
                 if (_timing.get("state") != "READY_SHADOW"
                         or _max_price is None
