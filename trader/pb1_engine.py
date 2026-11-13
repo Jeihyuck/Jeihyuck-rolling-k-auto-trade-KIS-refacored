@@ -5796,17 +5796,33 @@ class PB1Engine:
                 context={"code": cf.code, "mode": "ENFORCE", "approved": False},
             )
         if _timing_eligible and _timing_mode in {"SHADOW", "ENFORCE"}:
+            _timing_now = now_kst()
             _timing = evaluate_proof_for_candidate(
                 env=self.env,
                 account_scope=get_account_key(env=self.env),
                 code=str(cf.code).zfill(6),
-                now=now_kst(),
+                now=_timing_now,
                 style=_timing_style,
                 setup_ok=bool((cf.features or {}).get("setup_ok", cf.setup_ok)),
                 trigger_ok=bool((cf.features or {}).get("trigger_ok")),
                 pivot=(cf.features or {}).get("pivot"),
                 order_price=float(order_price or 0.0),
             )
+            # Preserve the actual pre-submit timing verdict in the existing
+            # candidate evaluation/ORDER_SKIP payload for later read-only audits.
+            # This does not authorize trades or alter owner strategy thresholds.
+            if isinstance(getattr(cf, "features", None), dict):
+                cf.features["entry_timing_evidence"] = {
+                    "evaluated_at_kst": _timing_now.isoformat(),
+                    "mode": _timing_mode,
+                    "approved": os.getenv("KR_PB1_ENTRY_TIMING_APPROVED", "0") == "1",
+                    "state": str(_timing.get("state") or "UNKNOWN"),
+                    "reason": str(_timing.get("reason") or "UNRECORDED"),
+                    "latest_bar_ts": _timing.get("latest_bar_ts"),
+                    "max_entry_price": _timing.get("max_entry_price"),
+                    "submitted_reference_price": float(order_price or 0),
+                    "is_order_authorization": False,
+                }
             logger.info(
                 "[KR][ENTRY][PRICE_AWARE_TIMING] code=%s style=%s mode=%s state=%s "
                 "reason=%s max_price=%s enforced=%s source=COMPLETED_KIS_1M",
@@ -5818,6 +5834,17 @@ class PB1Engine:
             )
             if (_timing_mode == "ENFORCE"
                     and os.getenv("KR_PB1_ENTRY_TIMING_APPROVED", "0") == "1"):
+                # MARKET orders cannot enforce a minute-proof maximum BUY
+                # price. Explicit KIS 00 and PB1 LIMIT are the only supported
+                # bounded paths; never treat a reference price as a limit.
+                if str(order_type or "").strip().upper() not in {"LIMIT", "00"}:
+                    return UnifiedGateDecision(
+                        ok=False,
+                        reason_codes=["KR_ENTRY_TIMING_PRICE_CAP_UNENFORCEABLE_ORDER_TYPE"],
+                        blocking_stage="pre_submit_timing",
+                        context={"code": cf.code, "order_type": str(order_type),
+                                 "timing_state": _timing.get("state")},
+                    )
                 _max_price = _timing.get("max_entry_price")
                 if (_timing.get("state") != "READY_SHADOW"
                         or _max_price is None
