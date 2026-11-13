@@ -36,3 +36,8 @@ def test_ready_minute_proof_cannot_authorize_unbounded_market_buy(monkeypatch):
         assert decision.reason_codes == [
             "KR_ENTRY_TIMING_PRICE_CAP_UNENFORCEABLE_ORDER_TYPE"
         ]
+        evidence = candidate.features["entry_timing_evidence"]
+        assert evidence["state"] == "READY_SHADOW"
+        assert evidence["mode"] == "ENFORCE"
+        assert evidence["max_entry_price"] == 10100.0
+        assert evidence["is_order_authorization"] is False
