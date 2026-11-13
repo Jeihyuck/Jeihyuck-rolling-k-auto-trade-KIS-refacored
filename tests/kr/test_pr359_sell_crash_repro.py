@@ -355,3 +355,35 @@ def test_unpriced_native_sell_quantity_and_order_watermark_share_transaction(mon
     assert order["status"] == "PARTIAL_FILLED"
     assert int(_json_dict_for_test(order["response_json"])["confirmed_fill_qty"]) == 10
     assert fills == [], "quantity-only KIS proof must not fabricate a priced fill"
+
+
+def test_tp_stage_journal_database_failure_isolated_by_nested_savepoint(monkeypatch, isolated_engine):
+    engine = isolated_engine
+    import trader.kr.us_profit_stage_journal as stage_journal
+
+    table = schema_for_engine(engine).job_checkpoints
+    monkeypatch.setattr(stage_journal, "_assert_scope", lambda **_kwargs: None)
+    with engine.begin() as conn:
+        outer_savepoint = conn.begin_nested()
+        conn.execute(sa.schema.DropTable(table))
+        result = stage_journal.observe_broker_stage(
+            engine=engine,
+            contract={"sha256": "test-contract"},
+            account_id="practice:test",
+            trading_epoch_id="test-epoch",
+            position_cycle_id="test-cycle",
+            code="251970",
+            stage="TP1",
+            client_order_key="pr359-tp-savepoint",
+            broker_odno="0000040226",
+            cumulative_filled_qty=1,
+            broker_order_accepted=True,
+            broker_fill_source="KIS_DAILY_CCLD_VERIFIED",
+            source_trade_date=date(2026, 10, 22),
+            _conn=conn,
+        )
+        assert result.accepted is False
+        # The failed journal SELECT must roll back only its savepoint. The
+        # enclosing broker-settlement transaction remains usable.
+        assert conn.execute(sa.text("SELECT 1")).scalar_one() == 1
+        outer_savepoint.rollback()
