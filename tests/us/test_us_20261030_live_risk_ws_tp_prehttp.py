@@ -509,7 +509,8 @@ def test_pg_us353_native_tp_claim_reserve_http_gate_and_exact_abort(
         "position_lifecycle_id": cycle, "strategy_owner": "US_STANDARD",
         "submit_attempt_id": attempt,
         "meta": {"submit_attempt_id": attempt, "profit_capture_stage": "tp1",
-                 "position_lifecycle_id": cycle, "strategy_owner": "US_STANDARD"},
+                 "position_lifecycle_id": cycle, "strategy_owner": "US_STANDARD",
+                 "tp_pending_deferred_to_claim": True},
     }, trade_date=td)
 
     identity = SemanticActionIdentity(
@@ -526,11 +527,16 @@ def test_pg_us353_native_tp_claim_reserve_http_gate_and_exact_abort(
         trade_date=td, symbol="GILD", stage="tp1", position_lifecycle_id=cycle,
         client_order_key=key, attempt_id=attempt, action_key=identity.action_key,
     )
+    claim_meta = {
+        "submit_attempt_id": attempt, "profit_capture_stage": "tp1",
+        "position_lifecycle_id": cycle, "strategy_owner": "US_STANDARD",
+        "tp_pending_deferred_to_claim": True,
+    }
     assert repos.reserve_us_profit_capture_stage_after_claim(
-        **args, qty=5, notional_usd=500,
+        **args, qty=5, notional_usd=500, intent_meta=claim_meta,
     )
     assert not repos.reserve_us_profit_capture_stage_after_claim(
-        **args, qty=5, notional_usd=500,
+        **args, qty=5, notional_usd=500, intent_meta=claim_meta,
     ), "the same TP stage cannot be reserved twice"
     assert not repos.verify_us_tp_claim_stage_at_http_boundary(**args)
 
