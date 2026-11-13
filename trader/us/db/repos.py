@@ -3632,12 +3632,15 @@ def verify_us_tp_claim_stage_at_http_boundary(
              WHERE trade_date=:td AND client_order_key=:key
                AND trading_epoch_id=:epoch
         """), params).mappings().all()
-        return all(
-            str(e.get("submit_attempt_id") or "") == params["attempt"]
-            and str(e.get("event_type") or "") in {
-                "BROKER_CLAIM_PREPARED", "BROKER_SUBMIT_STARTED",
-            }
-            for e in events
+        return (
+            any(str(e.get("event_type") or "") == "BROKER_SUBMIT_STARTED" for e in events)
+            and all(
+                str(e.get("submit_attempt_id") or "") == params["attempt"]
+                and str(e.get("event_type") or "") in {
+                    "BROKER_CLAIM_PREPARED", "BROKER_SUBMIT_STARTED",
+                }
+                for e in events
+            )
         )
 
 
