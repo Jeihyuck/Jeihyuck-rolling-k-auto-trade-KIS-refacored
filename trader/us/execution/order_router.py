@@ -2694,6 +2694,8 @@ def route_order(
                     attempt_id=str(intent.get("submit_attempt_id") or ""),
                     action_key=claim.action_key,
                     qty=int(qty), notional_usd=float(qty * price),
+                    limit_price_usd=float(price),
+                    intent_meta=dict(intent.get("meta") or {}),
                 )
             except Exception as _tp_reserve_exc:
                 _claim_tp_reserved = False
