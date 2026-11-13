@@ -2329,6 +2329,7 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
     # KIS-confirmed no-fill cancel must never commit to us_orders without
     # terminalizing its exact Execution Claim in the SAME SQL transaction.
     atomic_cancel_claim_applied = False
+    atomic_tp_stage_applied = False
     if status not in {"PARTIALLY_FILLED", "FILLED"}:
         if engine is None:
             matches = [o for o in _MEM_ORDERS if str(o.get("trade_date")) == td and str(o.get("client_order_key")) == key]
@@ -2413,7 +2414,54 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
                         and (raw_row or {}).get("remaining_qty_present") is True
                         and bool(_cancel_claim_key and _cancel_attempt_id)
                     )
-                    if _cancel_zero_fill_proven or _tqqq_partial_cancel_proven:
+                    # US_STANDARD TP has a different owner and original
+                    # signed BUY contract from TQQQ Infinite. Apply its native
+                    # KIS partial-cancel terminalization only when the exact
+                    # *same-day*, same-cycle TP stage is already reserved
+                    # by this original SELL key and all broker quantities
+                    # are explicitly certified. Never borrow the TQQQ TTL rule.
+                    _standard_tp_stage = str(order_meta.get("profit_capture_stage") or "").lower()
+                    _standard_tp_cycle = str(order_meta.get("position_lifecycle_id") or "").strip()
+                    _standard_tp_candidate = bool(
+                        status == "CANCELLED" and side.upper() == "SELL"
+                        and str(order_meta.get("strategy_owner") or "").upper() == "US_STANDARD"
+                        and order_meta.get("tp_pending_deferred_to_claim") is True
+                        and _standard_tp_stage in {"tp1", "tp2", "tp3"}
+                        and _standard_tp_cycle and active_epoch_id
+                        and 0 < (filled_qty_value or 0) < int(requested_qty)
+                        and broker_remaining_qty == 0
+                        and action_remaining_qty == int(requested_qty) - int(filled_qty_value)
+                        and broker_requested_valid
+                        and broker_requested_qty == int(requested_qty)
+                        and _is_kis_order_cumulative_evidence(evidence_type)
+                        and (raw_row or {}).get("filled_qty_present") is True
+                        and (raw_row or {}).get("remaining_qty_present") is True
+                        and bool(_cancel_claim_key and _cancel_attempt_id)
+                    )
+                    _standard_tp_partial_cancel_proven = False
+                    if _standard_tp_candidate:
+                        _standard_tp_row = conn.execute(text("""
+                            SELECT stage_status, requested_qty, cumulative_filled_qty
+                              FROM us_profit_capture_lifecycle
+                             WHERE trade_date=:td AND symbol=:sym AND stage=:stage
+                               AND position_lifecycle_id=:cycle
+                               AND client_order_key=:key AND trading_epoch_id=:epoch
+                             FOR UPDATE
+                        """), {
+                            "td": td, "sym": str(symbol).upper(),
+                            "stage": _standard_tp_stage,
+                            "cycle": _standard_tp_cycle, "key": key,
+                            "epoch": str(active_epoch_id),
+                        }).mappings().one_or_none()
+                        _standard_tp_partial_cancel_proven = bool(
+                            _standard_tp_row
+                            and str(_standard_tp_row["stage_status"]) == "PENDING"
+                            and int(_standard_tp_row["requested_qty"] or 0) == int(requested_qty)
+                            and 0 <= int(_standard_tp_row["cumulative_filled_qty"] or 0)
+                            <= int(filled_qty_value)
+                        )
+                    if (_cancel_zero_fill_proven or _tqqq_partial_cancel_proven
+                            or _standard_tp_partial_cancel_proven):
                         _cancel_snapshot = record_execution_action_observation_by_key(
                             _cancel_claim_key,
                             attempt_id=_cancel_attempt_id,
@@ -2424,11 +2472,28 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
                         )
                         _valid_terminal = (
                             {"PARTIALLY_SATISFIED"}
-                            if _tqqq_partial_cancel_proven
+                            if (_tqqq_partial_cancel_proven
+                                or _standard_tp_partial_cancel_proven)
                             else {"RETRYABLE", "PARTIALLY_SATISFIED", "SATISFIED"}
                         )
                         if _cancel_snapshot.action_state not in _valid_terminal:
                             raise RuntimeError("cancel_claim_terminal_state_not_confirmed")
+                        if _standard_tp_partial_cancel_proven:
+                            # TP stage, original SELL order and Claim either
+                            # commit together or all roll back. An ACK/unknown
+                            # cannot be mistaken for terminal authority.
+                            from trader.us.profit_capture import sync_profit_capture_stage_from_order
+                            sync_profit_capture_stage_from_order(
+                                trade_date=td, symbol=symbol,
+                                position_lifecycle_id=_standard_tp_cycle,
+                                order_meta=order_meta, client_order_key=key,
+                                broker_order_no=raw_order_no,
+                                profit_capture_stage=_standard_tp_stage,
+                                order_status=status, evidence_type=evidence_type,
+                                filled_qty=filled_qty_value,
+                                requested_qty=requested_qty, _conn=conn,
+                            )
+                            atomic_tp_stage_applied = True
                         atomic_cancel_claim_applied = True
             except Exception as _cancel_atomic_exc:
                 logger.exception(
@@ -2446,6 +2511,7 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
             side.upper() == "SELL"
             and order_meta.get("profit_capture_stage")
             and filled_qty_value is not None
+            and not atomic_tp_stage_applied
         ):
             from trader.us.profit_capture import sync_profit_capture_stage_from_order
             sync_profit_capture_stage_from_order(trade_date=td, symbol=symbol,
