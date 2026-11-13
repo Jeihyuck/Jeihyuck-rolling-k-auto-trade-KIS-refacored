@@ -48,11 +48,21 @@ Before installing anything, retain a read-only snapshot of active
 account/epoch, source BUY contracts, positions, fills, execution claims,
 schema migrations and triggers. Take the approved schema backup.
 
-After a **separately authorized merge and controlled WSL update**, check the
-effective code SHA and account. Apply `0063` through the repository's normal
-approved migration mechanism, respecting the SQL splitter and a single
-transaction. Do NOT manually execute a partial statement, manually create a
-synthetic signed BUY, or install `0063` on an unverified old trading code path.
+After a **separately authorized merge**, the first new KR trading-date
+session runs `deploy_preflight`: if that date has no code pin, it synchronizes
+the approved `origin/dual-agent` code and re-executes the wrapper on the new
+SHA. Then `run-kr-prep.sh` calls `trade_session_runner --session prep`,
+which calls `prep_runner.main()`; that invokes `run_migrations(engine)`.
+Therefore migration `0063` is normally applied automatically during PREP
+unless `MIGRATE_MODE=OFF`. Confirm the effective WSL SHA, practice account,
+`MIGRATE_MODE`, and the `[DB][MIGRATE][APPLY]` / `[DB][MIGRATE][MIGRATE OK]`
+log before treating the migration as installed. If migrations are intentionally
+disabled, use the approved repository migration runner in a separately
+authorized maintenance window; do not manually execute SQL fragments or mark
+`schema_migrations` by hand.
+
+Do NOT allow the old pinned session to continue on a different SHA, manually
+create a synthetic signed BUY, or apply `0063` to an unverified old code path.
 
 The following command **only reads** operational DB and should be executed
 from the authorized operator WSL with its configured DB credentials:
@@ -118,6 +128,10 @@ For the same operator SHA and account/epoch:
    tick. Do not loosen order submission, broker safety or guard policy
    to force a positive test.
 
-**Gate conclusion:** Code CI PASS is not live PASS; the operator must supply
-new independently observed WSL/KIS proof on the deployed code before declaring
-full release acceptance. Keep #359 DRAFT until these gates are met.
+**Merge vs. live-release decision:** Gate A (current base, exact source
+review and full CI) is the pre-merge gate. Once Gate A is satisfied, #359 may
+be marked ready and merged by explicit operator authorization. Gates B-D are
+**post-merge deployment and live-acceptance gates**; they block declaring the
+trading release operationally complete, not the code merge itself. Code CI
+PASS is never live PASS. Keep unresolved original KIS `UNCERTAIN` and CLOSE
+`PENDING_SETTLEMENT` states visible until independently proven.
