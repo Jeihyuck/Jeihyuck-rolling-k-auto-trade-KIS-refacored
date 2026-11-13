@@ -1,5 +1,5 @@
 """PR-A: KR real-time volume source-clock boundary (synthetic, no broker calls)."""
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -69,3 +69,65 @@ def test_quote_without_exchange_clock_cannot_be_made_fresh_from_receipt_time():
                     "age_sec": 0.1, "source": "KIS_WEBSOCKET"})
     assert proof["confirmation_state"] == "UNKNOWN"
     assert proof["quote_as_of"] is None
+
+
+def test_attested_rest_request_binding_without_clock_still_fails_closed():
+    proof = _proof({
+        "source": "KIS_REST_INQUIRE_PRICE",
+        "source_identity": "AUTHENTICATED_REST_REQUEST_BOUND",
+        "requested_symbol": "219130",
+        "received_at": NOW.timestamp(),
+        "acml_vol": 2000,
+    })
+    assert proof["quote_identity_attestation"] == "AUTHENTICATED_REST_REQUEST"
+    assert proof["confirmation_state"] == "UNKNOWN"
+    assert proof["failure_reason"] == "kis_exchange_quote_time_missing"
+
+
+def test_spoofed_rest_source_label_alone_does_not_authorize_buy():
+    proof = _proof({
+        "source": "KIS_REST_INQUIRE_PRICE", "acml_vol": 2000,
+        "stck_cntg_hour": "122900",
+    })
+    assert proof["failure_reason"] == "kis_quote_identity_unverified"
+
+
+def test_authenticated_rest_without_native_day_labeled_inferred_not_native():
+    proof = _proof({
+        "source": "KIS_REST_INQUIRE_PRICE",
+        "source_identity": "AUTHENTICATED_REST_REQUEST_BOUND",
+        "requested_symbol": "219130", "received_at": NOW.timestamp(),
+        "acml_vol": 2000, "stck_cntg_hour": "122900",
+    })
+    assert proof["confirmation_state"] == "VERIFIED"
+    assert proof["quote_trade_date_attestation"] == "SESSION_INFERRED_NOT_NATIVE"
+    assert proof["quote_received_at"] is not None
+
+
+def test_old_cached_quote_not_fresh_just_because_decision_time_is_now():
+    proof = _proof({
+        "source": "KIS_WEBSOCKET", "symbol": "219130",
+        "received_at": (NOW - timedelta(minutes=3)).timestamp(),
+        "acml_vol": 2000, "stck_cntg_hour": "122900",
+    })
+    assert proof["confirmation_state"] == "UNKNOWN"
+    assert proof["failure_reason"] == "kis_quote_receipt_stale_or_future"
+
+
+def test_ws_subscribed_symbol_mismatch_rejected():
+    proof = _proof({
+        "source": "KIS_WEBSOCKET", "symbol": "005930",
+        "received_at": NOW.timestamp(), "acml_vol": 2000,
+        "stck_cntg_hour": "122900",
+    })
+    assert proof["failure_reason"] == "quote_symbol_mismatch"
+
+
+def test_explicit_native_trade_date_mismatch_never_falls_back_to_raw():
+    proof = _proof({
+        "source": "KIS_WEBSOCKET", "symbol": "219130",
+        "received_at": NOW.timestamp(), "acml_vol": 2000,
+        "stck_cntg_hour": "122900", "stck_bsop_date": "20261112",
+        "raw": {"stck_bsop_date": "20261113"},
+    })
+    assert proof["failure_reason"] == "kis_quote_trade_date_mismatch"
