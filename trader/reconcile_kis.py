@@ -2061,6 +2061,10 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
         preview_price = (_to_float(_first_value(row, ["ccld_prc", "avg_prvs", "filled_price"]))
                          if cumulative_sell_evidence is None else float(cumulative_sell_evidence["avg_price"]))
         preview_id = _first_value(row, ["ccld_no", "trade_id", "exec_id"])
+        preview_buy_price = (
+            float(cumulative_buy_evidence["avg_price"])
+            if cumulative_buy_evidence is not None else preview_price
+        )
         preview_cumulative_qty = _to_int(
             _first_value(row, ["tot_ccld_qty", "cumulative_filled_qty"])
         )
@@ -2087,7 +2091,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
             isinstance(engine, sa.engine.Engine)
             and side == "BUY" and source_order
             and request_json.get("enforce_entry_contract") is True
-            and preview_price is not None
+            and preview_buy_price is not None
             and (preview_id or cumulative_buy_evidence is not None)
         )
         if not (defer_sell_order or defer_signed_buy_order):
@@ -2750,8 +2754,9 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                         "confirmed_fill_qty": next_confirmed_qty,
                         "confirmed_fill_notional": next_confirmed_notional,
                         "confirmed_fill_price": (
-                            float(cumulative_sell_evidence["avg_price"])
-                            if cumulative_sell_evidence else source_response.get("confirmed_fill_price")
+                            float(next_confirmed_notional) / float(next_confirmed_qty)
+                            if next_confirmed_qty > 0 and next_confirmed_notional > 0
+                            else source_response.get("confirmed_fill_price")
                         ),
                         "broker_cumulative_evidence_type": (
                             "KIS_ORDER_CUMULATIVE_EXECUTION"
