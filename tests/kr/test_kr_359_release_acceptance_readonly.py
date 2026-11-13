@@ -97,3 +97,25 @@ def test_no_new_run_is_not_a_live_code_attestation():
     s = good_snapshot()
     s["entry_shas"] = {}
     assert evaluate_readiness(s, SHA)["checks"]["operator_run_sha"] == "BLOCKED"
+
+
+
+def test_bad_signed_open_position_and_buy_hash_are_strict_release_blockers():
+    s = good_snapshot()
+    s["malformed_signed_open"] = 1
+    result = evaluate_readiness(s, SHA)
+    assert result["checks"]["active_signed_position_contracts"] == "BLOCKED"
+    assert result["release_readiness"] == "BLOCKED"
+    s["malformed_signed_open"] = 0
+    s["malformed_signed_buy"] = 1
+    assert evaluate_readiness(s, SHA)["checks"]["existing_signed_buy_contracts"] == "BLOCKED"
+
+
+def test_five_zero_qty_closed_legacy_hash_gaps_reported_not_autorepaired():
+    s = good_snapshot()
+    s["historical_closed_missing_exit_sha"] = 5
+    result = evaluate_readiness(s, SHA)
+    assert result["checks"]["closed_historical_signed_meta"] == "REVIEW_HISTORICAL"
+    assert result["checks"]["active_signed_position_contracts"] == "PASS"
+    assert result["counts"]["historical_closed_missing_exit_sha"] == 5
+    assert result["release_readiness"] == "OPERATOR_KIS_ATTESTATION_REQUIRED"
