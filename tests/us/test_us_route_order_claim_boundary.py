@@ -1316,9 +1316,14 @@ def test_native_buy_cannot_reach_http_if_exact_submit_record_fails(monkeypatch, 
     assert result["status"] == "ORDER_DISABLED_DURABLE_LEDGER_UNAVAILABLE"
     assert result["broker_submit"] is False
     assert not http_events
-    [event] = attempts
-    assert event["event_type"] == "BROKER_SUBMIT_STARTED"
+    # When the first STARTED journal write fails, the router also tries
+    # to persist an explicit PRE_IO abort. The injected DB outage rejects
+    # both; only STARTED is relevant to the exact-submit boundary assertion.
+    started = [e for e in attempts if e.get("event_type") == "BROKER_SUBMIT_STARTED"]
+    assert len(started) == 1, attempts
+    event = started[0]
     assert event["requested_qty"] == 2
+    assert not any(e.get("event_type") == "BROKER_ACK_RECEIVED" for e in attempts)
     assert event["payload"]["order_price"] == 10
     assert event["payload"]["exchange"] == "NASDAQ"
     assert event["payload"]["pre_order_position_qty"] == 0

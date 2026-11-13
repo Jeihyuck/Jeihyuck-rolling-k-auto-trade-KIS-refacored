@@ -1263,6 +1263,14 @@ def prepare_exit_position_snapshots(
                 except Exception:
                     pass
             symbol = pos.get("symbol", "")
+            if pos.get("exit_resolution_failed"):
+                logger.error(
+                    "[US_EXIT][SYMBOL_ISOLATED][RESOLVER_FAILURE] symbol=%s reason=%s "
+                    "action=skip_only_this_symbol",
+                    symbol, pos.get("exit_resolution_failure_reason") or "unknown",
+                )
+                _observe_snapshot_outcome("SKIP", "resolver_failure")
+                continue
             raw_exchange = pos.get("exchange", "NASDAQ")
             try:
                 exchange = normalize_us_exchange(raw_exchange)
@@ -1459,6 +1467,18 @@ def _evaluate_exit_intents_from_snapshots(
     hold_count = 0
     from trader.us.pb1.us_exit_router import route_exit_by_book_horizon
     for pos in snapshots or []:
+        # Public callers may provide already-prepared snapshots and bypass
+        # prepare_exit_position_snapshots(). Preserve the same per-symbol
+        # original-contract/quantity failure fence at this final decision edge.
+        # A corrupt BUY/cycle must never be repaired by generic runtime policy.
+        if pos.get("exit_resolution_failed"):
+            logger.error(
+                "[US_EXIT][SYMBOL_ISOLATED][RESOLVER_FAILURE] symbol=%s "
+                "reason=%s action=SKIP_THIS_SYMBOL",
+                pos.get("symbol"),
+                pos.get("exit_resolution_failure_reason") or "UNKNOWN",
+            )
+            continue
         # The original BUY-time V2 policy was already verified by DB and
         # is restored ONLY for the in-memory exit decision. Router still
         # needs independent authenticated KIS proof to issue the SELL.
@@ -1476,7 +1496,27 @@ def _evaluate_exit_intents_from_snapshots(
         if current_price <= 0:
             continue
 
-        intent = route_exit_by_book_horizon(position=pos, current_price=current_price, now=now, include_trend_time=include_trend_time)
+        try:
+            intent = route_exit_by_book_horizon(
+                position=pos, current_price=current_price, now=now,
+                include_trend_time=include_trend_time,
+            )
+        except Exception as exc:
+            # A corrupt/missing lifecycle or an individual strategy-evaluator
+            # failure is scoped to this symbol. It must not suppress unrelated
+            # symbols' already-proven protective SELL signals. Do not substitute
+            # a default V2/V3 contract or invent an exit for this position.
+            position_meta = pos.get("meta") if isinstance(pos.get("meta"), dict) else {}
+            logger.exception(
+                "[US_EXIT][SYMBOL_ISOLATED][EVALUATION_ERROR] "
+                "symbol=%s cycle=%s contract_sha=%s error_type=%s action=SKIP_THIS_SYMBOL",
+                symbol,
+                pos.get("position_cycle_id") or position_meta.get("position_cycle_id")
+                or pos.get("position_lifecycle_id") or position_meta.get("position_lifecycle_id"),
+                pos.get("entry_exit_contract_sha256") or position_meta.get("entry_exit_contract_sha256"),
+                type(exc).__name__,
+            )
+            continue
         if intent is not None and intent.get("exit_type") == "soft_stop_loss":
             allowed, repeat_reason = soft_stop_repeat_allowed(pos, intraday_market_overlay=str(pos.get("intraday_market_overlay") or "NORMAL"), close_session=bool(pos.get("close_session")))
             if not allowed:

@@ -41,6 +41,63 @@ logger = logging.getLogger(__name__)
 AI_TECH_COMBINED_CLUSTERS = {"AI_SEMI", "AI_SOFTWARE", "DATA_CENTER_POWER", "MEGA_TECH"}
 
 
+def us_add_contract_requires_lot_policy(intent: dict, original_contract: dict) -> bool:
+    """Fail closed when ADD would silently replace an original BUY's strategy.
+
+    A same-contract ADD remains under the current management policy; a new
+    strategy or signed agreement needs an independently approved lot policy.
+    This is a pure pre-KIS check and never rewrites the original contract.
+    """
+    from trader.us.entry_exit_contract import extract_us_entry_exit_contract
+
+    meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+    incoming = extract_us_entry_exit_contract(intent, meta)
+    parent_sha = str(original_contract.get("sha256") or "")
+    if incoming and str(incoming.get("sha256") or "") != parent_sha:
+        return True
+    incoming_style = str(
+        intent.get("entry_style_selected") or meta.get("entry_style_selected") or ""
+    ).strip()
+    prior_style = str(
+        (original_contract.get("entry_provenance") or {}).get("entry_style_selected")
+        or (original_contract.get("entry_strategy_detail") or {}).get("selected_style")
+        or ""
+    ).strip()
+    if incoming_style and prior_style and incoming_style != prior_style:
+        return True
+
+    # Some producers transmit the engine name/version but not the selected
+    # style.  A different explicit strategy/version must not be relabelled
+    # under the incumbent frozen BUY, even when no new signed contract exists.
+    incoming_strategy = str(
+        intent.get("entry_strategy") or meta.get("entry_strategy") or ""
+    ).strip()
+    prior_strategy = str(original_contract.get("entry_strategy") or "").strip()
+    if incoming_strategy and prior_strategy and incoming_strategy != prior_strategy:
+        return True
+    # Router builds entry_strategy from the frozen parent later in the ADD
+    # path. Reject an explicit *execution* strategy conflict before that
+    # reassignment, otherwise a different caller's strategy would be silently
+    # relabelled under the incumbent BUY. The generic strategy_name is not an
+    # execution-engine authority and must not be compared to entry_strategy.
+    requested_engine = str(intent.get("strategy") or meta.get("strategy") or "").strip()
+    if requested_engine and prior_strategy and requested_engine != prior_strategy:
+        return True
+    incoming_version = str(
+        intent.get("strategy_version") or meta.get("strategy_version") or ""
+    ).strip()
+    previous_version = str(
+        (original_contract.get("entry_strategy_detail") or {}).get("strategy_version")
+        or ""
+    ).strip()
+    if incoming_version and previous_version and incoming_version != previous_version:
+        return True
+    asserted_parent = str(meta.get("parent_entry_contract_sha256") or "").strip()
+    if asserted_parent and asserted_parent != parent_sha:
+        return True
+    return False
+
+
 def defensive_micro_first_buy_budget_error(intent: dict, *, qty: int, price: float) -> str | None:
     """Additional pre-ledger/HTTP budget fence for the new TQQQ-only probe.
 
@@ -498,6 +555,30 @@ def _assert_tp_post_quote_submit_authority(
         _check_stage4()
     if context is not None and not context.broker_submit_allowed():
         raise KisUSPreSubmitError("US_TICK_AUTHORITY_EXPIRED_BEFORE_HTTP")
+    # The KIS quote GET may overlap a late correction to a previous TP fill.
+    # Re-read the exact stage and claim *after* that I/O, not merely before
+    # it. A superseded fill makes the claim UNCERTAIN and fences this POST.
+    meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+    if side == "SELL" and meta.get("tp_pending_deferred_to_claim") is True:
+        try:
+            from trader.us.db.repos import verify_us_tp_claim_stage_at_http_boundary
+            from trader.us.profit_capture import tp_stage_lifecycle_from_order_proof
+            cycle = tp_stage_lifecycle_from_order_proof(
+                str(intent.get("position_lifecycle_id") or meta.get("position_lifecycle_id") or ""),
+                meta, client_order_key=client_order_key,
+            )
+            if not verify_us_tp_claim_stage_at_http_boundary(
+                trade_date=str(intent.get("trade_date") or ""), symbol=symbol,
+                stage=str(meta.get("profit_capture_stage") or ""),
+                position_lifecycle_id=cycle, client_order_key=client_order_key,
+                attempt_id=attempt_id, action_key=str(meta.get("execution_action_key") or ""),
+            ):
+                raise RuntimeError("TP_STAGE_OR_CLAIM_CHANGED_DURING_QUOTE")
+        except Exception as exc:
+            raise KisUSPreSubmitError("US_TP_STAGE_CLAIM_FENCED_AFTER_QUOTE") from exc
+        _check_stage4()
+        if context is not None and not context.broker_submit_allowed():
+            raise KisUSPreSubmitError("US_TICK_AUTHORITY_EXPIRED_BEFORE_HTTP")
     decision_ok, decision_reason = _tp_decision_fresh_for_native_http(
         intent, max_age_sec=max_decision_age_sec,
     )
@@ -1065,15 +1146,27 @@ def _tp_unsubmitted_attempt_may_release_stage(
             if str(row.get("client_order_key") or "") == key:
                 return False
         events = load_order_events(trade_date)
-        for event in events:
-            if str(event.get("client_order_key") or "") != key:
-                continue
-            if str(event.get("event_type") or "") in {
-                "BROKER_SUBMIT_STARTED", "BROKER_ACK_RECEIVED", "BROKER_ACK_RECOVERED",
-                "ORDER_PARTIALLY_FILLED", "ORDER_FILLED", "ORDER_CANCELLED",
-            }:
-                return False
-        return True
+        from trader.us.execution.order_journal import (
+            proven_unsent_attempts, broker_submission_possible_for_client_key,
+        )
+        related = [
+            event for event in events
+            if str(event.get("client_order_key") or "") == key
+        ]
+        # Absence from a query is NOT durable evidence that an HTTP attempt
+        # never occurred. Authorize release only when this exact attempt has
+        # a persisted BEFORE_BOUNDARY/PRE_IO abort and no contradictory
+        # actual ACK/unknown/possible HTTP event. No time-based inference.
+        attempt_id = str(intent.get("submit_attempt_id") or "").strip()
+        if not related or not attempt_id:
+            return False
+        if broker_submission_possible_for_client_key(related, key):
+            return False
+        proven = proven_unsent_attempts(related)
+        return (key, attempt_id) in proven and all(
+            (key, str(event.get("submit_attempt_id") or "")) in proven
+            for event in related
+        )
     except Exception as exc:
         logger.error("[US_PROFIT_CAPTURE][TP_FENCE][UNKNOWN] symbol=%s key=%s err=%s",
                      symbol, key, exc)
@@ -1226,6 +1319,16 @@ def route_order(
     # This check deliberately precedes identity normalization, persistence and
     # every KIS call: malformed legacy intents cannot bypass symbol ownership.
     from trader.us.strategy_ownership import is_valid_tqqq_intent, owner_for_symbol, TQQQ_OWNER, TQQQ_SYMBOL
+    # A future dedicated owner must install its own explicit router/contract,
+    # fill attribution and SELL adapter. Never quietly adopt that owner into
+    # US_STANDARD through the legacy non-TQQQ symbol fallback.
+    raw_meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+    explicit_owner = str(intent.get("strategy_owner") or raw_meta.get("strategy_owner") or "").upper()
+    registered_owner = owner_for_symbol(intent.get("symbol"))
+    if explicit_owner and explicit_owner != registered_owner:
+        logger.error("[US_ORDER][OWNER_NOT_REGISTERED] symbol=%s owner=%s", intent.get("symbol"), explicit_owner)
+        return {"status": "BLOCKED", "reason": "US_OWNER_ADAPTER_NOT_REGISTERED",
+                "broker_submit": False, "intent": intent}
     if owner_for_symbol(intent.get("symbol")) == TQQQ_OWNER and not is_valid_tqqq_intent(intent):
         logger.error(
             "[TQQQ_INF][OWNERSHIP_REJECT] symbol=TQQQ strategy_owner=%s sleeve_id=%s",
@@ -1364,6 +1467,20 @@ def route_order(
                 )
                 return {
                     "status": "BLOCKED", "reason": "US_ADD_PARENT_CONTRACT_MISSING",
+                    "broker_submit": False, "intent": intent,
+                }
+            # Different entry strategies and signed exit contracts cannot
+            # share the existing cycle without a proven lot allocator.  Do
+            # not silently replace the requested signal with the incumbent
+            # contract and then pretend that the ADD belongs to that BUY.
+            if us_add_contract_requires_lot_policy(intent, parent_contract):
+                logger.error(
+                    "[US_ORDER][ADD_PARENT_CONTRACT][BLOCK] symbol=%s reason=US_ADD_DIFFERENT_CONTRACT_OR_STRATEGY",
+                    symbol_upper,
+                )
+                return {
+                    "status": "BLOCKED",
+                    "reason": "US_ADD_DIFFERENT_CONTRACT_OR_STRATEGY_REQUIRES_LOT_POLICY",
                     "broker_submit": False, "intent": intent,
                 }
             management = parent_contract.get("management") or {}
@@ -1675,6 +1792,9 @@ def route_order(
         }
 
     # 2. intent DB 저장
+    # The initial qty is durable now, but risk/orderable-cash checks below may
+    # safely reduce the eventual executable qty before any broker boundary.
+    originally_persisted_buy_qty = qty if side == "BUY" else None
     if not _persist_with_trade_date(save_order_intent, intent):
         return {"status": "INVALID_ORDER_IDENTITY", "reason": "intent_persistence_rejected", "broker_submit": False, "intent": intent}
 
@@ -2226,6 +2346,24 @@ def route_order(
         intent, strategy_requested_qty=strategy_requested_qty, final_qty=qty, price=price
     )
 
+    # NEW/ADD US BUY (and dedicated TQQQ BUY) can be resized by the canonical
+    # risk cap or fresh KIS cash. Without pre-I/O finalization the original
+    # us_order_intents.qty disagrees with actual us_orders.qty_requested and
+    # exact native fill evidence, creating an orphan position the next day.
+    # Never rewrite a POST-possible attempt or the signed V2/V3 contract.
+    if side == "BUY" and qty != originally_persisted_buy_qty:
+        from trader.us.db.repos import finalize_us_buy_intent_pre_submit
+        if not finalize_us_buy_intent_pre_submit(intent, trade_date=str(trade_date)):
+            logger.critical(
+                "[US_BUY][RESIZED_INTENT_FINALIZE_FAILED] symbol=%s initial_qty=%s final_qty=%s broker_submit=0",
+                symbol_upper, originally_persisted_buy_qty, qty,
+            )
+            return {
+                "status": "ORDER_DISABLED_BUY_INTENT_FINALIZATION",
+                "reason": "resized_original_buy_intent_unverified",
+                "broker_submit": False, "retry_order": False, "intent": intent,
+            }
+
     # Last possible fence and durable write occur immediately before the API.
     if context is not None and not context.broker_submit_allowed():
         from trader.us.execution.order_journal import append_order_event
@@ -2555,6 +2693,79 @@ def route_order(
                 "intent": intent,
             }
         intent.setdefault("meta", {})["execution_action_key"] = claim.action_key
+        if (
+            side == "SELL"
+            and str(intent.get("strategy_owner") or "").upper() == "US_STANDARD"
+            and (intent.get("meta") or {}).get("tp_pending_deferred_to_claim") is True
+        ):
+            # No PENDING reservation existed before this point: any failure
+            # before Claim acquisition leaves only an intent, never a stranded
+            # TP stage. A durable Claim plus an exact scoped stage are required
+            # before any broker-send event or HTTP access.
+            try:
+                from trader.us.db.repos import reserve_us_profit_capture_stage_after_claim
+                from trader.us.profit_capture import tp_stage_lifecycle_from_order_proof
+                _claim_tp_meta = intent.get("meta") or {}
+                _claim_tp_stage = str(_claim_tp_meta.get("profit_capture_stage") or "").lower()
+                _claim_tp_cycle = tp_stage_lifecycle_from_order_proof(
+                    str(intent.get("position_lifecycle_id") or _claim_tp_meta.get("position_lifecycle_id") or ""),
+                    _claim_tp_meta, client_order_key=str(order_key or ""),
+                )
+                _claim_tp_reserved = reserve_us_profit_capture_stage_after_claim(
+                    trade_date=str(trade_date), symbol=symbol_upper,
+                    stage=_claim_tp_stage, position_lifecycle_id=_claim_tp_cycle,
+                    client_order_key=str(order_key or ""),
+                    attempt_id=str(intent.get("submit_attempt_id") or ""),
+                    action_key=claim.action_key,
+                    qty=int(qty), notional_usd=float(qty * price),
+                    limit_price_usd=float(price),
+                    intent_meta=dict(intent.get("meta") or {}),
+                )
+            except Exception as _tp_reserve_exc:
+                _claim_tp_reserved = False
+                logger.error(
+                    "[US_PROFIT_CAPTURE][CLAIM_STAGE_RESERVE_FAILED] symbol=%s "
+                    "type=%s action=ABORT_BEFORE_HTTP",
+                    symbol_upper, type(_tp_reserve_exc).__name__,
+                )
+            if not _claim_tp_reserved:
+                # No TP is released here: the exact same attempt is finalized
+                # pre-HTTP, and the next eligible tick may rebuild a decision.
+                # A failed abort event or Claim release is UNKNOWN and fenced.
+                _tp_abort_ok = False
+                _tp_claim_released = False
+                try:
+                    from trader.us.execution.order_journal import append_order_event
+                    append_order_event(
+                        "BROKER_SUBMIT_ABORTED_PRE_IO", intent, context=context,
+                        broker_status="TP_CLAIM_STAGE_RESERVATION_FAILED",
+                        require_db=_native_kis,
+                    )
+                    _tp_abort_ok = True
+                except Exception:
+                    logger.exception("[US_PROFIT_CAPTURE][CLAIM_RESERVE_ABORT_JOURNAL_UNAVAILABLE]")
+                try:
+                    from trader.us.db.repos import release_execution_action_before_submit
+                    release_execution_action_before_submit(
+                        claim_identity, attempt_id=intent["submit_attempt_id"],
+                    )
+                    _tp_claim_released = True
+                except Exception:
+                    logger.exception("[US_PROFIT_CAPTURE][CLAIM_RESERVE_RELEASE_FAILED]")
+                if order_key:
+                    mark_order_intent_blocked(order_key, reason="tp_stage_claim_reservation_failed_before_http")
+                return {
+                    "status": "ORDER_DISABLED_TP_STAGE_RESERVATION_FAILED",
+                    "broker_submit": False, "retry_order": False,
+                    "requires_reconcile": not (_tp_abort_ok and _tp_claim_released),
+                    "intent": intent,
+                }
+            intent.setdefault("meta", {})["tp_claim_stage_reserved"] = True
+            logger.info(
+                "[US_PROFIT_CAPTURE][CLAIM_STAGE_RESERVED] symbol=%s stage=%s "
+                "key=%s action=ALLOW_PRE_HTTP_GUARDS",
+                symbol_upper, _claim_tp_stage, str(order_key or ""),
+            )
     except Exception as exc:
         logger.critical("[US_ORDER][EXECUTION_CLAIM][UNAVAILABLE] broker_submit=blocked err=%s", exc)
         return {
@@ -2584,19 +2795,82 @@ def route_order(
             return f"{type(exc).__name__}: {exc}"
 
     from trader.us.execution.order_journal import append_order_event
+    _native_tp_claimed = bool(
+        _native_kis and side == "SELL"
+        and (intent.get("meta") or {}).get("tp_claim_stage_reserved") is True
+    )
+    _require_native_submit_journal = bool(
+        _native_kis and (side == "BUY" or _native_tp_claimed)
+    )
     try:
         append_order_event("BROKER_SUBMIT_STARTED", intent, context=context,
-                           require_db=side == "BUY" and _native_kis)
+                           require_db=_require_native_submit_journal)
     except Exception as exc:
+        # No native KIS order call is reachable when STARTED journaling fails.
+        # Still, a TP stage may already have been reserved after Claim.
+        # Persist an exact pre-I/O abort before attempting the Claim release;
+        # if either proof fails, leave that stage PENDING for AM/Close audit.
+        _journal_abort_saved = False
+        _claim_released = False
+        _tp_released = False
+        try:
+            append_order_event(
+                "BROKER_SUBMIT_ABORTED_PRE_IO", intent, context=context,
+                broker_status="DURABLE_STARTED_JOURNAL_FAILED_BEFORE_HTTP",
+                require_db=_require_native_submit_journal,
+            )
+            _journal_abort_saved = True
+        except Exception:
+            logger.exception(
+                "[US_ORDER][STARTED_JOURNAL_ABORT_PROOF_FAILED] action_key=%s",
+                claim.action_key,
+            )
         try:
             from trader.us.db.repos import release_execution_action_before_submit
             release_execution_action_before_submit(
                 claim_identity, attempt_id=intent["submit_attempt_id"],
             )
+            _claim_released = True
         except Exception:
             logger.exception("[US_ORDER][EXECUTION_CLAIM][PRE_SUBMIT_RELEASE_FAILED] action_key=%s", claim.action_key)
-        logger.critical("[US_ORDER][JOURNAL_FAILED] broker_submit=blocked error=%s", exc)
-        return {"status": "ORDER_DISABLED_DURABLE_LEDGER_UNAVAILABLE", "reason": "durable_journal_write_failed", "broker_submit": False, "retry_order": False, "intent": intent}
+        if (_journal_abort_saved and _claim_released and side == "SELL"
+                and (intent.get("meta") or {}).get("tp_claim_stage_reserved") is True):
+            try:
+                from trader.us.db.repos import release_us_profit_capture_pre_http_abort
+                from trader.us.profit_capture import tp_stage_lifecycle_from_order_proof
+                _tp_cycle = tp_stage_lifecycle_from_order_proof(
+                    str(intent.get("position_lifecycle_id") or ""),
+                    intent.get("meta"), client_order_key=str(order_key or ""),
+                )
+                _tp_released = release_us_profit_capture_pre_http_abort(
+                    trade_date=str(trade_date), symbol=symbol_upper,
+                    stage=str((intent.get("meta") or {}).get("profit_capture_stage") or ""),
+                    position_lifecycle_id=_tp_cycle,
+                    client_order_key=str(order_key or ""),
+                )
+            except Exception:
+                logger.exception("[US_PROFIT_CAPTURE][STARTED_JOURNAL_TP_RELEASE_FAILED]")
+        _tp_needs_proof = (
+            side == "SELL"
+            and (intent.get("meta") or {}).get("tp_claim_stage_reserved") is True
+            and not _tp_released
+        )
+        logger.critical(
+            "[US_ORDER][JOURNAL_FAILED] broker_submit=blocked error_type=%s "
+            "abort_saved=%d claim_released=%d tp_released=%d",
+            type(exc).__name__, int(_journal_abort_saved),
+            int(_claim_released), int(_tp_released),
+        )
+        return {
+            "status": "ORDER_DISABLED_DURABLE_LEDGER_UNAVAILABLE",
+            "reason": "durable_journal_write_failed", "broker_submit": False,
+            "retry_order": False,
+            "requires_reconcile": (
+                not _journal_abort_saved or not _claim_released or _tp_needs_proof
+            ),
+            "tp_stage_released_pre_io": _tp_released,
+            "intent": intent,
+        }
     if context is not None and not context.broker_submit_allowed():
         abort_journal_error = None
         try:
@@ -2605,7 +2879,7 @@ def route_order(
                 intent,
                 context=context,
                 broker_status="US_TICK_AUTHORITY_EXPIRED_BEFORE_HTTP",
-                require_db=side == "BUY" and _native_kis,
+                require_db=_require_native_submit_journal,
             )
         except Exception as exc:
             abort_journal_error = exc
@@ -2622,6 +2896,30 @@ def route_order(
                 "[US_ORDER][EXECUTION_CLAIM][PRE_BOUNDARY_RELEASE_FAILED] action_key=%s",
                 claim.action_key,
             )
+        # A matching claimed TP stage is released only after the *actual*
+        # before-boundary abort is durable and the Claim has been released.
+        # If proof is missing, the original stage remains fenced.
+        _tp_boundary_released = False
+        if (side == "SELL" and not abort_journal_error and release_error is None
+                and (intent.get("meta") or {}).get("tp_claim_stage_reserved") is True):
+            try:
+                from trader.us.db.repos import release_us_profit_capture_pre_http_abort
+                from trader.us.profit_capture import tp_stage_lifecycle_from_order_proof
+                _tp_cycle = tp_stage_lifecycle_from_order_proof(
+                    str(intent.get("position_lifecycle_id") or ""),
+                    intent.get("meta"), client_order_key=str(order_key or ""),
+                )
+                _tp_boundary_released = release_us_profit_capture_pre_http_abort(
+                    trade_date=str(trade_date), symbol=symbol_upper,
+                    stage=str((intent.get("meta") or {}).get("profit_capture_stage") or ""),
+                    position_lifecycle_id=_tp_cycle,
+                    client_order_key=str(order_key or ""),
+                )
+                if not _tp_boundary_released:
+                    release_error = RuntimeError("TP_BEFORE_BOUNDARY_RELEASE_UNVERIFIED")
+            except Exception as exc:
+                release_error = exc
+                logger.exception("[US_PROFIT_CAPTURE][PRE_BOUNDARY_RELEASE_FAILED]")
         # A release alone is not a terminal intent: the exact DB abort proof,
         # released claim, and lack of broker evidence must agree.
         if (side == "BUY" and _native_kis and not abort_journal_error
@@ -2653,6 +2951,7 @@ def route_order(
             "broker_submit": False,
             "retry_order": release_error is None,
             "requires_reconcile": release_error is not None,
+            "tp_stage_released_pre_io": _tp_boundary_released,
             "intent": intent,
         }
     logger.info("[US_ORDER][SUBMIT] symbol=%s side=%s qty=%s price=%.4f", symbol, side, qty, price)
@@ -2711,6 +3010,29 @@ def route_order(
                 raise KisUSPreSubmitError(
                     "US_ACCOUNT_RESERVATION_FENCED_BEFORE_HTTP"
                 ) from _reservation_exc
+        if (side == "SELL"
+                and (intent.get("meta") or {}).get("tp_pending_deferred_to_claim") is True):
+            try:
+                from trader.us.db.repos import verify_us_tp_claim_stage_at_http_boundary
+                from trader.us.profit_capture import tp_stage_lifecycle_from_order_proof
+                _boundary_meta = intent.get("meta") or {}
+                _boundary_cycle = tp_stage_lifecycle_from_order_proof(
+                    str(intent.get("position_lifecycle_id") or ""),
+                    _boundary_meta, client_order_key=str(order_key or ""),
+                )
+                if not verify_us_tp_claim_stage_at_http_boundary(
+                    trade_date=str(trade_date), symbol=symbol_upper,
+                    stage=str(_boundary_meta.get("profit_capture_stage") or ""),
+                    position_lifecycle_id=_boundary_cycle,
+                    client_order_key=str(order_key or ""),
+                    attempt_id=str(intent.get("submit_attempt_id") or ""),
+                    action_key=claim.action_key,
+                ):
+                    raise RuntimeError("TP_STAGE_OR_CLAIM_STALE_BEFORE_HTTP")
+            except Exception as _boundary_stage_exc:
+                raise KisUSPreSubmitError(
+                    "US_TP_STAGE_CLAIM_FENCED_BEFORE_HTTP"
+                ) from _boundary_stage_exc
         # The tick may be cancelled while KIS's own rate limiter waits or
         # while a reservation/health query runs. Do not submit after its
         # absolute deadline or after durable session authority has changed.
@@ -3023,6 +3345,7 @@ def route_order(
                 "US_STAGE4_WRITER_FENCED_BEFORE_HTTP",
                 "US_TICK_AUTHORITY_EXPIRED_BEFORE_HTTP",
                 "US_ACCOUNT_RESERVATION_FENCED_BEFORE_HTTP",
+                "US_TP_STAGE_CLAIM_FENCED_BEFORE_HTTP",
                 "US_TP_DECISION_EXPIRED_BEFORE_HTTP",
                 "US_TP_DECISION_TIME_UNVERIFIED",
                 "US_TP_DECISION_AGE_CONFIG_INVALID",
@@ -3050,7 +3373,7 @@ def route_order(
                     "BROKER_SUBMIT_ABORTED_PRE_IO", intent, context=context,
                     broker_status=failure_code,
                     raw_response={"error_code": failure_code, "stage": "BEFORE_HTTP"},
-                    require_db=side == "BUY" and _native_kis,
+                    require_db=_require_native_submit_journal,
                 )
                 abort_journal_ok = True
             except Exception as journal_exc:
@@ -3101,6 +3424,7 @@ def route_order(
             # when KIS HTTP was provably never reached. Never clear PENDING
             # when Claim release/journal proof failed or the order is unknown.
             tp_stage = str((intent.get("meta") or {}).get("profit_capture_stage") or "").lower()
+            _tp_pre_io_stage_released = False
             if (not requires_reconcile and side == "SELL"
                     and tp_stage in {"tp1", "tp2", "tp3"}):
                 try:
@@ -3125,6 +3449,7 @@ def route_order(
                             "action=RECONCILE_ONLY", symbol_upper, tp_stage,
                         )
                     else:
+                        _tp_pre_io_stage_released = True
                         logger.warning(
                             "[US_PROFIT_CAPTURE][PRE_IO_ABORT_RELEASED] symbol=%s stage=%s "
                             "action=REEVALUATE_NEXT_TICK", symbol_upper, tp_stage,
@@ -3153,6 +3478,7 @@ def route_order(
                 "retry_order": not requires_reconcile and not terminal_pre_io_intent,
                 "fresh_signal_required": terminal_pre_io_intent,
                 "requires_reconcile": requires_reconcile,
+                "tp_stage_released_pre_io": _tp_pre_io_stage_released,
                 "intent": intent,
             }
         # KIS API 자체 실패 → REJECT (SELL no-balance after ACK is reconciliatory, not fatal)

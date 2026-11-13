@@ -2131,7 +2131,11 @@ def test_claim_pre_submit_outbox_atomic_rollback(pg_engine):
     assert counts == (1, 1)
 
 
-def test_claim_reservation_outbox_triplet_rolls_back_as_one(pg_engine):
+@pytest.mark.parametrize("owner,symbol", [
+    ("TQQQ_INFINITE", "TQQQ"),
+    ("US_STANDARD", "AMGN"),
+])
+def test_claim_reservation_outbox_triplet_rolls_back_as_one(pg_engine, owner, symbol):
     """Full Stage 1+3 DB preparation is one atomic write on PostgreSQL.
 
     Three durable rows (Claim / account reservation / immutable pre-submit
@@ -2154,7 +2158,12 @@ def test_claim_reservation_outbox_triplet_rolls_back_as_one(pg_engine):
         conn.exec_driver_sql(Path(
             "migrations/0056_us_execution_authority_reservations.sql"
         ).read_text())
-    fingerprint = hashlib.sha256(b"stage-123-synthetic-test").hexdigest()
+    # Both parametrized owners share this real PostgreSQL database. Keep
+    # their account-reservation leases distinct to avoid a cross-owner
+    # reservation idempotency collision that is unrelated to rollback.
+    fingerprint = hashlib.sha256(
+        ("stage-123-synthetic-test:" + owner).encode("utf-8")
+    ).hexdigest()
     authority = AccountExecutionAuthority(
         pg_engine, env="practice", account_fingerprint=fingerprint,
         trading_epoch_id="stage123-epoch",
@@ -2165,18 +2174,18 @@ def test_claim_reservation_outbox_triplet_rolls_back_as_one(pg_engine):
     identity = SemanticActionIdentity(
         env="practice", account_id=fingerprint,
         market="US", trading_epoch_id="stage123-epoch",
-        strategy_owner="TQQQ_INFINITE", lifecycle_id="stage123-cycle",
+        strategy_owner=owner, lifecycle_id="stage123-cycle",
         action="BUY", trade_date=date(2026, 10, 20),
     )
-    key = "TQQQ_INF_V3:stage123-cycle:2026-10-20:BUY"
-    attempt = "stage123-reserved-attempt"
+    key = f"{owner}:stage123-cycle:2026-10-20:BUY"
+    attempt = "stage123-reserved-attempt:" + owner
     event = {
         "event_id": str(uuid4()), "trade_date": "2026-10-20",
         "event_type": "BROKER_CLAIM_PREPARED",
         "event_timestamp": datetime.now(timezone.utc).isoformat(),
         "session": "am", "session_run_id": "synthetic",
         "tick_id": "synthetic", "client_order_key": key,
-        "submit_attempt_id": attempt, "symbol": "TQQQ", "side": "BUY",
+        "submit_attempt_id": attempt, "symbol": symbol, "side": "BUY",
         "requested_qty": 3, "raw_broker_order_no": None,
         "canonical_broker_order_no": None,
         "position_lifecycle_id": "stage123-cycle",
@@ -2192,8 +2201,8 @@ def test_claim_reservation_outbox_triplet_rolls_back_as_one(pg_engine):
         ).acquired
         authority.reserve(
             lease=lease, action_key=attempt,
-            strategy_owner="TQQQ_INFINITE",
-            symbol="TQQQ", side="BUY", qty=3,
+            strategy_owner=owner,
+            symbol=symbol, side="BUY", qty=3,
             price_usd="100", broker_cash_usd="500",
             _conn=conn,
         )
@@ -2223,13 +2232,14 @@ def test_claim_reservation_outbox_triplet_rolls_back_as_one(pg_engine):
     assert counts() == (1, 1, 1)
     authority.assert_reserved_submit_authority(
         attempt_id=attempt, client_order_key=key,
-        strategy_owner="TQQQ_INFINITE", symbol="TQQQ", side="BUY", qty=3,
+        strategy_owner=owner, symbol=symbol, side="BUY", qty=3,
     )
     from trader.us.execution.account_authority import AuthorityUnavailable
     with pytest.raises(AuthorityUnavailable, match="STALE"):
         authority.assert_reserved_submit_authority(
             attempt_id=attempt, client_order_key=key,
-            strategy_owner="US_STANDARD", symbol="TQQQ", side="BUY", qty=3,
+            strategy_owner=("US_STANDARD" if owner == "TQQQ_INFINITE" else "TQQQ_INFINITE"),
+            symbol=symbol, side="BUY", qty=3,
         )
     # A lost HTTP response must NOT cause a second identical broker POST
     # from the same Claim/Attempt. The initial boundary transitions Attempt
@@ -2241,7 +2251,7 @@ def test_claim_reservation_outbox_triplet_rolls_back_as_one(pg_engine):
     with pytest.raises(AuthorityUnavailable, match="STALE"):
         authority.assert_reserved_submit_authority(
             attempt_id=attempt, client_order_key=key,
-            strategy_owner="TQQQ_INFINITE", symbol="TQQQ", side="BUY", qty=3,
+            strategy_owner=owner, symbol=symbol, side="BUY", qty=3,
         )
     authority.release_lease(lease=lease)
 
@@ -2741,6 +2751,35 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
     monkeypatch.setattr(repos, "_active_us_epoch", lambda conn=None: epoch)
     monkeypatch.setattr(repos, "_us_state_epoch_id", lambda conn=None: epoch)
 
+    # Native-shaped BUY partial fill must remain in the ORIGINAL order and
+    # cycle; a later cumulative fill cannot become a new position cycle.
+    partial_evidence = {
+        **meta, "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+        "cumulative_filled_qty": 2,
+    }
+    first_partial = repos.mark_order_filled_by_reconcile(
+        order_no=order_no, client_order_key=key, symbol="AMGN", side="BUY",
+        filled_qty=2, requested_qty=6, cumulative_filled_qty=2,
+        avg_price_usd=461.8, trade_date="2026-11-10",
+        evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        source="fills_by_order_no", meta=partial_evidence,
+    )
+    assert first_partial["status"] == "OK", first_partial
+    with pg_engine.connect() as conn:
+        before_late_fill = conn.execute(text("""
+            SELECT status,qty_filled,position_cycle_id
+              FROM us_orders WHERE order_no=:order_no
+        """), {"order_no": order_no}).mappings().one()
+        before_qty = conn.execute(text("""
+            SELECT qty FROM us_fills WHERE order_no=:order_no
+              AND side='BUY' AND symbol='AMGN'
+        """), {"order_no":order_no}).scalar_one()
+    assert (before_late_fill["status"],before_late_fill["qty_filled"],
+            before_late_fill["position_cycle_id"]) == (
+        "PARTIALLY_FILLED",2,cycle,
+    )
+    assert before_qty == 2
+
     evidence = {
         **meta, "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
         "cumulative_filled_qty": 6,
@@ -2884,3 +2923,1574 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
     assert tomorrow["meta"]["position_lifecycle_id"] == cycle
     assert tomorrow["meta"]["lineage_identity_status"] == "VERIFIED_CURRENT_EPOCH_CONTINUITY"
     assert tomorrow["meta"]["entry_exit_contract_sha256"] == contract["sha256"]
+
+    # An actual PostgreSQL / repo-reconciled partial SELL in the SAME scoped
+    # cycle must not orphan the original BUY V2/V3 on the next KIS balance day.
+    # This is an offline native-evidence fixture; never a real KIS HTTP call.
+    # The original V2 TP1 stage is reserved on the BUY cycle before SELL HTTP.
+    tp1_key = "partial-sell-amgn-ci"
+    repos.mark_us_profit_capture_stage(
+        "2026-11-12", "AMGN", "tp1", position_lifecycle_id=cycle,
+        order_key=tp1_key, qty=2, status="PENDING",
+    )
+    pending = repos.load_us_profit_capture_state(
+        "2026-11-12", ["AMGN"], {"AMGN": cycle},
+    )["AMGN"]
+    assert pending["tp1_pending"] is True and pending["tp1_done"] is False
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO us_position_risk_state(trading_epoch_id,trade_date,symbol,state)
+            VALUES (:epoch,'2026-11-11','AMGN',CAST(:state AS jsonb))
+            ON CONFLICT(trading_epoch_id,trade_date,symbol)
+            DO UPDATE SET state=EXCLUDED.state
+        """), {"epoch": epoch, "state": json.dumps({"lifecycle": first_lifecycle})})
+        conn.execute(text("""
+            INSERT INTO us_orders(
+                trade_date,client_order_key,symbol,exchange,side,
+                qty_requested,qty_filled,order_no,status,trading_epoch_id,
+                account_id,portfolio_epoch_id,position_cycle_id,meta)
+            VALUES ('2026-11-12','partial-sell-amgn-ci','AMGN','NASDAQ','SELL',
+                    2,0,'0000039785','ACK',:epoch,:account,:portfolio,:cycle,
+                    CAST(:meta AS jsonb))
+        """), {"epoch": epoch, "account": broker_hash,
+                 "portfolio": portfolio, "cycle": cycle,
+                 "meta": json.dumps({**meta, "pre_order_holding_qty": 6,
+                                      "profit_capture_stage": "tp1"})})
+
+    actual_sell = repos.mark_order_filled_by_reconcile(
+        order_no="0000039785", client_order_key="partial-sell-amgn-ci",
+        symbol="AMGN", side="SELL", filled_qty=2, requested_qty=2,
+        cumulative_filled_qty=2, avg_price_usd=475.0,
+        trade_date="2026-11-12", evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        source="fills_by_order_no",
+        meta={**meta, "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+              "cumulative_filled_qty": 2},
+    )
+    assert actual_sell["status"] == "OK", actual_sell
+    tp1 = repos.load_us_profit_capture_state(
+        "2026-11-12", ["AMGN"], {"AMGN": cycle},
+    )["AMGN"]
+    assert tp1["tp1_done"] is True and tp1["tp1_pending"] is False
+    assert int(tp1["meta"]["tp1_filled_qty"]) == 2
+    assert tp1["tp2_done"] is False
+    # Replaying the same cumulative KIS order evidence must not count 4 SOLD.
+    again = repos.mark_order_filled_by_reconcile(
+        order_no="0000039785", client_order_key=tp1_key,
+        symbol="AMGN", side="SELL", filled_qty=2, requested_qty=2,
+        cumulative_filled_qty=2, avg_price_usd=475.0,
+        trade_date="2026-11-12", evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        source="fills_by_order_no",
+        meta={**meta, "profit_capture_stage": "tp1"},
+    )
+    assert again["status"] == "OK", again
+    replay = repos.load_us_profit_capture_state(
+        "2026-11-13", ["AMGN"], {"AMGN": cycle},
+    )["AMGN"]
+    assert replay["tp1_done"] is True and int(replay["meta"]["tp1_filled_qty"]) == 2
+
+    with pg_engine.connect() as conn:
+        sell = conn.execute(text("""
+            SELECT o.qty_filled AS order_filled, o.status, o.position_cycle_id,
+                   f.qty AS fill_qty, f.position_cycle_id AS fill_cycle,
+                   f.meta AS fill_meta
+              FROM us_orders o JOIN us_fills f
+                ON f.order_no=o.order_no AND f.client_order_key=o.client_order_key
+               AND f.trade_date=o.trade_date AND f.account_id=o.account_id
+             WHERE o.client_order_key='partial-sell-amgn-ci'
+        """)).mappings().one()
+    assert sell["status"] == "FILLED"
+    assert (sell["order_filled"], sell["fill_qty"]) == (2, 2)
+    assert (sell["position_cycle_id"], sell["fill_cycle"]) == (cycle, cycle)
+    assert sell["fill_meta"]["fill_evidence_type"] == "KIS_ORDER_CUMULATIVE_ACTUAL"
+
+    assert repos.save_position_snapshot(
+        [{"symbol": "AMGN", "exchange": "NASDAQ", "qty": 4,
+          "avg_cost": 461.8, "current_px": 474.0,
+          "balance_source": "kis_balance_authoritative", "meta": {}}],
+        trade_date="2026-11-13",
+        balance_fetch_status="OK", balance_parse_status="OK",
+        authoritative_positions=True, preserve_previous_positions=False,
+    ) == 1
+    with pg_engine.connect() as conn:
+        carried = conn.execute(text("""
+            SELECT qty,account_id,portfolio_epoch_id,position_cycle_id,meta
+              FROM us_positions WHERE as_of='2026-11-13' AND symbol='AMGN'
+                AND trading_epoch_id=:epoch
+        """), {"epoch": epoch}).mappings().one()
+    assert carried["qty"] == 4
+    assert (carried["account_id"], carried["portfolio_epoch_id"],
+            carried["position_cycle_id"]) == (broker_hash, portfolio, cycle)
+    assert carried["meta"]["entry_exit_contract"] == contract
+    assert carried["meta"]["entry_exit_contract_sha256"] == contract["sha256"]
+    assert carried["meta"]["lineage_identity_status"] == "VERIFIED_CURRENT_EPOCH_CONTINUITY"
+    assert carried["meta"]["lineage_verified_partial_sell_shares"] == 2
+
+    # TP1 is already DONE: only the original signed TP2 may emit another
+    # intent. This is the actual policy builder + PG stage ledger, with a
+    # simulated fresh authoritative KIS average (not an authenticated GET).
+    from trader.us.market_state_overlay import build_profit_capture_intents
+    stage_inputs = {
+        "symbol": "AMGN", "qty": 4, "orderable_qty": 4,
+        "current_price": 490.0, "position_lifecycle_id": cycle,
+        "entry_exit_contract": contract,
+        "broker_avg_price": 461.8, "broker_avg_price_currency": "USD",
+        "broker_avg_price_source": "kis_pchs_avg_pric",
+        "broker_avg_price_asof": "2026-11-13T16:00:00+00:00",
+        "balance_source": "kis_balance_authoritative",
+        "authoritative_positions": True,
+        "meta": {**carried["meta"], "entry_exit_contract": contract},
+    }
+    from datetime import datetime as dt, timezone as tz
+    next_tp = build_profit_capture_intents(
+        [stage_inputs], {"profit_capture_enabled": True, "market_state": "NORMAL"},
+        now=dt(2026, 11, 13, 16, tzinfo=tz.utc), trade_date="2026-11-13",
+    )
+    assert len(next_tp) == 1, next_tp
+    assert next_tp[0]["reason"] == "TAKE_PROFIT_TP2"
+    assert next_tp[0]["meta"]["source_entry_contract_sha256"] == contract["sha256"]
+    assert next_tp[0]["position_lifecycle_id"] == cycle
+    assert not any(t.get("reason") == "TAKE_PROFIT_TP1" for t in next_tp)
+
+    # Continue the real original-BUY -> actual BUY fill -> carry -> original
+    # TP1 fill -> next-day original TP2 evaluation THROUGH THE ORDER ROUTER.
+    # Only the broker API boundary is simulated; no real KIS calls occur.
+    from trader.us.runner.trade_tick_runner import route_exit_orders_immediately
+    from trader.us.execution import order_router
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.us.db.execution_claim_schema import (
+        us_execution_attempts, us_execution_claims,
+    )
+    monkeypatch.setattr(repos, "_active_us_epoch",
+                        lambda _conn=None, **_kw: epoch)
+    monkeypatch.setattr(repos, "_us_state_epoch_id",
+                        lambda _conn=None, **_kw: epoch)
+    monkeypatch.setenv("WSL_RUN_MARKET", "")
+    monkeypatch.setenv("US_ACCOUNT_RESERVATION_MODE", "OFF")
+    monkeypatch.setenv("US_ATOMIC_CLAIM_OUTBOX_ENABLED", "0")
+    monkeypatch.setattr(order_router, "resolve_dry_run_for_us_order", lambda: False)
+    claim_repo = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts,
+    )
+    monkeypatch.setattr(repos, "_execution_claim_repo", lambda: claim_repo)
+    monkeypatch.setattr(repos, "claim_execution_action", claim_repo.acquire)
+    monkeypatch.setattr(
+        repos, "record_execution_action_observation", claim_repo.record_observation,
+    )
+    monkeypatch.setattr(
+        repos, "release_execution_action_before_submit", claim_repo.release_before_submit,
+    )
+
+    class TP2TestBroker:
+        def __init__(self):
+            self.posts = []
+
+        def get_us_price(self, symbol, exchange):
+            # Native-shaped *offline* quote; strict age/source/threshold gates
+            # remain active. This is never authenticated KIS price evidence.
+            import time
+            assert symbol == "AMGN" and exchange == "NASDAQ"
+            return {
+                "_quote_quality": "FRESH",
+                "_quote_source": "KIS_LIVE",
+                "_quote_asof_epoch": time.time(),
+                "output": {"last": 490.0},
+            }
+
+        def get_balance(self, **_kw):
+            return {"positions": [{
+                "symbol": "AMGN", "exchange": "NASDAQ",
+                "qty": 4, "holding_qty": 4, "orderable_qty": 4,
+                "avg_price": 461.8, "broker_avg_price_source": "kis_pchs_avg_pric",
+                "currency": "USD",
+            }]}
+
+        def place_us_sell_order(self, symbol, exchange, qty, price):
+            assert symbol == "AMGN" and exchange == "NASDAQ"
+            assert qty > 0
+            self.posts.append((symbol, qty, price))
+            return {"ok": True, "order_no": "CI-AMGN-TP2-SELL"}
+
+    broker = TP2TestBroker()
+    tp2_intent = next_tp[0]
+    # The future-session 2026-11-13 scenario runs on today's real CI wall
+    # clock. At its *simulated pre-HTTP tick* refresh the decision timestamp,
+    # not the frozen contract, TP quantity, or TP threshold; keep the strict
+    # 30-second pre-HTTP freshness fence exercised by the actual router.
+    from datetime import datetime as _wall_datetime, timezone as _wall_timezone
+    tp2_intent.setdefault("meta", {})["last_profit_capture_at"] = (
+        _wall_datetime.now(_wall_timezone.utc).isoformat()
+    )
+    tp2_intent["trade_date"] = "2026-11-13"
+    tp2_intent.setdefault("strategy_owner", "US_STANDARD")
+    tp2_intent.setdefault("sleeve_id", "US_STANDARD")
+    tp2_intent.setdefault("holding_qty", 4)
+    tp2_intent.setdefault("orderable_qty", 4)
+    tp2_intent.setdefault("sellable_qty", 4)
+    tp2_intent.setdefault("available_qty", 4)
+    routed_tp2 = route_exit_orders_immediately(
+        [tp2_intent], buy_daily_notional=0, position_count=1,
+        effective_budget=10000, signal_only=False, kis_order_allowed=True,
+        current_position_symbols={"AMGN"}, kis_client=broker,
+    )
+    assert len(broker.posts) == 1, routed_tp2
+    assert routed_tp2["orders"][0]["status"] == "ACK", routed_tp2
+    tp2_qty = int(broker.posts[0][1])
+    # ACK is not TP2 completion; only actual native-format evidence can do so.
+    pending_tp2 = repos.load_us_profit_capture_state(
+        "2026-11-13", ["AMGN"], {"AMGN": cycle},
+    )["AMGN"]
+    assert pending_tp2["tp2_done"] is False
+    tp2_fill = repos.mark_order_filled_by_reconcile(
+        order_no="CI-AMGN-TP2-SELL",
+        client_order_key=tp2_intent["client_order_key"],
+        symbol="AMGN", side="SELL",
+        filled_qty=tp2_qty, requested_qty=tp2_qty,
+        cumulative_filled_qty=tp2_qty, avg_price_usd=490.0,
+        trade_date="2026-11-13",
+        evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        source="fills_by_order_no",
+        meta={**meta, "profit_capture_stage": "tp2",
+              "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+              "cumulative_filled_qty": tp2_qty},
+    )
+    assert tp2_fill["status"] == "OK", tp2_fill
+    done_tp2 = repos.load_us_profit_capture_state(
+        "2026-11-13", ["AMGN"], {"AMGN": cycle},
+    )["AMGN"]
+    assert done_tp2["tp1_done"] is True
+    assert done_tp2["tp2_done"] is True and not done_tp2["tp2_pending"]
+    assert int(done_tp2["meta"]["tp2_filled_qty"]) == tp2_qty
+    repeated_tp2 = repos.mark_order_filled_by_reconcile(
+        order_no="CI-AMGN-TP2-SELL",
+        client_order_key=tp2_intent["client_order_key"],
+        symbol="AMGN", side="SELL",
+        filled_qty=tp2_qty, requested_qty=tp2_qty,
+        cumulative_filled_qty=tp2_qty, avg_price_usd=490.0,
+        trade_date="2026-11-13",
+        evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        source="fills_by_order_no",
+        meta={**meta, "profit_capture_stage": "tp2",
+              "cumulative_filled_qty": tp2_qty},
+    )
+    assert repeated_tp2["status"] == "OK", repeated_tp2
+    reloaded_tp2 = repos.load_us_profit_capture_state(
+        "2026-11-13", ["AMGN"], {"AMGN": cycle},
+    )["AMGN"]
+    assert int(reloaded_tp2["meta"]["tp2_filled_qty"]) == tp2_qty
+    with pg_engine.connect() as conn:
+        persisted = conn.execute(text("""
+            SELECT o.meta AS order_meta, f.meta AS fill_meta, f.qty AS fill_qty
+            FROM us_orders o JOIN us_fills f
+              ON f.order_no=o.order_no AND f.client_order_key=o.client_order_key
+            WHERE o.order_no='CI-AMGN-TP2-SELL'
+        """)).mappings().one()
+    assert persisted["fill_qty"] == tp2_qty
+    assert persisted["order_meta"]["source_entry_contract_sha256"] == contract["sha256"]
+    assert persisted["fill_meta"]["position_lifecycle_id"] == cycle
+
+
+def test_pg_original_signed_buy_contract_survives_raw_snapshot_upsert(pg_engine, monkeypatch):
+    """Actual PG UPSERT must preserve V2/V3 and cycle after unproven broker copy."""
+    import json
+    from sqlalchemy import text
+    from trader.us.db import repos
+    from trader.us.entry_exit_contract import build_us_entry_exit_contract
+
+    monkeypatch.setattr(repos, "_active_us_epoch",
+                        lambda bind=None, **_kw: "fixture-original-scope")
+    source = {
+        "symbol": "LIFE", "strategy_owner": "US_STANDARD",
+        "entry_style_selected": "ENTRY_PULLBACK",
+        "entry_strategy": "us_pb1", "strategy": "us_pb1",
+        "book": "SWING_BOOK", "horizon": "SWING_CARRY",
+        "exit_policy": "US_SWING_DEFAULT",
+        "position_action": "NEW_POSITION_BUY",
+    }
+    frozen = build_us_entry_exit_contract(source)
+    changed = build_us_entry_exit_contract({
+        **source, "entry_style_selected": "ENTRY_BREAKOUT",
+    })
+    assert frozen["sha256"] != changed["sha256"]
+    original_meta = {
+        "strategy_owner": "US_STANDARD", "entry_style_selected": "ENTRY_PULLBACK",
+        "position_lifecycle_id": "cycle-original",
+        "position_cycle_id": "cycle-original",
+        "portfolio_epoch_id": "portfolio-fixture",
+        "entry_exit_contract": frozen,
+        "entry_exit_contract_sha256": frozen["sha256"],
+        "entry_exit_contract_version": frozen["version"],
+        "opened_trade_date": "2026-11-10",
+        "lineage_identity_status": "VERIFIED_ORIGINAL_KIS_BUY",
+    }
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO us_positions
+              (as_of,symbol,exchange,qty,avg_cost,current_px,unrealized_pnl_usd,
+               trading_epoch_id,account_id,portfolio_epoch_id,position_cycle_id,meta)
+            VALUES ('2026-11-11','LIFE','NASDAQ',6,60,62,12,
+                    'fixture-original-scope','account-fingerprint','portfolio-fixture',
+                    'cycle-original',CAST(:meta AS jsonb))
+        """), {"meta": json.dumps(original_meta)})
+    result = repos.save_position_snapshot([{
+        "symbol": "LIFE", "exchange": "NASDAQ", "qty": 6,
+        "avg_cost": 60, "current_px": 63,
+        "meta": {
+            "entry_style_selected": "ENTRY_BREAKOUT", "strategy_owner": "US_STANDARD",
+            "book": "SWING_BOOK", "horizon": "SWING_CARRY",
+            "exit_policy": "US_SWING_DEFAULT",
+            "entry_exit_contract": changed,
+            "entry_exit_contract_sha256": changed["sha256"],
+            "entry_exit_contract_version": changed["version"],
+        },
+    }], trade_date="2026-11-11", authoritative_positions=False)
+    assert result == 1
+    with pg_engine.connect() as conn:
+        row = conn.execute(text("""
+          SELECT qty,current_px,account_id,portfolio_epoch_id,position_cycle_id,meta
+          FROM us_positions WHERE symbol='LIFE' AND as_of='2026-11-11'
+          AND trading_epoch_id='fixture-original-scope'
+        """)).mappings().one()
+    assert row["qty"] == 6 and float(row["current_px"]) == 63
+    assert row["position_cycle_id"] == "cycle-original"
+    assert row["portfolio_epoch_id"] == "portfolio-fixture"
+    assert row["account_id"] == "account-fingerprint"
+    assert row["meta"]["entry_exit_contract"] == frozen
+    assert row["meta"]["entry_exit_contract_sha256"] == frozen["sha256"]
+    assert row["meta"]["entry_style_selected"] == "ENTRY_PULLBACK"
+    assert row["meta"]["lineage_identity_status"] == "VERIFIED_ORIGINAL_KIS_BUY"
+
+
+def test_pg_tqqq_cycle_version_cas_active_and_new_cycle(pg_engine, monkeypatch):
+    """Real PostgreSQL CAS: stale READY cannot overwrite an ACTIVE cycle."""
+    from dataclasses import replace
+    from datetime import date
+    from sqlalchemy import text
+    from trader.us.infinite.models import InfiniteState, Status
+    from trader.us.infinite.repository import InfiniteRepository, StateCorruptionError
+    from trader.us.infinite.policy_state import reserve_new_cycle
+
+    # Run the real pre-0052 TQQQ migration on a disposable CI schema; mirror
+    # the exact epoch composite PK implemented by the deployed 0052 migration.
+    with pg_engine.begin() as conn:
+        conn.exec_driver_sql("DROP TABLE IF EXISTS us_tqqq_infinite_state CASCADE")
+        conn.exec_driver_sql(open("migrations/0048_add_us_tqqq_infinite_state.sql",
+                                  encoding="utf-8").read())
+        conn.exec_driver_sql(
+            "ALTER TABLE us_tqqq_infinite_state ADD COLUMN trading_epoch_id TEXT"
+        )
+        conn.exec_driver_sql(
+            "ALTER TABLE us_tqqq_infinite_state "
+            "DROP CONSTRAINT us_tqqq_infinite_state_pkey"
+        )
+        conn.exec_driver_sql(
+            "ALTER TABLE us_tqqq_infinite_state "
+            "ADD PRIMARY KEY (trading_epoch_id,strategy_id,symbol)"
+        )
+    repo = InfiniteRepository(pg_engine)
+    monkeypatch.setattr(repo, "_epoch_id",
+                        lambda _conn, **_kw: "fixture-current-epoch")
+    ready = InfiniteState(
+        status=Status.READY, cycle_id="original-cycle",
+        cycle_start_date=date(2026, 11, 11), version=1,
+    )
+    repo.save_state(ready)
+    assert ready.version == 1
+    active = replace(ready, status=Status.ACTIVE)
+    repo.save_state(active)
+    assert active.version == 2
+    with pytest.raises(StateCorruptionError, match="STALE_VERSION_OR_CYCLE"):
+        repo.save_state(ready)
+    assert repo.load_state().status == Status.ACTIVE
+    pending = replace(active, status=Status.EXIT_PENDING)
+    repo.save_state(pending)
+    completed = replace(pending, status=Status.COMPLETE,
+                        cycle_complete_date=date(2026, 11, 12))
+    repo.save_state(completed)
+    next_ready = reserve_new_cycle(
+        completed, date(2026, 11, 13), cycle_id="distinct-next-cycle",
+    )
+    repo.save_state(next_ready)
+    current = repo.load_state()
+    assert current.status == Status.READY
+    assert current.cycle_id == "distinct-next-cycle"
+    assert current.version == 5
+
+
+def test_pg_risk_cash_resized_buy_intent_finalization_atomic(pg_engine, monkeypatch):
+    """Execution qty changes before claim/POST, never the signed sell contract."""
+    from sqlalchemy import text
+    from trader.us.db import repos
+    from trader.us.entry_exit_contract import build_us_entry_exit_contract
+
+    monkeypatch.setattr(repos, "_active_us_epoch",
+                        lambda bind=None, **kwargs: "fixture-resize-epoch")
+    initial = {
+        "client_order_key": "f" * 24, "symbol": "LIFY",
+        "exchange": "NASDAQ", "side": "BUY", "qty": 7,
+        "limit_price": 50, "notional_usd": 350,
+        "strategy_owner": "US_STANDARD", "sleeve_id": "US_STANDARD",
+        "strategy_name": "us_pb1", "strategy": "us_pb1",
+        "strategy_version": "fixture-v42",
+        "entry_style_selected": "ENTRY_MOMENTUM",
+        "position_action": "NEW_POSITION_BUY",
+        "book": "SWING_BOOK", "horizon": "SWING_CARRY",
+    }
+    signed = build_us_entry_exit_contract(initial)
+    initial["meta"] = {
+        "strategy_owner": "US_STANDARD", "strategy_name": "us_pb1",
+        "strategy_version": "fixture-v42", "sleeve_id": "US_STANDARD",
+        "entry_exit_contract": signed,
+        "entry_exit_contract_sha256": signed["sha256"],
+        "entry_exit_contract_version": signed["version"],
+        "entry_style_selected": "ENTRY_MOMENTUM",
+    }
+    assert repos.save_order_intent(initial, trade_date="2026-11-12")
+    resized = {**initial, "qty": 4, "notional_usd": 200}
+    assert repos.finalize_us_buy_intent_pre_submit(resized, trade_date="2026-11-12")
+    with pg_engine.connect() as conn:
+        row = conn.execute(text("""
+            SELECT qty,notional_usd,meta FROM us_order_intents
+            WHERE client_order_key=:key
+        """), {"key": initial["client_order_key"]}).mappings().one()
+    assert row["qty"] == 4
+    assert float(row["notional_usd"]) == 200
+    assert row["meta"]["entry_exit_contract"] == signed
+    assert row["meta"]["entry_exit_contract_sha256"] == signed["sha256"]
+    assert row["meta"]["execution_qty_finalization"]["original_qty"] == 7
+
+    # Once the same client key has an execution record, a different resize
+    # must fail closed and leave its original contract/qty untouched.
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO us_orders(
+                trade_date,client_order_key,symbol,exchange,side,
+                qty_requested,qty_filled,status,meta)
+            VALUES ('2026-11-12',:key,'LIFY','NASDAQ','BUY',
+                    4,0,'ACK','{}'::jsonb)
+        """), {"key": initial["client_order_key"]})
+    assert not repos.finalize_us_buy_intent_pre_submit(
+        {**initial, "qty": 3, "notional_usd": 150},
+        trade_date="2026-11-12",
+    )
+    with pg_engine.connect() as conn:
+        persisted = conn.execute(text("""
+            SELECT qty,meta FROM us_order_intents
+            WHERE client_order_key=:key
+        """), {"key": initial["client_order_key"]}).mappings().one()
+    assert persisted["qty"] == 4
+    assert persisted["meta"]["entry_exit_contract"] == signed
+
+
+def test_pg_closed_latest_snapshot_never_resurrects_old_buy_parent(pg_engine, monkeypatch):
+    """Real PG: a later zero-share balance disqualifies the old ADD parent."""
+    import json
+    from sqlalchemy import text
+    from trader.us.db import repos
+    from trader.us.entry_exit_contract import build_us_entry_exit_contract
+
+    epoch = "fixture-closed-cycle-epoch"
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda _conn=None: epoch)
+    frozen = build_us_entry_exit_contract({
+        "symbol": "AMGN", "strategy_owner": "US_STANDARD",
+        "position_action": "NEW_POSITION_BUY",
+        "entry_style_selected": "ENTRY_PULLBACK",
+        "book": "SWING_BOOK", "horizon": "SWING_CARRY",
+    })
+    with pg_engine.begin() as conn:
+        for dt, qty, cycle in (
+            ("2026-11-10", 6, "original-closed-cycle"),
+            ("2026-11-11", 0, "original-closed-cycle"),
+        ):
+            meta = {
+                "strategy_owner": "US_STANDARD",
+                "position_lifecycle_id": cycle,
+                "position_cycle_id": cycle,
+                "entry_exit_contract": frozen,
+                "entry_exit_contract_sha256": frozen["sha256"],
+            }
+            conn.execute(text("""
+                INSERT INTO us_positions
+                    (as_of,symbol,exchange,qty,avg_cost,trading_epoch_id,
+                     account_id,portfolio_epoch_id,position_cycle_id,meta)
+                VALUES (:dt,'AMGN','NASDAQ',:qty,100,:epoch,'hash-account',
+                        'portfolio-old',:cycle,CAST(:meta AS jsonb))
+            """), {"dt":dt,"qty":qty,"epoch":epoch,"cycle":cycle,
+                   "meta":json.dumps(meta)})
+    prior = repos.load_us_positions_by_symbols(["AMGN"], as_of="2026-11-10")
+    assert prior["AMGN"]["position_cycle_id"] == "original-closed-cycle"
+    assert prior["AMGN"]["meta"]["entry_exit_contract_sha256"] == frozen["sha256"]
+    # Reading 11/11 or later may not 'revive' a 11/10 positive holding.
+    assert repos.load_us_positions_by_symbols(["AMGN"], as_of="2026-11-11") == {}
+    assert repos.load_us_positions_by_symbols(["AMGN"], as_of="2026-11-12") == {}
+    assert repos.load_us_positions_by_symbols(["AMGN"]) == {}
+
+
+@pytest.mark.parametrize("paper_profile", [False, True], ids=["legacy-off", "paper-on-enforce"])
+@pytest.mark.parametrize("multiple_unresolved", [False, True], ids=["ko-only", "ko-kr-tmo"])
+def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
+    pg_engine, monkeypatch, paper_profile, multiple_unresolved,
+):
+    """Real PG -> exit resolver -> signed original V2/V3 -> actual order
+    router and fake broker ACK; neither a real KIS request nor a KIS fill.
+    """
+    import json
+    from datetime import datetime, timezone
+    from uuid import uuid4
+    from sqlalchemy import text
+    from trader.us.db import repos
+    from trader.us.entry_exit_contract import build_us_entry_exit_contract
+    from trader.us.pb1.us_exit_position_resolver import enrich_us_positions_for_exit
+    from trader.us.pb1.us_exit_engine import generate_exit_intents, should_skip_exit_due_to_pending_sell
+    from trader.us.runner.trade_tick_runner import route_exit_orders_immediately
+
+    epoch = (
+        "fixture-ten-symbol-exit-epoch-on"
+        if paper_profile else "fixture-ten-symbol-exit-epoch"
+    )
+    if multiple_unresolved:
+        epoch += "-multiple"
+    # The focused acceptance and full suite can run in the same CI database.
+    # us_positions and account reservations deliberately survive the lean
+    # fixture, so each invocation must own its own practice account + epoch.
+    epoch += "-" + uuid4().hex
+    symbols = ["ABBV", "AMGN", "DHR", "HCA", "KO",
+               "KR", "MCK", "PFE", "PG", "TMO"]
+    blocked = {"KO", "KR", "TMO"} if multiple_unresolved else {"KO"}
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda _conn=None, **_kw: epoch)
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setattr(
+        "trader.us.protective_stop_obligation.record_confirmed_stop",
+        lambda *_args, **_kw: None,
+    )
+    with pg_engine.begin() as conn:
+        for idx, sym in enumerate(symbols):
+            # Four actual US_STANDARD entry selections retain distinct signed
+            # originals; they share the existing book/horizon exit philosophy.
+            selected_style = (
+                "ENTRY_PULLBACK", "ENTRY_MOMENTUM",
+                "ENTRY_BREAKOUT", "ENTRY_MINERVINI",
+            )[idx % 4]
+            # Alternate the existing V2 and approved practice-only V3
+            # contract builders at BUY-time, then keep both frozen while
+            # downstream engine/router run with the common runtime mode.
+            use_v3 = bool(idx % 2)
+            monkeypatch.setenv(
+                "US_SWING_EXIT_MODE",
+                "V3_ACTIVE_PRACTICE" if use_v3 else "LEGACY_V2",
+            )
+            monkeypatch.setenv(
+                "US_SWING_V3_DEPLOY_APPROVED", "1" if use_v3 else "0",
+            )
+            signed = build_us_entry_exit_contract({
+                "symbol": sym, "strategy_owner": "US_STANDARD",
+                "position_action": "NEW_POSITION_BUY",
+                "entry_style_selected": selected_style,
+                "book": "SWING_BOOK", "horizon": "SWING_CARRY",
+            })
+            assert signed["version"] == (
+                "us_entry_exit_contract_v3" if use_v3
+                else "us_entry_exit_contract_v2"
+            )
+            meta = {
+                "strategy_owner": "US_STANDARD",
+                "sleeve_id": "US_STANDARD",
+                "position_lifecycle_id": f"fixture-cycle-{sym}",
+                "position_cycle_id": f"fixture-cycle-{sym}",
+                "entry_exit_contract": signed,
+                "entry_exit_contract_sha256": signed["sha256"],
+                "entry_time": "2026-11-10T16:00:00+00:00",
+                "orderable_qty": 4,
+            }
+            if sym == "ABBV":
+                # Real missing-contract row: a profitable/flat holding cannot
+                # inherit a different symbol's original exit agreement.
+                meta.pop("entry_exit_contract")
+                meta.pop("entry_exit_contract_sha256")
+                meta.pop("position_lifecycle_id")
+                meta.pop("position_cycle_id")
+            conn.execute(text("""
+                INSERT INTO us_positions(
+                    as_of,symbol,exchange,qty,avg_cost,current_px,trading_epoch_id,
+                    account_id,portfolio_epoch_id,position_cycle_id,meta)
+                VALUES ('2026-11-12',:sym,'NASDAQ',4,100,:price,:epoch,
+                        'hash-fixture','portfolio-fixture',:cycle,CAST(:meta AS jsonb))
+            """), {
+                "sym": sym, "price": 100 if sym == "ABBV" else 80,
+                "epoch": epoch, "cycle": None if sym == "ABBV" else f"fixture-cycle-{sym}",
+                "meta": json.dumps(meta),
+            })
+        for blocked_symbol in blocked:
+            conn.execute(text("""
+            INSERT INTO us_orders(
+                trade_date,client_order_key,symbol,exchange,side,qty_requested,
+                qty_filled,order_no,status,dry_run,trading_epoch_id,meta)
+            VALUES ('2026-11-12',:key,:sym,'NYSE','SELL',
+                    1,0,:order_no,'ACK',false,:epoch,'{}'::jsonb)
+        """), {"epoch": epoch, "sym": blocked_symbol,
+                "key": "fixture-" + blocked_symbol + "-unresolved",
+                "order_no": blocked_symbol + "-UNRESOLVED"})
+
+    # Deliberately change the runtime defaults after BUY creation. Decisions
+    # must continue to use each held position's signed original V2/V3.
+    monkeypatch.setenv("US_SWING_EXIT_MODE", "LEGACY_V2")
+    monkeypatch.setenv("US_SWING_V3_DEPLOY_APPROVED", "0")
+    positions = repos.load_us_positions_by_symbols(symbols, as_of="2026-11-12")
+    assert set(positions) == set(symbols)
+    for blocked_symbol in blocked:
+        assert should_skip_exit_due_to_pending_sell(blocked_symbol, "2026-11-12")[0] is True
+    resolved, resolution = enrich_us_positions_for_exit(
+        list(positions.values()), trade_date="2026-11-12", env="practice",
+    )
+    assert len(resolved) == 10
+    for row in resolved:
+        row["resolved_current_price"] = float(row.get("current_px") or 0)
+        # Real PG snapshots do not own a fresh broker orderable-qty column.
+        # The normal tick merges KIS balance before exit evaluation: inject
+        # the explicit 4-share test-broker snapshot here, not a guessed DB
+        # value. V3's strict orderable proof gate is kept intact.
+        row["holding_qty"] = 4
+        row["orderable_qty"] = 4
+        row["sellable_qty"] = 4
+        row["orderable_qty_source"] = "TEST_BROKER_FRESH_BALANCE"
+        # Preserve the actual signed original from the stored DB JSON.
+        row_meta = row.get("meta") or {}
+        if row["symbol"] != "ABBV":
+            assert row_meta["entry_exit_contract_sha256"] == row_meta["entry_exit_contract"]["sha256"]
+            row["entry_exit_contract"] = row_meta["entry_exit_contract"]
+    now = datetime(2026, 11, 12, 15, 0, tzinfo=timezone.utc)
+    signals = generate_exit_intents(
+        [], prepared_snapshots=resolved, now=now, include_trend_time=False,
+    )
+    found = {intent["symbol"]: intent for intent in signals if intent.get("side") == "SELL"}
+    assert len(found) == len(symbols) - len(blocked) - 1, found
+    assert not (blocked | {"ABBV"}).intersection(found)
+    for sym, intent in found.items():
+        assert intent["position_lifecycle_id"] == f"fixture-cycle-{sym}"
+        assert intent["source_entry_contract_sha256"] == (
+            positions[sym]["meta"]["entry_exit_contract_sha256"]
+        )
+    if paper_profile or multiple_unresolved:
+        # The legacy-off parameter ran earlier against the same PG fixture.
+        # Distinct test sessions must not reuse its date-scoped SELL client
+        # keys; otherwise the operational router correctly deduplicates all
+        # eight, but this test mistakes fixture pollution for failed isolation.
+        for candidate in signals:
+            if candidate.get("side") == "SELL":
+                candidate["client_order_key"] = (
+                    f"ci-{int(paper_profile)}-{int(multiple_unresolved)}-"
+                    + str(candidate["client_order_key"])
+                )
+    routed = route_exit_orders_immediately(
+        signals, buy_daily_notional=0, position_count=10,
+        effective_budget=10000, signal_only=True, kis_order_allowed=True,
+        current_position_symbols=set(symbols),
+    )
+    assert len(routed["orders"]) == len(found)
+    assert {order.get("symbol") for order in routed["orders"]} == set(found)
+    assert all(order["status"] == "SIGNAL_ONLY" for order in routed["orders"])
+
+    # Continue the *same* real SQL-loaded resolver -> engine signals through
+    # the unmocked order router, durable PG intent/claim/ACK repositories, and
+    # a deterministic test broker HTTP boundary (NEVER authenticated KIS).
+    # SIGNAL_ONLY above is intentionally not credited as a submitted SELL.
+    from trader.us.execution import order_router
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.us.db.execution_claim_schema import (
+        us_execution_attempts, us_execution_claims,
+    )
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("WSL_RUN_MARKET", "")
+    monkeypatch.setenv("US_ATOMIC_CLAIM_OUTBOX_ENABLED", "1" if paper_profile else "0")
+    monkeypatch.setenv("US_ACCOUNT_RESERVATION_MODE", "ENFORCE" if paper_profile else "OFF")
+    monkeypatch.setenv("US_RECONCILE_WORKER_MODE", "RESERVATION_ONLY" if paper_profile else "LEGACY")
+    monkeypatch.setattr(order_router, "resolve_dry_run_for_us_order", lambda: False)
+    if paper_profile:
+        import hashlib
+        from pathlib import Path
+        import trader.account_state as account_state
+        from trader.us import config as us_cfg
+        from trader.us.execution import reservation_reconcile_worker
+        with pg_engine.begin() as conn:
+            conn.exec_driver_sql(Path(
+                "migrations/0056_us_execution_authority_reservations.sql"
+            ).read_text())
+        # Each parameter is a separate simulated brokerage account. Prior
+        # tests leave active reservations by design, and production correctly
+        # counts the same account's reservations across different epochs.
+        raw_account = f"practice:ten-symbol-concurrency-integration-{epoch}"
+        account_fingerprint = hashlib.sha256(raw_account.encode()).hexdigest()
+        monkeypatch.setattr(
+            account_state, "get_account_key", lambda **_kw: raw_account,
+        )
+        monkeypatch.setattr(repos, "_us_execution_claim_scope", lambda: {
+            "env": "practice",
+            "account_id": account_fingerprint,
+            "trading_epoch_id": epoch,
+        })
+        monkeypatch.setattr(us_cfg, "assert_us_paper_order_allowed", lambda: None)
+        monkeypatch.setattr(
+            reservation_reconcile_worker,
+            "assert_fresh_reservation_worker", lambda **_kw: True,
+        )
+    claim_repo = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts,
+    )
+    monkeypatch.setattr(repos, "_execution_claim_repo", lambda: claim_repo)
+    monkeypatch.setattr(repos, "claim_execution_action", claim_repo.acquire)
+    monkeypatch.setattr(
+        repos, "record_execution_action_observation",
+        claim_repo.record_observation,
+    )
+    monkeypatch.setattr(
+        repos, "release_execution_action_before_submit",
+        claim_repo.release_before_submit,
+    )
+
+    class TestBroker:
+        def __init__(self):
+            self.sells = []
+
+        def get_balance(self, **_kwargs):
+            return {"positions": [
+                {"symbol": sym, "exchange": "NASDAQ",
+                 "qty": 4, "holding_qty": 4, "orderable_qty": 4,
+                 "avg_price": 100.0, "currency": "USD"}
+                for sym in symbols
+            ]}
+
+        def place_us_sell_order(self, symbol, exchange, qty, price):
+            assert symbol not in blocked | {"ABBV"}
+            assert exchange == "NASDAQ" and qty > 0
+            self.sells.append((symbol, qty, price))
+            return {"ok": True, "order_no": "CI-SELL-" + symbol}
+
+    if paper_profile:
+        monkeypatch.setattr(order_router, "NativeKisUSClient", TestBroker)
+    broker = TestBroker()
+    for intent in signals:
+        intent["trade_date"] = "2026-11-12"
+        intent.setdefault("limit_price", 80.0)
+        intent.setdefault("strategy_owner", "US_STANDARD")
+        intent.setdefault("sleeve_id", "US_STANDARD")
+        intent.setdefault("holding_qty", 4)
+        intent.setdefault("orderable_qty", 4)
+        intent.setdefault("sellable_qty", 4)
+        intent.setdefault("available_qty", 4)
+    actual_routes = route_exit_orders_immediately(
+        signals, buy_daily_notional=0, position_count=10,
+        effective_budget=10000, signal_only=False, kis_order_allowed=True,
+        current_position_symbols=set(symbols), kis_client=broker,
+    )
+    # A broker HTTP adapter call proves actual router traversal. The DB claims
+    # and ACKs prove local write order, not live brokerage acceptance.
+    assert len(broker.sells) == len(found), actual_routes
+    assert {sym for sym, *_ in broker.sells} == set(found)
+    assert all(row.get("status") == "ACK" for row in actual_routes["orders"]), actual_routes
+    with pg_engine.connect() as conn:
+        pg_sell_rows = conn.execute(text("""
+            SELECT symbol, status, client_order_key, order_no, meta
+            FROM us_orders
+            WHERE trade_date='2026-11-12' AND side='SELL'
+              AND order_no LIKE 'CI-SELL-%'
+        """)).mappings().all()
+    assert len(pg_sell_rows) == len(found)
+    assert {r["symbol"] for r in pg_sell_rows} == set(found)
+    if paper_profile:
+        with pg_engine.connect() as conn:
+            reservations = conn.execute(text("""
+                SELECT symbol,side,state,requested_qty
+                  FROM us_execution_account_reservations
+                 WHERE env='practice' AND trading_epoch_id=:epoch
+            """), {"epoch": epoch}).mappings().all()
+            outbox = conn.execute(text("""
+                SELECT symbol,side,COUNT(*) AS n
+                  FROM us_order_events
+                 WHERE trade_date='2026-11-12'
+                   AND event_type='BROKER_CLAIM_PREPARED'
+                 GROUP BY symbol,side
+            """)).mappings().all()
+            attempts = conn.execute(text("""
+                SELECT COUNT(*) FROM us_execution_attempts a
+                  JOIN us_execution_claims c ON c.action_key=a.action_key
+                 WHERE c.trading_epoch_id=:epoch
+            """), {"epoch": epoch}).scalar_one()
+        assert {r["symbol"] for r in reservations} == set(found)
+        assert all(r["side"] == "SELL" and r["requested_qty"] > 0
+                   for r in reservations)
+        assert {r["symbol"] for r in outbox} == set(found)
+        assert all(r["n"] == 1 for r in outbox)
+        assert attempts == len(found)
+    assert {
+        positions[row["symbol"]]["meta"]["entry_exit_contract"]["version"]
+        for row in pg_sell_rows
+    } == {"us_entry_exit_contract_v2", "us_entry_exit_contract_v3"}
+    assert {
+        positions[row["symbol"]]["meta"]["entry_exit_contract"]
+        ["entry_strategy_detail"]["selected_style"]
+        for row in pg_sell_rows
+    } == {
+        "ENTRY_PULLBACK", "ENTRY_MOMENTUM",
+        "ENTRY_BREAKOUT", "ENTRY_MINERVINI",
+    }
+    for record in pg_sell_rows:
+        assert record["status"] == "ACK"
+        # SELL carries the immutable BUY as a *source* lineage reference;
+        # it must not pretend to be the BUY that originally signed the policy.
+        assert record["meta"]["source_entry_contract_sha256"] == (
+            positions[record["symbol"]]["meta"]["entry_exit_contract_sha256"]
+        )
+
+
+
+@pytest.mark.parametrize(
+    "selected_style,contract_mode,paper_profile,paper_failure",
+    [
+        (style, mode, False, None)
+        for mode in ("LEGACY_V2", "V3_ACTIVE_PRACTICE")
+        for style in ("ENTRY_PULLBACK", "ENTRY_MOMENTUM", "ENTRY_BREAKOUT", "ENTRY_MINERVINI")
+    ] + [
+        pytest.param("ENTRY_PULLBACK", "V3_ACTIVE_PRACTICE", True, None,
+                     id="real-pg-paper-on-enforce-native-router"),
+        pytest.param("ENTRY_PULLBACK", "V3_ACTIVE_PRACTICE", True, "unknown_ack",
+                     id="real-pg-paper-on-enforce-post-unknown-ack"),
+        pytest.param("ENTRY_PULLBACK", "V3_ACTIVE_PRACTICE", True, "ack_db_failure",
+                     id="real-pg-paper-on-enforce-post-ack-db-failure"),
+    ],
+)
+def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
+    amgn_pg_engine, monkeypatch, tmp_path, selected_style, contract_mode,
+    paper_profile, paper_failure,
+):
+    """Eight explicit production-router paths; only KIS HTTP is a test broker.
+
+    Do not seed BUY order/intent, contract, position, or the eventual SELL by
+    fixture. The actual BUY router must create/persist a signed original, then
+    real repository cumulative-fill, snapshot, resolver, engine and SELL router
+    must independently carry it through an overnight process restart.
+    """
+    import hashlib
+    from datetime import datetime, timezone
+    from sqlalchemy import text
+    from trader.us.db import repos
+    from trader.us.execution import order_router
+    from trader.us.execution.order_router import route_order
+    from trader.us.entry_exit_contract import verify_us_entry_exit_contract
+    from trader.us.pb1.us_exit_position_resolver import enrich_us_positions_for_exit
+    from trader.us.pb1.us_exit_engine import generate_exit_intents
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.us.db.execution_claim_schema import (
+        us_execution_claims, us_execution_attempts,
+    )
+    import trader.account_state as account_state
+
+    engine = amgn_pg_engine
+    symbol = "AMGN"
+    # Use UUID-shaped IDs compatible with the actual portfolio-epoch schema.
+    epoch = "e3d79991-73aa-425d-971b-cbb80c7e9c10"
+    portfolio = "f6f8b13e-10d9-481f-8f0d-8987be0946c0"
+    raw_account = "practice:offline-eight-combinations"
+    account_hash = hashlib.sha256(raw_account.encode()).hexdigest()
+    is_v3 = contract_mode == "V3_ACTIVE_PRACTICE"
+    expected_version = (
+        "us_entry_exit_contract_v3" if is_v3 else "us_entry_exit_contract_v2"
+    )
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("WSL_RUN_MARKET", "US")
+    monkeypatch.setenv("US_SWING_EXIT_MODE", contract_mode)
+    monkeypatch.setenv("US_SWING_V3_DEPLOY_APPROVED", "1" if is_v3 else "0")
+    monkeypatch.setenv("US_ACCOUNT_RESERVATION_MODE", "ENFORCE" if paper_profile else "OFF")
+    monkeypatch.setenv("US_ATOMIC_CLAIM_OUTBOX_ENABLED", "1" if paper_profile else "0")
+    monkeypatch.setenv("US_RECONCILE_WORKER_MODE", "RESERVATION_ONLY" if paper_profile else "LEGACY")
+    # The shared CI suite intentionally applies a $100 test risk cap for
+    # unrelated rejection cases. Restore the repository production DEFAULT
+    # $2,500 maximum within this one 6x$100 BUY scenario; do not disable risk.
+    monkeypatch.setenv("US_MAX_ORDER_USD", "2500")
+    monkeypatch.setenv("US_ORDER_JOURNAL_DIR", str(tmp_path / "journal"))
+    monkeypatch.setattr(
+        repos, "_active_us_epoch", lambda _conn=None, **_kw: epoch,
+    )
+    monkeypatch.setattr(
+        repos, "_us_state_epoch_id", lambda _conn=None, **_kw: epoch,
+    )
+    monkeypatch.setattr(
+        account_state, "get_account_key", lambda **_kw: raw_account,
+    )
+    monkeypatch.setattr(
+        order_router, "resolve_dry_run_for_us_order", lambda: False,
+    )
+    # Parametrized CI cases represent separate fresh processes and separate
+    # disposable databases, unlike the module-level live-process dedupe cache.
+    monkeypatch.setattr(order_router, "_SENT_ORDER_KEYS", set())
+    monkeypatch.setattr(order_router, "_BLOCKED_INTENT_KEYS", set())
+    claim_repo = DurableExecutionClaimRepo(
+        engine, us_execution_claims, us_execution_attempts,
+    )
+    monkeypatch.setattr(repos, "_execution_claim_repo", lambda: claim_repo)
+    monkeypatch.setattr(repos, "claim_execution_action", claim_repo.acquire)
+    monkeypatch.setattr(
+        repos, "record_execution_action_observation",
+        claim_repo.record_observation,
+    )
+    monkeypatch.setattr(
+        repos, "release_execution_action_before_submit",
+        claim_repo.release_before_submit,
+    )
+    # Both epoch tables are the actual production SQLAlchemy schema, not
+    # a shortened CI DDL stub. The BUY router must perform its normal
+    # account -> portfolio -> deterministic cycle binding in PostgreSQL.
+    from trader.db.schema import schema_for_engine
+    epoch_schema = schema_for_engine(engine)
+    epoch_schema.trading_epochs.create(engine, checkfirst=True)
+    epoch_schema.portfolio_epochs.create(engine, checkfirst=True)
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO trading_epochs(
+                trading_epoch_id,env,account_id,status,reason)
+            VALUES (:epoch,'practice',:account,'ACTIVE','CI_EIGHT')
+        """), {"epoch":epoch,"account":raw_account})
+        conn.execute(text("""
+            INSERT INTO portfolio_epochs(
+                portfolio_epoch_id,trading_epoch_id,env,account_id,
+                sid,mode,strategy,status,reason)
+            VALUES (:portfolio,:epoch,'practice',:account,
+                    0,0,'US_STANDARD','ACTIVE','CI_EIGHT')
+        """), {"portfolio":portfolio,"epoch":epoch,"account":raw_account})
+    cycle = hashlib.sha256("|".join((
+        account_hash, epoch, portfolio, "US_STANDARD", symbol,
+        "2026-11-10", "NEW_POSITION_BUY",
+    )).encode("utf-8")).hexdigest()[:32]
+
+    class TestBroker:
+        def __init__(self):
+            self.qty = 0
+            self.posts = []
+
+        def get_orderable_cash(self, **_kw):
+            return 100000.0
+
+        def get_us_balance(self, *, force_refresh=False):
+            # Native KIS shape used by the real pre-HTTP BUY baseline reader.
+            assert force_refresh is True
+            assert self.qty == 0
+            return {
+                "rt_cd": "0", "output1": [], "output2": {},
+                "balance_complete": True, "balance_authoritative": True,
+            }
+
+        def get_balance(self, **_kw):
+            return {"positions": [{
+                "symbol": symbol, "exchange": "NASDAQ", "qty": self.qty,
+                "holding_qty": self.qty, "orderable_qty": self.qty,
+                "avg_price": 10.0,
+            }]} if self.qty else {"positions": []}
+
+        def place_us_buy_order(self, sym, exchange, qty, price):
+            assert (sym, exchange, qty, price) == (symbol, "NASDAQ", 6, 10.0)
+            self.posts.append(("BUY", sym, qty))
+            if paper_failure == "unknown_ack":
+                # The fake broker may have received the economic order; this
+                # transport error MUST NOT authorize a second native POST.
+                raise TimeoutError("synthetic_unknown_ack_after_post")
+            return {"ok": True, "order_no": "CI-BUY-EIGHT"}
+
+        def place_us_sell_order(self, sym, exchange, qty, price):
+            assert sym == symbol and exchange == "NASDAQ"
+            assert 0 < qty <= self.qty
+            self.posts.append(("SELL", sym, qty))
+            return {"ok": True, "order_no": "CI-SELL-EIGHT"}
+
+    if paper_profile:
+        # Keep the actual router, PostgreSQL authority and Claim+Outbox path.
+        # Only the transport is a test broker; no KIS credential or HTTP.
+        from pathlib import Path
+        from trader.us import config as us_cfg
+        from trader.us.execution import reservation_reconcile_worker
+        with engine.begin() as conn:
+            conn.exec_driver_sql(Path(
+                "migrations/0056_us_execution_authority_reservations.sql"
+            ).read_text())
+        monkeypatch.setattr(order_router, "NativeKisUSClient", TestBroker)
+        monkeypatch.setattr(us_cfg, "assert_us_paper_order_allowed", lambda: None)
+        monkeypatch.setattr(
+            reservation_reconcile_worker,
+            "assert_fresh_reservation_worker", lambda **_kw: True,
+        )
+    broker = TestBroker()
+    original_intent = {
+        "trade_date": "2026-11-10",
+        "client_order_key": "ci-eight-original-buy",
+        "symbol": symbol, "exchange": "NASDAQ", "side": "BUY",
+        "qty": 6, "limit_price": 10.0, "notional_usd": 60.0,
+        "strategy_owner": "US_STANDARD", "sleeve_id": "US_STANDARD",
+        "strategy": "us_pb1", "strategy_name": "us_pb1",
+        "strategy_version": "offline-eight-v1",
+        "entry_style_selected": selected_style,
+        "position_action": "NEW_POSITION_BUY",
+        "entry_reason": selected_style,
+        "book": "SWING_BOOK", "horizon": "SWING_CARRY",
+        # Supply the exact classification provenance required by the
+        # production canonical risk gate; do not monkeypatch away risk checks.
+        "theme_cluster": "OTHER",
+        "classification_source": "CI_FINAL30_OFFLINE",
+        "position_state": "NEW",
+        "position_lifecycle_id": cycle, "position_cycle_id": cycle,
+        "portfolio_epoch_id": portfolio, "trading_epoch_id": epoch,
+        "broker_account_hash": account_hash,
+        "meta": {
+            "broker_account_hash": account_hash,
+            "trading_epoch_id": epoch, "portfolio_epoch_id": portfolio,
+            "position_cycle_id": cycle, "position_lifecycle_id": cycle,
+            "entry_style_selected": selected_style,
+            "theme_cluster": "OTHER",
+            "classification_source": "CI_FINAL30_OFFLINE",
+            "position_state": "NEW",
+            "position_action": "NEW_POSITION_BUY",
+        },
+    }
+    # Non-native test adapters deliberately bypass the native-only baseline
+    # hook in route_order. Exercise that *real operating function* explicitly
+    # with native-shaped GET evidence rather than hand-writing a fake
+    # pre_order_holding_qty into order metadata.
+    order_router._capture_native_buy_baseline(original_intent, broker, None)
+    assert original_intent["meta"]["pre_order_holding_qty"] == 0
+    assert original_intent["meta"]["pre_order_position_source"] == "kis_balance_authoritative"
+    if paper_failure == "ack_db_failure":
+        def synthetic_ack_failure(*_args, **_kw):
+            raise RuntimeError("synthetic_ack_db_failure")
+        monkeypatch.setattr(repos, "save_order_ack", synthetic_ack_failure)
+    buy = route_order(
+        original_intent, kis_client=broker,
+        allowed_symbols={symbol}, current_position_symbols=set(),
+        total_portfolio_usd=20000, available_cash_usd=10000,
+        now=datetime(2026, 11, 10, 16, 0, tzinfo=timezone.utc),
+    )
+    if paper_failure:
+        expected = ("BROKER_SUBMIT_RESULT_UNKNOWN" if paper_failure == "unknown_ack"
+                    else "ACK_DB_FAILED")
+        assert buy["status"] == expected, (paper_failure, buy)
+        assert buy["retry_order"] is False
+        assert buy["requires_reconcile"] is True
+        assert broker.posts == [("BUY", symbol, 6)]
+        with engine.connect() as conn:
+            original = conn.execute(text("""
+                SELECT meta FROM us_order_intents
+                 WHERE client_order_key='ci-eight-original-buy'
+            """)).mappings().one()
+            assert verify_us_entry_exit_contract(
+                original["meta"]["entry_exit_contract"]
+            )
+            assert conn.execute(text("""
+                SELECT count(*) FROM us_execution_account_reservations
+                 WHERE symbol='AMGN' AND side='BUY'
+            """)).scalar_one() == 1
+            assert conn.execute(text("""
+                SELECT count(*) FROM us_order_events
+                 WHERE client_order_key='ci-eight-original-buy'
+                   AND event_type='BROKER_CLAIM_PREPARED'
+            """)).scalar_one() == 1
+            assert conn.execute(text("""
+                SELECT count(*) FROM us_orders
+                 WHERE client_order_key='ci-eight-original-buy'
+            """)).scalar_one() == 0
+        retried = route_order(
+            {**original_intent, "client_order_key": "ci-eight-unsafely-retried-buy"},
+            kis_client=broker, allowed_symbols={symbol},
+            current_position_symbols=set(),
+            total_portfolio_usd=20000, available_cash_usd=10000,
+            now=datetime(2026, 11, 10, 16, 1, tzinfo=timezone.utc),
+        )
+        assert retried["status"] != "ACK", retried
+        assert broker.posts == [("BUY", symbol, 6)]
+        return
+    assert buy["status"] == "ACK", (selected_style, contract_mode, buy)
+    assert broker.posts == [("BUY", symbol, 6)]
+    with engine.connect() as conn:
+        original = conn.execute(text("""
+            SELECT meta,position_cycle_id,portfolio_epoch_id
+            FROM us_order_intents WHERE client_order_key='ci-eight-original-buy'
+        """)).mappings().one()
+        order = conn.execute(text("""
+            SELECT status,order_no,meta
+            FROM us_orders WHERE client_order_key='ci-eight-original-buy'
+        """)).mappings().one()
+    signed = original["meta"]["entry_exit_contract"]
+    assert verify_us_entry_exit_contract(signed)
+    assert signed["version"] == expected_version
+    assert signed["entry_strategy_detail"]["selected_style"] == selected_style
+    assert original["meta"]["entry_exit_contract_sha256"] == signed["sha256"]
+    assert order["status"] == "ACK" and order["order_no"] == "CI-BUY-EIGHT"
+    if paper_profile:
+        with engine.connect() as conn:
+            prepared = conn.execute(text("""
+                SELECT count(*) FROM us_order_events
+                 WHERE client_order_key='ci-eight-original-buy'
+                   AND event_type='BROKER_CLAIM_PREPARED'
+            """)).scalar_one()
+            reserved = conn.execute(text("""
+                SELECT count(*) FROM us_execution_account_reservations
+                 WHERE symbol='AMGN' AND side='BUY'
+                   AND strategy_owner='US_STANDARD'
+            """)).scalar_one()
+            claimed = conn.execute(text("""
+                SELECT count(*) FROM us_execution_claims
+                 WHERE trading_epoch_id=:epoch
+            """), {"epoch": epoch}).scalar_one()
+        assert (prepared, reserved, claimed) == (1, 1, 1)
+    # The native WSL binder must scope the *real BUY ledger*, not merely
+    # attach signed JSON to an otherwise anonymous client key.
+    with engine.connect() as conn:
+        durable_buy_scope = conn.execute(text("""
+            SELECT i.account_id AS i_account,i.portfolio_epoch_id AS i_portfolio,
+                   i.position_cycle_id AS i_cycle,i.trading_epoch_id AS i_epoch,
+                   o.account_id AS o_account,o.portfolio_epoch_id AS o_portfolio,
+                   o.position_cycle_id AS o_cycle,o.trading_epoch_id AS o_epoch
+              FROM us_order_intents i
+              JOIN us_orders o ON o.client_order_key=i.client_order_key
+             WHERE i.client_order_key='ci-eight-original-buy'
+        """)).mappings().one()
+    assert (
+        durable_buy_scope["i_account"],durable_buy_scope["i_portfolio"],
+        durable_buy_scope["i_cycle"],durable_buy_scope["i_epoch"],
+        durable_buy_scope["o_account"],durable_buy_scope["o_portfolio"],
+        durable_buy_scope["o_cycle"],durable_buy_scope["o_epoch"],
+    ) == (account_hash,portfolio,cycle,epoch,account_hash,portfolio,cycle,epoch), durable_buy_scope
+
+    fill_meta = {
+        **original["meta"],
+        "broker_account_hash": account_hash,
+        "trading_epoch_id": epoch,
+        "portfolio_epoch_id": portfolio,
+        "position_cycle_id": cycle,
+        "position_lifecycle_id": cycle,
+        "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+        "cumulative_filled_qty": 6,
+    }
+    if paper_profile:
+        partial = repos.mark_order_filled_by_reconcile(
+            order_no="CI-BUY-EIGHT", client_order_key="ci-eight-original-buy",
+            symbol=symbol, side="BUY", filled_qty=2, requested_qty=6,
+            cumulative_filled_qty=2, avg_price_usd=10.0,
+            trade_date="2026-11-10",
+            evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+            source="fills_by_order_no",
+            meta={**fill_meta, "cumulative_filled_qty": 2},
+        )
+        assert partial["status"] == "OK", partial
+        with engine.connect() as conn:
+            assert conn.execute(text("""
+                SELECT qty_filled FROM us_orders
+                 WHERE client_order_key='ci-eight-original-buy'
+            """)).scalar_one() == 2
+        # A newly launched OS process must independently read durable
+        # PostgreSQL state. This is a real process boundary, distinct from
+        # constructing a second repository object in the same interpreter.
+        import json as _json
+        import subprocess as _subprocess
+        import sys as _sys
+        import os as _os
+        _read_across_process = """
+import json, os
+from sqlalchemy import create_engine, text
+engine = create_engine(os.environ['US353_PG_TEST_URL'], future=True)
+with engine.connect() as conn:
+    row = conn.execute(text('''
+        SELECT i.position_cycle_id AS cycle,
+               i.meta->>'entry_exit_contract_sha256' AS digest,
+               o.qty_filled AS filled,
+               (SELECT count(*) FROM us_execution_attempts
+                 WHERE client_order_key='ci-eight-original-buy') AS attempts,
+               (SELECT count(*) FROM us_execution_account_reservations
+                 WHERE symbol='AMGN' AND side='BUY') AS reservations,
+               (SELECT count(*) FROM us_order_events
+                 WHERE client_order_key='ci-eight-original-buy'
+                   AND event_type='BROKER_CLAIM_PREPARED') AS outbox
+        FROM us_order_intents i
+        JOIN us_orders o USING (client_order_key)
+        WHERE i.client_order_key='ci-eight-original-buy'
+    ''')).mappings().one()
+    print(json.dumps(dict(row)))
+engine.dispose()
+"""
+        def _child_read(expected_qty):
+            child_env = _os.environ.copy()
+            child_env["US353_PG_TEST_URL"] = engine.url.render_as_string(
+                hide_password=False
+            )
+            result = _subprocess.run(
+                [_sys.executable, "-c", _read_across_process],
+                env=child_env, capture_output=True, text=True,
+                timeout=15,
+            )
+            # Never expose DB URL, process environment, or full stderr.
+            assert result.returncode == 0, "US353_CHILD_PG_READ_FAILED"
+            observed = _json.loads(result.stdout.strip())
+            assert observed["cycle"] == cycle, observed
+            assert observed["digest"] == signed["sha256"], observed
+            assert observed["filled"] == expected_qty, observed
+            assert observed["attempts"] == 1, observed
+            assert observed["reservations"] == 1, observed
+            assert observed["outbox"] == 1, observed
+        _child_read(2)
+        # A separate durable-repository instance sees the same original
+        # execution evidence before the delayed final cumulative fill.
+        fresh_partial_repo = DurableExecutionClaimRepo(
+            engine, us_execution_claims, us_execution_attempts,
+        )
+        monkeypatch.setattr(repos, "_execution_claim_repo", lambda: fresh_partial_repo)
+        monkeypatch.setattr(repos, "claim_execution_action", fresh_partial_repo.acquire)
+        monkeypatch.setattr(
+            repos, "record_execution_action_observation",
+            fresh_partial_repo.record_observation,
+        )
+    verified_buy = repos.mark_order_filled_by_reconcile(
+        order_no="CI-BUY-EIGHT", client_order_key="ci-eight-original-buy",
+        symbol=symbol, side="BUY", filled_qty=6, requested_qty=6,
+        cumulative_filled_qty=6, avg_price_usd=10.0,
+        trade_date="2026-11-10",
+        evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        source="fills_by_order_no", meta=fill_meta,
+    )
+    assert verified_buy["status"] == "OK", verified_buy
+    if paper_profile:
+        _child_read(6)
+    from trader.us.original_buy_lineage import load_verified_us_original_buy_scope
+    identity = {"env": "practice", "account_id": raw_account,
+                "trading_epoch_id": epoch, "strategy_owner": "US_STANDARD"}
+    original_buy_proof = load_verified_us_original_buy_scope(
+        symbol=symbol, trade_date="2026-11-10", qty=6, identity=identity,
+    )
+    assert original_buy_proof is not None, (
+        selected_style, contract_mode, durable_buy_scope,
+        "ORIGINAL_BUY_SCOPE_MISSING_AFTER_KIS_FORMAT_FILL",
+    )
+    assert original_buy_proof["position_cycle_id"] == cycle
+    broker.qty = 6
+    # First actual BUY snapshot: the repo proves account + epoch + original
+    # contract against its persistent native-shaped BUY order and fill.
+    assert repos.save_position_snapshot(
+        [{"symbol":symbol,"exchange":"NASDAQ","qty":6,
+          "avg_cost":10.0,"current_px":8.0,
+          "balance_source":"kis_balance_authoritative","meta":{}}],
+        trade_date="2026-11-10", balance_fetch_status="OK",
+        balance_parse_status="OK", authoritative_positions=True,
+        preserve_previous_positions=False,
+    ) == 1
+    # Real session lifecycle writer: this state does not come from a copied
+    # fixture or a freshly rebuilt ENV contract. It is derived from the
+    # original PostgreSQL BUY proof returned above and persisted by the
+    # same production lifecycle repository used at AM/CLOSE.
+    open_lifecycle = repos.save_us_position_lifecycle_atomic(
+        symbol, "2026-11-10", {
+            "lifecycle_id": original_buy_proof["position_cycle_id"],
+            "position_cycle_id": original_buy_proof["position_cycle_id"],
+            "portfolio_epoch_id": original_buy_proof["portfolio_epoch_id"],
+            "trading_epoch_id": original_buy_proof["trading_epoch_id"],
+            "account_id": original_buy_proof["account_id"],
+            "strategy_owner": original_buy_proof["strategy_owner"],
+            "env": original_buy_proof["env"], "is_open": True,
+            "opened_trade_date": "2026-11-10",
+            "opened_at": str(original_buy_proof["filled_at"]),
+            "opened_at_source": "confirmed_buy_fill",
+            "high_watermark": 10.0,
+            "entry_policy": {
+                "entry_exit_contract": signed,
+                "entry_exit_contract_sha256": signed["sha256"],
+                "entry_exit_contract_version": signed["version"],
+            },
+        },
+    )
+    assert open_lifecycle["position_cycle_id"] == cycle
+    assert open_lifecycle["entry_policy"]["entry_exit_contract_sha256"] == signed["sha256"]
+    # Restart: only a raw KIS-style balance is passed; no scope or contract
+    # copy is added to that snapshot.
+    assert repos.save_position_snapshot(
+        [{"symbol":symbol,"exchange":"NASDAQ","qty":6,
+          "avg_cost":10.0,"current_px":8.0,
+          "balance_source":"kis_balance_authoritative","meta":{}}],
+        trade_date="2026-11-11", balance_fetch_status="OK",
+        balance_parse_status="OK", authoritative_positions=True,
+        preserve_previous_positions=False,
+    ) == 1
+    with engine.connect() as conn:
+        carried = conn.execute(text("""
+            SELECT qty,account_id,portfolio_epoch_id,position_cycle_id,meta
+            FROM us_positions WHERE as_of='2026-11-11' AND symbol='AMGN'
+              AND trading_epoch_id=:epoch
+        """), {"epoch":epoch}).mappings().one()
+    assert carried["qty"] == 6
+    assert (carried["account_id"],carried["portfolio_epoch_id"],
+            carried["position_cycle_id"]) == (account_hash,portfolio,cycle)
+    assert carried["meta"]["entry_exit_contract_sha256"] == signed["sha256"]
+
+    # A different explicit engine is NOT a same-contract ADD, even when the
+    # malicious/buggy producer copied the incumbent selected style. No lot
+    # allocator exists, so do not create an intent, claim, or broker request.
+    changed_engine = {
+        **original_intent,
+        "client_order_key": "ci-eight-conflicting-add",
+        "trade_date": "2026-11-11",
+        "strategy": "different_execution_engine",
+        "position_action": "ADD_TO_EXISTING_BUY",
+        "qty": 1,
+        "notional_usd": 10.0,
+    }
+    denied = route_order(
+        changed_engine, kis_client=broker,
+        current_position_symbols={symbol}, allowed_symbols={symbol},
+        total_portfolio_usd=20000, available_cash_usd=10000,
+    )
+    assert denied["status"] == "BLOCKED", denied
+    assert denied["reason"] == (
+        "US_ADD_DIFFERENT_CONTRACT_OR_STRATEGY_REQUIRES_LOT_POLICY"
+    )
+    assert broker.posts == [("BUY", symbol, 6)]
+    with engine.connect() as conn:
+        assert conn.execute(text("""
+            SELECT COUNT(*) FROM us_order_intents
+            WHERE client_order_key='ci-eight-conflicting-add'
+        """)).scalar_one() == 0
+
+    # A restarted claim repository and reloaded position cannot trust the
+    # constructor's original intent object. Decisions read stored contract.
+    fresh_repo = DurableExecutionClaimRepo(
+        engine, us_execution_claims, us_execution_attempts,
+    )
+    monkeypatch.setattr(repos, "_execution_claim_repo", lambda: fresh_repo)
+    monkeypatch.setattr(repos, "claim_execution_action", fresh_repo.acquire)
+    monkeypatch.setattr(
+        repos, "record_execution_action_observation",
+        fresh_repo.record_observation,
+    )
+    loaded = repos.load_us_positions_by_symbols([symbol], as_of="2026-11-11")
+    resolved, _ = enrich_us_positions_for_exit(
+        list(loaded.values()), trade_date="2026-11-11", env="practice",
+    )
+    assert len(resolved) == 1
+    held = resolved[0]
+    held["resolved_current_price"] = 8.0
+    held["orderable_qty"] = 6
+    held["holding_qty"] = 6
+    held["sellable_qty"] = 6
+    held["entry_exit_contract"] = held["meta"]["entry_exit_contract"]
+    assert held["entry_exit_contract"]["sha256"] == signed["sha256"]
+    exits = generate_exit_intents(
+        [], prepared_snapshots=[held],
+        now=datetime(2026, 11, 11, 18, tzinfo=timezone.utc),
+        include_trend_time=False,
+    )
+    sells = [x for x in exits if x.get("side") == "SELL"]
+    assert len(sells) == 1, (selected_style, contract_mode, exits)
+    sell = sells[0]
+    assert sell["source_entry_contract_sha256"] == signed["sha256"]
+    assert sell["position_lifecycle_id"] == cycle
+    sell["trade_date"] = "2026-11-11"
+    sell.setdefault("exchange", "NASDAQ")
+    sell.setdefault("holding_qty", 6)
+    sell.setdefault("orderable_qty", 6)
+    sell.setdefault("sellable_qty", 6)
+    sell.setdefault("available_qty", 6)
+    route = route_order(
+        sell, kis_client=broker, current_position_symbols={symbol},
+        current_position_count=1, total_portfolio_usd=20000,
+        available_cash_usd=10000,
+    )
+    assert route["status"] == "ACK", (selected_style, contract_mode, route)
+    assert len(broker.posts) == 2
+    # A broker ACK alone does not prove a durable claim. The actual SELL
+    # order's action/attempt must resolve to the same PostgreSQL claim rows
+    # BEFORE any native-format fill is accepted.
+    with engine.connect() as conn:
+        sell_claim = conn.execute(text("""
+            SELECT o.meta->>'execution_action_key' AS action_key,
+                   o.meta->>'submit_attempt_id' AS attempt_id,
+                   c.action_key AS persisted_claim_key,
+                   a.attempt_id AS persisted_attempt_id
+            FROM us_orders o
+            LEFT JOIN us_execution_claims c
+              ON c.action_key=o.meta->>'execution_action_key'
+            LEFT JOIN us_execution_attempts a
+              ON a.action_key=c.action_key
+             AND a.attempt_id=o.meta->>'submit_attempt_id'
+            WHERE o.order_no='CI-SELL-EIGHT'
+        """)).mappings().one()
+    assert sell_claim["persisted_claim_key"] == sell_claim["action_key"], sell_claim
+    assert sell_claim["persisted_attempt_id"] == sell_claim["attempt_id"], sell_claim
+    actual_sell_qty = int(broker.posts[-1][2])
+    # Reconciliation must reject a stale BUY attempt attached to a SELL
+    # fill without mutating the SELL ACK or creating an accounting fill.
+    wrong_claim = repos.mark_order_filled_by_reconcile(
+        order_no="CI-SELL-EIGHT",
+        client_order_key=route["intent"]["client_order_key"],
+        symbol=symbol, side="SELL", filled_qty=actual_sell_qty,
+        requested_qty=actual_sell_qty,
+        cumulative_filled_qty=actual_sell_qty,
+        avg_price_usd=8.0, trade_date="2026-11-11",
+        evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        source="fills_by_order_no",
+        meta={**fill_meta, "cumulative_filled_qty":actual_sell_qty},
+    )
+    assert wrong_claim["status"] == "FILL_EXECUTION_CLAIM_IDENTITY_CONFLICT", wrong_claim
+    with engine.connect() as conn:
+        assert conn.execute(text("""
+            SELECT status FROM us_orders WHERE order_no='CI-SELL-EIGHT'
+        """)).scalar_one() == "ACK"
+        assert conn.execute(text("""
+            SELECT COUNT(*) FROM us_fills WHERE order_no='CI-SELL-EIGHT'
+        """)).scalar_one() == 0
+    confirmed_sell = repos.mark_order_filled_by_reconcile(
+        order_no="CI-SELL-EIGHT",
+        client_order_key=route["intent"]["client_order_key"],
+        symbol=symbol, side="SELL", filled_qty=actual_sell_qty,
+        requested_qty=actual_sell_qty,
+        cumulative_filled_qty=actual_sell_qty,
+        avg_price_usd=8.0, trade_date="2026-11-11",
+        evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        source="fills_by_order_no",
+        # SELL evidence references the immutable BUY contract, but does not
+        # impersonate the BUY's execution claim or submit attempt.
+        meta={**{
+            k: v for k, v in fill_meta.items()
+            if k not in ("execution_action_key", "submit_attempt_id")
+        }, "cumulative_filled_qty":actual_sell_qty,
+              "source_entry_contract_sha256":signed["sha256"]},
+    )
+    assert confirmed_sell["status"] == "OK", confirmed_sell
+    with engine.connect() as conn:
+        sell_row = conn.execute(text("""
+            SELECT o.status,o.meta AS order_meta, f.meta AS fill_meta,
+                   o.position_cycle_id AS order_cycle,
+                   f.position_cycle_id AS fill_cycle
+            FROM us_orders o JOIN us_fills f
+              ON f.order_no=o.order_no AND f.client_order_key=o.client_order_key
+            WHERE o.order_no='CI-SELL-EIGHT'
+        """)).mappings().one()
+    assert sell_row["status"] == "FILLED"
+    assert sell_row["order_meta"]["source_entry_contract_sha256"] == signed["sha256"]
+    assert (sell_row["order_cycle"],sell_row["fill_cycle"]) == (cycle,cycle)
+    assert sell_row["fill_meta"]["source_entry_contract_sha256"] == signed["sha256"]
+    if paper_profile:
+        with engine.connect() as conn:
+            original_count = conn.execute(text("""
+                SELECT count(*) FROM us_fills WHERE order_no='CI-SELL-EIGHT'
+            """)).scalar_one()
+        replay = repos.mark_order_filled_by_reconcile(
+            order_no="CI-SELL-EIGHT",
+            client_order_key=route["intent"]["client_order_key"],
+            symbol=symbol, side="SELL",
+            filled_qty=actual_sell_qty, requested_qty=actual_sell_qty,
+            cumulative_filled_qty=actual_sell_qty, avg_price_usd=8.0,
+            trade_date="2026-11-11",
+            evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+            source="fills_by_order_no",
+            meta={
+                **{k: v for k, v in fill_meta.items()
+                   if k not in ("execution_action_key", "submit_attempt_id")},
+                "cumulative_filled_qty": actual_sell_qty,
+                "source_entry_contract_sha256": signed["sha256"],
+            },
+        )
+        assert replay["status"] == "OK", replay
+        with engine.connect() as conn:
+            assert conn.execute(text("""
+                SELECT count(*) FROM us_fills WHERE order_no='CI-SELL-EIGHT'
+            """)).scalar_one() == original_count
+
+
+def test_pg_authoritative_balance_survives_optional_lineage_query_exception(
+    amgn_pg_engine, monkeypatch, caplog,
+):
+    """A failed optional original-scope SELECT must not poison broker balance.
+
+    This disposable real PostgreSQL database deliberately lacks the risk-state
+    table: verified carried lifecycle cannot be proven. The real repo must
+    preserve actual KIS-shaped qty but must NOT invent account/cycle authority.
+    """
+    import json
+    import hashlib
+    from sqlalchemy import text
+    from trader.us.db import repos
+    from trader.us.entry_exit_contract import build_us_entry_exit_contract
+
+    engine = amgn_pg_engine
+    epoch = "ci-savepoint-balance-epoch"
+    raw_account = "practice:ci-savepoint-account"
+    account_hash = hashlib.sha256(raw_account.encode()).hexdigest()
+    frozen = build_us_entry_exit_contract({
+        "symbol": "AMGN", "strategy_owner": "US_STANDARD",
+        "position_action": "NEW_POSITION_BUY",
+        "entry_style_selected": "ENTRY_PULLBACK",
+        "book": "SWING_BOOK", "horizon": "SWING_CARRY",
+    })
+    cycle = "ci-savepoint-source-cycle"
+    portfolio = "ci-savepoint-portfolio"
+    prior_meta = {
+        "env": "practice", "strategy_owner": "US_STANDARD",
+        "broker_account_hash": account_hash,
+        "trading_epoch_id": epoch, "portfolio_epoch_id": portfolio,
+        "position_cycle_id": cycle, "position_lifecycle_id": cycle,
+        "entry_exit_contract": frozen,
+        "entry_exit_contract_sha256": frozen["sha256"],
+        "entry_exit_contract_version": frozen["version"],
+        "lineage_resolution": "EXACT_ORIGINAL_KIS_CUMULATIVE_FULL_BUY",
+        "book": "SWING_BOOK", "horizon": "SWING_CARRY",
+        "exit_policy": "US_SWING_DEFAULT",
+    }
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda _conn=None, **_k: epoch)
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE trading_epochs(
+                trading_epoch_id TEXT PRIMARY KEY, env TEXT NOT NULL,
+                account_id TEXT NOT NULL, status TEXT NOT NULL
+            )
+        """))
+        conn.execute(text("""
+            INSERT INTO trading_epochs(trading_epoch_id,env,account_id,status)
+            VALUES (:epoch,'practice',:account,'ACTIVE')
+        """), {"epoch": epoch, "account": raw_account})
+        conn.execute(text("""
+            INSERT INTO us_positions(
+                as_of,symbol,exchange,qty,avg_cost,trading_epoch_id,
+                account_id,portfolio_epoch_id,position_cycle_id,meta
+            ) VALUES (
+                '2026-11-10','AMGN','NASDAQ',4,10,:epoch,
+                :account,:portfolio,:cycle,CAST(:meta AS jsonb)
+            )
+        """), {
+            "epoch": epoch, "account": account_hash, "portfolio": portfolio,
+            "cycle": cycle, "meta": json.dumps(prior_meta),
+        })
+        assert conn.execute(text(
+            "SELECT to_regclass('us_position_risk_state')"
+        )).scalar_one() is None
+
+    # The missing lifecycle table causes a SELECT ProgrammingError inside
+    # verified_carried_us_snapshot_identity. That read must roll back ONLY its
+    # SAVEPOINT and must not lose the raw next-day broker quantity.
+    saved = repos.save_position_snapshot(
+        [{"symbol": "AMGN", "exchange": "NASDAQ", "qty": 4,
+          "avg_cost": 10.0, "current_px": 8.0,
+          "balance_source": "kis_balance_authoritative", "meta": {}}],
+        trade_date="2026-11-11",
+        balance_fetch_status="OK", balance_parse_status="OK",
+        authoritative_positions=True, preserve_previous_positions=False,
+    )
+    assert saved == 1
+    assert any(
+        "[US_POSITIONS][ORIGINAL_SCOPE][UNAVAILABLE]" in rec.message
+        and "error=ProgrammingError" in rec.message
+        and "action=SAVE_UNVERIFIED_BALANCE_ONLY" in rec.message
+        for rec in caplog.records
+    ), "The savepoint failure branch was NOT exercised"
+    with engine.connect() as conn:
+        latest = conn.execute(text("""
+            SELECT qty,account_id,portfolio_epoch_id,position_cycle_id,meta
+            FROM us_positions
+            WHERE as_of='2026-11-11' AND symbol='AMGN'
+              AND trading_epoch_id=:epoch
+        """), {"epoch": epoch}).mappings().one()
+    assert latest["qty"] == 4
+    assert (latest["account_id"],latest["portfolio_epoch_id"],
+            latest["position_cycle_id"]) == (None,None,None)
+    assert latest["meta"].get("lineage_identity_status") not in {
+        "VERIFIED_CURRENT_EPOCH_CONTINUITY", "VERIFIED_ORIGINAL_KIS_BUY",
+    }

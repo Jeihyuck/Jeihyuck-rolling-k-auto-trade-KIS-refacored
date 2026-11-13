@@ -46,7 +46,13 @@ _POLICY_ENTRY_BLOCK_REASONS = {
     "allow_new_buy_false", "final30_empty", "final30_below_absolute_min",
     "final30_underfilled_regime_block", "score_contract_failed", "validation_failed",
     "volume_missing_provider_entry_block",
+    "opening_30min_buy_block",
 }
+
+
+def is_policy_entry_block_reason(reason: str | None) -> bool:
+    """Explicit, documented BUY-only restriction; never an execution fault."""
+    return str(reason or "").strip().lower() in _POLICY_ENTRY_BLOCK_REASONS
 
 
 _ORDER_PERMISSION_SELL_BLOCK_REASONS = frozenset({
@@ -96,10 +102,13 @@ def classify_runtime_integrity(tick_result: dict | None) -> str:
         or tick_result.get("trade_block_reason")
         or ""
     ).strip().lower()
-    if not bool(tick_result.get("entry_can_proceed", True)) and block_reason in _POLICY_ENTRY_BLOCK_REASONS:
-        return "POLICY_ENTRY_BLOCKED"
+    # A known entry policy never masks an independent failed protective SELL.
+    # Distinguish actual liveness from an intentional BUY denial. An explicit
+    # runtime failure takes precedence even if the trade was also policy-blocked.
     if tick_result.get("exit_route_liveness_failure") or tick_result.get("entry_degraded"):
         return "LIVENESS_DEGRADED"
+    if not bool(tick_result.get("entry_can_proceed", True)) and block_reason in _POLICY_ENTRY_BLOCK_REASONS:
+        return "POLICY_ENTRY_BLOCKED"
     return "OK"
 
 

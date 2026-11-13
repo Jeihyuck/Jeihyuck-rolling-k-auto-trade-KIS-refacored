@@ -448,7 +448,30 @@ def _enrich_single_position(
     """
     symbol = _normalize_symbol(pos.get("symbol", ""))
     exchange = str(pos.get("exchange") or "NASDAQ").strip() or "NASDAQ"
-    qty = _safe_int(pos.get("qty"))
+    raw_qty = pos.get("qty")
+    qty = _safe_int(raw_qty)
+    # Validate BEFORE the qty<=0 fast return. Otherwise a corrupt broker
+    # holding such as "corrupt" becomes zero, disappears from the exit set,
+    # and the outer per-symbol isolation never sees the evidence gap.
+    if (
+        isinstance(raw_qty, bool)
+        or (
+            raw_qty is not None
+            and str(raw_qty).strip()
+            and str(raw_qty).strip() != str(qty)
+        )
+    ):
+        logger.error(
+            "[US_EXIT_RESOLVER][SYMBOL_ISOLATED][INVALID_QTY] symbol=%s raw_qty=%r",
+            symbol, raw_qty,
+        )
+        return {
+            **pos, "symbol": symbol, "exchange": exchange,
+            "pnl_input_ok": False,
+            "entry_price_source": "invalid_position_qty",
+            "exit_resolution_failed": True,
+            "exit_resolution_failure_reason": "INVALID_POSITION_QTY",
+        }
     identity = _position_identity(pos, env=env)
     # Identity authority depends on account/env/trading epoch, not the
     # individual symbol or position lifecycle. Only cache this immutable
@@ -702,17 +725,54 @@ def enrich_us_positions_for_exit(
     ok_count = 0
 
     for pos in positions:
-        ep = _enrich_single_position(
-            pos, trade_date=trade_date, env=env,
-            scoped_identity_cache=scoped_identity_cache,
-            preloaded_risk_candidates=(
-                risk_candidates_by_symbol.get(_normalize_symbol(pos.get("symbol")))
-                if risk_candidates_by_symbol is not None else None
-            ),
-        )
-        qty = ep.get("qty", 0)
+        try:
+            ep = _enrich_single_position(
+                pos, trade_date=trade_date, env=env,
+                scoped_identity_cache=scoped_identity_cache,
+                preloaded_risk_candidates=(
+                    risk_candidates_by_symbol.get(_normalize_symbol(pos.get("symbol")))
+                    if risk_candidates_by_symbol is not None else None
+                ),
+            )
+        except Exception as exc:
+            # A corrupt original BUY/cycle for one symbol is NOT an account-wide
+            # exit failure. Retain its real balance and original metadata for
+            # diagnosis, but explicitly fence only this symbol's exit decision.
+            # Never invent a contract, cycle, entry price, or a zero balance.
+            symbol = _normalize_symbol(pos.get("symbol"))
+            logger.exception(
+                "[US_EXIT_RESOLVER][SYMBOL_ISOLATED][ERROR] symbol=%s reason=%s",
+                symbol, type(exc).__name__,
+            )
+            ep = dict(pos)
+            ep["pnl_input_ok"] = False
+            ep["entry_price_source"] = "resolver_exception"
+            ep["exit_resolution_failed"] = True
+            ep["exit_resolution_failure_reason"] = type(exc).__name__
+        # A corrupt quantity must not crash resolution for every other symbol.
+        # Keep a positive broker holding visible to incident reporting, but do
+        # NOT convert ambiguous qty into executable shares or an exit intent.
+        raw_qty = ep.get("qty", 0)
+        qty = _safe_int(raw_qty)
+        if isinstance(raw_qty, bool) or (
+            raw_qty is not None
+            and str(raw_qty).strip()
+            and str(raw_qty).strip() != str(qty)
+            and not (isinstance(raw_qty, int) and not isinstance(raw_qty, bool))
+        ):
+            logger.error(
+                "[US_EXIT_RESOLVER][SYMBOL_ISOLATED][INVALID_QTY] symbol=%s raw_qty=%r",
+                _normalize_symbol(ep.get("symbol")), raw_qty,
+            )
+            ep["pnl_input_ok"] = False
+            ep["exit_resolution_failed"] = True
+            ep["exit_resolution_failure_reason"] = "INVALID_POSITION_QTY"
+            ep["entry_price_source"] = "invalid_position_qty"
+            # Broker-reported holding_qty is diagnostic evidence only; the
+            # invalid executable qty is deliberately not repaired here.
+            qty = max(qty, _safe_int(ep.get("holding_qty")))
 
-        # qty <= 0 제외
+        # Strictly empty positions are not exit candidates.
         if qty <= 0:
             continue
 

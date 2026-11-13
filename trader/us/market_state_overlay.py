@@ -1005,7 +1005,7 @@ def resolve_profit_capture_stage_quantity(
     return min(runner_capacity, stage_qty)
 
 
-def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_sell_symbols: set[str] | None = None, now=None, trade_date: str | None = None, profit_capture_state: dict[str, dict] | None = None) -> list[dict]:
+def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_sell_symbols: set[str] | None = None, now=None, trade_date: str | None = None, profit_capture_state: dict[str, dict] | None = None, *, defer_pending_until_claim: bool = False) -> list[dict]:
     from decimal import Decimal
     from trader.us.profit_capture import authoritative_broker_avg, as_decimal, calc_return_rate
     from trader.us.strategy_ownership import exclude_non_standard
@@ -1202,7 +1202,8 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
                     pre_http_abort = (
                         last_status == "FAILED"
                         and last_evidence == "BROKER_SUBMIT_ABORTED_PRE_IO"
-                        and not state.get(f"{stage}_broker_order_no")
+                        and (not state.get(f"{stage}_broker_order_no")
+                             or stage_filled_qty > 0)
                     )
                     broker_terminal = (
                         last_status in {"CANCELLED", "CANCELED", "REJECTED", "EXPIRED"}
@@ -1216,14 +1217,62 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
                     if prior_order_keys and not (
                         last_stage == stage and (pre_http_abort or broker_terminal)
                     ):
+                        # No time-based auto-unfence or synthetic KIS terminal.
+                        # Surface the *exact* stage ledger evidence so AM/Close
+                        # read-only reconciliation can distinguish prior
+                        # intent-only attempts from possible broker submissions.
+                        # This is diagnostic only: unrelated symbol SELLs proceed.
                         logger.warning(
                             "[US_PROFIT_CAPTURE][RETRY_FENCED] symbol=%s stage=%s "
-                            "prior_attempts=%d reason=NO_PROVEN_PRE_HTTP_ABORT",
-                            sym, stage, len(prior_order_keys),
+                            "owner=US_STANDARD lifecycle=%s attempts=%d "
+                            "last_key=%s stage_key=%s broker_order_no=%s "
+                            "last_stage=%s last_status=%s last_evidence=%s "
+                            "reason=NO_PROVEN_PRE_HTTP_ABORT "
+                            "action=RECONCILE_REQUIRED scope=THIS_TP_STAGE "
+                            "next=VERIFY_ORIGINAL_KIS_AND_DURABLE_ATTEMPT_AT_AM_CLOSE",
+                            sym, stage, lifecycle, len(prior_order_keys),
+                            prior_order_keys[-1], durable_stage_key or "NONE",
+                            durable_broker_no or "NONE",
+                            last_stage or "NONE", last_status or "NONE",
+                            last_evidence or "NONE",
                         )
                         break
                     order_key = base_order_key if not prior_order_keys else f"{base_order_key}_R{len(prior_order_keys) + 1}"
-                    pending_intent = ({"symbol": sym, "side": "SELL", "qty": qty, "quantity": qty, "limit_price": price, "notional_usd": qty * price, "reason": reason, "client_order_key": order_key, "position_lifecycle_id": lifecycle, **({"partial_exit_allowed": contract_partial_exit_allowed} if contract_sha is not None else {}), "meta": {"reason": reason, "profit_capture_stage": stage, "position_lifecycle_id": lifecycle, "broker_avg_price": str(broker_avg), **avg_provenance, "return_rate_at_decision": str(return_rate), "tp_threshold_fraction": str(threshold), "profit_capture_sell_fraction": str(sell_pct), "profit_capture_runner_min_remain_pct": str(local_runner_min), "profit_capture_stage_target_qty": stage_target_qty, "profit_capture_stage_filled_qty": stage_filled_qty, "profit_capture_decision_holding_qty": q, "runner_remaining_pct": (q - qty) / q, "market_state": overlay.get("market_state"), "last_profit_capture_at": (now or datetime.now(timezone.utc)).isoformat(), "source_entry_contract_sha256": contract_sha, "source_entry_contract_version": entry_contract.get("version") if contract_sha else None, "exit_rule_source": ("ENTRY_EXIT_CONTRACT_V3" if entry_contract.get("version") == "us_entry_exit_contract_v3" else "ENTRY_EXIT_CONTRACT_V2") if contract_sha else "LEGACY_GLOBAL_TP", "partial_exit_scope": "PROFIT_CAPTURE_STAGE" if contract_sha else "LEGACY_GLOBAL_TP", **({"partial_exit_allowed": contract_partial_exit_allowed} if contract_partial_exit_allowed is not None else {})}})
+                    # A native intent-only rejection has no TP stage to
+                    # reserve its order key. Reusing that key on the next
+                    # evaluation would collide with the old immutable
+                    # us_order_intents row and stale submit_attempt_id.
+                    # Bind a fresh key to this one decision/attempt instead.
+                    # The semantic Claim and later TP row still serialize
+                    # all requests for the SAME economic TP stage; this is
+                    # not a second authorization to POST an unresolved SELL.
+                    native_tp_attempt_id = None
+                    if defer_pending_until_claim and not p.get("legacy_nine_decision_only_provisional"):
+                        from uuid import uuid4
+                        native_tp_attempt_id = str(uuid4())
+                        order_key = f"{order_key}_A{native_tp_attempt_id.replace('-', '')[:16]}"
+                    pending_intent = ({"symbol": sym, "side": "SELL", "strategy_owner": "US_STANDARD", "qty": qty, "quantity": qty, "limit_price": price, "notional_usd": qty * price, "reason": reason, "client_order_key": order_key, "position_lifecycle_id": lifecycle, **({"partial_exit_allowed": contract_partial_exit_allowed} if contract_sha is not None else {}), "meta": {"reason": reason, "profit_capture_stage": stage, "position_lifecycle_id": lifecycle, "broker_avg_price": str(broker_avg), **avg_provenance, "return_rate_at_decision": str(return_rate), "tp_threshold_fraction": str(threshold), "profit_capture_sell_fraction": str(sell_pct), "profit_capture_runner_min_remain_pct": str(local_runner_min), "profit_capture_stage_target_qty": stage_target_qty, "profit_capture_stage_filled_qty": stage_filled_qty, "profit_capture_decision_holding_qty": q, "runner_remaining_pct": (q - qty) / q, "market_state": overlay.get("market_state"), "last_profit_capture_at": (now or datetime.now(timezone.utc)).isoformat(), "source_entry_contract_sha256": contract_sha, "source_entry_contract_version": entry_contract.get("version") if contract_sha else None, "exit_rule_source": ("ENTRY_EXIT_CONTRACT_V3" if entry_contract.get("version") == "us_entry_exit_contract_v3" else "ENTRY_EXIT_CONTRACT_V2") if contract_sha else "LEGACY_GLOBAL_TP", "partial_exit_scope": "PROFIT_CAPTURE_STAGE" if contract_sha else "LEGACY_GLOBAL_TP", **({"partial_exit_allowed": contract_partial_exit_allowed} if contract_partial_exit_allowed is not None else {})}})
+                    # Preserve the already-resolved original BUY scope through
+                    # the TP intent and durable order. Never pick one side of
+                    # a conflicting top-level/metadata identity.
+                    position_meta = p.get("meta") if isinstance(p.get("meta"), dict) else {}
+                    identity_conflict = False
+                    for scope_field in ("broker_account_hash", "trading_epoch_id",
+                                        "portfolio_epoch_id", "position_cycle_id"):
+                        direct, nested = p.get(scope_field), position_meta.get(scope_field)
+                        if direct not in (None, "") and nested not in (None, "") and str(direct) != str(nested):
+                            identity_conflict = True
+                            break
+                        value = direct if direct not in (None, "") else nested
+                        if value not in (None, ""):
+                            pending_intent[scope_field] = value
+                            pending_intent["meta"][scope_field] = value
+                    if identity_conflict:
+                        logger.error("[US_PROFIT_CAPTURE][SCOPE_CONFLICT] symbol=%s stage=%s", sym, stage)
+                        break
+                    if native_tp_attempt_id:
+                        pending_intent["submit_attempt_id"] = native_tp_attempt_id
+                        pending_intent["meta"]["submit_attempt_id"] = native_tp_attempt_id
                     if trade_date:
                         if p.get("legacy_nine_decision_only_provisional") is True:
                             # Original nine V2 positions were stripped of
@@ -1236,6 +1285,14 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
                             pending_intent.setdefault("meta", {})[
                                 "legacy_nine_tp_pending_deferred"
                             ] = True
+                        elif defer_pending_until_claim:
+                            # Native US_STANDARD execution: decision is NOT a
+                            # submission. Only the one acquired Claim may
+                            # reserve this stage, immediately before broker
+                            # submission. Pre-Claim rejection cannot strand
+                            # a phantom PENDING TP. Legacy V2 KIS-proof-only
+                            # reservations retain their separate path.
+                            pending_intent["meta"]["tp_pending_deferred_to_claim"] = True
                         else:
                             try:
                                 from trader.us.db.repos import mark_us_profit_capture_stage

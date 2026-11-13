@@ -832,6 +832,17 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
             broker_authoritative = True
             logger.debug("[TQQQ_INF][TEST_DOUBLE] treating injected positions as authoritative baseline")
 
+        # A database-only or stale balance row cannot prove that a newly
+        # reserved READY cycle owns a real KIS holding.  Do not activate or
+        # place another BUY using an unverified broker quantity; the next
+        # authoritative KIS snapshot can complete the native fill transition.
+        if not broker_authoritative and broker.qty > 0:
+            current = repository.load_state(symbol=config.symbol)
+            if current is not None and current.status == Status.READY:
+                logger.error("[TQQQ_INF][READY][BALANCE_UNVERIFIED] action=BLOCK_ONLY_TQQQ")
+                return {"status": "BLOCK", "reason": "TQQQ_READY_BROKER_BALANCE_NOT_AUTHORITATIVE",
+                        "orders": []}
+
         if cancel_order is not None and query_order is not None:
             try:
                 ttl_result = reconcile_tqqq_open_buy_ttl(
@@ -863,7 +874,12 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                                broker.qty, broker.orderable_qty, broker.average_price, state.cycle_id)
             else:
                 state = InfiniteState(symbol=config.symbol)
-        elif broker.qty > 0 and (not state.cycle_id or state.total_filled_notional <= 0):
+        elif broker.qty > 0 and (not state.cycle_id or state.total_filled_notional <= 0) and not (
+            state.status == Status.READY and state.cycle_id
+        ):
+            # READY with a reserved current cycle is NOT broker-proven ACTIVE.
+            # Only reconcile_metadata's cycle-bound native fill + matching
+            # broker balance may activate it; fallback cost is not a fill.
             recovered = recover_state_from_broker(
                 config=config, broker=broker, trading_date=trading_date,
                 cycle_id=state.cycle_id or (

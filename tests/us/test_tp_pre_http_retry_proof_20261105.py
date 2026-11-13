@@ -43,6 +43,24 @@ def test_first_tp_with_persisted_stage_routes_once():
     mark.assert_called_once()
 
 
+def test_tp_intent_preserves_original_position_scope():
+    scope = {"broker_account_hash": "acct", "trading_epoch_id": "epoch",
+             "portfolio_epoch_id": "portfolio", "position_cycle_id": "cycle"}
+    with patch.dict(POSITION, scope):
+        out, _ = _evaluate({})
+    assert len(out) == 1
+    for field, value in scope.items():
+        assert out[0][field] == value
+        assert out[0]["meta"][field] == value
+
+
+def test_tp_intent_rejects_conflicting_original_position_scope():
+    with patch.dict(POSITION, {"portfolio_epoch_id": "one", "meta": {"portfolio_epoch_id": "two"}}):
+        out, mark = _evaluate({})
+    assert out == []
+    mark.assert_not_called()
+
+
 def test_db_stage_write_failure_does_not_route_broker_intent():
     out, mark = _evaluate({}, persist_side_effect=RuntimeError("db down"))
     assert out == []
@@ -61,6 +79,24 @@ def test_old_unknown_attempt_does_not_create_new_r_key():
     out, mark = _evaluate(state)
     assert out == []
     mark.assert_not_called()
+
+
+def test_unverified_tp_stage_does_not_suppress_other_symbol():
+    positions = [
+        {**POSITION, "symbol": "KO", "position_lifecycle_id": "ko-cycle"},
+        dict(POSITION),
+    ]
+    states = {"KO": {"tp1_pending": True}, "HCA": {}}
+    from decimal import Decimal
+    with patch("trader.us.profit_capture.authoritative_broker_avg",
+               return_value=(Decimal("100"), {"broker_avg_price_source": "kis_pchs_avg_pric"})):
+        with patch("trader.us.db.repos.mark_us_profit_capture_stage"):
+            out = build_profit_capture_intents(
+                positions, {"profit_capture_enabled": True}, now=NOW, trade_date=DATE,
+                profit_capture_state=states, defer_pending_until_claim=True,
+            )
+    assert [intent["symbol"] for intent in out] == ["HCA"]
+    assert out[0]["meta"]["tp_pending_deferred_to_claim"] is True
 
 
 def test_proven_pre_http_abort_can_create_new_attempt():
@@ -94,6 +130,20 @@ def test_broker_confirmed_cancelled_partial_allows_only_remainder():
     assert out[0]["qty"] == 3
     assert out[0]["client_order_key"].endswith("_R2")
     mark.assert_called_once()
+
+
+def test_proven_abort_after_partial_keeps_original_remainder():
+    state = {
+        "tp1_broker_order_no": "original-cancelled-order",
+        "meta": {
+            "tp1_order_keys": ["original", "aborted"],
+            "tp1_qty": 5, "tp1_filled_qty": 2,
+            "last_stage": "tp1", "last_status": "FAILED",
+            "last_evidence_type": "BROKER_SUBMIT_ABORTED_PRE_IO",
+        },
+    }
+    out, _ = _evaluate(state)
+    assert len(out) == 1 and out[0]["qty"] == 3
 
 
 def test_unverified_cancelled_never_retries():
@@ -423,3 +473,81 @@ def test_non_tp_protective_sell_has_no_new_pre_http_age_gate():
         assert _tp_decision_fresh_for_native_http(
             stage_intent, now_utc=NOW,
         ) == (True, "NOT_NATIVE_PROFIT_CAPTURE_TP")
+
+
+def test_ko_kr_tp2_missing_pre_http_proof_is_stage_scoped_and_never_resubmits(caplog):
+    """2026-11-12 incident: preserve the live no-duplicate SELL safety gate.
+
+    KO/KR ledger contains a durable attempt key but no broker-send/abort
+    certification. A DB-only absence of orders or an old failure string is
+    never authorization to submit a second SELL.
+    """
+    import logging
+    from decimal import Decimal
+    for symbol, prior_status in (
+        ("KO", "US_RECOVERY_SCOPE_UNVERIFIED"),
+        ("KR", "ORDER_DISABLED_DURABLE_LEDGER_UNAVAILABLE"),
+    ):
+        position = {
+            **POSITION, "symbol": symbol,
+            "position_lifecycle_id": f"original-cycle-{symbol}",
+        }
+        key = f"US_PC_2026-11-04_{symbol}_original-cycle-{symbol}_TAKE_PROFIT_TP2"
+        state = {
+            "tp1_done": True,
+            "meta": {
+                "tp1_done": True,
+                "tp2_order_keys": [key],
+                "tp2_qty": 5,
+                "tp2_filled_qty": 0,
+                "last_stage": "tp2",
+                "last_status": prior_status,
+                "last_evidence_type": None,
+            },
+        }
+        caplog.clear()
+        with patch(
+            "trader.us.profit_capture.authoritative_broker_avg",
+            return_value=(Decimal("100"), {"broker_avg_price_source": "kis_pchs_avg_pric"}),
+        ), patch("trader.us.db.repos.mark_us_profit_capture_stage") as mark:
+            with caplog.at_level(logging.WARNING):
+                decisions = build_profit_capture_intents(
+                    [position], {"profit_capture_enabled": True},
+                    now=NOW, trade_date=DATE,
+                    profit_capture_state={symbol: state},
+                )
+        assert decisions == [], symbol
+        mark.assert_not_called()
+        fence = [rec.message for rec in caplog.records
+                 if "[US_PROFIT_CAPTURE][RETRY_FENCED]" in rec.message]
+        assert len(fence) == 1, symbol
+        assert f"symbol={symbol}" in fence[0]
+        assert "stage=tp2" in fence[0]
+        assert f"last_key={key}" in fence[0]
+        assert f"last_status={prior_status}" in fence[0]
+        assert "action=RECONCILE_REQUIRED scope=THIS_TP_STAGE" in fence[0]
+
+
+def test_proven_pre_http_abort_remains_only_safe_tp_retry_evidence():
+    """No blanket release of an attempt merely because a stage is marked failed."""
+    for stg in ("tp1", "tp2", "tp3"):
+        stem = {"tp1_done": stg != "tp1", "tp2_done": stg == "tp3"}
+        state = {**stem, "meta": {
+            f"{stg}_order_keys": ["durable-first-attempt"],
+            "last_stage": stg, "last_status": "FAILED",
+            "last_evidence_type": "BROKER_SUBMIT_ABORTED_PRE_IO",
+        }}
+        # A claimed pre-HTTP abort coupled with a real broker order number
+        # must still be fenced: broker evidence dominates stale status.
+        state[f"{stg}_broker_order_no"] = "0000043554"
+        with patch(
+            "trader.us.profit_capture.authoritative_broker_avg",
+            return_value=(__import__("decimal").Decimal("100"),
+                          {"broker_avg_price_source": "kis_pchs_avg_pric"}),
+        ), patch("trader.us.db.repos.mark_us_profit_capture_stage") as mark:
+            decisions = build_profit_capture_intents(
+                [dict(POSITION)], {"profit_capture_enabled": True},
+                now=NOW, trade_date=DATE, profit_capture_state={"HCA": state},
+            )
+        assert decisions == []
+        mark.assert_not_called()

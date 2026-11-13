@@ -1234,14 +1234,23 @@ def generate_entry_intents(
                             "max_entry_price": _price_opportunity.get("max_entry_price"),
                             "reference_rr": _price_opportunity.get("risk_reward_reference"),
                             "verified_bars": len(_observed_bars),
+                            "observed_at_et": _op_now.isoformat(),
+                            "last_completed_bar_et": (_price_opportunity.get("facts") or {}).get("last_completed_bar"),
+                            "last_completed_bar_age_sec": (_price_opportunity.get("facts") or {}).get("last_completed_bar_age_sec"),
+                            "opening_coverage": (_price_opportunity.get("facts") or {}).get("opening"),
                         })
                     logger.info(
                         "[US_ENTRY][PRICE_OPPORTUNITY] symbol=%s style=%s "
-                        "mode=%s state=%s reason=%s bar_count=%d max_entry=%s rr=%s",
+                        "mode=%s state=%s reason=%s bar_count=%d max_entry=%s rr=%s "
+                        "observed_at_et=%s last_completed_bar_et=%s bar_age_sec=%s opening_bars=%s",
                         symbol, _family, _opportunity_mode,
                         _price_opportunity["state"], _price_opportunity["reason"],
                         len(_observed_bars), _price_opportunity.get("max_entry_price"),
                         _price_opportunity.get("risk_reward_reference"),
+                        _op_now.isoformat(),
+                        (_price_opportunity.get("facts") or {}).get("last_completed_bar"),
+                        (_price_opportunity.get("facts") or {}).get("last_completed_bar_age_sec"),
+                        ((_price_opportunity.get("facts") or {}).get("opening") or {}).get("observed_1m"),
                     )
                     if _opportunity_mode == "ENFORCE" and _price_opportunity["state"] != "READY":
                         track_skip(symbol, "ENTRY_TIMING_WAIT", {

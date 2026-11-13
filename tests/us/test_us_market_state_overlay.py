@@ -468,3 +468,38 @@ def test_daily_crash_rebound_missing_or_hard_down_fails_closed():
     blocked = eval_state(provider=p)
     assert blocked["market_state"] == "DEFENSE_CRASH_CONFIRMED"
     assert blocked["intraday_rebound"]["hard_down"] is True
+
+
+def test_native_tp_decision_defers_pending_until_claim(monkeypatch):
+    """A risk-gate rejection before Claim must not create phantom TP PENDING."""
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
+    repos._MEM_PROFIT_CAPTURE_STATE.clear()
+    td = "2026-11-13"
+    overlay = {"market_state": "STRONG_RISK_ON", "profit_capture_enabled": True}
+    pos = authoritative_position("TESTTP", 103)
+    decisions = build_profit_capture_intents(
+        [pos], overlay, trade_date=td, defer_pending_until_claim=True,
+    )
+    assert len(decisions) == 1
+    assert decisions[0]["meta"]["tp_pending_deferred_to_claim"] is True
+    assert decisions[0]["reason"] == "TAKE_PROFIT_TP1"
+    state = repos.load_us_profit_capture_state(
+        td, ["TESTTP"], {"TESTTP": "life-TESTTP"},
+    ).get("TESTTP", {})
+    assert not state.get("tp1_pending")
+    assert not state.get("tp1_done")
+    # A rejected decision does not consume a TP stage; a new tick may
+    # re-evaluate it using fresh broker quantity, price and risk guards.
+    next_tick = build_profit_capture_intents(
+        [pos], overlay, trade_date=td, defer_pending_until_claim=True,
+    )
+    assert len(next_tick) == 1
+    assert decisions[0]["strategy_owner"] == "US_STANDARD"
+    assert next_tick[0]["client_order_key"] != decisions[0]["client_order_key"]
+    assert next_tick[0]["submit_attempt_id"] != decisions[0]["submit_attempt_id"]
+    assert next_tick[0]["meta"]["submit_attempt_id"] == next_tick[0]["submit_attempt_id"]
+    assert "_A" in next_tick[0]["client_order_key"]
+    assert not repos.load_us_profit_capture_state(
+        td, ["TESTTP"], {"TESTTP": "life-TESTTP"},
+    ).get("TESTTP", {}).get("tp1_pending")
+    repos._MEM_PROFIT_CAPTURE_STATE.clear()

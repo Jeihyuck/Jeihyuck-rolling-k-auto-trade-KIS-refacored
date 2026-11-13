@@ -1408,9 +1408,15 @@ def persist_profit_capture_ack_from_route(intent: dict, result: dict, trade_date
         or ack.get("ODNO") or ack.get("odno") or None
     )
     from trader.us.db.repos import mark_us_profit_capture_stage
+    from trader.us.profit_capture import tp_stage_lifecycle_from_order_proof
+    # Forward-managed SELL execution claims may have a distinct runtime ID;
+    # the TP ledger belongs to the original, signed BUY lifecycle.
+    ledger_lifecycle = tp_stage_lifecycle_from_order_proof(
+        lifecycle, intent.get("meta"), client_order_key=order_key,
+    )
     mark_us_profit_capture_stage(
         trade_date, str(intent.get("symbol") or ""), stage,
-        order_key=order_key, position_lifecycle_id=lifecycle,
+        order_key=order_key, position_lifecycle_id=ledger_lifecycle,
         broker_order_no=broker_order_no,
         qty=int(intent.get("qty") or intent.get("quantity") or 0),
         notional_usd=float(intent.get("notional_usd") or 0.0),
@@ -1446,11 +1452,15 @@ def release_proven_tp_pre_submit_block(
         return False
     try:
         from trader.us.db.repos import release_us_profit_capture_pre_http_abort
+        from trader.us.profit_capture import tp_stage_lifecycle_from_order_proof
+        ledger_lifecycle = tp_stage_lifecycle_from_order_proof(
+            lifecycle, meta, client_order_key=key,
+        )
         released = release_us_profit_capture_pre_http_abort(
             trade_date=str(trade_date),
             symbol=str(intent.get("symbol") or ""),
             stage=stage,
-            position_lifecycle_id=lifecycle,
+            position_lifecycle_id=ledger_lifecycle,
             client_order_key=key,
         )
     except Exception as exc:
@@ -1647,7 +1657,34 @@ def route_exit_orders_immediately(
             status = str(result.get("status") or "ERROR")
             meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
             stage = str(meta.get("profit_capture_stage") or "")
-            if stage:
+            _routed_meta = ((result.get("intent") or {}).get("meta") or {}) if isinstance(result.get("intent"), dict) else {}
+            _deferred_without_stage = bool(
+                stage and meta.get("tp_pending_deferred_to_claim") is True
+                and not (_routed_meta.get("tp_claim_stage_reserved") or meta.get("tp_claim_stage_reserved"))
+                and not result.get("broker_submit")
+                and str(result.get("status") or "").upper() not in {
+                    "ACK", "BROKER_SUBMIT_RESULT_UNKNOWN", "ACK_DB_FAILED",
+                    "ACK_DB_FAILED_RECONCILE_REQUIRED",
+                }
+            )
+            if _deferred_without_stage:
+                # No PENDING was created at the strategy decision; a rejection
+                # before Claim must NOT manufacture one during result sync.
+                logger.info(
+                    "[US_PROFIT_CAPTURE][INTENT_ONLY_BLOCK] symbol=%s stage=%s "
+                    "result=%s action=NO_TP_RESERVATION",
+                    intent.get("symbol"), stage, result.get("status"),
+                )
+            if stage and result.get("tp_stage_released_pre_io") is True:
+                # The repository already wrote an exact aborted-before-HTTP
+                # certificate with row/claim locks. A second generic FAILED
+                # sync would erase that evidence and re-fence the next TP.
+                logger.info(
+                    "[US_PROFIT_CAPTURE][PROVEN_PRE_IO_RELEASE_PRESERVED] "
+                    "symbol=%s stage=%s action=REEVALUATE_NEXT_TICK",
+                    intent.get("symbol"), stage,
+                )
+            if stage and not _deferred_without_stage and result.get("tp_stage_released_pre_io") is not True:
                 from trader.us.profit_capture import sync_profit_capture_stage_from_order
                 # A generic BLOCKED is not proof that this stage has no
                 # broker-open attempt. Only a positively verified pre-submit
@@ -1676,6 +1713,7 @@ def route_exit_orders_immediately(
                         broker_order_no=result.get("order_no"), profit_capture_stage=stage,
                         order_status=mapped_status, evidence_type=None, filled_qty=0,
                         requested_qty=int(intent.get("qty") or 0),
+                        order_meta=meta,
                     )
             action = "ROUTED" if status in {"ACK", "DRY_RUN", "SIGNAL_ONLY"} else ("DEDUP" if "DUPLICATE" in status else "BLOCKED" if "BLOCK" in status else "SKIPPED")
             decision = {"symbol": str(intent.get("symbol") or "").upper(), "side": "SELL", "qty": int(intent.get("qty") or intent.get("quantity") or 0),
@@ -1689,6 +1727,14 @@ def route_exit_orders_immediately(
             logger.warning("[US_EXIT][ROUTE_IMMEDIATE][WARN] intent=%s error=%s", intent.get("symbol"), exc)
             meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
             stage = str(meta.get("profit_capture_stage") or "")
+            if stage and meta.get("tp_pending_deferred_to_claim") is True and not meta.get("tp_claim_stage_reserved"):
+                # A local Python exception before an acquired Claim cannot
+                # turn an unreserved intent into a PENDING historical order.
+                logger.warning(
+                    "[US_PROFIT_CAPTURE][INTENT_ONLY_EXCEPTION] symbol=%s stage=%s "
+                    "action=NO_TP_STATE_WRITE", intent.get("symbol"), stage,
+                )
+                stage = ""
             if stage:
                 # A proven pre-HTTP abort can release a TP reservation, while
                 # unknown/ACK evidence requires a fence. A STARTED event alone
@@ -1722,6 +1768,7 @@ def route_exit_orders_immediately(
                     evidence_type=None,
                     filled_qty=0,
                     requested_qty=int(intent.get("qty") or 0),
+                    order_meta=meta,
                 )
             orders.append({"status": "ERROR", "error": str(exc), "intent": intent})
     sent, ack, rejected, blocked = _routed_order_truth_counts(orders)
@@ -1838,6 +1885,10 @@ def run_trade_tick(
         now = datetime.fromisoformat(force_now).astimezone(NY_TZ)
     else:
         now = now_ny()
+    # Preserve the upstream session/PREP permission BEFORE the opening policy
+    # overwrites it. A simultaneous denied runtime gate must never be mislabeled
+    # as the normal 09:30-10:00 ET BUY opening restriction.
+    entry_permission_before_opening = bool(entry_can_proceed)
     opening_buy_blocked, opening_buy_start_et = _is_us_opening_buy_blocked(now)
     if opening_buy_blocked:
         entry_can_proceed = False
@@ -3192,7 +3243,11 @@ def run_trade_tick(
                 allow_new_symbols = True
                 logger.warning("[US_ENTRY][CRASH_REBOUND_LIMIT] exposure_multiplier=%s max_new_positions=%s prep_reason=%s", market_state_overlay.get("exposure_multiplier"), market_state_overlay.get("effective_max_new_positions"), prep_reason)
         existing_sell_symbols = {str(i.get("symbol") or "").upper().strip() for i in exit_intents if str(i.get("side") or "").upper() == "SELL"}
-        profit_capture_intents = build_profit_capture_intents(current_positions, market_state_overlay, existing_sell_symbols, now=now, trade_date=trade_date)
+        profit_capture_intents = build_profit_capture_intents(
+            current_positions, market_state_overlay, existing_sell_symbols,
+            now=now, trade_date=trade_date,
+            defer_pending_until_claim=(real_order_mode and not offline),
+        )
         if profit_capture_intents:
             exit_intents.extend(profit_capture_intents)
     except Exception as _market_state_exc:
@@ -3677,9 +3732,47 @@ def run_trade_tick(
         entry_degraded_reason = "DAILY_NOTIONAL_UNAVAILABLE"
         logger.error("[US_ENTRY][BLOCK] reason=DAILY_NOTIONAL_UNAVAILABLE error=%s", daily_notional_load_error)
     elif reconcile_entry_block or not entry_can_proceed:
-        entry_degraded = True
-        entry_degraded_reason = str(ack_gate["reason"] or "entry_can_proceed_false") if reconcile_entry_block else "entry_can_proceed_false"
-        logger.info("[US_ENTRY][SKIP] session=%s tick=%s reason=%s", session, tick_index, entry_degraded_reason)
+        # Only an *identified* buy-only policy (opening window or the
+        # authoritative session/PREP reason) is expected. Real entry, sell,
+        # fill and reconcile failures remain degraded regardless of regime.
+        from trader.us.runner.status_contract import is_policy_entry_block_reason
+        _upstream_policy_reason = str(entry_block_reason or "").strip()
+        _upstream_policy_only = (
+            not entry_permission_before_opening
+            and is_policy_entry_block_reason(_upstream_policy_reason)
+        )
+        _opening_policy_only = (
+            opening_buy_blocked and entry_permission_before_opening
+            and str(entry_block_reason or "").strip().lower() in {"", "ok", "none"}
+            and session_entry_allowed is not False
+        )
+        policy_only = bool(
+            (_upstream_policy_only or _opening_policy_only)
+            and not reconcile_entry_block and bool(exit_can_proceed)
+            and not recon.get("block_new_entry", False)
+            and bool(balance_circuit.get("entry_can_proceed", False))
+            and bool(daily_notional_available)
+            and not fills_contract_error and not fills_temp_error
+            and not locals().get("_early_pilot_stream_incomplete", False)
+            and not locals().get("system_invariant_failure")
+        )
+        if policy_only:
+            entry_degraded = False
+            entry_degraded_reason = ""
+            entry_policy_block_reason = (
+                _upstream_policy_reason if _upstream_policy_only
+                else "OPENING_30MIN_BUY_BLOCK"
+            )
+            logger.info("[US_ENTRY][POLICY_BLOCKED] session=%s tick=%s reason=%s liveness=OK",
+                        session, tick_index, entry_policy_block_reason)
+        else:
+            entry_degraded = True
+            entry_degraded_reason = (
+                str(ack_gate["reason"] or "reconcile_entry_block")
+                if reconcile_entry_block else str(entry_block_reason or "entry_can_proceed_false")
+            )
+            logger.warning("[US_ENTRY][DEGRADED_SKIP] session=%s tick=%s reason=%s",
+                           session, tick_index, entry_degraded_reason)
     elif after_cutoff:
         last_stage = "entry_cutoff_guard"
         logger.info(
@@ -5138,7 +5231,7 @@ def run_trade_tick(
         ),
         "exit_route_reconcile_required": exit_route_reconcile_required,
         "entry_can_proceed": entry_can_proceed,
-        "entry_block_reason": entry_block_reason,
+        "entry_block_reason": locals().get("entry_policy_block_reason") or entry_block_reason,
         "trade_block_reason": locals().get("trade_block_reason", ""),
         "entry_degraded": entry_degraded,
         "exit_route_liveness_failure": exit_route_liveness_failure,

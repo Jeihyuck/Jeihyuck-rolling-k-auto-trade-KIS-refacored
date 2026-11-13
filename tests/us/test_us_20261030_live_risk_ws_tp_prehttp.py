@@ -107,7 +107,7 @@ def test_stale_or_missing_live_quotes_never_make_risk_look_normal():
     )
 
 
-def test_tp_pre_http_abort_releases_only_own_pending_intent(monkeypatch):
+def test_tp_pre_http_abort_without_postgres_claim_never_releases_pending_intent(monkeypatch):
     monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
     repos.reset_memory_stores()
     args = {
@@ -125,15 +125,17 @@ def test_tp_pre_http_abort_releases_only_own_pending_intent(monkeypatch):
     assert not repos.release_us_profit_capture_pre_http_abort(
         **args, client_order_key="wrong-attempt",
     )
-    assert repos.release_us_profit_capture_pre_http_abort(
+    # An in-memory fixture has neither durable Claim release nor the exact
+    # PRE_IO event: it MUST stay fenced. Positive release is proven by the
+    # migrated-PostgreSQL Claim+event test below, never by this fixture.
+    assert not repos.release_us_profit_capture_pre_http_abort(
         **args, client_order_key="gild-tp1-exact",
     )
     current = repos.load_us_profit_capture_state(
         "2026-10-29", ["GILD"], {"GILD": "life-gild"},
     )["GILD"]
-    assert current["tp1_pending"] is False
+    assert current["tp1_pending"] is True
     assert current["tp1_done"] is False
-    assert current["meta"]["last_evidence_type"] == "BROKER_SUBMIT_ABORTED_PRE_IO"
 
 
 def test_tp_pre_http_abort_cannot_clear_acked_order(monkeypatch):
@@ -328,8 +330,10 @@ def test_gild_tp1_route_pre_http_fence_recovers_only_after_claim_release(
     assert client.http_calls == 0
     assert "BROKER_SUBMIT_ABORTED_PRE_IO" in events
     assert "CLAIM_RELEASE" in events
-    assert state["tp1_pending"] is (not claim_release_ok)
-    assert result["requires_reconcile"] is (not claim_release_ok)
+    # A mocked Claim release does not make an in-memory stage durable.
+    # Both routes must stay blocked despite a PRE_IO callback event.
+    assert state["tp1_pending"] is True
+    assert result["requires_reconcile"] is True
 
 
 # This production-migration fixture uses a disposable CI PostgreSQL database,
@@ -341,7 +345,7 @@ from tests.us.test_us_postgres_integration_real import pg_engine  # noqa: E402,F
     not os.getenv("PBCORE_TEST_POSTGRES_URL"),
     reason="disposable PostgreSQL acceptance URL unavailable",
 )
-def test_pg_tp1_pre_http_abort_exact_row_lock_and_idempotent_release(pg_engine):
+def test_pg_tp1_pre_http_abort_without_journal_or_claim_stays_fenced(pg_engine):
     from sqlalchemy import text
 
     repos.reset_memory_stores()
@@ -365,11 +369,11 @@ def test_pg_tp1_pre_http_abort_exact_row_lock_and_idempotent_release(pg_engine):
         trade_date=td, symbol="GILD", stage="tp1",
         position_lifecycle_id=lifecycle, client_order_key="WRONG_KEY",
     )
-    assert repos.release_us_profit_capture_pre_http_abort(
+    # DB absence is not proof of an authorized ABORT_PRE_IO.
+    assert not repos.release_us_profit_capture_pre_http_abort(
         trade_date=td, symbol="GILD", stage="tp1",
         position_lifecycle_id=lifecycle, client_order_key=key,
     )
-    # A duplicated abort callback must never release a new claim/order.
     assert not repos.release_us_profit_capture_pre_http_abort(
         trade_date=td, symbol="GILD", stage="tp1",
         position_lifecycle_id=lifecycle, client_order_key=key,
@@ -381,10 +385,228 @@ def test_pg_tp1_pre_http_abort_exact_row_lock_and_idempotent_release(pg_engine):
             WHERE trade_date=:td AND symbol='GILD'
             AND stage='tp1' AND position_lifecycle_id=:lifecycle
         """), {"td": td, "lifecycle": lifecycle}).mappings().one()
-    assert after["stage_status"] == "NOT_TRIGGERED"
+    assert after["stage_status"] == "PENDING"
     assert int(after["cumulative_filled_qty"]) == 0
-    assert after["state"]["tp1_pending"] is False
+    assert after["state"]["tp1_pending"] is True
     assert after["state"]["tp1_done"] is False
+
+
+
+@pytest.mark.skipif(
+    not os.getenv("PBCORE_TEST_POSTGRES_URL"),
+    reason="disposable PostgreSQL acceptance URL unavailable",
+)
+def test_pg_proven_same_attempt_pre_io_abort_releases_only_locked_tp(
+    pg_engine, monkeypatch,
+):
+    """Real migrated PG: journal + Claim release + exact TP row, no broker."""
+    from datetime import date, datetime, timezone
+    from uuid import uuid4
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.execution_state import SemanticActionIdentity
+    from trader.us.db.execution_claim_schema import (
+        us_execution_attempts, us_execution_claims,
+    )
+
+    repos.reset_memory_stores()
+    td, epoch = "2026-10-29", "pg-us353-test-epoch"
+    lifecycle, key = "GILD_PG_PROVEN_CYCLE", "GILD_PG_PROVEN_TP1"
+    attempt_id = "GILD_PG_PROVEN_ATTEMPT"
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda _bind=None, **_kw: epoch)
+
+    repos.mark_us_profit_capture_stage(
+        td, "GILD", "tp1", position_lifecycle_id=lifecycle,
+        order_key=key, qty=5, status="PENDING",
+    )
+    identity = SemanticActionIdentity(
+        env="practice", account_id="pg-us353-test-account",
+        market="US", trading_epoch_id=epoch, strategy_owner="US_STANDARD",
+        lifecycle_id=lifecycle, action="TAKE_PROFIT_TP1",
+        trade_date=date.fromisoformat(td),
+    )
+    claim_repo = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts,
+    )
+    assert claim_repo.acquire(
+        identity, attempt_id=attempt_id, requested_qty=5, client_order_key=key,
+    ).acquired
+    assert not repos.release_us_profit_capture_pre_http_abort(
+        trade_date=td, symbol="GILD", stage="tp1",
+        position_lifecycle_id=lifecycle, client_order_key=key,
+    ), "active claim and absent abort are NOT proof"
+    claim_repo.release_before_submit(identity, attempt_id=attempt_id)
+    # A released claim alone is insufficient without durable explicit abort.
+    assert not repos.release_us_profit_capture_pre_http_abort(
+        trade_date=td, symbol="GILD", stage="tp1",
+        position_lifecycle_id=lifecycle, client_order_key=key,
+    )
+    assert repos.append_us_order_event({
+        "event_id": str(uuid4()), "trade_date": td,
+        "event_type": "BROKER_SUBMIT_ABORTED_PRE_IO",
+        "event_timestamp": datetime.now(timezone.utc).isoformat(),
+        "session": "am", "session_run_id": "pg-us353-proven",
+        "tick_id": "pg-us353-tick",
+        "trading_epoch_id": epoch,
+        "client_order_key": key, "submit_attempt_id": attempt_id,
+        "symbol": "GILD", "side": "SELL", "requested_qty": 5,
+        "raw_broker_order_no": None, "canonical_broker_order_no": None,
+        "position_lifecycle_id": lifecycle,
+        "profit_capture_stage": "tp1", "cumulative_filled_qty": 0,
+        "payload": {"strategy_owner": "US_STANDARD"},
+        "idempotency_key": "pg-us353-proven-abort",
+    })
+    assert repos.release_us_profit_capture_pre_http_abort(
+        trade_date=td, symbol="GILD", stage="tp1",
+        position_lifecycle_id=lifecycle, client_order_key=key,
+    )
+    assert not repos.release_us_profit_capture_pre_http_abort(
+        trade_date=td, symbol="GILD", stage="tp1",
+        position_lifecycle_id=lifecycle, client_order_key=key,
+    ), "duplicate abort must not release again"
+    state = repos.load_us_profit_capture_state(
+        td, ["GILD"], {"GILD": lifecycle},
+    )["GILD"]
+    assert state["tp1_pending"] is False
+    assert state["tp1_done"] is False
+    assert state["meta"]["last_evidence_type"] == "BROKER_SUBMIT_ABORTED_PRE_IO"
+
+
+
+def test_us353_memory_tp_abort_without_durable_claim_never_releases(monkeypatch):
+    """No engine means no authoritative PRE_IO evidence; fail closed."""
+    repos.reset_memory_stores()
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
+    td, cycle, key = "2026-11-13", "US353_MEMORY_CYCLE", "US353_MEMORY_TP1"
+    repos.mark_us_profit_capture_stage(
+        td, "GILD", "tp1", position_lifecycle_id=cycle,
+        order_key=key, qty=2, status="PENDING",
+    )
+    assert not repos.release_us_profit_capture_pre_http_abort(
+        trade_date=td, symbol="GILD", stage="tp1",
+        position_lifecycle_id=cycle, client_order_key=key,
+    )
+    state = repos.load_us_profit_capture_state(
+        td, ["GILD"], {"GILD": cycle},
+    )["GILD"]
+    assert state["tp1_pending"] is True
+    repos.reset_memory_stores()
+
+
+@pytest.mark.skipif(
+    not os.getenv("PBCORE_TEST_POSTGRES_URL"),
+    reason="disposable PostgreSQL acceptance URL unavailable",
+)
+def test_pg_us353_native_tp_claim_reserve_http_gate_and_exact_abort(
+    pg_engine, monkeypatch,
+):
+    """Migrated PostgreSQL: a specific US_STANDARD Claim alone can reserve TP.
+
+    Deliberately uses no network or native KIS client. Proves NOT_TRIGGERED
+    before Claim, one-stage CAS, missing STARTED fail-closed, exact STARTED
+    authority, no release without Claim+durable abort, and idempotent release.
+    """
+    from datetime import date, datetime, timezone
+    from uuid import uuid4
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.execution_state import SemanticActionIdentity
+    from trader.us.db.execution_claim_schema import (
+        us_execution_attempts, us_execution_claims,
+    )
+    from sqlalchemy import text
+
+    repos.reset_memory_stores()
+    td, epoch = "2026-10-29", "pg-us353-native-tp-epoch"
+    account = "pg-us353-native-tp-account"
+    cycle = "GILD_PG_US353_CLAIMED_NATIVE"
+    key = "GILD_PG_US353_CLAIMED_TP1"
+    attempt = "GILD_PG_US353_CLAIMED_ATTEMPT"
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda _bind=None, **_kw: epoch)
+    monkeypatch.setattr(repos, "_us_execution_claim_scope", lambda: {
+        "env": "practice", "account_id": account, "market": "US",
+        "trading_epoch_id": epoch,
+    })
+    assert repos.save_order_intent({
+        "trade_date": td, "symbol": "GILD", "side": "SELL",
+        "exchange": "NYSE", "qty": 5, "limit_price": 100,
+        "notional_usd": 500, "client_order_key": key,
+        "position_lifecycle_id": cycle, "strategy_owner": "US_STANDARD",
+        "submit_attempt_id": attempt,
+        "meta": {"submit_attempt_id": attempt, "profit_capture_stage": "tp1",
+                 "position_lifecycle_id": cycle, "strategy_owner": "US_STANDARD",
+                 "tp_pending_deferred_to_claim": True},
+    }, trade_date=td)
+
+    identity = SemanticActionIdentity(
+        env="practice", account_id=account, market="US", trading_epoch_id=epoch,
+        strategy_owner="US_STANDARD", lifecycle_id=cycle, action="TP1",
+        trade_date=date.fromisoformat(td),
+    )
+    repo = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts,
+    )
+    assert repo.acquire(identity, attempt_id=attempt, requested_qty=5,
+                        client_order_key=key).acquired
+    args = dict(
+        trade_date=td, symbol="GILD", stage="tp1", position_lifecycle_id=cycle,
+        client_order_key=key, attempt_id=attempt, action_key=identity.action_key,
+    )
+    claim_meta = {
+        "submit_attempt_id": attempt, "profit_capture_stage": "tp1",
+        "position_lifecycle_id": cycle, "strategy_owner": "US_STANDARD",
+        "tp_pending_deferred_to_claim": True,
+    }
+    assert repos.reserve_us_profit_capture_stage_after_claim(
+        **args, qty=5, notional_usd=500, limit_price_usd=100,
+        intent_meta=claim_meta,
+    )
+    assert not repos.reserve_us_profit_capture_stage_after_claim(
+        **args, qty=5, notional_usd=500, limit_price_usd=100,
+        intent_meta=claim_meta,
+    ), "the same TP stage cannot be reserved twice"
+    assert not repos.verify_us_tp_claim_stage_at_http_boundary(**args)
+
+    def event(kind, suffix):
+        return repos.append_us_order_event({
+            "event_id": str(uuid4()), "trade_date": td,
+            "event_type": kind, "event_timestamp": datetime.now(timezone.utc).isoformat(),
+            "session": "am", "session_run_id": "pg-us353-native",
+            "tick_id": "pg-us353-native-tick", "trading_epoch_id": epoch,
+            "client_order_key": key, "submit_attempt_id": attempt,
+            "symbol": "GILD", "side": "SELL", "requested_qty": 5,
+            "raw_broker_order_no": None, "canonical_broker_order_no": None,
+            "position_lifecycle_id": cycle, "profit_capture_stage": "tp1",
+            "cumulative_filled_qty": 0,
+            "payload": {"strategy_owner": "US_STANDARD"},
+            "idempotency_key": f"pg-us353-native-{suffix}",
+        })
+
+    assert event("BROKER_SUBMIT_STARTED", "started")
+    assert repos.verify_us_tp_claim_stage_at_http_boundary(**args)
+    assert not repos.release_us_profit_capture_pre_http_abort(
+        trade_date=td, symbol="GILD", stage="tp1",
+        position_lifecycle_id=cycle, client_order_key=key,
+    ), "the live claim/started event cannot be mistaken for a safe abort"
+
+    assert event("BROKER_SUBMIT_ABORTED_PRE_IO", "abort")
+    repo.release_before_submit(identity, attempt_id=attempt)
+    assert not repos.verify_us_tp_claim_stage_at_http_boundary(**args)
+    assert repos.release_us_profit_capture_pre_http_abort(
+        trade_date=td, symbol="GILD", stage="tp1",
+        position_lifecycle_id=cycle, client_order_key=key,
+    )
+    assert not repos.release_us_profit_capture_pre_http_abort(
+        trade_date=td, symbol="GILD", stage="tp1",
+        position_lifecycle_id=cycle, client_order_key=key,
+    )
+    with pg_engine.connect() as conn:
+        row = conn.execute(text("""
+            SELECT stage_status,state FROM us_profit_capture_lifecycle
+             WHERE trade_date=:td AND symbol='GILD' AND stage='tp1'
+               AND position_lifecycle_id=:cycle
+        """), {"td": td, "cycle": cycle}).mappings().one()
+    assert row["stage_status"] == "NOT_TRIGGERED"
+    assert row["state"]["meta"]["last_evidence_type"] == "BROKER_SUBMIT_ABORTED_PRE_IO"
 
 
 @pytest.mark.skipif(
@@ -433,3 +655,684 @@ def test_pg_tp1_ack_is_immune_to_late_pre_http_abort(pg_engine):
 def test_tp_router_status_requires_complete_pre_http_proof(router, expected):
     from trader.us.runner.trade_tick_runner import _profit_capture_router_status
     assert _profit_capture_router_status(router) == expected
+
+
+@pytest.mark.skipif(
+    not os.getenv("PBCORE_TEST_POSTGRES_URL"),
+    reason="disposable PostgreSQL acceptance URL unavailable",
+)
+def test_pg_tp_claim_reservation_rearms_only_unsent_intent(pg_engine, monkeypatch):
+    """Real migrated PG: old risk BLOCKED intent -> fresh Claim -> TP -> HTTP gate."""
+    from datetime import date, datetime, timezone
+    from uuid import uuid4
+    from sqlalchemy import text
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.execution_state import SemanticActionIdentity
+    from trader.us.db.execution_claim_schema import (
+        us_execution_attempts, us_execution_claims,
+    )
+    td, epoch, account = "2026-10-29", "pg-us353-rearm-epoch", "pg-us353-rearm-account"
+    sym, cycle, key, prior, attempt = (
+        "REGTP", "rearm-buy-cycle", "US_PC_2026-10-29_REGTP_rearm-buy-cycle_TAKE_PROFIT_TP1",
+        "preclaim-blocked", "claimed-now",
+    )
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda _bind=None, **_kw: epoch)
+    monkeypatch.setattr(repos, "_us_execution_claim_scope", lambda: {
+        "env": "practice", "account_id": account, "market": "US",
+        "trading_epoch_id": epoch,
+    })
+    old_meta = {
+        "strategy_owner": "US_STANDARD", "position_lifecycle_id": cycle,
+        "profit_capture_stage": "tp1", "submit_attempt_id": prior,
+        "tp_pending_deferred_to_claim": True, "source_entry_contract_sha256": "signed-v2",
+    }
+    assert repos.save_order_intent({
+        "trade_date": td, "symbol": sym, "side": "SELL", "qty": 3,
+        "limit_price": 101, "notional_usd": 303, "client_order_key": key,
+        "meta": old_meta, "strategy_owner": "US_STANDARD",
+    }, trade_date=td)
+    repos.mark_order_intent_blocked(key, reason="risk_gate_preclaim_blocked")
+    with pg_engine.connect() as conn:
+        assert conn.execute(text(
+            "SELECT status FROM us_order_intents WHERE client_order_key=:key"
+        ), {"key": key}).scalar_one() == "BLOCKED"
+        assert conn.execute(text(
+            "SELECT COUNT(*) FROM us_profit_capture_lifecycle WHERE symbol=:symbol"
+        ), {"symbol": sym}).scalar_one() == 0
+
+    claim_repo = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts,
+    )
+    identity = SemanticActionIdentity(
+        env="practice", account_id=account, market="US",
+        trading_epoch_id=epoch, strategy_owner="US_STANDARD",
+        lifecycle_id=cycle, action="TAKE_PROFIT_TP1",
+        trade_date=date.fromisoformat(td),
+    )
+    assert claim_repo.acquire(
+        identity, attempt_id=attempt, requested_qty=3,
+        client_order_key=key,
+    ).acquired
+    new_meta = {
+        **old_meta, "submit_attempt_id": attempt,
+        "last_profit_capture_at": datetime.now(timezone.utc).isoformat(),
+    }
+    args = {
+        "trade_date": td, "symbol": sym, "stage": "tp1",
+        "position_lifecycle_id": cycle, "client_order_key": key,
+        "attempt_id": attempt, "action_key": identity.action_key,
+    }
+    assert repos.reserve_us_profit_capture_stage_after_claim(
+        **args, qty=3, notional_usd=315, limit_price_usd=105,
+        intent_meta=new_meta,
+    )
+    assert not repos.reserve_us_profit_capture_stage_after_claim(
+        **args, qty=3, notional_usd=315, limit_price_usd=105,
+        intent_meta=new_meta,
+    ), "second concurrent Claim must never reserve an existing TP"
+    with pg_engine.connect() as conn:
+        intent = conn.execute(text(
+            "SELECT status,qty,limit_price_usd,notional_usd,meta "
+            "FROM us_order_intents WHERE client_order_key=:key"
+        ), {"key": key}).mappings().one()
+        assert intent["status"] == "PENDING"
+        assert intent["qty"] == 3
+        assert float(intent["limit_price_usd"]) == 105
+        assert intent["meta"]["submit_attempt_id"] == attempt
+        assert intent["meta"]["source_entry_contract_sha256"] == "signed-v2"
+    assert not repos.verify_us_tp_claim_stage_at_http_boundary(**args), (
+        "a Claim without a durable STARTED event cannot cross HTTP"
+    )
+
+    def event(kind, suffix):
+        return {
+            "event_id": str(uuid4()), "trade_date": td, "event_type": kind,
+            "event_timestamp": datetime.now(timezone.utc).isoformat(),
+            "session": "am", "session_run_id": "pg-us353-native",
+            "tick_id": "pg-us353-native-tick", "trading_epoch_id": epoch,
+            "client_order_key": key, "submit_attempt_id": attempt,
+            "symbol": sym, "side": "SELL", "requested_qty": 3,
+            "raw_broker_order_no": None, "canonical_broker_order_no": None,
+            "position_lifecycle_id": cycle, "profit_capture_stage": "tp1",
+            "cumulative_filled_qty": 0,
+            "payload": {"strategy_owner": "US_STANDARD"},
+            "idempotency_key": "pg-us353-"+suffix,
+        }
+    assert repos.append_us_order_event(event("BROKER_SUBMIT_STARTED", "started"))
+    assert repos.verify_us_tp_claim_stage_at_http_boundary(**args)
+    assert not repos.verify_us_tp_claim_stage_at_http_boundary(
+        **{**args, "attempt_id": "different_attempt"},
+    ), "another writer cannot submit against our stage/Claim"
+
+    # Actual broker-possible evidence must never authorize a second POST.
+    assert repos.append_us_order_event(event("BROKER_SUBMIT_RESULT_UNKNOWN", "unknown"))
+    assert not repos.verify_us_tp_claim_stage_at_http_boundary(**args)
+    assert not repos.release_us_profit_capture_pre_http_abort(
+        trade_date=td, symbol=sym, stage="tp1",
+        position_lifecycle_id=cycle, client_order_key=key,
+    )
+
+
+@pytest.mark.skipif(
+    not os.getenv("PBCORE_TEST_POSTGRES_URL"),
+    reason="disposable PostgreSQL acceptance URL unavailable",
+)
+def test_pg_tp_claim_reservation_rejects_wrong_scope_or_contract(pg_engine, monkeypatch):
+    from datetime import date
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.execution_state import SemanticActionIdentity
+    from trader.us.db.execution_claim_schema import (
+        us_execution_attempts, us_execution_claims,
+    )
+    td, epoch, account = "2026-10-29", "pg-us353-foreign-epoch", "pg-us353-account"
+    sym, cycle, key, attempt = "SCOPE", "cycle-scope", "US_PC_scope_TP1", "scope-attempt"
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda _bind=None, **_kw: epoch)
+    monkeypatch.setattr(repos, "_us_execution_claim_scope", lambda: {
+        "env": "practice", "account_id": account, "market": "US",
+        "trading_epoch_id": epoch,
+    })
+    old_meta = {
+        "strategy_owner": "US_STANDARD", "position_lifecycle_id": cycle,
+        "source_entry_contract_sha256": "signed-old",
+        "profit_capture_stage": "tp1", "submit_attempt_id": "old-preclaim",
+        "tp_pending_deferred_to_claim": True,
+    }
+    assert repos.save_order_intent({
+        "trade_date": td, "symbol": sym, "side": "SELL", "qty": 2,
+        "limit_price": 100, "notional_usd": 200,
+        "client_order_key": key, "meta": old_meta,
+    }, trade_date=td)
+    repos.mark_order_intent_blocked(key, reason="no_broker_submission")
+    claim_repo = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts,
+    )
+    identity = SemanticActionIdentity(
+        env="practice", account_id=account, market="US",
+        trading_epoch_id=epoch, strategy_owner="US_STANDARD",
+        lifecycle_id=cycle, action="TAKE_PROFIT_TP1",
+        trade_date=date.fromisoformat(td),
+    )
+    assert claim_repo.acquire(
+        identity, attempt_id=attempt, requested_qty=2, client_order_key=key,
+    ).acquired
+    args = {
+        "trade_date": td, "symbol": sym, "stage": "tp1",
+        "position_lifecycle_id": cycle, "client_order_key": key,
+        "attempt_id": attempt, "action_key": identity.action_key,
+        "qty": 2, "notional_usd": 204, "limit_price_usd": 102,
+    }
+    assert not repos.reserve_us_profit_capture_stage_after_claim(
+        **args, intent_meta={**old_meta, "submit_attempt_id": attempt,
+                             "source_entry_contract_sha256": "signed-different"},
+    )
+    monkeypatch.setattr(repos, "_us_execution_claim_scope", lambda: {
+        "env": "practice", "account_id": "other-account",
+        "market": "US", "trading_epoch_id": epoch,
+    })
+    assert not repos.reserve_us_profit_capture_stage_after_claim(
+        **args, intent_meta={**old_meta, "submit_attempt_id": attempt},
+    )
+
+
+@pytest.mark.skipif(
+    not os.getenv("PBCORE_TEST_POSTGRES_URL"),
+    reason="disposable PostgreSQL acceptance URL unavailable",
+)
+@pytest.mark.parametrize("prior_status", ["PENDING", "FILLED"])
+def test_pg_us353_cross_day_open_tp_fences_new_claim_reservation(
+    pg_engine, monkeypatch, prior_status,
+):
+    """An older pending/filled TP cannot be recreated in the same BUY cycle.
+
+    Exact native KIS terminal recovery is a separate path.  A fresh-session
+    Claim alone does not give a new attempt authority over that old stage.
+    Uses migrated PostgreSQL, never live KIS or operating tables.
+    """
+    from datetime import date
+    from sqlalchemy import text
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.execution_state import SemanticActionIdentity
+    from trader.us.db.execution_claim_schema import (
+        us_execution_attempts, us_execution_claims,
+    )
+
+    repos.reset_memory_stores()
+    suffix = prior_status.lower()
+    epoch = "pg-us353-cross-day-" + suffix
+    account = "pg-us353-cross-day-account"
+    cycle = "GILD_US353_CROSS_DAY_" + suffix
+    old_key = "US353_PREVIOUS_TP1_" + suffix
+    new_key = "US353_NEXT_TP1_" + suffix
+    prior_date, next_date = "2026-10-28", "2026-10-29"
+    attempt = "US353_NEXT_ATTEMPT_" + suffix
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda _bind=None, **_kw: epoch)
+    monkeypatch.setattr(repos, "_us_execution_claim_scope", lambda: {
+        "env": "practice", "account_id": account, "market": "US",
+        "trading_epoch_id": epoch,
+    })
+    previous_kwargs = dict(
+        position_lifecycle_id=cycle, order_key=old_key, qty=5,
+    )
+    if prior_status == "FILLED":
+        previous_kwargs.update(
+            status="FILLED", filled_qty=5,
+            evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        )
+    else:
+        previous_kwargs["status"] = "PENDING"
+    repos.mark_us_profit_capture_stage(
+        prior_date, "GILD", "tp1", **previous_kwargs,
+    )
+    assert repos.save_order_intent({
+        "trade_date": next_date, "symbol": "GILD", "exchange": "NYSE",
+        "side": "SELL", "qty": 5, "limit_price": 101,
+        "notional_usd": 505, "strategy_owner": "US_STANDARD",
+        "client_order_key": new_key, "submit_attempt_id": attempt,
+        "position_lifecycle_id": cycle,
+        "meta": {
+            "strategy_owner": "US_STANDARD",
+            "submit_attempt_id": attempt,
+            "position_lifecycle_id": cycle,
+            "profit_capture_stage": "tp1",
+            "tp_pending_deferred_to_claim": True,
+        },
+    }, trade_date=next_date)
+    identity = SemanticActionIdentity(
+        env="practice", account_id=account, market="US",
+        trading_epoch_id=epoch, strategy_owner="US_STANDARD",
+        lifecycle_id=cycle, action="TP1",
+        trade_date=date.fromisoformat(next_date),
+    )
+    claims = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts,
+    )
+    assert claims.acquire(
+        identity, attempt_id=attempt, requested_qty=5,
+        client_order_key=new_key,
+    ).acquired
+    assert not repos.reserve_us_profit_capture_stage_after_claim(
+        trade_date=next_date, symbol="GILD", stage="tp1",
+        position_lifecycle_id=cycle, client_order_key=new_key,
+        attempt_id=attempt, action_key=identity.action_key, qty=5,
+        notional_usd=505, limit_price_usd=101,
+        intent_meta={
+            "strategy_owner": "US_STANDARD",
+            "submit_attempt_id": attempt,
+            "position_lifecycle_id": cycle,
+            "profit_capture_stage": "tp1",
+            "tp_pending_deferred_to_claim": True,
+        },
+    ), "an unresolved/filled earlier-session TP must not authorize another SELL"
+    with pg_engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT trade_date, stage_status, client_order_key
+              FROM us_profit_capture_lifecycle
+             WHERE symbol='GILD' AND stage='tp1'
+               AND position_lifecycle_id=:cycle AND trading_epoch_id=:epoch
+             ORDER BY trade_date
+        """), {"cycle": cycle, "epoch": epoch}).mappings().all()
+    assert len(rows) == 1
+    assert str(rows[0]["trade_date"]) == prior_date
+    assert rows[0]["stage_status"] == (
+        "PENDING" if prior_status == "PENDING" else "DONE"
+    )
+    assert rows[0]["client_order_key"] == old_key
+
+
+@pytest.mark.skipif(
+    not os.getenv("PBCORE_TEST_POSTGRES_URL"),
+    reason="disposable PostgreSQL acceptance URL unavailable",
+)
+@pytest.mark.parametrize("claim_commit_failure", [False, True])
+@pytest.mark.parametrize("retry_next_day", [False, True])
+@pytest.mark.parametrize("abort_retry_before_http", [False, True])
+@pytest.mark.parametrize("repeat_partial", [False, True])
+def test_pg_us353_standard_tp_native_partial_cancel_commits_claim_stage_together(
+    pg_engine, monkeypatch, claim_commit_failure, retry_next_day, abort_retry_before_http,
+    repeat_partial,
+):
+    """Native KIS-shaped US_STANDARD SELL 5 -> fill 2 -> cancel remaining 3.
+
+    Only the exact original TP stage and Claim are terminalized. Never
+    authorize a second broker POST from a cancel without KIS source proof.
+    TQQQ Infinite is not involved; migrated PostgreSQL is disposable CI.
+    """
+    from datetime import date
+    from sqlalchemy import text
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.execution_state import SemanticActionIdentity
+    from trader.us.db.execution_claim_schema import (
+        us_execution_attempts, us_execution_claims,
+    )
+    import json
+
+    repos.reset_memory_stores()
+    trade_date, epoch = "2026-10-29", "pg-us353-standard-cancel-epoch"
+    account, cycle = "pg-us353-standard-cancel-account", "GILD_US353_TP_CYCLE"
+    key, attempt = "US_PC_2026-10-29_GILD_GILD_US353_TP_CYCLE_TAKE_PROFIT_TP1", "GILD_US353_CANCEL_ATTEMPT"
+    order_no = "0000039951"
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("NULLIM_US_SETTLEMENT_ACTIVATE", "0")
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda _conn=None, **_kw: epoch)
+    monkeypatch.setattr(repos, "_us_execution_claim_scope", lambda: {
+        "env": "practice", "account_id": account,
+        "market": "US", "trading_epoch_id": epoch,
+    })
+    ledger = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts,
+    )
+    monkeypatch.setattr(repos, "_execution_claim_repo", lambda: ledger)
+    identity = SemanticActionIdentity(
+        env="practice", account_id=account, market="US",
+        trading_epoch_id=epoch, strategy_owner="US_STANDARD",
+        lifecycle_id=cycle, action="TP1",
+        trade_date=date.fromisoformat(trade_date),
+    )
+    assert ledger.acquire(
+        identity, attempt_id=attempt, requested_qty=5, client_order_key=key,
+    ).acquired
+    ledger.record_observation(
+        identity, attempt_id=attempt, state="UNRESOLVED",
+        cumulative_filled_qty=None, authoritative=False,
+    )
+    repos.mark_us_profit_capture_stage(
+        trade_date, "GILD", "tp1", position_lifecycle_id=cycle,
+        order_key=key, qty=5, status="PENDING",
+    )
+    meta = {
+        "execution_action_key": identity.action_key,
+        "submit_attempt_id": attempt, "strategy_owner": "US_STANDARD",
+        "profit_capture_stage": "tp1", "position_lifecycle_id": cycle,
+        "tp_pending_deferred_to_claim": True,
+        "broker_account_hash": account, "trading_epoch_id": epoch,
+        "source_entry_contract_sha256": "us353-original-signed-contract",
+        "portfolio_epoch_id": "us353-portfolio", "position_cycle_id": "us353-cycle",
+    }
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO us_orders(
+                trade_date, client_order_key, symbol, exchange, side,
+                qty_requested, qty_filled, order_no, status, env,
+                trading_epoch_id, meta
+            ) VALUES (:td,:key,'GILD','NYSE','SELL',5,0,:order_no,'ACK',
+                      'practice',:epoch,CAST(:meta AS jsonb))
+        """), {
+            "td": trade_date, "key": key, "order_no": order_no,
+            "epoch": epoch, "meta": json.dumps(meta),
+        })
+    broker_row = {
+        "order_no": order_no, "symbol": "GILD", "side": "SELL",
+        "status": "CANCELLED", "requested_qty": 5,
+        "requested_qty_present": True, "filled_qty": 2,
+        "filled_qty_present": True, "remaining_qty": 0,
+        "remaining_qty_present": True, "broker_open_qty": 0,
+        "broker_open_qty_present": True, "avg_price": 101.5,
+    }
+    if claim_commit_failure:
+        real_claim_write = repos.record_execution_action_observation_by_key
+
+        def fail_only_terminal_claim(*args, **kwargs):
+            if kwargs.get("state") == "CANCELLED" and kwargs.get("_conn") is not None:
+                raise RuntimeError("injected_terminal_claim_transaction_failure")
+            return real_claim_write(*args, **kwargs)
+
+        monkeypatch.setattr(
+            repos, "record_execution_action_observation_by_key",
+            fail_only_terminal_claim,
+        )
+    result = repos.apply_broker_order_observation(
+        trade_date=trade_date, client_order_key=key,
+        raw_order_no=order_no, canonical_order_no="39951",
+        symbol="GILD", side="SELL", requested_qty=5, filled_qty=2,
+        remaining_qty=3, broker_status="CANCELLED",
+        evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL", raw_row=broker_row,
+    )
+    if claim_commit_failure:
+        assert result["status"] == "RECONCILE_UPDATE_FAILED", result
+        assert result["retry_order"] is False
+        assert result["entry_fence"] is True
+        with pg_engine.connect() as conn:
+            protected_order = conn.execute(text("""
+                SELECT status FROM us_orders
+                 WHERE trade_date=:td AND client_order_key=:key
+            """), {"td": trade_date, "key": key}).scalar_one()
+        assert protected_order != "CANCELLED"
+        protected_stage = repos.load_us_profit_capture_state(
+            trade_date, ["GILD"], {"GILD": cycle},
+        )["GILD"]
+        assert protected_stage["tp1_pending"] is True
+        assert ledger.get(identity).active_attempt_id == attempt
+        return
+    assert result["status"] == "OK", result
+    assert result["authoritative"] is True
+    assert result["order_status"] == "CANCELLED"
+    claim = ledger.get(identity)
+    assert claim.action_state == "PARTIALLY_SATISFIED"
+    assert claim.cumulative_filled_qty == 2
+    assert claim.remaining_target_qty == 3
+    assert claim.active_attempt_id is None
+    stage = repos.load_us_profit_capture_state(
+        trade_date, ["GILD"], {"GILD": cycle},
+    )["GILD"]
+    assert stage["tp1_pending"] is False
+    assert stage["tp1_done"] is False
+    assert int(stage["meta"]["tp1_filled_qty"]) == 2
+    assert stage["tp1_order_key"] == key
+    with pg_engine.connect() as conn:
+        order = conn.execute(text("""
+            SELECT status, qty_filled, meta
+            FROM us_orders WHERE trade_date=:td AND client_order_key=:key
+        """), {"td": trade_date, "key": key}).mappings().one()
+    assert order["status"] == "CANCELLED"
+    assert order["qty_filled"] == 2
+    assert int(order["meta"]["semantic_action_remaining_qty"]) == 3
+    assert int(order["meta"]["broker_open_qty"]) == 0
+
+    # Real PostgreSQL continuation: the same economic Claim retains its
+    # original five-share target and creates a new three-share attempt.
+    retry_date = "2026-10-30" if retry_next_day else trade_date
+    retry_key = key + "_RETRY"
+    retry_attempt = attempt + "_RETRY"
+    retry_meta = {**meta, "submit_attempt_id": retry_attempt}
+    if not retry_next_day and not abort_retry_before_http and not repeat_partial:
+        # Exercise the unmocked order router and durable PG gates through a
+        # KIS-shaped test broker. No real broker/network request is made.
+        from datetime import datetime, timezone
+        from trader.us.execution import order_router
+        from trader.us import config as us_config
+        retry_identity = SemanticActionIdentity(
+            env="practice", account_id=account, market="US", trading_epoch_id=epoch,
+            strategy_owner="US_STANDARD", lifecycle_id=cycle, action="TP1",
+            trade_date=date.fromisoformat(retry_date),
+        )
+        monkeypatch.setenv("WSL_RUN_MARKET", "")
+        monkeypatch.setenv("US_ATOMIC_CLAIM_OUTBOX_ENABLED", "0")
+        monkeypatch.setenv("US_ACCOUNT_RESERVATION_MODE", "OFF")
+        monkeypatch.setenv("US_RECONCILE_WORKER_MODE", "LEGACY")
+        monkeypatch.setattr(order_router, "resolve_dry_run_for_us_order", lambda: False)
+        monkeypatch.setattr(order_router, "canonical_order_risk_check", lambda *_a, **_kw: None)
+        monkeypatch.setattr(order_router, "enrich_sell_exchange", lambda *_a, **_kw: "NYSE")
+        monkeypatch.setattr(order_router, "_semantic_action_identity", lambda *_a, **_kw: retry_identity)
+        monkeypatch.setattr(order_router, "_get_broker_position", lambda *_a, **_kw: {
+            "symbol": "GILD", "qty": 12, "orderable_qty": 12,
+            "currency": "USD", "avg_price": 90,
+        })
+        monkeypatch.setattr(us_config, "assert_us_paper_order_allowed", lambda: None)
+        monkeypatch.setattr(repos, "claim_execution_action", ledger.acquire)
+        monkeypatch.setattr(repos, "record_execution_action_observation", ledger.record_observation)
+        monkeypatch.setattr(repos, "release_execution_action_before_submit", ledger.release_before_submit)
+
+        class NativeTestBroker:
+            def __init__(self):
+                self.callback = None
+                self.submissions = []
+            def set_before_order_http(self, callback):
+                self.callback = callback
+            def clear_before_order_http(self):
+                self.callback = None
+            def get_us_price(self, *_args):
+                return {"_quote_quality": "FRESH", "_quote_source": "KIS_LIVE",
+                        "_quote_asof_epoch": time.time(), "output": {"last": "102"}}
+            def place_us_sell_order(self, symbol, exchange, qty, price):
+                assert self.callback is not None
+                self.callback()
+                self.submissions.append((symbol, qty))
+                return {"ok": True, "order_no": "0000039953"}
+        monkeypatch.setattr(order_router, "NativeKisUSClient", NativeTestBroker)
+        broker = NativeTestBroker()
+        retry_meta.update({
+            "reason": "TAKE_PROFIT_TP1", "profit_capture_stage_target_qty": 5,
+            "profit_capture_stage_filled_qty": 2, "profit_capture_sell_fraction": .25,
+            "profit_capture_runner_min_remain_pct": .4, "tp_threshold_fraction": .03,
+            "return_rate_at_decision": str(102 / 90 - 1),
+            "last_profit_capture_at": datetime.now(timezone.utc).isoformat(),
+        })
+        result = order_router.route_order({
+            "trade_date": retry_date, "symbol": "GILD", "exchange": "NYSE",
+            "side": "SELL", "qty": 3, "limit_price": 102, "notional_usd": 306,
+            "strategy_owner": "US_STANDARD", "client_order_key": retry_key,
+            "submit_attempt_id": retry_attempt, "position_lifecycle_id": cycle,
+            "reason": "TAKE_PROFIT_TP1", "meta": retry_meta,
+        }, kis_client=broker, current_position_symbols={"GILD"})
+        assert result.get("status") == "ACK", result
+        assert broker.submissions == [("GILD", 3)]
+        with pg_engine.connect() as conn:
+            retry_order = conn.execute(text("""
+                SELECT qty_requested, meta FROM us_orders
+                 WHERE client_order_key=:key AND trading_epoch_id=:epoch
+            """), {"key": retry_key, "epoch": epoch}).mappings().one()
+        assert int(retry_order["qty_requested"]) == 3
+        assert retry_order["meta"]["source_entry_contract_sha256"] == meta["source_entry_contract_sha256"]
+        return
+    assert repos.save_order_intent({
+        "trade_date": retry_date, "symbol": "GILD", "exchange": "NYSE",
+        "side": "SELL", "qty": 3, "limit_price": 102, "notional_usd": 306,
+        "strategy_owner": "US_STANDARD", "client_order_key": retry_key,
+        "submit_attempt_id": retry_attempt, "position_lifecycle_id": cycle,
+        "meta": retry_meta,
+    }, trade_date=retry_date)
+    retry_identity = SemanticActionIdentity(
+        env="practice", account_id=account, market="US", trading_epoch_id=epoch,
+        strategy_owner="US_STANDARD", lifecycle_id=cycle, action="TP1",
+        trade_date=date.fromisoformat(retry_date),
+    )
+    assert retry_identity.action_key == identity.action_key
+    if repeat_partial and abort_retry_before_http and not retry_next_day:
+        # Two independent workers race to continue this exact economic TP.
+        # PostgreSQL Claim/CAS may grant one three-share attempt, never two.
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier
+        barrier = Barrier(2)
+        def acquire_contender(suffix):
+            fresh_repo = DurableExecutionClaimRepo(
+                pg_engine, us_execution_claims, us_execution_attempts,
+            )
+            barrier.wait(timeout=10)
+            return fresh_repo.acquire(
+                retry_identity, attempt_id=retry_attempt + suffix,
+                requested_qty=3, fresh_validation=True,
+                client_order_key=retry_key + suffix,
+            )
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = list(executor.map(acquire_contender, ("_A", "_B")))
+        assert sum(result.acquired for result in outcomes) == 1
+        with pg_engine.connect() as conn:
+            active_count = conn.execute(text("""
+                SELECT COUNT(*) FROM us_execution_attempts
+                 WHERE action_key=:action AND attempt_state='CREATED'
+            """), {"action": identity.action_key}).scalar_one()
+        assert active_count == 1
+        return
+    assert ledger.acquire(
+        retry_identity, attempt_id=retry_attempt, requested_qty=3,
+        fresh_validation=True, client_order_key=retry_key,
+    ).acquired
+    retry_args = dict(
+        trade_date=retry_date, symbol="GILD", stage="tp1",
+        position_lifecycle_id=cycle, client_order_key=retry_key,
+        attempt_id=retry_attempt, action_key=identity.action_key,
+    )
+    assert repos.reserve_us_profit_capture_stage_after_claim(
+        **retry_args, qty=3, notional_usd=306, limit_price_usd=102,
+        intent_meta=retry_meta,
+    )
+    from uuid import uuid4
+    from datetime import datetime, timezone
+    assert repos.append_us_order_event({
+        "event_id": str(uuid4()), "trade_date": retry_date,
+        "event_type": "BROKER_SUBMIT_STARTED",
+        "event_timestamp": datetime.now(timezone.utc).isoformat(),
+        "session": "am", "session_run_id": "us353-retry", "tick_id": "retry",
+        "trading_epoch_id": epoch, "client_order_key": retry_key,
+        "submit_attempt_id": retry_attempt, "symbol": "GILD", "side": "SELL",
+        "requested_qty": 3, "raw_broker_order_no": None,
+        "canonical_broker_order_no": None, "position_lifecycle_id": cycle,
+        "profit_capture_stage": "tp1", "cumulative_filled_qty": 0,
+        "payload": {"strategy_owner": "US_STANDARD"},
+        "idempotency_key": "us353-partial-retry-started",
+    })
+    assert repos.verify_us_tp_claim_stage_at_http_boundary(**retry_args)
+    if abort_retry_before_http:
+        assert repos.append_us_order_event({
+            "event_id": str(uuid4()), "trade_date": retry_date,
+            "event_type": "BROKER_SUBMIT_ABORTED_PRE_IO",
+            "event_timestamp": datetime.now(timezone.utc).isoformat(),
+            "session": "am", "session_run_id": "us353-retry", "tick_id": "retry",
+            "trading_epoch_id": epoch, "client_order_key": retry_key,
+            "submit_attempt_id": retry_attempt, "symbol": "GILD", "side": "SELL",
+            "requested_qty": 3, "raw_broker_order_no": None,
+            "canonical_broker_order_no": None, "position_lifecycle_id": cycle,
+            "profit_capture_stage": "tp1", "cumulative_filled_qty": 0,
+            "payload": {"strategy_owner": "US_STANDARD"},
+            "idempotency_key": "us353-partial-retry-aborted",
+        })
+        ledger.release_before_submit(retry_identity, attempt_id=retry_attempt)
+        assert repos.release_us_profit_capture_pre_http_abort(
+            trade_date=retry_date, symbol="GILD", stage="tp1",
+            position_lifecycle_id=cycle, client_order_key=retry_key,
+        )
+        assert ledger.get(retry_identity).remaining_target_qty == 3
+        next_key, next_attempt = retry_key + "_NEW", retry_attempt + "_NEW"
+        next_meta = {**retry_meta, "submit_attempt_id": next_attempt}
+        assert repos.save_order_intent({
+            "trade_date": retry_date, "symbol": "GILD", "exchange": "NYSE",
+            "side": "SELL", "qty": 3, "limit_price": 102, "notional_usd": 306,
+            "strategy_owner": "US_STANDARD", "client_order_key": next_key,
+            "submit_attempt_id": next_attempt, "position_lifecycle_id": cycle,
+            "meta": next_meta,
+        }, trade_date=retry_date)
+        assert ledger.acquire(retry_identity, attempt_id=next_attempt, requested_qty=3,
+                              fresh_validation=True, client_order_key=next_key).acquired
+        retry_args = {**retry_args, "client_order_key": next_key, "attempt_id": next_attempt}
+        assert repos.reserve_us_profit_capture_stage_after_claim(
+            **retry_args, qty=3, notional_usd=306, limit_price_usd=102,
+            intent_meta=next_meta,
+        )
+        assert repos.append_us_order_event({
+            "event_id": str(uuid4()), "trade_date": retry_date,
+            "event_type": "BROKER_SUBMIT_STARTED",
+            "event_timestamp": datetime.now(timezone.utc).isoformat(),
+            "session": "am", "session_run_id": "us353-retry", "tick_id": "retry",
+            "trading_epoch_id": epoch, "client_order_key": next_key,
+            "submit_attempt_id": next_attempt, "symbol": "GILD", "side": "SELL",
+            "requested_qty": 3, "raw_broker_order_no": None,
+            "canonical_broker_order_no": None, "position_lifecycle_id": cycle,
+            "profit_capture_stage": "tp1", "cumulative_filled_qty": 0,
+            "payload": {"strategy_owner": "US_STANDARD"},
+            "idempotency_key": "us353-partial-retry-new-started",
+        })
+        assert repos.verify_us_tp_claim_stage_at_http_boundary(**retry_args)
+    if not repeat_partial:
+        # A corrected late fill on the superseded original order fences HTTP.
+        ledger.record_observation(
+            retry_identity, attempt_id=attempt, state="CANCELLED",
+            cumulative_filled_qty=3, authoritative=True,
+        )
+        assert not repos.verify_us_tp_claim_stage_at_http_boundary(**retry_args)
+        return
+
+    # A second actual partial-cancel is summed by order, retaining target 5:
+    # 5 -> fill 2/cancel 3 -> fill 1/cancel 2 -> authorize exactly 2.
+    current_key, current_attempt = retry_args["client_order_key"], retry_args["attempt_id"]
+    current_meta = {**meta, "submit_attempt_id": current_attempt}
+    ledger.record_observation(retry_identity, attempt_id=current_attempt, state="UNRESOLVED",
+                              cumulative_filled_qty=None, authoritative=False)
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO us_orders(trade_date,client_order_key,symbol,exchange,side,
+                qty_requested,qty_filled,order_no,status,env,trading_epoch_id,meta)
+            VALUES (:td,:key,'GILD','NYSE','SELL',3,0,'0000039952','ACK',
+                    'practice',:epoch,CAST(:meta AS jsonb))
+        """), {"td": retry_date, "key": current_key, "epoch": epoch,
+                "meta": json.dumps(current_meta)})
+    second_cancel = {**broker_row, "order_no": "0000039952", "requested_qty": 3,
+                     "filled_qty": 1}
+    result = repos.apply_broker_order_observation(
+        trade_date=retry_date, client_order_key=current_key,
+        raw_order_no="0000039952", canonical_order_no="39952", symbol="GILD",
+        side="SELL", requested_qty=3, filled_qty=1, remaining_qty=2,
+        broker_status="CANCELLED", evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        raw_row=second_cancel,
+    )
+    assert result["status"] == "OK", result
+    assert ledger.get(retry_identity).remaining_target_qty == 2
+    updated = repos.load_us_profit_capture_state(retry_date, ["GILD"], {"GILD": cycle})["GILD"]
+    assert int(updated["meta"]["tp1_filled_qty"]) == 3
+    assert int(updated["meta"]["tp1_qty"]) == 5
+    third_key, third_attempt = key + "_THIRD", attempt + "_THIRD"
+    third_meta = {**meta, "submit_attempt_id": third_attempt}
+    assert repos.save_order_intent({
+        "trade_date": retry_date, "symbol": "GILD", "exchange": "NYSE",
+        "side": "SELL", "qty": 2, "limit_price": 102, "notional_usd": 204,
+        "strategy_owner": "US_STANDARD", "client_order_key": third_key,
+        "submit_attempt_id": third_attempt, "position_lifecycle_id": cycle,
+        "meta": third_meta,
+    }, trade_date=retry_date)
+    assert ledger.acquire(retry_identity, attempt_id=third_attempt, requested_qty=2,
+                          fresh_validation=True, client_order_key=third_key).acquired
+    assert repos.reserve_us_profit_capture_stage_after_claim(
+        trade_date=retry_date, symbol="GILD", stage="tp1", position_lifecycle_id=cycle,
+        client_order_key=third_key, attempt_id=third_attempt, action_key=identity.action_key,
+        qty=2, notional_usd=204, limit_price_usd=102, intent_meta=third_meta,
+    )

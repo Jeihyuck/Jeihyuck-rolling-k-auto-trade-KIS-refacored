@@ -136,3 +136,87 @@ def test_session_preserves_early_tick_liveness_failure_for_health_and_close(
     assert close["status"] == "FAILED_RECONCILE"
     assert close["report"]["close_integrity_status"] == "RECONCILE_REQUIRED"
     assert close["report"]["runtime_liveness_failures"][0]["sell_liveness_status"] == "LIVENESS_DEGRADED"
+
+
+def test_opening_30min_is_expected_policy_not_entry_liveness():
+    from trader.us.runner.status_contract import classify_runtime_integrity
+    assert classify_runtime_integrity({
+        "entry_can_proceed": False,
+        "entry_block_reason": "OPENING_30MIN_BUY_BLOCK",
+        "entry_degraded": False,
+    }) == "POLICY_ENTRY_BLOCKED"
+    # An unidentified denied entry must NOT be silently treated as policy.
+    assert classify_runtime_integrity({
+        "entry_can_proceed": False,
+        "entry_block_reason": "",
+        "entry_degraded": True,
+    }) == "LIVENESS_DEGRADED"
+    # Unknown ACK, execution invariant and protection failures override policy.
+    assert classify_runtime_integrity({
+        "entry_can_proceed": False,
+        "entry_block_reason": "OPENING_30MIN_BUY_BLOCK",
+        "entry_degraded": False,
+        "unresolved_ack_count": 1,
+    }) == "RECONCILE_REQUIRED"
+    assert classify_runtime_integrity({
+        "entry_can_proceed": False,
+        "entry_block_reason": "OPENING_30MIN_BUY_BLOCK",
+        "system_invariant_failure": "BUY_INTENT_PERSISTENCE_REJECTED",
+    }) == "INTEGRITY_DEGRADED"
+
+
+def test_opening_policy_close_ok_without_hiding_reconcile(tmp_path, monkeypatch):
+    from trader.us.runner.daily_report_runner import run_daily_report
+    from trader.us.runner.status_contract import classify_runtime_integrity
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("US_DAILY_REPORT_BASE", str(tmp_path / "reports"))
+    payload = {
+        "trade_date": "2026-07-20", "final_status": "OK",
+        "runtime_integrity_status": classify_runtime_integrity({
+            "entry_can_proceed": False,
+            "entry_block_reason": "OPENING_30MIN_BUY_BLOCK",
+            "entry_degraded": False,
+        }),
+        "entry_liveness_status": "OK",
+        "entry_degraded": 0,
+        "sell_liveness_status": "OK",
+        "reconcile_liveness_status": "OK",
+    }
+    _write_us_schedule_health(payload, "am")
+    report = run_daily_report(
+        env="practice", session="close", trade_date="2026-07-20", offline=True,
+        final_balance={"positions": []}, final_positions=[], kis_fills=[],
+    )
+    assert report["status"] == "OK"
+    assert report["report"]["runtime_liveness_failures"] == []
+
+    payload.update({
+        "runtime_integrity_status": "RECONCILE_REQUIRED",
+        "reconcile_liveness_status": "RECONCILE_REQUIRED",
+    })
+    _write_us_schedule_health(payload, "am")
+    blocked = run_daily_report(
+        env="practice", session="close", trade_date="2026-07-20", offline=True,
+        final_balance={"positions": []}, final_positions=[], kis_fills=[],
+    )
+    assert blocked["status"] == "FAILED_RECONCILE"
+
+
+def test_policy_block_never_masks_a_failed_protective_sell():
+    from trader.us.runner.status_contract import classify_runtime_integrity
+    base = {
+        "entry_can_proceed": False,
+        "entry_block_reason": "OPENING_30MIN_BUY_BLOCK",
+        "entry_degraded": False,
+    }
+    assert classify_runtime_integrity(base) == "POLICY_ENTRY_BLOCKED"
+    assert classify_runtime_integrity({
+        **base, "exit_route_liveness_failure": True,
+    }) == "LIVENESS_DEGRADED"
+    assert classify_runtime_integrity({
+        **base, "entry_degraded": True,
+    }) == "LIVENESS_DEGRADED"
+    assert classify_runtime_integrity({
+        **base, "exit_route_reconcile_required": True,
+    }) == "RECONCILE_REQUIRED"
