@@ -64,7 +64,12 @@ def build_kr_volume_proof(
         "daily_source": str(daily_source or "UNKNOWN"),
         "proof_date": None,
         "quote_as_of": None,
-        "quote_received_at": observed_at.isoformat(),
+        "quote_received_at": None,
+        "decision_at": observed_at.isoformat(),
+        "quote_transport_age_seconds": None,
+        "quote_source": "UNKNOWN",
+        "quote_identity_attestation": "UNVERIFIED",
+        "quote_trade_date_attestation": "UNVERIFIED",
         "exchange_time_raw": None,
         "exchange_quote_age_seconds": None,
         "quote_volume_field": None,
@@ -142,15 +147,64 @@ def build_kr_volume_proof(
 
     quote = snapshot if isinstance(snapshot, dict) else {}
     raw = quote.get("raw") if isinstance(quote.get("raw"), dict) else {}
+    source = str(quote.get("source") or raw.get("source") or "UNKNOWN").upper()
+    proof["quote_source"] = source
     quoted_code = str(quote.get("symbol") or quote.get("code") or "").strip().lstrip("A")
-    raw_quote_day = (quote.get("trade_date") or quote.get("stck_bsop_date")
-                     or raw.get("trade_date") or raw.get("stck_bsop_date"))
+    if quoted_code and quoted_code.zfill(6) != str(code).zfill(6):
+        return reject("quote_symbol_mismatch", failed=True)
+    if source == "KIS_WEBSOCKET":
+        # Stream symbol is carried by the subscribed KIS trade record.
+        if not quoted_code:
+            return reject("kis_quote_identity_unverified")
+        proof["quote_identity_attestation"] = "KIS_WS_SUBSCRIPTION"
+    elif source in {"KIS_REST_INQUIRE_PRICE", "KIS_REST_TIME_ITEMCONCLUSION"}:
+        # KIS inquire-price may not repeat the requested code in output.
+        # Authenticated wrapper request binding is not a native symbol field.
+        requested = str(quote.get("requested_symbol") or "").strip().lstrip("A")
+        if (quote.get("source_identity") != "AUTHENTICATED_REST_REQUEST_BOUND"
+                or requested.zfill(6) != str(code).zfill(6)):
+            return reject("kis_quote_identity_unverified")
+        proof["quote_identity_attestation"] = "AUTHENTICATED_REST_REQUEST"
+    elif source != "UNKNOWN":
+        return reject("kis_quote_source_unverified")
+    # A historical mock/legacy quote with no source field is not proof of a
+    # source. Preserve its UNVERIFIED status for diagnostics; caller's actual
+    # KIS wrappers carry attestation and must be used for live BUY.
+    raw_quote_day = (
+        quote["trade_date"] if "trade_date" in quote else
+        quote["stck_bsop_date"] if "stck_bsop_date" in quote else
+        raw.get("trade_date") if "trade_date" in raw else
+        raw.get("stck_bsop_date")
+    )
     if raw_quote_day is not None:
         actual_quote_day = _day(raw_quote_day)
         if actual_quote_day is None or actual_quote_day != session:
             return reject("kis_quote_trade_date_mismatch", failed=True)
-    if quoted_code and quoted_code.zfill(6) != str(code).zfill(6):
-        return reject("quote_symbol_mismatch", failed=True)
+        proof["quote_trade_date_attestation"] = "NATIVE_RESPONSE_DATE"
+    else:
+        # Exchange trade clock plus same-session local observation is only an
+        # inferred date. Do not label it a native exchange date.
+        proof["quote_trade_date_attestation"] = "SESSION_INFERRED_NOT_NATIVE"
+    receipt = quote.get("received_at")
+    if receipt is not None:
+        try:
+            if isinstance(receipt, datetime):
+                transport_at = receipt
+            elif isinstance(receipt, (float, int)):
+                transport_at = datetime.fromtimestamp(float(receipt), tz=KST)
+            else:
+                transport_at = datetime.fromisoformat(str(receipt).replace("Z", "+00:00"))
+            if transport_at.tzinfo is None:
+                return reject("kis_quote_receipt_timestamp_unverified")
+            age = (received - transport_at.astimezone(KST)).total_seconds()
+            proof["quote_received_at"] = transport_at.isoformat()
+            proof["quote_transport_age_seconds"] = round(age, 3)
+            if age < -10 or age > 30:
+                return reject("kis_quote_receipt_stale_or_future")
+        except (ValueError, OverflowError, TypeError, OSError):
+            return reject("kis_quote_receipt_timestamp_unverified")
+    else:
+        proof["quote_received_at"] = None
     # stck_vol is NOT cumulative. An explicitly invalid top-level acml_vol
     # must never be replaced by an unrelated cached raw copy.
     # Retain which source supplied the quote for post-incident audit.
@@ -173,14 +227,27 @@ def build_kr_volume_proof(
         if cumulative < previous:
             return reject("cumulative_volume_decreased", failed=True)
 
+    # Evidence is a broker exchange timestamp, never a synthesized local time.
+    # In particular, str(None or "").zfill(6) fabricated "000000" and
+    # misclassified a missing market clock as a stale midnight quote.
     trade_clock = (
         quote["stck_cntg_hour"] if "stck_cntg_hour" in quote
         else raw.get("stck_cntg_hour")
     )
     proof["exchange_time_raw"] = str(trade_clock) if trade_clock is not None else None
-    clock = str(trade_clock or "").zfill(6)
-    if len(clock) != 6 or not clock.isdigit():
+    if trade_clock is None or (
+        isinstance(trade_clock, str) and not trade_clock.strip()
+    ):
         return reject("kis_exchange_quote_time_missing")
+    # HHMMSS may arrive as a five-digit integer (e.g. 09:30:00 = 93000).
+    # Never zero-pad the *absence* of a clock or accept midnight for a
+    # regular-session KR PB1 BUY.
+    clock = str(trade_clock).strip()
+    if not clock.isdigit() or len(clock) > 6:
+        return reject("kis_exchange_quote_time_invalid", failed=True)
+    clock = clock.zfill(6)
+    if clock == "000000":
+        return reject("kis_exchange_quote_time_invalid", failed=True)
     try:
         exchange_ts = datetime.combine(
             session, datetime.strptime(clock, "%H%M%S").time(), tzinfo=KST
@@ -214,6 +281,11 @@ def build_kr_volume_proof(
         if info.get("vol_ok") is not True:
             return reject("breakout_volume_trigger_missing")
         proof["breakout_volume_confirmed"] = True
+    # Quote provenance is a necessary part of VERIFIED economic evidence.
+    # Legacy synthetic dictionaries may still exercise diagnostics above,
+    # but unknown transport cannot ever authorize an operational KR BUY.
+    if source == "UNKNOWN":
+        return reject("kis_quote_source_unverified")
     proof["confirmation_state"] = "VERIFIED"
     proof["failure_reason"] = None
     proof["failure_category"] = None

@@ -28,6 +28,17 @@ def _proof(**overrides):
         "entry_style": "MOMENTUM",
     }
     args.update(overrides)
+    # These are synthetic authenticated-request fixtures, not archived
+    # broker responses. Live BUY still needs the actual KIS wrapper binding.
+    snapshot = args.get("snapshot")
+    if isinstance(snapshot, dict) and "source" not in snapshot:
+        args["snapshot"] = {
+            "source": "KIS_REST_INQUIRE_PRICE",
+            "source_identity": "AUTHENTICATED_REST_REQUEST_BOUND",
+            "requested_symbol": "005930",
+            "received_at": NOW.timestamp(),
+            **snapshot,
+        }
     return build_kr_volume_proof(**args)
 
 
