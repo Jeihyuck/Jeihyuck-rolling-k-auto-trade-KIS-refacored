@@ -1657,7 +1657,25 @@ def route_exit_orders_immediately(
             status = str(result.get("status") or "ERROR")
             meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
             stage = str(meta.get("profit_capture_stage") or "")
-            if stage:
+            _routed_meta = ((result.get("intent") or {}).get("meta") or {}) if isinstance(result.get("intent"), dict) else {}
+            _deferred_without_stage = bool(
+                stage and meta.get("tp_pending_deferred_to_claim") is True
+                and not (_routed_meta.get("tp_claim_stage_reserved") or meta.get("tp_claim_stage_reserved"))
+                and not result.get("broker_submit")
+                and str(result.get("status") or "").upper() not in {
+                    "ACK", "BROKER_SUBMIT_RESULT_UNKNOWN", "ACK_DB_FAILED",
+                    "ACK_DB_FAILED_RECONCILE_REQUIRED",
+                }
+            )
+            if _deferred_without_stage:
+                # No PENDING was created at the strategy decision; a rejection
+                # before Claim must NOT manufacture one during result sync.
+                logger.info(
+                    "[US_PROFIT_CAPTURE][INTENT_ONLY_BLOCK] symbol=%s stage=%s "
+                    "result=%s action=NO_TP_RESERVATION",
+                    intent.get("symbol"), stage, result.get("status"),
+                )
+            if stage and not _deferred_without_stage:
                 from trader.us.profit_capture import sync_profit_capture_stage_from_order
                 # A generic BLOCKED is not proof that this stage has no
                 # broker-open attempt. Only a positively verified pre-submit
@@ -1700,6 +1718,14 @@ def route_exit_orders_immediately(
             logger.warning("[US_EXIT][ROUTE_IMMEDIATE][WARN] intent=%s error=%s", intent.get("symbol"), exc)
             meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
             stage = str(meta.get("profit_capture_stage") or "")
+            if stage and meta.get("tp_pending_deferred_to_claim") is True and not meta.get("tp_claim_stage_reserved"):
+                # A local Python exception before an acquired Claim cannot
+                # turn an unreserved intent into a PENDING historical order.
+                logger.warning(
+                    "[US_PROFIT_CAPTURE][INTENT_ONLY_EXCEPTION] symbol=%s stage=%s "
+                    "action=NO_TP_STATE_WRITE", intent.get("symbol"), stage,
+                )
+                stage = ""
             if stage:
                 # A proven pre-HTTP abort can release a TP reservation, while
                 # unknown/ACK evidence requires a fence. A STARTED event alone
