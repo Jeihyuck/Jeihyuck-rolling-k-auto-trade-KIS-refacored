@@ -3450,6 +3450,122 @@ def mark_us_profit_capture_stage(
 
 
 
+def reserve_us_profit_capture_stage_after_claim(
+    *, trade_date: str, symbol: str, stage: str, position_lifecycle_id: str,
+    client_order_key: str, attempt_id: str, action_key: str, qty: int,
+    notional_usd: float,
+) -> bool:
+    """Atomically reserve a native US_STANDARD TP only AFTER its Claim exists.
+
+    The builder creates a decision, not a PENDING broker order. An intent-only
+    rejection therefore never owns a TP stage. Stage -> Claim lock order is
+    the same as the proven-pre-HTTP release path. A second owner cannot
+    replace another pending key even if it has a distinct action instance.
+    No broker I/O occurs here and a failed DB commit forbids HTTP.
+    """
+    sym = str(symbol or "").strip().upper()
+    stg = str(stage or "").strip().lower()
+    cycle = str(position_lifecycle_id or "").strip()
+    key = str(client_order_key or "").strip()
+    attempt = str(attempt_id or "").strip()
+    action = str(action_key or "").strip()
+    if (stg not in {"tp1", "tp2", "tp3"}
+            or not all((trade_date, sym, cycle, key, attempt, action))
+            or int(qty or 0) < 1):
+        return False
+    engine = _get_engine_or_none()
+    if engine is None:
+        return False
+    with engine.begin() as conn:
+        epoch = _active_us_epoch(conn, required=True)
+        scope = _us_execution_claim_scope()
+        if (not epoch or scope.get("env") != "practice"
+                or str(scope.get("trading_epoch_id")) != str(epoch)
+                or not scope.get("account_id")):
+            return False
+        params = {
+            "td": str(trade_date), "sym": sym, "stage": stg,
+            "cycle": cycle, "key": key, "attempt": attempt,
+            "action": action, "epoch": str(epoch),
+            "account": scope["account_id"],
+        }
+        # Serializes the absent-row case as well as an existing reservation.
+        conn.execute(text("""
+            SELECT pg_advisory_xact_lock(hashtextextended(:identity,0))
+        """), {"identity": "|".join((str(epoch), str(trade_date), sym, cycle, stg))})
+        stage_row = conn.execute(text("""
+            SELECT stage_status, client_order_key, cumulative_filled_qty
+              FROM us_profit_capture_lifecycle
+             WHERE trade_date=:td AND symbol=:sym
+               AND position_lifecycle_id=:cycle AND stage=:stage
+               AND trading_epoch_id=:epoch
+             FOR UPDATE
+        """), params).mappings().one_or_none()
+        if stage_row and (
+            str(stage_row["stage_status"]) in {"PENDING", "DONE"}
+            or int(stage_row.get("cumulative_filled_qty") or 0) > 0
+        ):
+            return False
+        # A second attempt, an unknown ACK, or an unscoped claim cannot
+        # replace the stage reservation.
+        claim = conn.execute(text("""
+            SELECT c.action_state, c.active_attempt_id, c.lifecycle_id,
+                   c.account_id, a.attempt_state, a.client_order_key,
+                   a.requested_qty
+              FROM us_execution_claims c
+              JOIN us_execution_attempts a ON a.action_key=c.action_key
+             WHERE c.action_key=:action AND a.attempt_id=:attempt
+               AND c.trade_date=:td AND c.env='practice' AND c.market='US'
+               AND c.account_id=:account AND c.trading_epoch_id=:epoch
+               AND c.strategy_owner='US_STANDARD'
+             FOR UPDATE OF c
+        """), params).mappings().all()
+        if (len(claim) != 1
+                or str(claim[0]["action_state"]) != "IN_FLIGHT"
+                or str(claim[0].get("active_attempt_id") or "") != attempt
+                or str(claim[0].get("attempt_state") or "") != "SUBMITTING"
+                or str(claim[0].get("client_order_key") or "") != key
+                or int(claim[0].get("requested_qty") or 0) < int(qty)):
+            return False
+        row = conn.execute(text("""
+            SELECT status, meta, symbol, side FROM us_order_intents
+             WHERE trade_date=:td AND client_order_key=:key
+               AND symbol=:sym AND side='SELL' AND trading_epoch_id=:epoch
+             FOR UPDATE
+        """), params).mappings().one_or_none()
+        if (row is None or str(row.get("status") or "") not in {"PENDING", "SUBMITTED"}
+                or str(_parse_json_meta(row.get("meta")).get("submit_attempt_id") or "") != attempt):
+            return False
+        if conn.execute(text("""
+            SELECT 1 FROM us_orders WHERE trade_date=:td
+               AND client_order_key=:key AND trading_epoch_id=:epoch LIMIT 1
+        """), params).scalar_one_or_none() is not None:
+            return False
+        events = conn.execute(text("""
+            SELECT event_type FROM us_order_events WHERE trade_date=:td
+               AND client_order_key=:key AND trading_epoch_id=:epoch
+        """), params).scalars().all()
+        if any(str(event) not in {"BROKER_CLAIM_PREPARED"} for event in events):
+            return False
+        mark_us_profit_capture_stage(
+            str(trade_date), sym, stg, order_key=key,
+            position_lifecycle_id=cycle, qty=int(qty),
+            notional_usd=float(notional_usd), status="PENDING",
+            _conn=conn,
+        )
+        saved = conn.execute(text("""
+            SELECT stage_status, client_order_key
+              FROM us_profit_capture_lifecycle
+             WHERE trade_date=:td AND symbol=:sym
+               AND position_lifecycle_id=:cycle AND stage=:stage
+               AND trading_epoch_id=:epoch
+        """), params).mappings().one_or_none()
+        return bool(
+            saved and str(saved["stage_status"]) == "PENDING"
+            and str(saved["client_order_key"] or "") == key
+        )
+
+
 def release_us_profit_capture_pre_http_abort(
     *, trade_date: str, symbol: str, stage: str,
     position_lifecycle_id: str, client_order_key: str,
@@ -3534,7 +3650,7 @@ def release_us_profit_capture_pre_http_abort(
             not str(e.get("submit_attempt_id") or "").strip()
             or (
                 str(e.get("event_type") or "") not in
-                (abort_types | {"BROKER_SUBMIT_STARTED"})
+                (abort_types | {"BROKER_SUBMIT_STARTED", "BROKER_CLAIM_PREPARED"})
             )
             or (
                 str(e.get("submit_attempt_id") or "") != attempt_id
