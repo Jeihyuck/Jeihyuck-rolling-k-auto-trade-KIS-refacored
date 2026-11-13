@@ -347,4 +347,6 @@ def test_production_atomic_buy_uses_decision_notional_not_current_execution_pric
     source = open("trader/reconcile_kis.py", encoding="utf-8").read()
     assert "buy_cost_delta_override=float(decision.notional_delta)" in source
     assert "decision.qty_delta > 0 or decision.notional_delta != 0" in source
-    assert "and (incremental_daily_qty > 0 or atomic_writer_active)" in source
+    assert "incremental_daily_qty > 0" in source
+    assert "buy_notional_delta > 0" in source
+    assert "atomic_writer_active" in source
