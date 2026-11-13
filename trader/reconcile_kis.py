@@ -204,12 +204,18 @@ def _record_execution_claim_observation(
     else:
         claim_state = "UNRESOLVED"
     try:
-        orders_repo.record_execution_claim_for_order(
-            str(source_order.get("client_order_key") or ""),
+        claim_kwargs = dict(
             state=claim_state,
             cumulative_filled_qty=filled_qty,
             authoritative=authoritative,
-            _conn=_conn,
+        )
+        # Preserve legacy call contract while sharing the physical settlement
+        # transaction only when a real connection has been supplied.
+        if _conn is not None:
+            claim_kwargs["_conn"] = _conn
+        orders_repo.record_execution_claim_for_order(
+            str(source_order.get("client_order_key") or ""),
+            **claim_kwargs,
         )
     except LookupError:
         return None
