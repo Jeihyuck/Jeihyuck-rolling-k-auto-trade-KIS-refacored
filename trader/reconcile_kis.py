@@ -2247,7 +2247,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                     }
                 )
         if filled_qty and filled_price is not None and side != "UNKNOWN":
-            fills_repo.upsert_fill(
+            native_fill_kwargs = dict(
                 env=env,
                 run_id=reconcile_run_id,
                 order_id=str((source_order or {}).get("order_id") or "") or None,
@@ -2286,6 +2286,16 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                     ),
                 },
             )
+            # A signed KIS BUY fill and its corresponding position mutation
+            # must share ONE physical transaction. Previously the fill was
+            # committed here, before the actual position writer could fail.
+            signed_native_buy = bool(
+                side == "BUY" and source_order
+                and request_json.get("enforce_entry_contract") is True
+                and (incremental_daily_qty > 0 or atomic_writer_active)
+            )
+            if not signed_native_buy:
+                fills_repo.upsert_fill(**native_fill_kwargs)
             # KIS cumulative BUY average is the *whole order* average, not
             # the price of the incremental shares. Preserve broker notional.
             buy_delta_price = float(filled_price)
@@ -2301,7 +2311,8 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                 and (incremental_daily_qty > 0 or atomic_writer_active)
             ):
                 def _legacy_buy_apply():
-                    return positions_repo.apply_fill(
+                    def _apply_buy_position(*, _conn=None):
+                        kwargs = dict(
                         env=env,
                         strategy=str(source_order.get("strategy") or strategy),
                         sid=int(source_order.get("sid") or 1),
@@ -2333,13 +2344,34 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                             next_confirmed_notional - previous_confirmed_notional
                             if cumulative_buy_evidence is not None else None
                         ),
+                        )
+                        if _conn is not None:
+                            kwargs["_conn"] = _conn
+                        return positions_repo.apply_fill(**kwargs)
+                    if (isinstance(fills_repo, FillsRepo)
+                            and isinstance(positions_repo, PositionsRepo)
+                            and fills_repo.engine is positions_repo.engine):
+                        with fills_repo.engine.begin() as conn:
+                            fills_repo.upsert_fill(**native_fill_kwargs, _conn=conn)
+                            return _apply_buy_position(_conn=conn)
+                    # Non-production test/legacy adapters cannot attest a
+                    # shared connection. Preserve behavior but never report
+                    # this branch as production-atomic.
+                    logger.warning(
+                        "[KR][NATIVE_BUY][NONATOMIC_ADAPTER] code=%s reason=NO_SHARED_REPOS", code,
                     )
+                    fills_repo.upsert_fill(**native_fill_kwargs)
+                    return _apply_buy_position()
 
                 atomic_buy_applied = False
                 if atomic_observation is not None and atomic_release is not None:
                     from trader.settlement.kr_cutover import route_kr_settlement
 
                     def _atomic_buy_apply(conn, _obs, decision):
+                        if (not isinstance(fills_repo, FillsRepo)
+                                or fills_repo.engine is not engine):
+                            raise RuntimeError("KR_NATIVE_BUY_WRITER_SHARED_DB_REQUIRED")
+                        fills_repo.upsert_fill(**native_fill_kwargs, _conn=conn)
                         if decision.qty_delta > 0 or decision.notional_delta != 0:
                             positions_repo.apply_fill(
                                 env=env,
