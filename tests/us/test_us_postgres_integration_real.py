@@ -3435,6 +3435,7 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
     """
     import json
     from datetime import datetime, timezone
+    from uuid import uuid4
     from sqlalchemy import text
     from trader.us.db import repos
     from trader.us.entry_exit_contract import build_us_entry_exit_contract
@@ -3448,6 +3449,10 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
     )
     if multiple_unresolved:
         epoch += "-multiple"
+    # The focused acceptance and full suite can run in the same CI database.
+    # us_positions and account reservations deliberately survive the lean
+    # fixture, so each invocation must own its own practice account + epoch.
+    epoch += "-" + uuid4().hex
     symbols = ["ABBV", "AMGN", "DHR", "HCA", "KO",
                "KR", "MCK", "PFE", "PG", "TMO"]
     blocked = {"KO", "KR", "TMO"} if multiple_unresolved else {"KO"}
@@ -3612,7 +3617,7 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
         # Each parameter is a separate simulated brokerage account. Prior
         # tests leave active reservations by design, and production correctly
         # counts the same account's reservations across different epochs.
-        raw_account = f"practice:ten-symbol-concurrency-integration-{int(multiple_unresolved)}"
+        raw_account = f"practice:ten-symbol-concurrency-integration-{epoch}"
         account_fingerprint = hashlib.sha256(raw_account.encode()).hexdigest()
         monkeypatch.setattr(
             account_state, "get_account_key", lambda **_kw: raw_account,
