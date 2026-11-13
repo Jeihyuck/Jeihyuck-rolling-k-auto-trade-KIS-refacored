@@ -90,14 +90,11 @@ DB_IDLE_IN_TX_SESSION_TIMEOUT_MS: "15000"
 ```
 
 ### PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT
-- **기본값**: `0`
-- **설명**: order lookup timeout 시 fail-open 동작
-- **권장값**: `1` (timeout 시 빈 배열 반환)
-- **사용처**: trade-am, trade-afternoon
+- **상태**: Deprecated. Trading-state repositories ignore this flag.
+- **설명**: 과거 practice 계정의 order lookup timeout을 빈 배열로 처리하던 호환 설정
+- **현재 정책**: OrdersRepo, FillsRepo, PositionsRepo의 주문·체결·포지션 조회는 항상 fail-closed다. DB 오류는 빈 결과로 바꾸지 않고 호출자에게 전달하여 주문 판단을 중단한다.
+- **권장값**: unset 또는 `0`. `1` 설정은 사용하지 말 것.
 
-```yaml
-PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT: "1"
-```
 
 ## 시작 지연 감지
 
@@ -167,7 +164,6 @@ env:
   DB_LOCK_TIMEOUT_MS: "5000"
   DB_STATEMENT_TIMEOUT_MS: "15000"
   DB_IDLE_IN_TX_SESSION_TIMEOUT_MS: "15000"
-  PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT: "1"
   
   # Start Delay Detection
   PB1_MAX_START_DELAY_SEC_AM: "1800"
