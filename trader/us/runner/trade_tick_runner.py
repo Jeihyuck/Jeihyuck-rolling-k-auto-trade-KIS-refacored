@@ -3700,7 +3700,7 @@ def run_trade_tick(
             and bool(daily_notional_available)
             and not fills_contract_error and not fills_temp_error
             and not locals().get("_early_pilot_stream_incomplete", False)
-            and not entry_block_reason
+            and str(entry_block_reason or "").strip().lower() in {"", "ok", "none"}
             and not locals().get("system_invariant_failure")
         )
         if opening_policy_only:
