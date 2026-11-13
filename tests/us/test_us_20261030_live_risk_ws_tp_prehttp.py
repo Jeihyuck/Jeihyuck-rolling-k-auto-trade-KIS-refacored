@@ -387,6 +387,86 @@ def test_pg_tp1_pre_http_abort_without_journal_or_claim_stays_fenced(pg_engine):
     assert after["state"]["tp1_done"] is False
 
 
+
+@pytest.mark.skipif(
+    not os.getenv("PBCORE_TEST_POSTGRES_URL"),
+    reason="disposable PostgreSQL acceptance URL unavailable",
+)
+def test_pg_proven_same_attempt_pre_io_abort_releases_only_locked_tp(
+    pg_engine, monkeypatch,
+):
+    """Real migrated PG: journal + Claim release + exact TP row, no broker."""
+    from datetime import date, datetime, timezone
+    from uuid import uuid4
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.execution_state import SemanticActionIdentity
+    from trader.us.db.execution_claim_schema import (
+        us_execution_attempts, us_execution_claims,
+    )
+
+    repos.reset_memory_stores()
+    td, epoch = "2026-10-29", "pg-us353-test-epoch"
+    lifecycle, key = "GILD_PG_PROVEN_CYCLE", "GILD_PG_PROVEN_TP1"
+    attempt_id = "GILD_PG_PROVEN_ATTEMPT"
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda _bind=None, **_kw: epoch)
+
+    repos.mark_us_profit_capture_stage(
+        td, "GILD", "tp1", position_lifecycle_id=lifecycle,
+        order_key=key, qty=5, status="PENDING",
+    )
+    identity = SemanticActionIdentity(
+        env="practice", account_id="pg-us353-test-account",
+        market="US", trading_epoch_id=epoch, strategy_owner="US_STANDARD",
+        lifecycle_id=lifecycle, action="TAKE_PROFIT_TP1",
+        trade_date=date.fromisoformat(td),
+    )
+    claim_repo = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts,
+    )
+    assert claim_repo.acquire(
+        identity, attempt_id=attempt_id, requested_qty=5, client_order_key=key,
+    ).acquired
+    assert not repos.release_us_profit_capture_pre_http_abort(
+        trade_date=td, symbol="GILD", stage="tp1",
+        position_lifecycle_id=lifecycle, client_order_key=key,
+    ), "active claim and absent abort are NOT proof"
+    claim_repo.release_before_submit(identity, attempt_id=attempt_id)
+    # A released claim alone is insufficient without durable explicit abort.
+    assert not repos.release_us_profit_capture_pre_http_abort(
+        trade_date=td, symbol="GILD", stage="tp1",
+        position_lifecycle_id=lifecycle, client_order_key=key,
+    )
+    assert repos.append_us_order_event({
+        "event_id": str(uuid4()), "trade_date": td,
+        "event_type": "BROKER_SUBMIT_ABORTED_PRE_IO",
+        "event_timestamp": datetime.now(timezone.utc).isoformat(),
+        "session": "am", "session_run_id": "pg-us353-proven",
+        "tick_id": "pg-us353-tick",
+        "trading_epoch_id": epoch,
+        "client_order_key": key, "submit_attempt_id": attempt_id,
+        "symbol": "GILD", "side": "SELL", "requested_qty": 5,
+        "raw_broker_order_no": None, "canonical_broker_order_no": None,
+        "position_lifecycle_id": lifecycle,
+        "profit_capture_stage": "tp1", "cumulative_filled_qty": 0,
+        "payload": {"strategy_owner": "US_STANDARD"},
+        "idempotency_key": "pg-us353-proven-abort",
+    })
+    assert repos.release_us_profit_capture_pre_http_abort(
+        trade_date=td, symbol="GILD", stage="tp1",
+        position_lifecycle_id=lifecycle, client_order_key=key,
+    )
+    assert not repos.release_us_profit_capture_pre_http_abort(
+        trade_date=td, symbol="GILD", stage="tp1",
+        position_lifecycle_id=lifecycle, client_order_key=key,
+    ), "duplicate abort must not release again"
+    state = repos.load_us_profit_capture_state(
+        td, ["GILD"], {"GILD": lifecycle},
+    )["GILD"]
+    assert state["tp1_pending"] is False
+    assert state["tp1_done"] is False
+    assert state["meta"]["last_evidence_type"] == "BROKER_SUBMIT_ABORTED_PRE_IO"
+
+
 @pytest.mark.skipif(
     not os.getenv("PBCORE_TEST_POSTGRES_URL"),
     reason="disposable PostgreSQL acceptance URL unavailable",
