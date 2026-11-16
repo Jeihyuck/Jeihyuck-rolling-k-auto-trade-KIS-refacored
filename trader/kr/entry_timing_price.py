@@ -62,11 +62,30 @@ def resolve_bounded_prpr_limit(
     if quote_age < -2 or quote_age > max_quote_age_sec or bool(quote.get("stale")):
         return block("QUOTE_STALE", quote_age_sec=round(quote_age, 3))
     source = str(quote.get("source") or "").upper()
-    if source not in {"KIS_REST_INQUIRE_PRICE", "KIS_WEBSOCKET"}:
+    identity = str(quote.get("source_identity") or "").upper()
+    # Never treat a free-text source label as authenticated broker evidence.
+    # REST binds the submitted request code; WS binds the parsed subscription
+    # code. Missing/contradictory identity must fail closed for every symbol.
+    expected_identity = {
+        "KIS_REST_INQUIRE_PRICE": "AUTHENTICATED_REST_REQUEST_BOUND",
+        "KIS_WEBSOCKET": "KIS_WS_PARSED_SYMBOL",
+    }.get(source)
+    if expected_identity is None or identity != expected_identity:
         return block("QUOTE_SOURCE_UNVERIFIED", quote_age_sec=round(quote_age, 3))
-    requested_code = str(quote.get("requested_symbol") or quote.get("symbol") or "").removeprefix("A")
-    if requested_code and requested_code.zfill(6) != str(code).zfill(6):
-        return block("QUOTE_SYMBOL_MISMATCH")
+    market = str(quote.get("market") or "").upper()
+    if market != "KR":
+        return block("QUOTE_MARKET_UNVERIFIED")
+    requested_raw = str(quote.get("requested_symbol") or "").strip()
+    symbol_raw = str(quote.get("symbol") or "").strip()
+    if not requested_raw and not symbol_raw:
+        return block("QUOTE_SYMBOL_UNVERIFIED")
+    normalized_code = str(code).removeprefix("A").zfill(6)
+    for raw_code in (requested_raw, symbol_raw):
+        if not raw_code:
+            continue
+        normalized_quote = raw_code.removeprefix("A")
+        if not normalized_quote.isascii() or not normalized_quote.isdigit() or normalized_quote.zfill(6) != normalized_code:
+            return block("QUOTE_SYMBOL_MISMATCH")
     quote_day = str(quote.get("stck_bsop_date") or "").replace("-", "")
     if quote_day and quote_day != now.strftime("%Y%m%d"):
         return block("QUOTE_STALE", quote_date_mismatch=True)
@@ -166,7 +185,7 @@ def maybe_bound_pb1_prpr_fallback(
         env="practice", account_scope=account_scope, code=symbol,
         now=now, style=style,
         setup_ok=bool(features.get("setup_ok", getattr(cf, "setup_ok", False))),
-        trigger_ok=bool(features.get("trigger_ok")),
+        trigger_ok=bool(features.get("breakout_trigger_ok") or features.get("trigger_ok")),
         pivot=features.get("pivot"), order_price=close,
     )
     if timing.get("state") != "READY_SHADOW":
