@@ -376,3 +376,33 @@ def test_appkey_rejection_invalidates_even_recent_ws_quote(monkeypatch):
     # ownership cooldown, it is not a verified usable market quote.
     svc.put_quote(market="KR", symbol="093320", last=175400.0)
     assert svc.get_fresh_quote("KR", "093320", max_age_sec=10.0) is None
+
+
+def test_kinx_native_bar_diagnostics_isolates_source_date_and_ohlcv_failures():
+    from trader.kr.opening_bar_contract import diagnose_native_bar_rows
+    now = datetime(2026, 11, 16, 13, 30, tzinfo=KST)
+    good = {"date": "2026-11-16", "time": "090100",
+            "open": 100.0, "high": 110.0, "low": 90.0,
+            "close": 101.0, "volume": 12.0}
+    rows = [
+        good, dict(good), {**good, "time": "090200", "date": ""},
+        {**good, "time": "090300", "date": "2026-11-13"},
+        {**good, "time": "090400", "volume": 0},
+        {**good, "time": "090500", "low": 120.0},
+        {**good, "time": "bad"},
+        {**good, "time": "130000"},  # accepted completed current day
+        {**good, "time": "133000"},  # current unfinished minute
+    ]
+    info = diagnose_native_bar_rows(rows, now)
+    assert info["total_rows"] == 9
+    assert info["valid_unique_minutes"] == 2
+    assert info["duplicate_valid_rows"] == 1
+    assert info["excluded_by_reason"] == {
+        "SOURCE_DATE_MISSING": 1,
+        "SOURCE_DATE_MISMATCH": 1,
+        "OHLCV_MISSING_OR_NONPOSITIVE": 1,
+        "OHLC_INCONSISTENT": 1,
+        "SOURCE_CLOCK_INVALID": 1,
+        "CURRENT_OR_FUTURE_MINUTE": 1,
+    }
+    assert info["no_trade_minutes_proven"] is False
