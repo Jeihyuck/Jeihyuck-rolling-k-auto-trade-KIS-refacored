@@ -712,3 +712,81 @@ def test_entire_synthetic_final30_bars_isolated_per_symbol_and_account(
     assert blocked["state"] == "UNKNOWN"
     assert blocked["reason"] == "CONFLICTING_NATIVE_COMPLETED_BAR"
     assert not load(LATE, code=codes[1])["source_conflicts"]
+
+
+
+def test_bounded_buy_price_preserves_single_authoritative_notional():
+    from trader.kr.entry_timing_price import apply_verified_bounded_limit
+    cf = SimpleNamespace(
+        features={"order_price": 72500.0, "limit_price": 72500.0,
+                  "planned_value": 145000.0,
+                  "order_price_source": "prpr_slippage"},
+        planned_value=145000.0, sizing_details={
+            "qty": 2, "price": 72500.0, "notional": 145000.0,
+        },
+    )
+    plan = {"qty": 2, "limit_price": 72500.0,
+            "order_price": 72500.0, "planned_value": 145000.0}
+    proof = {
+        "state": "BOUNDED_LIMIT", "not_order_authorization": True,
+        "new_limit": 72300.0, "price_floor": 71811.6,
+        "price_ceiling": 72388.4,
+    }
+    price = apply_verified_bounded_limit(
+        cf=cf, plan=plan, price_proof=proof,
+        original_price=72500.0, qty=2,
+    )
+    assert price == 72300.0
+    assert plan["limit_price"] == plan["order_price"] == price
+    assert cf.features["limit_price"] == cf.features["order_price"] == price
+    assert plan["planned_value"] == cf.features["planned_value"] == cf.planned_value == 144600.0
+    assert cf.sizing_details["price"] == price
+    assert cf.sizing_details["notional"] == 144600.0
+    assert plan["qty"] == cf.sizing_details["qty"] == 2
+    assert cf.features["order_price_source"] == "timing_bounded_prpr_limit"
+
+
+@pytest.mark.parametrize("override", [
+    {"state": "WAIT"},
+    {"not_order_authorization": False},
+    {"new_limit": 72600.0},
+    {"new_limit": 72400.0, "price_ceiling": 72388.4},
+    {"new_limit": -1},
+])
+def test_bounded_price_invalid_contract_never_mutates_buy_notional(override):
+    from trader.kr.entry_timing_price import apply_verified_bounded_limit
+    cf = SimpleNamespace(
+        features={"order_price": 72500.0, "planned_value": 72500.0},
+        planned_value=72500.0, sizing_details={"qty": 1, "price": 72500.0},
+    )
+    plan = {"qty": 1, "order_price": 72500.0, "planned_value": 72500.0}
+    proof = {
+        "state": "BOUNDED_LIMIT", "not_order_authorization": True,
+        "new_limit": 72300.0, "price_floor": 71811.6,
+        "price_ceiling": 72388.4,
+        **override,
+    }
+    with pytest.raises(ValueError, match="KR_BOUND_PRICE_PROOF_INVALID"):
+        apply_verified_bounded_limit(
+            cf=cf, plan=plan, price_proof=proof,
+            original_price=72500.0, qty=1,
+        )
+    assert cf.planned_value == cf.features["planned_value"] == 72500.0
+    assert plan["order_price"] == 72500.0
+    assert cf.sizing_details["price"] == 72500.0
+
+
+def test_live_pb1_price_and_retry_notional_reach_overlay_without_old_feature():
+    """Guard actual AM source ordering without using an external broker."""
+    import inspect
+    from trader.pb1_engine import PB1Engine
+    src = inspect.getsource(PB1Engine._place_entry)
+    assert src.count("apply_verified_bounded_limit(") == 1
+    assert src.index("apply_verified_bounded_limit(") < src.index(
+        "self.ensure_entry_exit_plan("
+    ) < src.index("self._resolve_entry_pre_submit(")
+    assert 'cf.features["planned_value"] = _current_value' in src
+    overlay = src[src.index("_pre_api_intent = {"):]
+    assert overlay.index("**(cf.features or {})") < overlay.index(
+        '"planned_value": float(record_price or 0.0) * float(qty or 0)'
+    )
