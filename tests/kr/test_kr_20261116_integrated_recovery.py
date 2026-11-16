@@ -532,3 +532,49 @@ def test_ready_native_pb1_can_reprice_fallback_but_never_authorize_buy(monkeypat
     assert cf.features["order_price_source"] == "prpr_slippage"
     # Function proposes a limit; it intentionally never mutates the
     # candidate or submits to the fake broker.
+
+
+def test_real_am_price_repair_hook_precedes_contract_and_pre_submit():
+    """Regression for the P0 mistake: bounded code was placed in PB1-CLOSE.
+
+    Source-level location assertions supplement the pure helper tests: there
+    is no mock BUY approval or simulated KIS fill here. The AM _place_entry
+    must call the repair before freezing entry/exit contract, and the CLOSE
+    path must *never* call the helper.
+    """
+    import inspect
+    from trader.pb1_engine import PB1Engine
+    source = inspect.getsource(PB1Engine._place_entry)
+    assert source.count("maybe_bound_pb1_prpr_fallback(") == 1
+    assert source.index("maybe_bound_pb1_prpr_fallback(") < source.index(
+        "self.ensure_entry_exit_plan("
+    ) < source.index("self._resolve_entry_pre_submit(")
+    assert '"timing_bounded_prpr_limit"' in source
+    assert "cf.features[\"order_price\"] = _bounded" in source
+    # Same module's CLOSE flow must never take AM timing repair route.
+    for method_name, method in PB1Engine.__dict__.items():
+        if not method_name.startswith("_place_") or method_name == "_place_entry":
+            continue
+        assert "maybe_bound_pb1_prpr_fallback(" not in inspect.getsource(method)
+
+
+def test_bounded_price_rejects_wrong_symbol_or_bad_source():
+    from trader.kr.entry_timing_price import resolve_bounded_prpr_limit
+    now = datetime(2026, 11, 16, 9, 45, tzinfo=KST)
+    timing = {"state": "READY_SHADOW", "reference_price": 72100,
+              "max_entry_price": 72500}
+    quote = {"last": 72100, "received_at": now.timestamp() - 1,
+             "source": "KIS_REST_INQUIRE_PRICE",
+             "requested_symbol": "121600"}
+    wrong = resolve_bounded_prpr_limit(
+        code="093320", original_price=72500, timing=timing,
+        quote=quote, observed_at=now,
+    )
+    assert wrong["state"] == "BLOCK"
+    assert wrong["reason"] == "QUOTE_SYMBOL_MISMATCH"
+    unknown = resolve_bounded_prpr_limit(
+        code="121600", original_price=72500, timing=timing,
+        quote={**quote, "source": "DAILY_CLOSE_FALLBACK"}, observed_at=now,
+    )
+    assert unknown["reason"] == "QUOTE_SOURCE_UNVERIFIED"
+    assert unknown["new_limit"] is None
