@@ -312,3 +312,51 @@ def test_nano_order_price_evidence_records_signed_0p5pct_without_gate_relaxation
     assert proof["order_price_source"] == "prpr_slippage"
     assert proof["is_order_authorization"] is False
     assert decision.reason_codes == ["KR_ENTRY_TIMING_NOT_READY_OR_PRICE_TOO_HIGH"]
+
+
+def test_ws_identical_appkey_has_one_cross_process_owner(tmp_path, monkeypatch):
+    """One appkey has one socket owner, whether selected via KR or US key.
+
+    A WSL process crash automatically releases the kernel flock; no stale
+    PID file may grant ownership. No broker connection is made in this test.
+    """
+    from trader.marketdata.kis_ws_price import KisWebSocketPriceService
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("KIS_WS_OWNER_LOCK_DIR", str(tmp_path))
+    monkeypatch.setenv("KIS_APP_KEY", "synthetic-shared-app-key")
+    monkeypatch.setenv("KIS_APP_SECRET", "synthetic-secret")
+    monkeypatch.setenv("KIS_US_APP_KEY", "synthetic-shared-app-key")
+    monkeypatch.setenv("KIS_US_APP_SECRET", "synthetic-secret")
+    first = KisWebSocketPriceService()
+    second = KisWebSocketPriceService()
+    a = first._acquire_owner_lock()
+    assert a is not None
+    try:
+        assert second._acquire_owner_lock() is None
+        assert list(tmp_path.glob("*.lock"))
+        assert "synthetic-shared-app-key" not in (
+            list(tmp_path.glob("*.lock"))[0].read_text()
+        )
+    finally:
+        first._release_owner_lock(a)
+    b = second._acquire_owner_lock()
+    assert b is not None
+    second._release_owner_lock(b)
+
+
+def test_ws_different_appkeys_do_not_block_each_other(tmp_path, monkeypatch):
+    from trader.marketdata.kis_ws_price import KisWebSocketPriceService
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("KIS_WS_OWNER_LOCK_DIR", str(tmp_path))
+    monkeypatch.setenv("KIS_APP_SECRET", "offline-only")
+    first = KisWebSocketPriceService()
+    second = KisWebSocketPriceService()
+    monkeypatch.setenv("KIS_APP_KEY", "offline-key-one")
+    a = first._acquire_owner_lock()
+    monkeypatch.setenv("KIS_APP_KEY", "offline-key-two")
+    b = second._acquire_owner_lock()
+    try:
+        assert a is not None and b is not None
+    finally:
+        first._release_owner_lock(a)
+        second._release_owner_lock(b)
