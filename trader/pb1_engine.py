@@ -5852,11 +5852,10 @@ class PB1Engine:
                 blocking_stage="submit",
                 context={"code": display_code, "buy_start": buy_start, "stage": stage},
             )
-        # Separate intraday timing from yesterday's Final30/setup:
-        # SHADOW only by default; ENFORCE requires explicit practice approval.
-        # Never block protective SELL, other owner sleeves, existing ADDs or
-        # an independently approved PB1-CLOSE entry policy here.
-        _timing_mode = str(os.getenv("KR_PB1_ENTRY_TIMING_MODE", "SHADOW")).strip().upper()
+        # KR practice PB1 new BUY must use the native 1m ENFORCE policy.
+        # Never silently fall back to SHADOW/setup-only when .env is stale.
+        # Other owners, protective SELL, ADD and PB1-CLOSE keep their own policy.
+        _timing_mode = str(os.getenv("KR_PB1_ENTRY_TIMING_MODE", "ENFORCE")).strip().upper()
         _timing_style = str(
             (cf.features or {}).get("entry_style_selected")
             or (cf.features or {}).get("entry_setup_family")
@@ -5872,12 +5871,24 @@ class PB1Engine:
             and _is_kr_stock_code(cf.code)
             and _timing_style in KR_TIMING_STYLES
         )
-        # An explicitly unapproved ENFORCE request must not silently
-        # downgrade to the old setup-only BUY path. This applies only to
-        # standard PB1 new BUY, never protective SELL, ADD, or independent owners.
+        # SHADOW/OFF/unknown cannot authorize a PB1 practice BUY.
+        # OFF is a fail-closed emergency BUY halt, never a legacy bypass.
+        if _timing_eligible and _timing_mode != "ENFORCE":
+            logger.error(
+                "[KR][ENTRY][PRICE_AWARE_TIMING][BLOCK] code=%s mode=%s "
+                "reason=ENFORCE_REQUIRED", cf.code, _timing_mode,
+            )
+            return UnifiedGateDecision(
+                ok=False,
+                reason_codes=["KR_ENTRY_TIMING_ENFORCE_REQUIRED"],
+                blocking_stage="pre_submit_timing",
+                context={"code": cf.code, "mode": _timing_mode},
+            )
+        # Current user policy approves ENFORCE for KR PB1 practice by default.
+        # An explicit approval=0 remains a BUY halt, not a downgrade to SHADOW.
         if (
-            _timing_eligible and _timing_mode == "ENFORCE"
-            and os.getenv("KR_PB1_ENTRY_TIMING_APPROVED", "0") != "1"
+            _timing_eligible
+            and os.getenv("KR_PB1_ENTRY_TIMING_APPROVED", "1") != "1"
         ):
             logger.error(
                 "[KR][ENTRY][PRICE_AWARE_TIMING][BLOCK] code=%s mode=ENFORCE "
@@ -5889,7 +5900,7 @@ class PB1Engine:
                 blocking_stage="pre_submit_timing",
                 context={"code": cf.code, "mode": "ENFORCE", "approved": False},
             )
-        if _timing_eligible and _timing_mode in {"SHADOW", "ENFORCE"}:
+        if _timing_eligible:
             _timing_now = now_kst()
             _timing = evaluate_proof_for_candidate(
                 env=self.env,
@@ -5898,7 +5909,10 @@ class PB1Engine:
                 now=_timing_now,
                 style=_timing_style,
                 setup_ok=bool((cf.features or {}).get("setup_ok", cf.setup_ok)),
-                trigger_ok=bool((cf.features or {}).get("trigger_ok")),
+                trigger_ok=bool(
+                    (cf.features or {}).get("breakout_trigger_ok")
+                    or (cf.features or {}).get("trigger_ok")
+                ),
                 pivot=(cf.features or {}).get("pivot"),
                 order_price=float(order_price or 0.0),
             )
@@ -5909,7 +5923,7 @@ class PB1Engine:
                 cf.features["entry_timing_evidence"] = {
                     "evaluated_at_kst": _timing_now.isoformat(),
                     "mode": _timing_mode,
-                    "approved": os.getenv("KR_PB1_ENTRY_TIMING_APPROVED", "0") == "1",
+                    "approved": os.getenv("KR_PB1_ENTRY_TIMING_APPROVED", "1") == "1",
                     "state": str(_timing.get("state") or "UNKNOWN"),
                     "reason": str(_timing.get("reason") or "UNRECORDED"),
                     "latest_bar_ts": _timing.get("latest_bar_ts"),
@@ -5945,11 +5959,9 @@ class PB1Engine:
                 cf.code, _timing_style, _timing_mode,
                 _timing.get("state"), _timing.get("reason"),
                 _timing.get("max_entry_price"),
-                int(_timing_mode == "ENFORCE"
-                    and os.getenv("KR_PB1_ENTRY_TIMING_APPROVED", "0") == "1"),
+                1,
             )
-            if (_timing_mode == "ENFORCE"
-                    and os.getenv("KR_PB1_ENTRY_TIMING_APPROVED", "0") == "1"):
+            if _timing_eligible:
                 # MARKET orders cannot enforce a minute-proof maximum BUY
                 # price. Explicit KIS 00 and PB1 LIMIT are the only supported
                 # bounded paths; never treat a reference price as a limit.
