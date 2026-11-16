@@ -11288,7 +11288,10 @@ class PB1Engine:
         # +0.5% prpr buffer. Only verified, fresh, scope-matched KIS evidence
         # can LOWER the final LIMIT; a missing/unsafe quote cannot reprice.
         if isinstance(cf.features, dict) and cf.features.get("order_price_source") == "prpr_slippage":
-            from trader.kr.entry_timing_price import maybe_bound_pb1_prpr_fallback
+            from trader.kr.entry_timing_price import (
+                maybe_bound_pb1_prpr_fallback,
+                apply_verified_bounded_limit,
+            )
             try:
                 _price_proof = maybe_bound_pb1_prpr_fallback(
                     engine=self, cf=cf, stage=stage,
@@ -11309,17 +11312,23 @@ class PB1Engine:
                 cf.features["timing_bounded_price_evidence"] = _price_proof
             if _price_proof.get("state") == "BOUNDED_LIMIT":
                 _old = float(record_price)
-                _bounded = float(_price_proof["new_limit"])
+                try:
+                    _bounded = apply_verified_bounded_limit(
+                        cf=cf, plan=plan, price_proof=_price_proof,
+                        original_price=record_price, qty=int(qty),
+                    )
+                except (ValueError, TypeError) as _apply_exc:
+                    logger.error(
+                        "[KR][ENTRY][TIMING_BOUNDED_PRICE][BLOCK] code=%s "
+                        "reason=BOUND_PROOF_NOTIONAL_INVALID type=%s",
+                        cf.code, type(_apply_exc).__name__,
+                    )
+                    status["skipped"] = 1
+                    status["skipped_reason"] = "KR_BOUND_PRICE_PROOF_INVALID"
+                    status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
+                    status["terminal_event"] = "FINAL_SKIP"
+                    return status
                 limit_price = record_price = _bounded
-                plan.update(
-                    limit_price=_bounded, order_price=_bounded,
-                    planned_value=_bounded * int(qty),
-                    price_source="timing_bounded_prpr_limit",
-                )
-                cf.features["limit_price"] = _bounded
-                cf.features["order_price"] = _bounded
-                cf.features["order_price_source"] = "timing_bounded_prpr_limit"
-                cf.planned_value = _bounded * int(qty)
                 logger.info(
                     "[KR][ENTRY][TIMING_BOUNDED_PRICE] code=%s original=%.0f "
                     "bounded=%.0f method=%s ref=%.0f quote_age_sec=%s "
@@ -11429,11 +11438,22 @@ class PB1Engine:
             fresh_qty = int(qty or 0)
             qty = min(fresh_qty, remaining_target_qty)
             cf.planned_qty = qty
+            # Retry-target shrinkage must also update every downstream
+            # notional projection, not only the durable entry-plan row.
+            _current_value = float(record_price or 0.0) * float(qty)
+            cf.planned_value = _current_value
+            if isinstance(cf.features, dict):
+                cf.features["planned_value"] = _current_value
+            if isinstance(getattr(cf, "sizing_details", None), dict):
+                cf.sizing_details.update(
+                    qty=qty, price=float(record_price or 0.0),
+                    notional=_current_value,
+                )
             if isinstance(plan, dict):
                 plan["qty"] = qty
                 plan["execution_retry_remaining_target_qty"] = remaining_target_qty
                 if float(record_price or 0.0) > 0:
-                    plan["planned_value"] = float(record_price) * float(qty)
+                    plan["planned_value"] = _current_value
             entry_meta["execution_retry_remaining_target_qty"] = remaining_target_qty
             entry_meta["execution_retry_fresh_sizing_qty"] = fresh_qty
             entry_meta["execution_retry_submit_qty"] = qty
@@ -11642,7 +11662,13 @@ class PB1Engine:
             return status
         if self._is_kr_equity_context() and env_bool("KR_MARKET_STATE_OVERLAY_ENABLE", True):
             overlay = getattr(self, "_kr_market_state_overlay", None) or {"market_state": "KR_NORMAL", "force_entry_block": False}
-            _pre_api_intent = {"side": "BUY", "code": cf.code, "name": stock_name, "planned_value": float(record_price or 0.0) * float(qty or 0), **(cf.features or {})}
+            # Canonical broker-bound notional must win over an earlier sizing
+            # feature. The old dict expansion order silently overwrote it.
+            _pre_api_intent = {
+                **(cf.features or {}),
+                "side": "BUY", "code": cf.code, "name": stock_name,
+                "planned_value": float(record_price or 0.0) * float(qty or 0),
+            }
             _pre_api_block = filter_kr_entry_intent(_pre_api_intent, overlay, positions=getattr(self, "_kr_overlay_positions", []))
             if _pre_api_block.get("status") == "BLOCKED":
                 reason = str(_pre_api_block.get("reason") or "KR_MARKET_STATE_ENTRY_BLOCK")
