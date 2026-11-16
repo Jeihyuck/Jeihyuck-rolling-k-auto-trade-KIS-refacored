@@ -551,8 +551,9 @@ def test_real_am_price_repair_hook_precedes_contract_and_pre_submit():
     assert source.index("maybe_bound_pb1_prpr_fallback(") < source.index(
         "self.ensure_entry_exit_plan("
     ) < source.index("self._resolve_entry_pre_submit(")
-    assert '"timing_bounded_prpr_limit"' in source
-    assert "cf.features[\"order_price\"] = _bounded" in source
+    # The price/notional update now lives in the independently tested helper.
+    assert "apply_verified_bounded_limit(" in source
+    assert "limit_price = record_price = _bounded" in source
     # Same module's CLOSE flow must never take AM timing repair route.
     for method_name, method in PB1Engine.__dict__.items():
         if not method_name.startswith("_place_") or method_name == "_place_entry":
