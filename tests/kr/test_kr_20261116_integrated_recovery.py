@@ -53,11 +53,11 @@ def test_partial_opening_18_plus_18_recovers_afternoon_gate_without_fabrication(
                         lambda *parts: tmp_path.joinpath(*parts))
     early = START + timedelta(minutes=18)
     first = save(early, candles(0, 18), vwap=None)
-    assert first["bars"] == 17  # 09:17 has not completed at 09:18
+    assert first["bars"] == 18  # 09:17 has completed by 09:18
     # The original proof is too old for any live order after five minutes.
     assert load(LATE) is None
     second = save(LATE, candles(17, 36), vwap=10100)
-    assert second["added_bars"] == 19
+    assert second["added_bars"] == 18
     assert second["bars"] == 36
     merged = load(LATE)
     assert merged is not None
