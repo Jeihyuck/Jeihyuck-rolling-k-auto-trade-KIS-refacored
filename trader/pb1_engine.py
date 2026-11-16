@@ -5816,6 +5816,28 @@ class PB1Engine:
         order_type: str,
         allow_add_to_existing: bool = False,
     ) -> UnifiedGateDecision:
+        # The original MOMENTUM setup may be promoted to MOMENTUM_SWING.
+        # Reject a mutated finalized plan, not the legitimate original signal.
+        _final_contract = (cf.features or {}).get("final_entry_contract_proof")
+        if _final_contract is not None:
+            from trader.kr.final_entry_contract_proof import (
+                verify_final_entry_contract_proof,
+            )
+            _frozen_plan = (cf.features or {}).get("entry_exit_plan")
+            if (not isinstance(_frozen_plan, dict)
+                    or not verify_final_entry_contract_proof(
+                        plan=_frozen_plan, proof=_final_contract,
+                    )):
+                logger.error(
+                    "[KR][ENTRY][FINAL_CONTRACT_PROOF][BLOCK] code=%s reason=PROOF_MISMATCH",
+                    cf.code,
+                )
+                return UnifiedGateDecision(
+                    ok=False,
+                    reason_codes=["KR_FINAL_ENTRY_CONTRACT_PROOF_MISMATCH"],
+                    blocking_stage="pre_submit_contract",
+                    context={"code": cf.code},
+                )
         opening_blocked, buy_start = self._is_kr_opening_buy_blocked(self._now_kst)
         if opening_blocked:
             display_code = self._display_code(cf.code)
