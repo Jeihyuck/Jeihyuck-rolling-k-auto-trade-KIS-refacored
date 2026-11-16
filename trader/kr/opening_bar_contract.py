@@ -110,9 +110,21 @@ def inspect_completed_bar_coverage(*, rows: list[dict], now: datetime) -> dict:
     now = now.astimezone(KST)
     bars = clean_completed_bars(rows, now)
     state, reason, opening, after_open = _completed_bar_structure(bars, now)
+    opening_minutes = sorted({
+        datetime.fromisoformat(bar["timestamp"]).strftime("%H:%M")
+        for bar in opening
+    })
+    observed = set(opening_minutes)
+    unobserved = [
+        f"09:{i:02d}" for i in range(30) if f"09:{i:02d}" not in observed
+    ]
     return {
         "state": state, "reason": reason,
         "bars": len(bars), "opening_count": len(opening),
+        # Unobserved does NOT prove a broker data gap: some minutes may have
+        # no genuine trades. Never synthesize their OHLC or volume.
+        "opening_valid_minutes": opening_minutes,
+        "opening_unobserved_minutes": unobserved,
         "post_open_count": len(after_open),
         "latest_bar_ts": bars[-1]["timestamp"] if bars else None,
         "latest_bar_age_sec": (
