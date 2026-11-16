@@ -360,3 +360,19 @@ def test_ws_different_appkeys_do_not_block_each_other(tmp_path, monkeypatch):
     finally:
         first._release_owner_lock(a)
         second._release_owner_lock(b)
+
+
+def test_appkey_rejection_invalidates_even_recent_ws_quote(monkeypatch):
+    from trader.marketdata.kis_ws_price import KisWebSocketPriceService
+    monkeypatch.setenv("KIS_WS_PRICE_TEST_ENABLE", "1")
+    monkeypatch.setenv("KIS_WS_PRICE_ENABLED", "1")
+    monkeypatch.setenv("FORCE_HTTP", "1")
+    svc = KisWebSocketPriceService()
+    svc.put_quote(market="KR", symbol="093320", last=175300.0)
+    assert svc.get_fresh_quote("KR", "093320", max_age_sec=10.0)
+    svc._schedule_appkey_contention()
+    assert svc.get_fresh_quote("KR", "093320", max_age_sec=10.0) is None
+    # Even if a late socket callback provides data during the broker
+    # ownership cooldown, it is not a verified usable market quote.
+    svc.put_quote(market="KR", symbol="093320", last=175400.0)
+    assert svc.get_fresh_quote("KR", "093320", max_age_sec=10.0) is None
