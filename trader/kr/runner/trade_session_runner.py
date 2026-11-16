@@ -1029,6 +1029,12 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         result.update({
             "economic_settlement_state": str(pb1_result.get("economic_settlement_state") or "UNKNOWN"),
             "economic_settlement_pending": int(bool(close_economic_reason)),
+            "today_economic_settlement_state": str(
+                pb1_result.get("today_economic_settlement_state") or "NOT_REPORTED"),
+            "historical_economic_settlement_state": str(
+                pb1_result.get("historical_economic_settlement_state") or "NOT_REPORTED"),
+            "today_priced_sell_gap_count": pb1_result.get("today_priced_sell_gap_count"),
+            "historical_priced_sell_gap_count": pb1_result.get("historical_priced_sell_gap_count"),
             "native_priced_sell_gap_count": pb1_result.get("native_priced_sell_gap_count"),
             "phase": "close",
             "phase_executed": status not in {"FAIL", "FAILED"},
