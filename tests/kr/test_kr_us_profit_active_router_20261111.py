@@ -277,3 +277,75 @@ def test_diagnostic_samsung_position_never_mutates_amendment(monkeypatch):
     )
     assert result is None
     assert len(calls) == 1
+
+
+def test_stale_active_tp_balance_gets_one_fresh_native_read_without_relaxing_owner(monkeypatch):
+    """2026-11-16 Samsung-like initial stale TP: one native refresh, then
+    immutable owner/contract/stage and broker quantity checks still apply."""
+    pos = setup_contract(monkeypatch)
+
+    class FreshNativeKis(FakeKis):
+        def __init__(self, *, source="api", broker_qty=100):
+            super().__init__()
+            self.balance_calls = 0
+            self.source = source
+            self.broker_qty = broker_qty
+
+        def get_balance_cached(self, *, force=False, return_source=False):
+            assert force is True and return_source is True
+            self.balance_calls += 1
+            return {
+                "rt_cd": "0",
+                "output1": [{
+                    "pdno": "005930", "hldg_qty": str(self.broker_qty),
+                    "ord_psbl_qty": str(self.broker_qty),
+                    "pchs_avg_pric": "100",
+                }],
+                "output2": [{"ord_psbl_cash": "1000000"}],
+            }, self.source
+
+    kis = FreshNativeKis()
+    result = router.evaluate_active_kr_tp(
+        position=pos, engine=object(), kis=kis,
+        env="practice", code="005930",
+        balance_snapshot=FakeBalance(freshness=BalanceFreshness.STALE),
+    )
+    assert result["action"] == "ACTIVE_TP", result
+    assert result["stage"] == "TP1"
+    assert kis.balance_calls == 1
+
+    cached = FreshNativeKis(source="wrapper_cache")
+    blocked = router.evaluate_active_kr_tp(
+        position=pos, engine=object(), kis=cached,
+        env="practice", code="005930",
+        balance_snapshot=FakeBalance(freshness=BalanceFreshness.STALE),
+    )
+    assert blocked["action"] == "BLOCK"
+    assert blocked["reason"] == "KR_TP_BALANCE_REFRESH_NATIVE_UNVERIFIED"
+    assert cached.calls == 0  # No quote, DB stage claim or broker order.
+
+    mismatch = FreshNativeKis(broker_qty=99)
+    denied = router.evaluate_active_kr_tp(
+        position=pos, engine=object(), kis=mismatch,
+        env="practice", code="005930",
+        balance_snapshot=FakeBalance(freshness=BalanceFreshness.STALE),
+    )
+    assert denied["action"] == "BLOCK"
+    assert denied["reason"] == "KR_TP_KIS_AVG_OR_QTY_MISMATCH"
+    assert mismatch.balance_calls == 1
+
+
+def test_stale_tp_balance_refresh_failure_remains_fail_closed(monkeypatch):
+    pos = setup_contract(monkeypatch)
+
+    class BrokenBalanceKis(FakeKis):
+        def get_balance_cached(self, **kwargs):
+            raise TimeoutError("synthetic REST timeout, never use stale cache")
+
+    result = router.evaluate_active_kr_tp(
+        position=pos, engine=object(), kis=BrokenBalanceKis(),
+        env="practice", code="005930",
+        balance_snapshot=FakeBalance(freshness=BalanceFreshness.STALE),
+    )
+    assert result["action"] == "BLOCK"
+    assert result["reason"] == "KR_TP_BALANCE_REFRESH_FAILED"
