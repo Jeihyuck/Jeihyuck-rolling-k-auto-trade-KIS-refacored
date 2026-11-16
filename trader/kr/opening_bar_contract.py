@@ -240,29 +240,92 @@ def _evidence_file(env: str, account_scope: str, code: str, now: datetime) -> Pa
 def save_opening_proof(*, env: str, account_scope: str, code: str,
                        now: datetime, raw_bars: list[dict], vwap: float | None,
                        vwap_source: str) -> dict:
+    """Merge only attested same-day completed KIS bars, under a process lock.
+
+    A partial REST response must not erase earlier valid completed candles.
+    A historic proof may contribute *candles*, never fresh VWAP or freshness.
+    Divergent values for an immutable completed minute are quarantined; do
+    not fabricate a preferred price or authorize BUY on conflicting evidence.
+    """
+    import tempfile
+
     now = now.astimezone(KST)
-    cleaned = clean_completed_bars(raw_bars, now)
-    payload = {
-        "version": VERSION, "env": str(env).lower(), "code": str(code).zfill(6),
-        "as_of": now.isoformat(), "trade_date": now.date().isoformat(),
-        "source": "KIS_FHKST03010200", "bars": [
-            {**bar, "date": now.date().isoformat(), "time": datetime.fromisoformat(bar["timestamp"]).strftime("%H%M%S")}
-            for bar in cleaned
-        ],
-        "vwap": _positive(vwap),
-        "vwap_source": vwap_source if _positive(vwap) else "UNKNOWN",
-    }
-    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    payload["sha256"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    new_bars = clean_completed_bars(raw_bars, now)
     path = _evidence_file(env, account_scope, code, now)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, path)
-    return {"path": str(path), "bars": len(cleaned), "sha256": payload["sha256"]}
+    lock_path = path.with_suffix(".lock")
+
+    # Both the AM and PM observer may run during a handoff. The lock file is
+    # stable across os.replace; locking the replaced proof inode is unsafe.
+    import fcntl
+    with lock_path.open("a+b") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            previous = load_opening_proof(
+                env=env, account_scope=account_scope, code=code, now=now,
+                max_age_seconds=None,
+            )
+            old_bars = clean_completed_bars((previous or {}).get("bars") or [], now)
+            merged = {bar["timestamp"]: bar for bar in old_bars}
+            conflicts = set((previous or {}).get("source_conflicts") or [])
+            added = 0
+            for bar in new_bars:
+                key = bar["timestamp"]
+                if key in merged and merged[key] != bar:
+                    conflicts.add(key)
+                    # The old verified evidence is preserved, but cannot be
+                    # used to authorize an entry until the conflict is resolved.
+                    continue
+                if key not in merged:
+                    added += 1
+                merged[key] = bar
+            bars = [merged[key] for key in sorted(merged)]
+            payload = {
+                "version": VERSION, "env": str(env).lower(),
+                "code": str(code).zfill(6),
+                "as_of": now.isoformat(), "trade_date": now.date().isoformat(),
+                "source": "KIS_FHKST03010200",
+                "bars": [
+                    {**bar, "date": now.date().isoformat(),
+                     "time": datetime.fromisoformat(bar["timestamp"]).strftime("%H%M%S")}
+                    for bar in bars
+                ],
+                "vwap": _positive(vwap),
+                "vwap_source": vwap_source if _positive(vwap) else "UNKNOWN",
+                "source_conflicts": sorted(conflicts),
+            }
+            canonical = json.dumps(
+                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            )
+            payload["sha256"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+            # Use a unique temp path + fsync to prevent partial proof exposure
+            # across concurrent collectors, cancellation and WSL restarts.
+            temp_name = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", dir=path.parent,
+                    prefix=path.stem + ".", suffix=".tmp", delete=False,
+                ) as temp_file:
+                    temp_name = temp_file.name
+                    json.dump(payload, temp_file, ensure_ascii=False)
+                    temp_file.flush()
+                    os.fsync(temp_file.fileno())
+                os.replace(temp_name, path)
+            finally:
+                if temp_name and os.path.exists(temp_name):
+                    os.unlink(temp_name)
+            return {
+                "path": str(path), "bars": len(bars),
+                "new_bars": len(new_bars), "reused_bars": len(old_bars),
+                "added_bars": added, "source_conflicts": sorted(conflicts),
+                "sha256": payload["sha256"],
+            }
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
-def load_opening_proof(*, env: str, account_scope: str, code: str, now: datetime) -> dict | None:
+def load_opening_proof(*, env: str, account_scope: str, code: str, now: datetime,
+                       max_age_seconds: float | None = 180) -> dict | None:
     now = now.astimezone(KST)
     path = _evidence_file(env, account_scope, code, now)
     if not path.is_file():
@@ -274,7 +337,9 @@ def load_opening_proof(*, env: str, account_scope: str, code: str, now: datetime
                 or payload.get("code") != str(code).zfill(6)
                 or payload.get("env") != str(env).lower()
                 or payload.get("trade_date") != now.date().isoformat()
-                or stamp > now or (now - stamp).total_seconds() > 180):
+                or stamp.tzinfo is None or stamp > now
+                or (max_age_seconds is not None
+                    and (now - stamp).total_seconds() > max_age_seconds)):
             return None
         digest = payload.pop("sha256", "")
         canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -295,6 +360,9 @@ def evaluate_proof_for_candidate(*, env: str, account_scope: str, code: str,
     )
     if not payload:
         return _result("UNKNOWN", "NO_FRESH_VERIFIED_KIS_MINUTE_BAR_PROOF")
+    if payload.get("source_conflicts"):
+        return _result("UNKNOWN", "CONFLICTING_NATIVE_COMPLETED_BAR",
+                       source_conflicts=list(payload["source_conflicts"]))
     return evaluate_price_aware_entry(
         style=style, rows=payload["bars"], now=now,
         vwap=payload["vwap"],
