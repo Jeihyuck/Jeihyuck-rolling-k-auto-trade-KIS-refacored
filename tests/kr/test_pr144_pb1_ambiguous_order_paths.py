@@ -17,7 +17,9 @@ from trader.reconcile_kis import (
 )
 from trader.trade_plan import build_entry_exit_plan
 from trader.window_router import WindowDecision
-from tests.kr.test_kr_entry_authoritative_gate_state import _build_candidate
+from tests.kr.test_kr_entry_authoritative_gate_state import (
+    _build_candidate, _install_native_minute_enforce_test_proof,
+)
 from tests.kr.execution_claim_fixtures import create_schema_with_active_test_epoch
 
 
@@ -215,6 +217,9 @@ def _run_sell(engine, position):
 
 
 def test_regular_buy_unresolved_ack_survives_restart_and_blocks_resubmit(monkeypatch):
+    # This test targets durable order/claim behavior AFTER the active 1m BUY gate.
+    # A synthetic test-only ready proof is required; SHADOW execution is forbidden.
+    _install_native_minute_enforce_test_proof(monkeypatch)
     monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda *_args: (True, "ok"))
     db = _new_db()
     kis = AmbiguousBuyKis()
@@ -237,6 +242,9 @@ def test_regular_buy_unresolved_ack_survives_restart_and_blocks_resubmit(monkeyp
 
 
 def test_kr_claim_acquisition_failure_blocks_before_broker_submit(monkeypatch):
+    # This test targets durable order/claim behavior AFTER the active 1m BUY gate.
+    # A synthetic test-only ready proof is required; SHADOW execution is forbidden.
+    _install_native_minute_enforce_test_proof(monkeypatch)
     monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda *_args: (True, "ok"))
 
     def unavailable_claim(*_args, **_kwargs):
@@ -255,6 +263,9 @@ def test_kr_claim_acquisition_failure_blocks_before_broker_submit(monkeypatch):
 
 
 def test_kr_claim_observation_failure_is_visible_and_keeps_submit_fence(monkeypatch):
+    # This test targets durable order/claim behavior AFTER the active 1m BUY gate.
+    # A synthetic test-only ready proof is required; SHADOW execution is forbidden.
+    _install_native_minute_enforce_test_proof(monkeypatch)
     monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda *_args: (True, "ok"))
     db = _new_db()
     kis = AckOnlyBuyKis()
@@ -1222,6 +1233,9 @@ def test_pb1_sell_execution_lifecycle_uses_position_cycle_not_sid_mode(monkeypat
 
 
 def test_pb1_entry_retry_qty_is_capped_to_durable_remaining_target(monkeypatch):
+    # This test targets durable order/claim behavior AFTER the active 1m BUY gate.
+    # A synthetic test-only ready proof is required; SHADOW execution is forbidden.
+    _install_native_minute_enforce_test_proof(monkeypatch)
     from types import SimpleNamespace
 
     monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda *_args: (True, "ok"))
