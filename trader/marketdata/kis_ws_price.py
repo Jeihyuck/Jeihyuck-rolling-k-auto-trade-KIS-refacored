@@ -409,6 +409,54 @@ class KisWebSocketPriceService:
         base = "ws://ops.koreainvestment.com:21000" if env == "real" else "ws://ops.koreainvestment.com:31000"
         return f"{base}/tryitout"
 
+    def _acquire_owner_lock(self):
+        """Exclusive cross-process KIS WS appkey owner within the WSL host.
+
+        A competing KR/US session sharing the same *credential* must use the
+        REST fallback, not open another WebSocket and flood 'appkey in use'.
+        This is an OS flock lifetime lease: abnormal process exit releases
+        the lock automatically. No credential is ever persisted or logged.
+        """
+        import fcntl
+        import hashlib
+        import tempfile
+        from pathlib import Path
+
+        appkey, secret = self._credentials()
+        if not appkey or not secret:
+            raise RuntimeError("KIS_WS_OWNER_MISSING_CREDENTIALS")
+        identity = (self._ws_url() + "\0" + appkey).encode("utf-8")
+        digest = hashlib.sha256(identity).hexdigest()
+        lock_dir = Path(os.getenv("KIS_WS_OWNER_LOCK_DIR") or
+                        str(Path(tempfile.gettempdir()) / "nullim-kis-ws-owner"))
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        path = lock_dir / (digest + ".lock")
+        stream = path.open("a+b")
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # The advisory lock, not PID metadata, is the owner authority.
+            stream.seek(0)
+            stream.truncate()
+            stream.write(("pid=%s\n" % os.getpid()).encode("ascii"))
+            stream.flush()
+            return stream
+        except BlockingIOError:
+            stream.close()
+            return None
+        except Exception:
+            stream.close()
+            raise
+
+    @staticmethod
+    def _release_owner_lock(stream) -> None:
+        if stream is None:
+            return
+        try:
+            import fcntl
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        finally:
+            stream.close()
+
     def _approval_key(self) -> str:
         app_key, app_secret = self._credentials()
         if not app_key or not app_secret:
@@ -530,7 +578,18 @@ class KisWebSocketPriceService:
 
         backoff = 1.0
         while not self._stop.is_set():
+            owner_stream = None
             try:
+                owner_stream = await asyncio.to_thread(self._acquire_owner_lock)
+                if owner_stream is None:
+                    self._last_error = "KIS_WS_APPKEY_OWNER_BUSY"
+                    logger.warning(
+                        "[KIS_WS][OWNER_BUSY] action=REST_FALLBACK "
+                        "retry_after_sec=15 owner=OTHER_WSL_PROCESS "
+                        "owner_pid_unverified=1",
+                    )
+                    await asyncio.sleep(15.0)
+                    continue
                 approval = await asyncio.to_thread(self._approval_key)
                 with self._lock:
                     self._approval_obtained = bool(approval)
@@ -670,6 +729,8 @@ class KisWebSocketPriceService:
                 logger.warning("[KIS_WS][DISCONNECTED] err=%s retry_sec=%.1f", self._last_error, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2.0, _env_float("KIS_WS_RECONNECT_MAX_SEC", 15.0))
+            finally:
+                self._release_owner_lock(owner_stream)
 
     async def _handle_message(self, ws: Any, message: Any) -> None:
         if isinstance(message, bytes):
