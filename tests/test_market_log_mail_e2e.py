@@ -433,3 +433,49 @@ def test_stage4_missing_referenced_log_degrades_but_does_not_cancel_mail(tmp_pat
         assert manifest["required_missing_count"] >= 1
         assert manifest["evidence_status"] == "DEGRADED"
         assert {"code": "REQUIRED_STAGE4_WORKER_LOG_MISSING_am", "path": worker_rel} in manifest["missing_evidence"]
+
+
+def test_kr_opening_observer_sidecar_log_is_archived_when_am_launches(tmp_path):
+    """Nov16 AM launched the collector, but the archive omitted its root log.
+
+    The mail must include native-minute diagnostics and redact secrets.
+    """
+    root = fixture_repo(tmp_path, "kr")
+    observer_rel = f"runtime/logs/kr/{DATE}/kr-opening-observer.log"
+    (root / f"runtime/logs/kr/{DATE}/am/attempt-1.log").write_text(
+        f"[KR][ENTRY_TIMING][OBSERVER_LAUNCH] pid=123 "
+        f"mode=READ_ONLY log={observer_rel}\\n"
+    )
+    observer = root / observer_rel
+    observer.write_text(
+        "[KR][OPENING_OBSERVER][COVERAGE_GAP] code=093320 "
+        "opening_valid=['09:00'] opening_unobserved=['09:01'] "
+        "KIS_APP_SECRET=private-test-secret\\n"
+    )
+    result, archive = run_mail(root, "kr")
+    assert result.returncode == 0, result.stdout + result.stderr
+    with tarfile.open(archive, "r:gz") as tf:
+        name = "./" + observer_rel
+        assert name in tf.getnames()
+        log = tf.extractfile(name).read()
+        assert b"093320" in log
+        assert b"private-test-secret" not in log
+        manifest = json.load(tf.extractfile("./NULLIM_LOG_ARCHIVE_MANIFEST.json"))
+        assert observer_rel in manifest["included_required_files"]
+
+
+def test_kr_launched_but_missing_observer_sidecar_degrades_mail_not_suppresses(tmp_path):
+    root = fixture_repo(tmp_path, "kr")
+    observer_rel = f"runtime/logs/kr/{DATE}/kr-opening-observer.log"
+    (root / f"runtime/logs/kr/{DATE}/am/attempt-1.log").write_text(
+        f"[KR][ENTRY_TIMING][OBSERVER_LAUNCH] pid=123 log={observer_rel}\\n"
+    )
+    result, archive = run_mail(root, "kr")
+    assert result.returncode == 0, result.stdout + result.stderr
+    with tarfile.open(archive, "r:gz") as tf:
+        manifest = json.load(tf.extractfile("./NULLIM_LOG_ARCHIVE_MANIFEST.json"))
+        assert manifest["evidence_status"] == "DEGRADED"
+        assert {
+            "code": "REQUIRED_KR_OPENING_OBSERVER_LOG_MISSING",
+            "path": observer_rel,
+        } in manifest["missing_evidence"]

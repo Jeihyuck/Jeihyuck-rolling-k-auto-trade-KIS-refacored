@@ -82,7 +82,41 @@ def _build_candidate(code: str) -> CandidateFeature:
     return cf
 
 
+
+def _install_native_minute_enforce_test_proof(monkeypatch) -> None:
+    """Allow unrelated order lifecycle tests to reach their downstream gates.
+
+    The synthetic accepted 1m proof is intentionally TEST-ONLY. It is not
+    observed KIS market data, does not enable SHADOW, and must never be
+    installed in production code. Dedicated opening-bar tests verify
+    native-source freshness and fail-closed behavior separately.
+    """
+    monkeypatch.setenv("KR_PB1_ENTRY_TIMING_MODE", "ENFORCE")
+    monkeypatch.setenv("KR_PB1_ENTRY_TIMING_APPROVED", "1")
+
+    def _confirmed_minute_proof(**kwargs):
+        assert kwargs["env"] == "practice"
+        assert kwargs["style"] in {
+            "ENTRY_PULLBACK", "ENTRY_MOMENTUM", "ENTRY_BREAKOUT",
+        }
+        assert len(str(kwargs["code"])) == 6
+        order_price = float(kwargs["order_price"])
+        assert order_price > 0
+        return {
+            "state": "READY_SHADOW",  # Legacy proof enum, *not* execution mode
+            "reason": "SYNTHETIC_COMPLETED_KIS_1M_TEST_ONLY",
+            "reference_price": order_price,
+            "max_entry_price": order_price,
+        }
+
+    monkeypatch.setattr(
+        "trader.pb1_engine.evaluate_proof_for_candidate",
+        _confirmed_minute_proof,
+    )
+
+
 def test_entry_pullback_candidates_do_not_hard_block(monkeypatch) -> None:
+    _install_native_minute_enforce_test_proof(monkeypatch)
     monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda kis, code: (True, "ok"))
     engine = _make_engine()
 
@@ -111,7 +145,8 @@ def test_entry_pullback_candidates_do_not_hard_block(monkeypatch) -> None:
         assert status["api_submitted"] == 1
 
 
-def test_hard_block_diagnostic_contains_gate_state_fields(caplog) -> None:
+def test_hard_block_diagnostic_contains_gate_state_fields(caplog, monkeypatch) -> None:
+    _install_native_minute_enforce_test_proof(monkeypatch)
     engine = _make_engine()
     cf = _build_candidate("086280")
     cf.risk_passed = False

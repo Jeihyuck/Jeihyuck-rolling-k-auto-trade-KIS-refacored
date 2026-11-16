@@ -35,9 +35,17 @@ def test_disabled_websocket_cannot_be_force_enabled(monkeypatch):
     assert svc.network_allowed("US") is False
 
 
-def test_websocket_adapter_reconnects_and_only_serves_fresh_quotes(monkeypatch):
+def test_websocket_adapter_reconnects_and_only_serves_fresh_quotes(monkeypatch, tmp_path):
     from trader.marketdata import kis_ws_price
 
+    # The actual socket owner now requires a credential-bound OS lease.
+    # This fully synthetic US broker double supplies no real credential.
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("KIS_US_APP_KEY", "US-OFFLINE-WEBSOCKET-TEST")
+    monkeypatch.setenv("KIS_US_APP_SECRET", "OFFLINE-ONLY")
+    monkeypatch.setenv("KIS_APP_KEY", "US-OFFLINE-WEBSOCKET-TEST")
+    monkeypatch.setenv("KIS_APP_SECRET", "OFFLINE-ONLY")
+    monkeypatch.setenv("KIS_WS_OWNER_LOCK_DIR", str(tmp_path))
     monkeypatch.setenv("KIS_WS_PRICE_ENABLED", "1")
     monkeypatch.setenv("KIS_WS_PRICE_TEST_ENABLE", "1")
     monkeypatch.setenv("US_KIS_HTTP_ENABLED", "1")

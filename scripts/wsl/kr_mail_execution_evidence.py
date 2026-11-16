@@ -81,6 +81,8 @@ def collect_kr_execution_status(stage: Path, trade: str) -> dict[str, Any]:
         summary[purpose] = {"status": status, "reason": reason}
     pb1 = _json(stage / "runtime" / "kr" / "session" / trade / "close" / "pb1_result.json")
     economic = str(pb1.get("economic_settlement_state") or "UNKNOWN")
+    today_economic = str(pb1.get("today_economic_settlement_state") or "NOT_REPORTED")
+    historical_economic = str(pb1.get("historical_economic_settlement_state") or "NOT_REPORTED")
     try:
         native_gap = int(pb1.get("native_priced_sell_gap_count") or 0)
     except (TypeError, ValueError):
@@ -100,6 +102,8 @@ def collect_kr_execution_status(stage: Path, trade: str) -> dict[str, Any]:
         for name, item in summary.items()
     ]
     summary_tokens.append(f"CLOSE_SETTLEMENT={economic}")
+    summary_tokens.append(f"TODAY_SETTLEMENT={today_economic}")
+    summary_tokens.append(f"HISTORICAL_SETTLEMENT={historical_economic}")
     if native_gap is not None:
         summary_tokens.append(f"SELL_PRICING_GAPS={native_gap}")
     # Never claim an all-session zero-order day from CLOSE counters alone.
@@ -109,6 +113,10 @@ def collect_kr_execution_status(stage: Path, trade: str) -> dict[str, Any]:
         "daily_execution_status": daily,
         "execution_sessions": summary,
         "close_economic_settlement_state": economic,
+        "close_today_economic_settlement_state": today_economic,
+        "close_historical_economic_settlement_state": historical_economic,
+        "close_today_priced_sell_gap_count": pb1.get("today_priced_sell_gap_count"),
+        "close_historical_priced_sell_gap_count": pb1.get("historical_priced_sell_gap_count"),
         "close_native_priced_sell_gap_count": native_gap,
         "execution_summary": "; ".join(summary_tokens),
     }

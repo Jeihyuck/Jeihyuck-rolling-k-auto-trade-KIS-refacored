@@ -17,7 +17,10 @@ from pathlib import Path
 import time
 
 from trader.account_state import get_account_key
-from trader.kr.opening_bar_contract import KST, save_opening_proof, inspect_completed_bar_coverage
+from trader.kr.opening_bar_contract import (
+    KST, save_opening_proof, load_opening_proof, inspect_completed_bar_coverage,
+    diagnose_native_bar_rows,
+)
 from trader.runtime_paths import repo_root
 from trader.time_utils import now_kst
 
@@ -186,6 +189,21 @@ def verified_native_kr_vwap(quote: dict, *, code: str, observed_at: datetime) ->
     return value, "VERIFIED_NATIVE_KIS_VWAP"
 
 
+# Per-process bounded backoff. Historical candles may need several sessions
+# of REST recovery; never block PB1's time-critical SELL route.
+_OPENING_REPAIR_NEXT: dict[str, tuple[float, int]] = {}
+
+
+def _repair_opening_due(code: str) -> bool:
+    now = time.monotonic()
+    next_at, attempt = _OPENING_REPAIR_NEXT.get(code, (0.0, 0))
+    if now < next_at:
+        return False
+    attempt = min(attempt + 1, 7)
+    _OPENING_REPAIR_NEXT[code] = (now + min(900.0, 20.0 * (2 ** attempt)), attempt)
+    return True
+
+
 def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: float = 0.8) -> dict:
     """No order methods are called; all I/O is read-only KIS and local proofs."""
     observed_at = observed_at.astimezone(KST)
@@ -229,6 +247,18 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
             raw = quote.get("raw") if isinstance(quote.get("raw"), dict) else {}
             quote_origin = str(quote.get("source") or raw.get("source") or "UNKNOWN")
             proof_now = now_kst()
+            native_diagnostic = diagnose_native_bar_rows(data, proof_now)
+            logger.info(
+                "[KR][OPENING_OBSERVER][KIS_NATIVE_BAR_AUDIT] code=%s "
+                "rows=%d valid_unique=%d duplicates=%d dropped=%s "
+                "first_valid=%s last_valid=%s no_trade_proven=0",
+                code, native_diagnostic["total_rows"],
+                native_diagnostic["valid_unique_minutes"],
+                native_diagnostic["duplicate_valid_rows"],
+                native_diagnostic["excluded_by_reason"],
+                native_diagnostic["first_valid_native"],
+                native_diagnostic["last_valid_native"],
+            )
             vwap, vwap_status = verified_native_kr_vwap(
                 quote, code=code, observed_at=proof_now,
             )
@@ -236,27 +266,90 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
             quote_day = str(quote["stck_bsop_date"] if "stck_bsop_date" in quote
                             else raw.get("stck_bsop_date") or "").replace("-", "")
             quote_clock = quote["stck_cntg_hour"] if "stck_cntg_hour" in quote else raw.get("stck_cntg_hour")
-            coverage = inspect_completed_bar_coverage(rows=data, now=proof_now)
             result = save_opening_proof(
                 env="practice", account_scope=scope, code=code,
                 now=proof_now, raw_bars=data,
                 vwap=vwap if verified_vwap else None,
                 vwap_source="KIS_NATIVE_WEIGHTED_AVG" if verified_vwap else "UNKNOWN",
             )
+            # Report and evaluate the persisted *merged* evidence, not merely
+            # this REST response: a partial fetch can complement prior candles.
+            persisted = load_opening_proof(
+                env="practice", account_scope=scope, code=code, now=proof_now,
+            )
+            if persisted is None:
+                raise RuntimeError("OPENING_PROOF_PERSISTED_READBACK_FAILED")
+            coverage = inspect_completed_bar_coverage(
+                rows=persisted["bars"], now=proof_now,
+            )
+            if (coverage["reason"] == "OPENING_BARS_MISSING_OR_INCOMPLETE"
+                    and observed_at.time() >= dtime(9, 30)
+                    and _repair_opening_due(code)):
+                # An extra native early-session read can recover partial KIS
+                # pages without inventing zero-volume or missing-time candles.
+                try:
+                    repair_rows = kis.get_intraday_candles_today(
+                        code, start_hhmm="091500",
+                    )
+                    if isinstance(repair_rows, list) and repair_rows:
+                        result = save_opening_proof(
+                            env="practice", account_scope=scope, code=code,
+                            now=proof_now,
+                            raw_bars=[r for r in repair_rows if isinstance(r, dict)],
+                            vwap=vwap if verified_vwap else None,
+                            vwap_source=("KIS_NATIVE_WEIGHTED_AVG"
+                                         if verified_vwap else "UNKNOWN"),
+                        )
+                        persisted = load_opening_proof(
+                            env="practice", account_scope=scope, code=code,
+                            now=proof_now,
+                        )
+                        if persisted is None:
+                            raise RuntimeError("OPENING_REPAIR_READBACK_FAILED")
+                        coverage = inspect_completed_bar_coverage(
+                            rows=persisted["bars"], now=proof_now,
+                        )
+                    logger.info(
+                        "[KR][OPENING_OBSERVER][REPAIR] code=%s anchor=091500 "
+                        "raw_rows=%s opening_count=%s reason=%s retries_bounded=1",
+                        code, len(repair_rows) if isinstance(repair_rows, list) else 0,
+                        coverage["opening_count"], coverage["reason"],
+                    )
+                except Exception as repair_exc:
+                    logger.warning(
+                        "[KR][OPENING_OBSERVER][REPAIR_FAIL] code=%s type=%s "
+                        "action=KEEP_OLD_VERIFIED_PROOF",
+                        code, type(repair_exc).__name__,
+                    )
+            if persisted.get("source_conflicts"):
+                coverage = {**coverage, "state": "UNKNOWN",
+                            "reason": "CONFLICTING_NATIVE_COMPLETED_BAR"}
             if coverage["state"] == "COVERED":
                 coverage_ok += 1
+            elif observed_at.time() >= dtime(9, 30):
+                logger.warning(
+                    "[KR][OPENING_OBSERVER][COVERAGE_GAP] code=%s "
+                    "reason=%s native_rows=%s persisted_bars=%s "
+                    "opening_valid=%s opening_unobserved=%s "
+                    "unobserved_not_proven_missing=1",
+                    code, coverage["reason"], len(data), result["bars"],
+                    coverage.get("opening_valid_minutes"),
+                    coverage.get("opening_unobserved_minutes"),
+                )
             if not verified_vwap:
                 missing_vwap += 1
             logger.info(
                 "[KR][OPENING_OBSERVER][COVERAGE] code=%s state=%s reason=%s "
                 "opening_count=%s post_open_count=%s bar_age_sec=%s "
                 "vwap_verified=%s vwap_reason=%s vwap_origin=%s day_present=%s "
-                "exchange_clock_present=%s read_only=1",
+                "exchange_clock_present=%s persisted_bars=%s new_bars=%s "
+                "reused_bars=%s conflicts=%s read_only=1",
                 code, coverage["state"], coverage["reason"],
                 coverage["opening_count"], coverage["post_open_count"],
                 coverage["latest_bar_age_sec"], int(verified_vwap),
                 vwap_status, quote_origin, int(bool(quote_day)),
-                int(bool(quote_clock)),
+                int(bool(quote_clock)), result["bars"], result["new_bars"],
+                result["reused_bars"], len(result["source_conflicts"]),
             )
             if result["bars"] > 0:
                 done += 1

@@ -67,6 +67,10 @@ class RealtimeQuote:
             "stale": False,
             "quality": "fresh",
             "source": self.source,
+            # Provenance: self.symbol is parsed from the WS KIS trade frame,
+            # not inferred from the caller's requested symbol.
+            "source_identity": "KIS_WS_PARSED_SYMBOL",
+            "requested_symbol": self.symbol,
             "exchange": self.exchange,
             "raw": {
                 "source": self.source,
@@ -115,6 +119,10 @@ class KisWebSocketPriceService:
         self._subscription_retry_after: dict[tuple[str, str], float] = {}
         self._subscription_retry_attempts: dict[tuple[str, str], int] = {}
         self._pending_unsubscribes: set[tuple[str, str]] = set()
+        # One broker-level appkey contention affects all subscription IDs;
+        # individual 1..15sec retries otherwise hammer KIS for each symbol.
+        self._appkey_busy_until: float = 0.0
+        self._appkey_busy_events: int = 0
 
     def enabled(self) -> bool:
         if os.getenv("PYTEST_CURRENT_TEST") and not _env_flag("KIS_WS_PRICE_TEST_ENABLE", False):
@@ -239,6 +247,10 @@ class KisWebSocketPriceService:
             return None
         key = (str(market or "").upper(), self._normalize_symbol(market, symbol))
         with self._lock:
+            # A rejected appkey invalidates the origin/ownership of all WS
+            # quotes, even ones that are younger than the usual TTL.
+            if time.monotonic() < self._appkey_busy_until:
+                return None
             quote = self._quotes.get(key)
         if not quote:
             return None
@@ -334,6 +346,8 @@ class KisWebSocketPriceService:
             "connections": self._connection_count,
             "reconnects": self._reconnect_count,
             "last_error": self._last_error,
+            "appkey_busy_events": self._appkey_busy_events,
+            "appkey_busy": time.monotonic() < self._appkey_busy_until,
         }
 
     def _ensure_started(self) -> None:
@@ -403,6 +417,55 @@ class KisWebSocketPriceService:
         base = "ws://ops.koreainvestment.com:21000" if env == "real" else "ws://ops.koreainvestment.com:31000"
         return f"{base}/tryitout"
 
+    def _acquire_owner_lock(self):
+        """Exclusive cross-process KIS WS appkey owner within the WSL host.
+
+        A competing KR/US session sharing the same *credential* must use the
+        REST fallback, not open another WebSocket and flood 'appkey in use'.
+        This is an OS flock lifetime lease: abnormal process exit releases
+        the lock automatically. No credential is ever persisted or logged.
+        """
+        import fcntl
+        import hashlib
+        import tempfile
+        from pathlib import Path
+
+        appkey, secret = self._credentials()
+        if not appkey or not secret:
+            raise RuntimeError("KIS_WS_OWNER_MISSING_CREDENTIALS")
+        identity = (str(os.getenv("KIS_ENV") or "practice").lower()
+                    + "\0" + appkey).encode("utf-8")
+        digest = hashlib.sha256(identity).hexdigest()
+        lock_dir = Path(os.getenv("KIS_WS_OWNER_LOCK_DIR") or
+                        str(Path(tempfile.gettempdir()) / "nullim-kis-ws-owner"))
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        path = lock_dir / (digest + ".lock")
+        stream = path.open("a+b")
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # The advisory lock, not PID metadata, is the owner authority.
+            stream.seek(0)
+            stream.truncate()
+            stream.write(("pid=%s\n" % os.getpid()).encode("ascii"))
+            stream.flush()
+            return stream
+        except BlockingIOError:
+            stream.close()
+            return None
+        except Exception:
+            stream.close()
+            raise
+
+    @staticmethod
+    def _release_owner_lock(stream) -> None:
+        if stream is None:
+            return
+        try:
+            import fcntl
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        finally:
+            stream.close()
+
     def _approval_key(self) -> str:
         app_key, app_secret = self._credentials()
         if not app_key or not app_secret:
@@ -425,13 +488,42 @@ class KisWebSocketPriceService:
             raise RuntimeError(f"KIS approval_key missing rt={data.get('rt_cd')} msg={data.get('msg1')}")
         return approval
 
+    def _schedule_appkey_contention(self, *, now_mono: float | None = None) -> float:
+        """Broker-wide anonymous appkey collision: hold ALL subscriptions.
+
+        The real KIS error contains tr_id=(null), tr_key empty. It is not a
+        per-symbol rejection; reconnecting instantly just floods the broker.
+        Pause globally and requeue every previously sent symbol for a future
+        verified ACK. REST remains the existing freshness-checked fallback.
+        """
+        now_value = time.monotonic() if now_mono is None else float(now_mono)
+        with self._lock:
+            self._appkey_busy_events += 1
+            base = max(30.0, _env_float("KIS_WS_APPKEY_BUSY_BASE_SEC", 60.0))
+            cap = max(base, _env_float("KIS_WS_APPKEY_BUSY_MAX_SEC", 300.0))
+            delay = min(cap, base * (2 ** min(self._appkey_busy_events - 1, 5)))
+            self._appkey_busy_until = max(self._appkey_busy_until, now_value + delay)
+            for subscription in self._desired.values():
+                self._retry_subscriptions.add(subscription)
+                self._subscription_retry_after[subscription] = max(
+                    self._subscription_retry_after.get(subscription, 0.0),
+                    self._appkey_busy_until,
+                )
+            self._broker_subscriptions_acked.clear()
+            # No stale websocket price may pass as executable KIS market data
+            # while ownership is contested. REST can be used independently.
+            self._quotes.clear()
+            self._last_error = "KIS_WS_APPKEY_ALREADY_IN_USE"
+        return delay
+
     def _schedule_subscription_retry(
         self,
         subscription: tuple[str, str],
         *,
         now_mono: float | None = None,
+        appkey_conflict: bool = False,
     ) -> float:
-        """Back off one rejected subscription without starving other symbols."""
+        """Bound retries; appkey ownership errors pause every subscription."""
         now_value = time.monotonic() if now_mono is None else float(now_mono)
         base = max(0.1, _env_float("KIS_WS_SUBSCRIBE_RETRY_BASE_SEC", 1.0))
         max_delay = max(base, _env_float("KIS_WS_SUBSCRIBE_RETRY_MAX_SEC", 15.0))
@@ -439,6 +531,23 @@ class KisWebSocketPriceService:
             attempt = int(self._subscription_retry_attempts.get(subscription, 0) or 0) + 1
             self._subscription_retry_attempts[subscription] = attempt
             delay = min(max_delay, base * (2 ** max(0, attempt - 1)))
+            if appkey_conflict:
+                self._appkey_busy_events += 1
+                busy_base = max(30.0, _env_float(
+                    "KIS_WS_APPKEY_BUSY_BASE_SEC", 60.0,
+                ))
+                busy_max = max(busy_base, _env_float(
+                    "KIS_WS_APPKEY_BUSY_MAX_SEC", 300.0,
+                ))
+                cooldown = min(
+                    busy_max,
+                    busy_base * (2 ** min(self._appkey_busy_events - 1, 5)),
+                )
+                self._appkey_busy_until = max(
+                    self._appkey_busy_until, now_value + cooldown,
+                )
+                delay = max(delay, cooldown)
+                self._last_error = "KIS_WS_APPKEY_ALREADY_IN_USE"
             self._subscription_retry_after[subscription] = now_value + delay
             self._retry_subscriptions.add(subscription)
             self._broker_subscriptions_acked.discard(subscription)
@@ -460,6 +569,8 @@ class KisWebSocketPriceService:
     ) -> tuple[tuple[str, str], tuple[str, str]] | None:
         """Pick a ready symbol fairly; rejected symbols wait for their backoff."""
         with self._lock:
+            if self._appkey_busy_until > now_mono:
+                return None  # REST remains the freshness-checked fallback.
             retry_after = dict(self._subscription_retry_after)
         for logical_key, subscription in list(desired.items())[:max_subscriptions]:
             if logical_key in sent:
@@ -479,7 +590,18 @@ class KisWebSocketPriceService:
 
         backoff = 1.0
         while not self._stop.is_set():
+            owner_stream = None
             try:
+                owner_stream = await asyncio.to_thread(self._acquire_owner_lock)
+                if owner_stream is None:
+                    self._last_error = "KIS_WS_APPKEY_OWNER_BUSY"
+                    logger.warning(
+                        "[KIS_WS][OWNER_BUSY] action=REST_FALLBACK "
+                        "retry_after_sec=15 owner=OTHER_WSL_PROCESS "
+                        "owner_pid_unverified=1",
+                    )
+                    await asyncio.sleep(15.0)
+                    continue
                 approval = await asyncio.to_thread(self._approval_key)
                 with self._lock:
                     self._approval_obtained = bool(approval)
@@ -619,6 +741,8 @@ class KisWebSocketPriceService:
                 logger.warning("[KIS_WS][DISCONNECTED] err=%s retry_sec=%.1f", self._last_error, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2.0, _env_float("KIS_WS_RECONNECT_MAX_SEC", 15.0))
+            finally:
+                self._release_owner_lock(owner_stream)
 
     async def _handle_message(self, ws: Any, message: Any) -> None:
         if isinstance(message, bytes):
@@ -656,6 +780,18 @@ class KisWebSocketPriceService:
                     "[KIS_WS][SUBSCRIBE_FAIL] tr_id=%s tr_key=%s msg=%s action=RETRY",
                     tr_id, tr_key, (payload.get("body") or {}).get("msg1"),
                 )
+                msg = str((payload.get("body") or {}).get("msg1") or "").upper()
+                appkey_conflict = "ALREADY IN USE" in msg and "APPKEY" in msg
+                if appkey_conflict:
+                    # KIS's observed 2026-11-16 reply carried no usable
+                    # subscription identity. Do NOT throw/reconnect in a loop.
+                    delay = self._schedule_appkey_contention()
+                    logger.warning(
+                        "[KIS_WS][APPKEY_CONTENTION] identity_missing=%d "
+                        "retry_all_after_sec=%.1f owner_unverified=1",
+                        int(not (tr_id and tr_key)), delay,
+                    )
+                    return
                 if tr_id and tr_key:
                     delay = self._schedule_subscription_retry((tr_id, tr_key))
                     logger.warning(
@@ -663,8 +799,8 @@ class KisWebSocketPriceService:
                         tr_id, tr_key, delay,
                     )
                 else:
-                    # Without a subscription identity, reconnect so the local
-                    # sent set is cleared and every desired symbol is retried.
+                    # Unknown non-appkey rejection cannot identify a safe
+                    # retry target, so reconnect with existing outer backoff.
                     raise RuntimeError(f"KIS WebSocket subscription rejected tr_id={tr_id or 'unknown'}")
             else:
                 tr_key = str((payload.get("header") or {}).get("tr_key") or "")

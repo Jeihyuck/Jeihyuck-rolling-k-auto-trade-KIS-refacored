@@ -3,13 +3,21 @@
 # No change to KIS real accounts, KR_INFINITE, US, SELL or CLOSE policies.
 kr_pb1_entry_timing_defaults() {
   if [[ "${STRATEGY_ENV:-}" == "practice" && "${KIS_ENV:-}" == "practice" ]]; then
-    # A legacy SHADOW from the old opt-in configuration is not the requested
-    # practice cutover. Retain explicit OFF as the emergency rollback.
+    # Legacy SHADOW is never an order-execution mode in KR practice.
+    # OFF is emergency BUY HALT (not fallback to setup-only orders).
     case "${KR_PB1_ENTRY_TIMING_MODE:-ENFORCE}" in
       ENFORCE|enforce) export KR_PB1_ENTRY_TIMING_MODE=ENFORCE ;;
       SHADOW|shadow|Shadow)
         echo "[KR][ENTRY_TIMING][UPGRADE] legacy_SHADOW_to_ENFORCE=1"
         export KR_PB1_ENTRY_TIMING_MODE=ENFORCE
+        # A previous SHADOW profile commonly carried approval=0. The user
+        # explicitly authorized ACTIVE practice cutover; upgrade that stale
+        # pair. An independent explicit ENFORCE+approval=0 or OFF remains
+        # an intentional fail-closed emergency BUY stop.
+        if [[ "${KR_PB1_ENTRY_TIMING_APPROVED:-1}" != "1" ]]; then
+          echo "[KR][ENTRY_TIMING][UPGRADE] legacy_shadow_approval_to_active=1"
+          export KR_PB1_ENTRY_TIMING_APPROVED=1
+        fi
         ;;
       OFF|off) export KR_PB1_ENTRY_TIMING_MODE=OFF ;;
       *)
@@ -19,7 +27,9 @@ kr_pb1_entry_timing_defaults() {
         ;;
     esac
     export KR_PB1_ENTRY_TIMING_APPROVED="${KR_PB1_ENTRY_TIMING_APPROVED:-1}"
-    export KR_PB1_ENTRY_TIMING_SHADOW_ENABLED="${KR_PB1_ENTRY_TIMING_SHADOW_ENABLED:-1}"
+    # The old quote-only parallel SHADOW must not mask the mandatory
+    # completed KIS 1m ENFORCE gate or be mistaken for live BUY authorization.
+    export KR_PB1_ENTRY_TIMING_SHADOW_ENABLED=0
     export KR_PB1_OPENING_OBSERVER_ENABLED="${KR_PB1_OPENING_OBSERVER_ENABLED:-1}"
     if [[ "$KR_PB1_ENTRY_TIMING_MODE" == "OFF" ]]; then
       export KR_PB1_OPENING_OBSERVER_ENABLED=0
@@ -31,11 +41,10 @@ kr_pb1_entry_timing_defaults() {
     export KR_PB1_ENTRY_TIMING_SHADOW_ENABLED="${KR_PB1_ENTRY_TIMING_SHADOW_ENABLED:-0}"
     export KR_PB1_OPENING_OBSERVER_ENABLED=0
   fi
-  echo "[KR][ENTRY_TIMING][EFFECTIVE_CONFIG] strategy_env=${STRATEGY_ENV:-unknown} kis_env=${KIS_ENV:-unknown} mode=$KR_PB1_ENTRY_TIMING_MODE approved=$KR_PB1_ENTRY_TIMING_APPROVED legacy_quote_shadow=$KR_PB1_ENTRY_TIMING_SHADOW_ENABLED opening_observer=$KR_PB1_OPENING_OBSERVER_ENABLED interval_sec=${KR_PB1_OPENING_OBSERVER_INTERVAL_SEC:-n/a}"
+  echo "[KR][ENTRY_TIMING][EFFECTIVE_CONFIG] strategy_env=${STRATEGY_ENV:-unknown} kis_env=${KIS_ENV:-unknown} mode=$KR_PB1_ENTRY_TIMING_MODE approved=$KR_PB1_ENTRY_TIMING_APPROVED legacy_quote_shadow=DISABLED opening_observer=$KR_PB1_OPENING_OBSERVER_ENABLED interval_sec=${KR_PB1_OPENING_OBSERVER_INTERVAL_SEC:-n/a}"
   if [[ "${STRATEGY_ENV:-}" == "practice" && "${KIS_ENV:-}" == "practice" ]] &&
      { [[ "$KR_PB1_ENTRY_TIMING_MODE" != "ENFORCE" ]] ||
        [[ "$KR_PB1_ENTRY_TIMING_APPROVED" != "1" ]] ||
-       [[ "$KR_PB1_ENTRY_TIMING_SHADOW_ENABLED" != "1" ]] ||
        [[ "$KR_PB1_OPENING_OBSERVER_ENABLED" != "1" ]]; }; then
     echo "[KR][ENTRY_TIMING][CONFIG_OVERRIDE][WARN] default practice activation overridden; review .env before trading"
   fi

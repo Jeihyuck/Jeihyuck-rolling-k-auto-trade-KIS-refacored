@@ -262,6 +262,21 @@ PY_PREV_KRX
 LOG_ROOT="runtime/logs/$MARKET/$TRADE_DATE"
 collect_path REQUIRED_LOG_MISSING "$LOG_ROOT/session-manifest.json"
 
+# The independent 1m observer writes its own root-of-day log rather than
+# a session-purpose subdirectory. On Nov16 the AM log documented an active
+# observer but the mail archive omitted this sole source-side evidence.
+# Include it only when a session actually launched the sidecar; legacy
+# sessions without that process retain their existing delivery semantics.
+if [[ "$MARKET" == kr ]]; then
+  if grep -hF '[KR][ENTRY_TIMING][OBSERVER_LAUNCH]' \
+      "$LOG_ROOT/am"/*.log "$LOG_ROOT/afternoon"/*.log \
+      2>/dev/null | grep -q .; then
+    collect_path REQUIRED_KR_OPENING_OBSERVER_LOG_MISSING \
+      "$LOG_ROOT/kr-opening-observer.log"
+    echo "[KR][OPENING_OBSERVER][ARCHIVE_EVIDENCE] path=$LOG_ROOT/kr-opening-observer.log source=LAUNCH_CONFIRMED"
+  fi
+fi
+
 if [[ "$MARKET" == kr ]]; then
   purposes=(prep am afternoon close)
   LEDGER_ENV="${NULLIM_LEDGER_ENV:-${STRATEGY_ENV:-practice}}"

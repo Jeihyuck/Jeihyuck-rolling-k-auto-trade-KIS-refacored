@@ -5816,6 +5816,28 @@ class PB1Engine:
         order_type: str,
         allow_add_to_existing: bool = False,
     ) -> UnifiedGateDecision:
+        # The original MOMENTUM setup may be promoted to MOMENTUM_SWING.
+        # Reject a mutated finalized plan, not the legitimate original signal.
+        _final_contract = (cf.features or {}).get("final_entry_contract_proof")
+        if _final_contract is not None:
+            from trader.kr.final_entry_contract_proof import (
+                verify_final_entry_contract_proof,
+            )
+            _frozen_plan = (cf.features or {}).get("entry_exit_plan")
+            if (not isinstance(_frozen_plan, dict)
+                    or not verify_final_entry_contract_proof(
+                        plan=_frozen_plan, proof=_final_contract,
+                    )):
+                logger.error(
+                    "[KR][ENTRY][FINAL_CONTRACT_PROOF][BLOCK] code=%s reason=PROOF_MISMATCH",
+                    cf.code,
+                )
+                return UnifiedGateDecision(
+                    ok=False,
+                    reason_codes=["KR_FINAL_ENTRY_CONTRACT_PROOF_MISMATCH"],
+                    blocking_stage="pre_submit_contract",
+                    context={"code": cf.code},
+                )
         opening_blocked, buy_start = self._is_kr_opening_buy_blocked(self._now_kst)
         if opening_blocked:
             display_code = self._display_code(cf.code)
@@ -5830,11 +5852,10 @@ class PB1Engine:
                 blocking_stage="submit",
                 context={"code": display_code, "buy_start": buy_start, "stage": stage},
             )
-        # Separate intraday timing from yesterday's Final30/setup:
-        # SHADOW only by default; ENFORCE requires explicit practice approval.
-        # Never block protective SELL, other owner sleeves, existing ADDs or
-        # an independently approved PB1-CLOSE entry policy here.
-        _timing_mode = str(os.getenv("KR_PB1_ENTRY_TIMING_MODE", "SHADOW")).strip().upper()
+        # KR practice PB1 new BUY must use the native 1m ENFORCE policy.
+        # Never silently fall back to SHADOW/setup-only when .env is stale.
+        # Other owners, protective SELL, ADD and PB1-CLOSE keep their own policy.
+        _timing_mode = str(os.getenv("KR_PB1_ENTRY_TIMING_MODE", "ENFORCE")).strip().upper()
         _timing_style = str(
             (cf.features or {}).get("entry_style_selected")
             or (cf.features or {}).get("entry_setup_family")
@@ -5842,20 +5863,41 @@ class PB1Engine:
         ).strip().upper()
         if _timing_style in {"MOMENTUM", "PULLBACK", "BREAKOUT"}:
             _timing_style = "ENTRY_" + _timing_style
-        _timing_eligible = (
+        _timing_scope = (
             str(getattr(self, "STRATEGY_NAME", "")) == "pb1_pullback_close"
             and str(getattr(self, "env", "")).lower() == "practice"
             and not allow_add_to_existing
             and str(stage or "").upper() != "PB1-CLOSE"
             and _is_kr_stock_code(cf.code)
-            and _timing_style in KR_TIMING_STYLES
         )
-        # An explicitly unapproved ENFORCE request must not silently
-        # downgrade to the old setup-only BUY path. This applies only to
-        # standard PB1 new BUY, never protective SELL, ADD, or independent owners.
+        _timing_eligible = _timing_scope and _timing_style in KR_TIMING_STYLES
+        if _timing_scope and not _timing_eligible:
+            # Unknown styles must not accidentally escape ENFORCE. Distinct
+            # strategy owners and independently approved PB1-CLOSE are excluded.
+            return UnifiedGateDecision(
+                ok=False,
+                reason_codes=["KR_ENTRY_TIMING_STYLE_UNSUPPORTED"],
+                blocking_stage="pre_submit_timing",
+                context={"code": cf.code, "style": _timing_style},
+            )
+        # SHADOW/OFF/unknown cannot authorize a PB1 practice BUY.
+        # OFF is a fail-closed emergency BUY halt, never a legacy bypass.
+        if _timing_eligible and _timing_mode != "ENFORCE":
+            logger.error(
+                "[KR][ENTRY][PRICE_AWARE_TIMING][BLOCK] code=%s mode=%s "
+                "reason=ENFORCE_REQUIRED", cf.code, _timing_mode,
+            )
+            return UnifiedGateDecision(
+                ok=False,
+                reason_codes=["KR_ENTRY_TIMING_ENFORCE_REQUIRED"],
+                blocking_stage="pre_submit_timing",
+                context={"code": cf.code, "mode": _timing_mode},
+            )
+        # Current user policy approves ENFORCE for KR PB1 practice by default.
+        # An explicit approval=0 remains a BUY halt, not a downgrade to SHADOW.
         if (
-            _timing_eligible and _timing_mode == "ENFORCE"
-            and os.getenv("KR_PB1_ENTRY_TIMING_APPROVED", "0") != "1"
+            _timing_eligible
+            and os.getenv("KR_PB1_ENTRY_TIMING_APPROVED", "1") != "1"
         ):
             logger.error(
                 "[KR][ENTRY][PRICE_AWARE_TIMING][BLOCK] code=%s mode=ENFORCE "
@@ -5867,7 +5909,7 @@ class PB1Engine:
                 blocking_stage="pre_submit_timing",
                 context={"code": cf.code, "mode": "ENFORCE", "approved": False},
             )
-        if _timing_eligible and _timing_mode in {"SHADOW", "ENFORCE"}:
+        if _timing_eligible:
             _timing_now = now_kst()
             _timing = evaluate_proof_for_candidate(
                 env=self.env,
@@ -5876,7 +5918,10 @@ class PB1Engine:
                 now=_timing_now,
                 style=_timing_style,
                 setup_ok=bool((cf.features or {}).get("setup_ok", cf.setup_ok)),
-                trigger_ok=bool((cf.features or {}).get("trigger_ok")),
+                trigger_ok=bool(
+                    (cf.features or {}).get("breakout_trigger_ok")
+                    or (cf.features or {}).get("trigger_ok")
+                ),
                 pivot=(cf.features or {}).get("pivot"),
                 order_price=float(order_price or 0.0),
             )
@@ -5887,12 +5932,34 @@ class PB1Engine:
                 cf.features["entry_timing_evidence"] = {
                     "evaluated_at_kst": _timing_now.isoformat(),
                     "mode": _timing_mode,
-                    "approved": os.getenv("KR_PB1_ENTRY_TIMING_APPROVED", "0") == "1",
+                    "approved": os.getenv("KR_PB1_ENTRY_TIMING_APPROVED", "1") == "1",
                     "state": str(_timing.get("state") or "UNKNOWN"),
                     "reason": str(_timing.get("reason") or "UNRECORDED"),
                     "latest_bar_ts": _timing.get("latest_bar_ts"),
                     "max_entry_price": _timing.get("max_entry_price"),
+                    # Persist source-native candle values for a reproducible
+                    # 0.5% slippage vs symmetric 0.4% gate investigation.
+                    # These observations do NOT relax or authorize BUY.
+                    "reference_price": _timing.get("reference_price"),
+                    "opening_count": _timing.get("opening_count"),
+                    "opening_high": _timing.get("opening_high"),
+                    "observed_volume_ratio": _timing.get("observed_volume_ratio"),
+                    "vwap_proven": _timing.get("vwap_proven"),
+                    "increasing_close": _timing.get("increasing_close"),
+                    "higher_lows": _timing.get("higher_lows"),
+                    "order_price_source": (
+                        (cf.features or {}).get("order_price_source")
+                        or (cf.features or {}).get("price_source")
+                    ),
+                    "order_type": str(order_type or ""),
                     "submitted_reference_price": float(order_price or 0),
+                    "signed_price_deviation_pct": (
+                        round(100.0 * (float(order_price) /
+                                       float(_timing["reference_price"]) - 1.0), 4)
+                        if isinstance(_timing.get("reference_price"), (int, float))
+                        and float(_timing["reference_price"]) > 0
+                        and float(order_price or 0) > 0 else None
+                    ),
                     "is_order_authorization": False,
                 }
             logger.info(
@@ -5901,11 +5968,9 @@ class PB1Engine:
                 cf.code, _timing_style, _timing_mode,
                 _timing.get("state"), _timing.get("reason"),
                 _timing.get("max_entry_price"),
-                int(_timing_mode == "ENFORCE"
-                    and os.getenv("KR_PB1_ENTRY_TIMING_APPROVED", "0") == "1"),
+                1,
             )
-            if (_timing_mode == "ENFORCE"
-                    and os.getenv("KR_PB1_ENTRY_TIMING_APPROVED", "0") == "1"):
+            if _timing_eligible:
                 # MARKET orders cannot enforce a minute-proof maximum BUY
                 # price. Explicit KIS 00 and PB1 LIMIT are the only supported
                 # bounded paths; never treat a reference price as a limit.
@@ -7667,6 +7732,30 @@ class PB1Engine:
                 "policy_source": plan_dict.get("policy_source"),
                 "policy_version": plan_dict.get("policy_version"),
             }
+        # Separate the original setup signal from the authoritative final
+        # BUY->SELL contract. ENTRY_MOMENTUM -> ENTRY_MOMENTUM_SWING is
+        # legitimate only when the final SWING owner is explicit and frozen.
+        # Existing position contracts are never rewritten here.
+        if is_kr and is_practice:
+            from trader.kr.final_entry_contract_proof import (
+                build_final_entry_contract_proof,
+                verify_final_entry_contract_proof,
+            )
+            original_identity = dict(
+                features.get("entry_identity_proof") or {}
+            )
+            final_proof = build_final_entry_contract_proof(
+                code=cf.code, owner="PB1", plan=plan_dict,
+                original_identity=original_identity,
+            )
+            if not verify_final_entry_contract_proof(
+                plan=plan_dict, proof=final_proof,
+            ):
+                raise ValueError("KR_FINAL_ENTRY_CONTRACT_PROOF_INVALID")
+            features["original_entry_identity_proof"] = original_identity
+            features["final_entry_contract_proof"] = final_proof
+            meta["original_entry_identity_proof"] = original_identity
+            meta["final_entry_contract_proof"] = final_proof
         setattr(cf, "entry_exit_plan", plan_dict)
         features["entry_exit_plan"] = plan_dict
         logger.info(
@@ -11216,6 +11305,65 @@ class PB1Engine:
                     cf.features["price_source"] = source_key
                     logger.warning("[KR][PRICE_FALLBACK][USED] code=%s source=%s order_price=%s", display_code, source_key, record_price)
                     break
+        # Keep the 0.4% symmetric price gate while avoiding the mechanical
+        # +0.5% prpr buffer. Only verified, fresh, scope-matched KIS evidence
+        # can LOWER the final LIMIT; a missing/unsafe quote cannot reprice.
+        if isinstance(cf.features, dict) and cf.features.get("order_price_source") == "prpr_slippage":
+            from trader.kr.entry_timing_price import (
+                maybe_bound_pb1_prpr_fallback,
+                apply_verified_bounded_limit,
+            )
+            try:
+                _price_proof = maybe_bound_pb1_prpr_fallback(
+                    engine=self, cf=cf, stage=stage,
+                    order_type=order_type,
+                    original_price=record_price,
+                    now=now_kst(),
+                )
+            except Exception as _bounded_exc:
+                logger.warning(
+                    "[KR][ENTRY][TIMING_BOUNDED_PRICE][NO_REPRICE] code=%s "
+                    "reason=PROOF_EVALUATION_ERROR error_type=%s "
+                    "action=EXISTING_ENFORCE_GATE_WILL_BLOCK_IF_REQUIRED",
+                    cf.code, type(_bounded_exc).__name__,
+                )
+                _price_proof = {"state": "BLOCK", "reason": "PROOF_EVALUATION_ERROR",
+                                "not_order_authorization": True}
+            if _price_proof.get("state") != "NOT_APPLICABLE":
+                cf.features["timing_bounded_price_evidence"] = _price_proof
+            if _price_proof.get("state") == "BOUNDED_LIMIT":
+                _old = float(record_price)
+                try:
+                    _bounded = apply_verified_bounded_limit(
+                        cf=cf, plan=plan, price_proof=_price_proof,
+                        original_price=record_price, qty=int(qty),
+                    )
+                except (ValueError, TypeError) as _apply_exc:
+                    logger.error(
+                        "[KR][ENTRY][TIMING_BOUNDED_PRICE][BLOCK] code=%s "
+                        "reason=BOUND_PROOF_NOTIONAL_INVALID type=%s",
+                        cf.code, type(_apply_exc).__name__,
+                    )
+                    status["skipped"] = 1
+                    status["skipped_reason"] = "KR_BOUND_PRICE_PROOF_INVALID"
+                    status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
+                    status["terminal_event"] = "FINAL_SKIP"
+                    return status
+                limit_price = record_price = _bounded
+                logger.info(
+                    "[KR][ENTRY][TIMING_BOUNDED_PRICE] code=%s original=%.0f "
+                    "bounded=%.0f method=%s ref=%.0f quote_age_sec=%s "
+                    "max_price=%s cap_0p4_unchanged=1",
+                    cf.code, _old, _bounded,
+                    _price_proof.get("reason"), _price_proof.get("reference_price"),
+                    _price_proof.get("quote_age_sec"), _price_proof.get("price_ceiling"),
+                )
+            elif _price_proof.get("state") == "BLOCK":
+                logger.info(
+                    "[KR][ENTRY][TIMING_BOUNDED_PRICE][NO_REPRICE] code=%s "
+                    "reason=%s action=RETAIN_ORIGINAL_ENFORCE_GATE",
+                    cf.code, _price_proof.get("reason"),
+                )
         entry_exit_plan_dict, plan_entry_meta = self.ensure_entry_exit_plan(
             cf,
             entry_price=float(entry_price or cf.features.get("entry_price") or record_price or 0.0),
@@ -11311,11 +11459,22 @@ class PB1Engine:
             fresh_qty = int(qty or 0)
             qty = min(fresh_qty, remaining_target_qty)
             cf.planned_qty = qty
+            # Retry-target shrinkage must also update every downstream
+            # notional projection, not only the durable entry-plan row.
+            _current_value = float(record_price or 0.0) * float(qty)
+            cf.planned_value = _current_value
+            if isinstance(cf.features, dict):
+                cf.features["planned_value"] = _current_value
+            if isinstance(getattr(cf, "sizing_details", None), dict):
+                cf.sizing_details.update(
+                    qty=qty, price=float(record_price or 0.0),
+                    notional=_current_value,
+                )
             if isinstance(plan, dict):
                 plan["qty"] = qty
                 plan["execution_retry_remaining_target_qty"] = remaining_target_qty
                 if float(record_price or 0.0) > 0:
-                    plan["planned_value"] = float(record_price) * float(qty)
+                    plan["planned_value"] = _current_value
             entry_meta["execution_retry_remaining_target_qty"] = remaining_target_qty
             entry_meta["execution_retry_fresh_sizing_qty"] = fresh_qty
             entry_meta["execution_retry_submit_qty"] = qty
@@ -11524,7 +11683,13 @@ class PB1Engine:
             return status
         if self._is_kr_equity_context() and env_bool("KR_MARKET_STATE_OVERLAY_ENABLE", True):
             overlay = getattr(self, "_kr_market_state_overlay", None) or {"market_state": "KR_NORMAL", "force_entry_block": False}
-            _pre_api_intent = {"side": "BUY", "code": cf.code, "name": stock_name, "planned_value": float(record_price or 0.0) * float(qty or 0), **(cf.features or {})}
+            # Canonical broker-bound notional must win over an earlier sizing
+            # feature. The old dict expansion order silently overwrote it.
+            _pre_api_intent = {
+                **(cf.features or {}),
+                "side": "BUY", "code": cf.code, "name": stock_name,
+                "planned_value": float(record_price or 0.0) * float(qty or 0),
+            }
             _pre_api_block = filter_kr_entry_intent(_pre_api_intent, overlay, positions=getattr(self, "_kr_overlay_positions", []))
             if _pre_api_block.get("status") == "BLOCKED":
                 reason = str(_pre_api_block.get("reason") or "KR_MARKET_STATE_ENTRY_BLOCK")

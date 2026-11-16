@@ -203,19 +203,66 @@ def evaluate_active_kr_tp(
             return block("KR_TP_BROKER_RESERVED_INVENTORY_RECONCILE_REQUIRED")
         # The immutable BUY contract is not sufficient: compare the current
         # broker balance avg, qty and orderable shares to DB every exit tick.
-        from trader.execution_state import BalanceFreshness
+        from trader.execution_state import BrokerBalanceSnapshot, BalanceFreshness
+        from trader.kis_wrapper import kr_tick_remaining_sec
         from datetime import datetime, timezone
-        if (
-            balance_snapshot is None
-            or getattr(balance_snapshot, "freshness", None) != BalanceFreshness.FRESH
-            or not callable(getattr(balance_snapshot, "position", None))
-        ):
+        from logging import getLogger
+        log = getLogger(__name__)
+
+        def is_fresh_verified_balance(snap: Any) -> bool:
+            if (
+                snap is None
+                or getattr(snap, "freshness", None) != BalanceFreshness.FRESH
+                or not callable(getattr(snap, "position", None))
+            ):
+                return False
+            fetched_at = getattr(snap, "fetched_at", None)
+            if not isinstance(fetched_at, datetime) or fetched_at.tzinfo is None:
+                return False
+            seconds = (datetime.now(timezone.utc)
+                       - fetched_at.astimezone(timezone.utc)).total_seconds()
+            return 0 <= seconds <= 180
+
+        if not is_fresh_verified_balance(balance_snapshot):
+            # The 2026-11-16 first TP evaluation had a stale inherited
+            # snapshot. ONE bounded native refresh is permitted for an ACTIVE
+            # protected SELL. No stale cache, fake DIAG payload or missing
+            # orderable quantity may be promoted to fresh broker authority.
+            remaining = kr_tick_remaining_sec()
+            if math.isfinite(remaining) and remaining < 15.0:
+                log.warning(
+                    "[KR_PROFIT_PARITY][BALANCE_REFRESH_SKIP] code=%s "
+                    "reason=INSUFFICIENT_TICK_BUDGET remaining_sec=%.2f",
+                    code, remaining,
+                )
+                return block("KR_TP_BALANCE_REFRESH_NO_BUDGET")
+            try:
+                raw, source = kis.get_balance_cached(force=True, return_source=True)
+                if (
+                    source != "api" or not isinstance(raw, dict)
+                    or raw.get("rt_cd") not in (None, "0")
+                    or raw.get("_diag_stub")
+                    or not isinstance(raw.get("output1"), list)
+                    or not raw.get("output2")
+                ):
+                    return block("KR_TP_BALANCE_REFRESH_NATIVE_UNVERIFIED")
+                balance_snapshot = BrokerBalanceSnapshot.from_kis(
+                    raw, source="api", fetched_at=datetime.now(timezone.utc),
+                )
+                log.info(
+                    "[KR_PROFIT_PARITY][BALANCE_REFRESH_OK] code=%s "
+                    "snapshot_id=%s source=KIS_FORCE_API",
+                    code, balance_snapshot.snapshot_id,
+                )
+            except Exception as exc:
+                log.warning(
+                    "[KR_PROFIT_PARITY][BALANCE_REFRESH_FAIL] code=%s type=%s "
+                    "action=BLOCK_AND_RETRY_NEXT_TICK",
+                    code, type(exc).__name__,
+                )
+                return block("KR_TP_BALANCE_REFRESH_FAILED")
+        if not is_fresh_verified_balance(balance_snapshot):
             return block("KR_TP_KIS_BALANCE_NOT_FRESH")
-        acquired_at = balance_snapshot.fetched_at
-        if acquired_at.tzinfo is None or (
-            datetime.now(timezone.utc) - acquired_at.astimezone(timezone.utc)
-        ).total_seconds() > 180:
-            return block("KR_TP_KIS_BALANCE_TOO_OLD")
         broker = balance_snapshot.position(code)
         broker_avg = float(broker.avg_price or 0)
         db_avg = float(position.get("avg_buy_price") or 0)

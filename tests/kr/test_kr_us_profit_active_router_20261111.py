@@ -28,27 +28,28 @@ from trader.kr import us_profit_execution_router as router
 class FakeKis:
     env = "practice"
 
-    def __init__(self, quote=None):
+    def __init__(self, quote=None, code="005930"):
         self.quote = quote if quote is not None else {"bid": 109.0}
+        self.expected_code = code
         self.calls = 0
 
     def get_price_snapshot(self, code, market="J"):
-        assert (code, market) == ("005930", "J")
+        assert (code, market) == (self.expected_code, "J")
         self.calls += 1
         return self.quote
 
 
-def setup_contract(monkeypatch):
+def setup_contract(monkeypatch, *, code="005930"):
     monkeypatch.setenv("KIS_ENV", "practice")
     monkeypatch.setenv("KR_SWING_US_PROFIT_MODE", "ACTIVE_PRACTICE")
     c = build_new_swing_parity_contract(
         strategy_owner="PB1", exit_policy_family="SWING_STAGED_EXIT",
         trade_horizon="SWING", position_action="NEW_POSITION_BUY",
         account_id="practice:account", trading_epoch_id="epoch-1",
-        position_cycle_id="cycle-1", runner_version="US_V3", code="005930",
+        position_cycle_id="cycle-1", runner_version="US_V3", code=code,
     )
     pos = {
-        "code": "005930", "strategy": "pb1_pullback_close", "status": "OPEN",
+        "code": code, "strategy": "pb1_pullback_close", "status": "OPEN",
         "trade_horizon": "SWING", "exit_policy_family": "SWING_STAGED_EXIT",
         "holding_source": "kis_balance", "kis_qty": 100, "qty": 100,
         "orderable_qty": 100, "avg_buy_price": 100,
@@ -277,3 +278,138 @@ def test_diagnostic_samsung_position_never_mutates_amendment(monkeypatch):
     )
     assert result is None
     assert len(calls) == 1
+
+
+def test_stale_active_tp_balance_gets_one_fresh_native_read_without_relaxing_owner(monkeypatch):
+    """2026-11-16 Samsung-like initial stale TP: one native refresh, then
+    immutable owner/contract/stage and broker quantity checks still apply."""
+    pos = setup_contract(monkeypatch)
+
+    class FreshNativeKis(FakeKis):
+        def __init__(self, *, source="api", broker_qty=100):
+            super().__init__()
+            self.balance_calls = 0
+            self.source = source
+            self.broker_qty = broker_qty
+
+        def get_balance_cached(self, *, force=False, return_source=False):
+            assert force is True and return_source is True
+            self.balance_calls += 1
+            return {
+                "rt_cd": "0",
+                "output1": [{
+                    "pdno": "005930", "hldg_qty": str(self.broker_qty),
+                    "ord_psbl_qty": str(self.broker_qty),
+                    "pchs_avg_pric": "100",
+                }],
+                "output2": [{"ord_psbl_cash": "1000000"}],
+            }, self.source
+
+    kis = FreshNativeKis()
+    result = router.evaluate_active_kr_tp(
+        position=pos, engine=object(), kis=kis,
+        env="practice", code="005930",
+        balance_snapshot=FakeBalance(freshness=BalanceFreshness.STALE),
+    )
+    assert result["action"] == "ACTIVE_TP", result
+    assert result["stage"] == "TP1"
+    assert kis.balance_calls == 1
+
+    cached = FreshNativeKis(source="wrapper_cache")
+    blocked = router.evaluate_active_kr_tp(
+        position=pos, engine=object(), kis=cached,
+        env="practice", code="005930",
+        balance_snapshot=FakeBalance(freshness=BalanceFreshness.STALE),
+    )
+    assert blocked["action"] == "BLOCK"
+    assert blocked["reason"] == "KR_TP_BALANCE_REFRESH_NATIVE_UNVERIFIED"
+    assert cached.calls == 0  # No quote, DB stage claim or broker order.
+
+    mismatch = FreshNativeKis(broker_qty=99)
+    denied = router.evaluate_active_kr_tp(
+        position=pos, engine=object(), kis=mismatch,
+        env="practice", code="005930",
+        balance_snapshot=FakeBalance(freshness=BalanceFreshness.STALE),
+    )
+    assert denied["action"] == "BLOCK"
+    assert denied["reason"] == "KR_TP_KIS_AVG_OR_QTY_MISMATCH"
+    assert mismatch.balance_calls == 1
+
+
+def test_stale_tp_balance_refresh_failure_remains_fail_closed(monkeypatch):
+    pos = setup_contract(monkeypatch)
+
+    class BrokenBalanceKis(FakeKis):
+        def get_balance_cached(self, **kwargs):
+            raise TimeoutError("synthetic REST timeout, never use stale cache")
+
+    result = router.evaluate_active_kr_tp(
+        position=pos, engine=object(), kis=BrokenBalanceKis(),
+        env="practice", code="005930",
+        balance_snapshot=FakeBalance(freshness=BalanceFreshness.STALE),
+    )
+    assert result["action"] == "BLOCK"
+    assert result["reason"] == "KR_TP_BALANCE_REFRESH_FAILED"
+
+
+def test_nov16_samsung_tp3_overrides_legacy_tp1_after_broker_proven_stages(monkeypatch):
+    """Observed Nov 16: prior TP1=8/Nov12, TP2=6/Nov13 from 33 BUY.
+
+    The legacy SWING_PCT_TP1 router's proposed 6 shares does not supersede
+    the explicitly amended ACTIVE_PRACTICE parity owner. Current broker
+    holding is 19 shares, so the next immutable stage is TP3 (3 shares).
+    No real broker order is submitted by this test.
+    """
+    pos = setup_contract(monkeypatch)
+    pos.update({"kis_qty": 19, "qty": 19, "orderable_qty": 19,
+                "avg_buy_price": 60200})
+    monkeypatch.setattr(router, "load_frozen_stage_states", lambda **kw: {
+        "TP1": {"status": "FILLED", "broker_fill_proven": True,
+                "target_qty": 8, "cumulative_filled_qty": 8},
+        "TP2": {"status": "FILLED", "broker_fill_proven": True,
+                "target_qty": 6, "cumulative_filled_qty": 6},
+        "TP3": {"status": "NOT_TRIGGERED"},
+    })
+    result = router.evaluate_active_kr_tp(
+        position=pos, engine=object(), kis=FakeKis(quote={"bid": 68600}),
+        env="practice", code="005930",
+        balance_snapshot=FakeBalance(
+            broker_qty=19, broker_orderable=19, broker_avg=60200),
+    )
+    assert result["action"] == "ACTIVE_TP"
+    assert result["stage"] == "TP3"
+    assert result["qty"] == 3
+
+
+
+@pytest.mark.parametrize("code", [
+    "005930", "000660", "093320", "121600", "028050", "035420", "066570"
+])
+def test_active_tp_owner_contract_is_not_samsung_or_kinx_specific(monkeypatch, code):
+    """Existing ACTIVE PB1 TP stays stage-based for any matching KR owner."""
+    pos = setup_contract(monkeypatch, code=code)
+    kis = FakeKis(code=code)
+    result = router.evaluate_active_kr_tp(
+        position=pos, engine=object(), kis=kis, env="practice", code=code,
+        balance_snapshot=FakeBalance(),
+    )
+    assert result["action"] == "ACTIVE_TP", (code, result)
+    assert result["stage"] == "TP1"
+    assert result["qty"] == 25
+    assert result["code"] == code
+    assert result["position_cycle_id"] == "cycle-1"
+    assert kis.calls == 1
+
+
+@pytest.mark.parametrize("code", ["093320", "121600", "035420"])
+def test_tp_never_uses_another_symbols_frozen_contract(monkeypatch, code):
+    pos = setup_contract(monkeypatch)
+    pos["code"] = code
+    kis = FakeKis(code=code)
+    result = router.evaluate_active_kr_tp(
+        position=pos, engine=object(), kis=kis, env="practice", code=code,
+        balance_snapshot=FakeBalance(),
+    )
+    assert result["action"] == "BLOCK"
+    assert result["reason"] == "KR_TP_POLICY_OWNER_OR_CYCLE_CONFLICT"
+    assert kis.calls == 0

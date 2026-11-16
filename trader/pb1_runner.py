@@ -10149,6 +10149,15 @@ def main() -> int:
             "sell_orders": int(metrics.get("sell_orders", 0) or 0),
             "economic_settlement_state": str(metrics.get("economic_settlement_state") or "NOT_CHECKED"),
             "economic_settlement_pending": int(metrics.get("economic_settlement_pending", 0) or 0),
+            # Retain the underlying audited current-day vs historical lanes.
+            # Otherwise a fully reconciled Samsung AM sell is incorrectly
+            # reported as a failed CLOSE solely because Oct27 KODEX remains.
+            "today_economic_settlement_state": str(
+                metrics.get("today_economic_settlement_state") or "NOT_REPORTED"),
+            "historical_economic_settlement_state": str(
+                metrics.get("historical_economic_settlement_state") or "NOT_REPORTED"),
+            "today_priced_sell_gap_count": metrics.get("today_priced_sell_gap_count"),
+            "historical_priced_sell_gap_count": metrics.get("historical_priced_sell_gap_count"),
             "native_priced_sell_gap_count": int(metrics.get("native_priced_sell_gap_count", -1)),
             "postsubmit_reconcile_ok": int(metrics.get("postsubmit_reconcile_ok", 0) or 0),
             "native_sell_orders_checked": int(metrics.get("native_sell_orders_checked", 0) or 0),

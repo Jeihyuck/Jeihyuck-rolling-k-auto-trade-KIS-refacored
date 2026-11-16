@@ -694,6 +694,12 @@ def _post_pb1_tick_reconcile(engine_obj: Any) -> None:
         strategy=strategy,
         tick_ts=now_kst(),
         balance_snapshot=snapshot,
+        # This per-tick broker-truth hook MUST reconcile current KIS orders,
+        # fills and claims only. Historical repair belongs to the durable
+        # AM/CLOSE recovery lane, not to every post-tick callback. Defaulting
+        # to reconcile_kis(historical_recovery=True) made every healthy tick
+        # repeat old economic repair and report degraded health.
+        historical_recovery=False,
     )
     final_holdings_rows = result.pop("_final_holdings_rows", None)
     if isinstance(final_holdings_rows, list):

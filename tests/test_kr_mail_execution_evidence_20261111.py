@@ -91,3 +91,29 @@ def test_mail_shell_uses_truthful_kr_execution_and_latency_markers():
     assert "[LOG_MAIL][SCHEDULE_LAG]" in text
     assert "[LOG_MAIL][SMTP_ACCEPTED]" in text
     assert 'if [[ "$DAILY_EXECUTION_STATUS" == FAILED ]]' in text
+
+
+def test_nov16_close_reports_samsung_today_settled_separately_from_kodex_history(tmp_path):
+    """Today an already-priced Samsung TP3 is not the Oct27 KODEX gap."""
+    m = _manifest(prep=True)
+    for row in m["sessions"].values():
+        row["attempts"][0].update(status="OK", reason="SESSION_END")
+    _write(tmp_path, "runtime/logs/kr/2026-11-16/session-manifest.json", m)
+    _write(tmp_path, "runtime/kr/session/2026-11-16/close/pb1_result.json", {
+        "economic_settlement_state": "ECONOMIC_SETTLEMENT_PENDING",
+        "economic_settlement_pending": 1,
+        "today_economic_settlement_state": "TODAY_ECONOMIC_SETTLED",
+        "historical_economic_settlement_state": "HISTORICAL_ECONOMIC_PENDING",
+        "native_priced_sell_gap_count": 2,
+        "today_priced_sell_gap_count": 0,
+        "historical_priced_sell_gap_count": 2,
+        "broker_submitted": 1,
+    })
+    result = _helper().collect_kr_execution_status(tmp_path, "2026-11-16")
+    assert result["daily_execution_status"] == "DEGRADED"
+    assert result["close_today_economic_settlement_state"] == "TODAY_ECONOMIC_SETTLED"
+    assert result["close_historical_economic_settlement_state"] == "HISTORICAL_ECONOMIC_PENDING"
+    assert result["close_today_priced_sell_gap_count"] == 0
+    assert result["close_historical_priced_sell_gap_count"] == 2
+    assert "TODAY_SETTLEMENT=TODAY_ECONOMIC_SETTLED" in result["execution_summary"]
+    assert "HISTORICAL_SETTLEMENT=HISTORICAL_ECONOMIC_PENDING" in result["execution_summary"]
