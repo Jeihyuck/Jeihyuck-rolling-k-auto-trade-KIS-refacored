@@ -673,3 +673,42 @@ def test_kr_ws_quote_carries_source_identity_and_parsed_symbol():
     assert quote["source"] == "KIS_WEBSOCKET"
     assert quote["source_identity"] == "KIS_WS_PARSED_SYMBOL"
     assert quote["requested_symbol"] == quote["symbol"] == "005930"
+
+
+
+def test_entire_synthetic_final30_bars_isolated_per_symbol_and_account(
+        tmp_path, monkeypatch):
+    """30 independent Final30 slots, not a KINX/Nano-specific repair.
+
+    The generated codes are synthetic and prove storage/owner isolation only;
+    they do not claim that historical KIS opening rows were observed.
+    """
+    monkeypatch.setattr(opening, "runtime_path",
+                        lambda *parts: tmp_path.joinpath(*parts))
+    codes = [str(101001 + i) for i in range(30)]
+    for code in codes:
+        first = save(START + timedelta(minutes=18), candles(0, 18),
+                     code=code, vwap=None)
+        second = save(LATE, candles(17, 36), code=code, vwap=None)
+        assert first["bars"] == 18
+        assert second["bars"] == 36
+    for code in codes:
+        proof = load(LATE, code=code)
+        assert proof is not None
+        assert len(proof["bars"]) == 36
+        assert proof["source_conflicts"] == []
+        assert opening.inspect_completed_bar_coverage(
+            rows=proof["bars"], now=LATE)["state"] == "COVERED"
+        assert load(LATE, account="unrelated-broker-account", code=code) is None
+
+    altered = candles(0, 36)
+    altered[9]["high"] += 20
+    save(LATE, altered, code=codes[0])
+    blocked = opening.evaluate_proof_for_candidate(
+        env="practice", account_scope="p:account:1",
+        code=codes[0], now=LATE, style="ENTRY_MOMENTUM",
+        setup_ok=True, trigger_ok=True, pivot=None, order_price=10000,
+    )
+    assert blocked["state"] == "UNKNOWN"
+    assert blocked["reason"] == "CONFLICTING_NATIVE_COMPLETED_BAR"
+    assert not load(LATE, code=codes[1])["source_conflicts"]
