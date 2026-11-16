@@ -425,7 +425,8 @@ class KisWebSocketPriceService:
         appkey, secret = self._credentials()
         if not appkey or not secret:
             raise RuntimeError("KIS_WS_OWNER_MISSING_CREDENTIALS")
-        identity = (self._ws_url() + "\0" + appkey).encode("utf-8")
+        identity = (str(os.getenv("KIS_ENV") or "practice").lower()
+                    + "\0" + appkey).encode("utf-8")
         digest = hashlib.sha256(identity).hexdigest()
         lock_dir = Path(os.getenv("KIS_WS_OWNER_LOCK_DIR") or
                         str(Path(tempfile.gettempdir()) / "nullim-kis-ws-owner"))
