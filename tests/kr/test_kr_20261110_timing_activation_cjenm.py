@@ -550,3 +550,24 @@ def test_practice_off_is_buy_halt_but_no_broker_order_or_proof_lookup(monkeypatc
         cf=cf, stage="PB1-AM", order_price=45350.0, order_type="LIMIT",
     )
     assert result.reason_codes == ["KR_ENTRY_TIMING_ENFORCE_REQUIRED"]
+
+
+def test_unknown_standard_pb1_style_cannot_escape_native_enforce(monkeypatch):
+    import trader.pb1_engine as pb1
+    monkeypatch.setenv("KR_PB1_ENTRY_TIMING_MODE", "ENFORCE")
+    monkeypatch.setenv("KR_PB1_ENTRY_TIMING_APPROVED", "1")
+    monkeypatch.setattr(pb1, "evaluate_proof_for_candidate",
+                        lambda **kw: pytest.fail("Unknown style must not request/order"))
+    engine = PB1Engine.__new__(PB1Engine)
+    engine.env = "practice"
+    engine._now_kst = CJ_BUY_TIME
+    candidate = SimpleNamespace(
+        code="035760", setup_ok=True,
+        features={"entry_style_selected": "ENTRY_UNKNOWN", "setup_ok": True},
+    )
+    decision = engine._resolve_entry_pre_submit(
+        cf=candidate, stage="PB1-AM", order_price=45350.0, order_type="LIMIT",
+    )
+    assert decision.ok is False
+    assert decision.reason_codes == ["KR_ENTRY_TIMING_STYLE_UNSUPPORTED"]
+    assert decision.blocking_stage == "pre_submit_timing"
