@@ -406,3 +406,93 @@ def test_kinx_native_bar_diagnostics_isolates_source_date_and_ohlcv_failures():
         "CURRENT_OR_FUTURE_MINUTE": 1,
     }
     assert info["no_trade_minutes_proven"] is False
+
+
+def test_nano_0p5pct_artificial_limit_is_bounded_to_original_0p4pct_gate():
+    from trader.kr.entry_timing_price import resolve_bounded_prpr_limit
+
+    now = datetime(2026, 11, 16, 9, 40, tzinfo=KST)
+    proof = {
+        "state": "READY_SHADOW", "reference_price": 72100.0,
+        "max_entry_price": 72800.0,
+    }
+    quote = {
+        "source": "KIS_REST_INQUIRE_PRICE", "requested_symbol": "121600",
+        "last": 72100.0, "received_at": now.timestamp() - 1,
+        "stck_bsop_date": "20261116",
+    }
+    result = resolve_bounded_prpr_limit(
+        code="121600", original_price=72500.0, timing=proof,
+        quote=quote, observed_at=now,
+    )
+    assert result["state"] == "BOUNDED_LIMIT"
+    assert result["reason"] == "PASSIVE_LIMIT_NO_ASK"
+    assert result["new_limit"] == 72300  # Native KRX tick, rounded DOWN
+    assert result["new_limit"] <= proof["max_entry_price"]
+    assert abs(result["new_limit"] / 72100 - 1) <= 0.004
+    assert result["not_order_authorization"] is True
+
+    # A native offer beyond the accepted maximum may NOT be chased.
+    high_ask = resolve_bounded_prpr_limit(
+        code="121600", original_price=72500, timing=proof,
+        quote={**quote, "ask": 72400}, observed_at=now,
+    )
+    assert high_ask["reason"] == "ASK_ABOVE_MAX_ENTRY_PRICE"
+    assert high_ask["new_limit"] is None
+
+    within = resolve_bounded_prpr_limit(
+        code="121600", original_price=72500, timing=proof,
+        quote={**quote, "ask": 72300}, observed_at=now,
+    )
+    assert within["state"] == "BOUNDED_LIMIT"
+    assert within["new_limit"] == 72300
+    assert within["reason"] == "VERIFIED_ASK"
+
+    stale = resolve_bounded_prpr_limit(
+        code="121600", original_price=72500, timing=proof,
+        quote={**quote, "received_at": now.timestamp() - 20},
+        observed_at=now,
+    )
+    assert stale["reason"] == "QUOTE_STALE"
+    assert stale["new_limit"] is None
+
+    under = resolve_bounded_prpr_limit(
+        code="121600", original_price=72500, timing=proof,
+        quote={**quote, "last": 70000}, observed_at=now,
+    )
+    assert under["reason"] == "MINUTE_CLOSE_PRICE_DEVIATION"
+    assert under["new_limit"] is None
+
+
+def test_bounded_price_never_turns_unready_momentum_into_buy(monkeypatch):
+    from trader.kr import entry_timing_price as ep
+    now = datetime(2026, 11, 16, 10, 30, tzinfo=KST)
+    monkeypatch.setenv("KR_PB1_ENTRY_TIMING_MODE", "ENFORCE")
+    monkeypatch.setenv("KR_PB1_ENTRY_TIMING_APPROVED", "1")
+    monkeypatch.setattr("trader.account_state.get_account_key", lambda env: "test-account")
+    monkeypatch.setattr("trader.kr.opening_bar_contract.load_opening_proof",
+                        lambda **kw: {"bars": [{"close": 72100.0}]})
+    monkeypatch.setattr("trader.kr.opening_bar_contract.evaluate_proof_for_candidate",
+                        lambda **kw: {"state": "WAIT",
+                                      "reason": "NO_CONFIRMED_MOMENTUM_RECLAIM"})
+    cf = SimpleNamespace(code="121600", setup_ok=True,
+                         features={"order_price_source": "prpr_slippage",
+                                   "entry_style_selected": "ENTRY_MOMENTUM",
+                                   "setup_ok": True})
+    eng = SimpleNamespace(
+        env="practice", STRATEGY_NAME="pb1_pullback_close",
+        _get_price_snapshot_cached=lambda *a, **kw: pytest.fail(
+            "No quote lookup after unready timing signal"),
+    )
+    result = ep.maybe_bound_pb1_prpr_fallback(
+        engine=eng, cf=cf, stage="PB1-AM", order_type="LIMIT",
+        original_price=72500, now=now,
+    )
+    assert result["state"] == "BLOCK"
+    assert result["reason"] == "TIMING_NOT_READY"
+    assert result["new_limit"] if False else True
+    # Independent owners, earlier policy and CLOSE are never rewritten.
+    assert ep.maybe_bound_pb1_prpr_fallback(
+        engine=eng, cf=cf, stage="PB1-CLOSE", order_type="LIMIT",
+        original_price=72500, now=now,
+    )["state"] == "NOT_APPLICABLE"
