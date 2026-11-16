@@ -294,6 +294,12 @@ def test_practice_wsl_legacy_shadow_upgrades_and_emergency_off_halts_buy():
     old_shadow = _run({"KR_PB1_ENTRY_TIMING_MODE": "SHADOW"})
     assert "legacy_SHADOW_to_ENFORCE=1" in old_shadow.stdout
     assert "RESULT:ENFORCE|1|1" in old_shadow.stdout
+    stale_shadow_unapproved = _run({
+        "KR_PB1_ENTRY_TIMING_MODE": "SHADOW",
+        "KR_PB1_ENTRY_TIMING_APPROVED": "0",
+    })
+    assert "legacy_shadow_approval_to_active=1" in stale_shadow_unapproved.stdout
+    assert "RESULT:ENFORCE|1|1" in stale_shadow_unapproved.stdout
     safety_off = _run({"KR_PB1_ENTRY_TIMING_MODE": "OFF"})
     assert "RESULT:OFF|1|0" in safety_off.stdout
     invalid = _run({"KR_PB1_ENTRY_TIMING_MODE": "typo-unrecognized"})
