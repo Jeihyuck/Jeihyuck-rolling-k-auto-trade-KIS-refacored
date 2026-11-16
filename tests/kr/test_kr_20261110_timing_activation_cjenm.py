@@ -105,8 +105,15 @@ def test_kis_observer_uses_opening_and_current_anchors_without_making_up_dates(m
         captured = kwargs["raw_bars"]
         assert len(captured) == 60
         assert all(row.get("date") == "20261110" for row in captured)
-        return {"bars": 35, "path": "/tmp/test-observer", "sha256": "offline-only"}
+        return {"bars": 35, "new_bars": 35, "reused_bars": 0,
+                "source_conflicts": [], "path": "/tmp/test-observer",
+                "sha256": "offline-only"}
     monkeypatch.setattr(obs, "save_opening_proof", _save)
+    # The collector now audits the merged durable readback, not just the
+    # unpersisted REST response. Mock both sides of that file contract.
+    monkeypatch.setattr(obs, "load_opening_proof",
+                        lambda **kwargs: {"bars": bars[:35],
+                                          "source_conflicts": []})
     class ReadOnlyKis:
         def get_intraday_candles_today(self, code, start_hhmm="090000"):
             assert code == "035760"
