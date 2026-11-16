@@ -206,3 +206,46 @@ def maybe_bound_pb1_prpr_fallback(
         # authenticated quote as time travelling / stale.
         observed_at=datetime.now(KST),
     )
+
+
+
+def apply_verified_bounded_limit(
+    *, cf: Any, plan: dict[str, Any], price_proof: Mapping[str, Any],
+    original_price: float, qty: int,
+) -> float:
+    """Atomically update the already-approved BUY price/notional projections.
+
+    This helper never authorizes an order: the caller must still pass the
+    immutable exit contract, independent sizing/duplicate/risk gates and the
+    real broker pre-submit checks. Inconsistent bound evidence fails closed.
+    """
+    features = getattr(cf, "features", None)
+    bounded = _pos(price_proof.get("new_limit"))
+    original = _pos(original_price)
+    floor = _pos(price_proof.get("price_floor"))
+    ceiling = _pos(price_proof.get("price_ceiling"))
+    if (
+        not isinstance(plan, dict) or not isinstance(features, dict)
+        or price_proof.get("state") != "BOUNDED_LIMIT"
+        or price_proof.get("not_order_authorization") is not True
+        or not isinstance(qty, int) or isinstance(qty, bool) or qty <= 0
+        or not all((bounded, original, floor, ceiling))
+        or bounded > original or not floor <= bounded <= ceiling
+        or normalize_kr_order_price(bounded, side="BUY")[0] != bounded
+    ):
+        raise ValueError("KR_BOUND_PRICE_PROOF_INVALID")
+    notional = float(bounded) * qty
+    plan.update(
+        limit_price=float(bounded), order_price=float(bounded),
+        planned_value=notional, price_source="timing_bounded_prpr_limit",
+    )
+    features.update(
+        limit_price=float(bounded), order_price=float(bounded),
+        order_price_source="timing_bounded_prpr_limit",
+        planned_value=notional,
+    )
+    cf.planned_value = notional
+    sizing = getattr(cf, "sizing_details", None)
+    if isinstance(sizing, dict):
+        sizing.update(qty=qty, price=float(bounded), notional=notional)
+    return float(bounded)
