@@ -204,7 +204,7 @@ def evaluate_active_kr_tp(
         # The immutable BUY contract is not sufficient: compare the current
         # broker balance avg, qty and orderable shares to DB every exit tick.
         from trader.execution_state import BrokerBalanceSnapshot, BalanceFreshness
-        from trader.kr.tick_deadline import kr_tick_remaining_sec
+        from trader.kis_wrapper import kr_tick_remaining_sec
         from datetime import datetime, timezone
         from logging import getLogger
         log = getLogger(__name__)
