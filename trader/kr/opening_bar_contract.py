@@ -18,6 +18,9 @@ from trader.runtime_paths import runtime_path
 
 KST = ZoneInfo("Asia/Seoul")
 VERSION = "kr_opening_bar_opportunity_v1"
+# One symmetric limit for both signal evaluation and broker-bound fallback.
+# It is an existing 0.4% policy, not a new / relaxed threshold.
+MAX_ORDER_PRICE_DEVIATION = 0.004
 STYLES = {
     "ENTRY_MOMENTUM": "MOMENTUM",
     "ENTRY_MOMENTUM_CONTINUATION": "MOMENTUM",
@@ -250,7 +253,7 @@ def evaluate_price_aware_entry(
         vwap=vwap_val, vwap_proven=bool(vwap_val is not None),
         increasing_close=rising, higher_lows=higher_lows,
     )
-    if abs(ordered_price / close - 1.0) > 0.004:
+    if abs(ordered_price / close - 1.0) > MAX_ORDER_PRICE_DEVIATION:
         return _result("WAIT", "ORDER_PRICE_MOVED_FROM_CONFIRMED_BAR", **proof)
 
     # Structural risk/room are entry-quality references, not live stop/TP.
