@@ -10,6 +10,14 @@ kr_pb1_entry_timing_defaults() {
       SHADOW|shadow|Shadow)
         echo "[KR][ENTRY_TIMING][UPGRADE] legacy_SHADOW_to_ENFORCE=1"
         export KR_PB1_ENTRY_TIMING_MODE=ENFORCE
+        # A previous SHADOW profile commonly carried approval=0. The user
+        # explicitly authorized ACTIVE practice cutover; upgrade that stale
+        # pair. An independent explicit ENFORCE+approval=0 or OFF remains
+        # an intentional fail-closed emergency BUY stop.
+        if [[ "${KR_PB1_ENTRY_TIMING_APPROVED:-1}" != "1" ]]; then
+          echo "[KR][ENTRY_TIMING][UPGRADE] legacy_shadow_approval_to_active=1"
+          export KR_PB1_ENTRY_TIMING_APPROVED=1
+        fi
         ;;
       OFF|off) export KR_PB1_ENTRY_TIMING_MODE=OFF ;;
       *)
