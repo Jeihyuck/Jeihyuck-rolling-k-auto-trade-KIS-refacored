@@ -18,11 +18,11 @@ KST = ZoneInfo("Asia/Seoul")
 CJ_BUY_TIME = datetime(2026, 11, 10, 9, 34, 51, tzinfo=KST)
 
 
-def test_kr_wsl_am_and_pm_enable_both_timing_shadows_and_readonly_collector():
+def test_kr_wsl_am_and_pm_enable_enforced_native_timing_and_readonly_collector():
     helper = Path("scripts/wsl/kr-entry-timing-activation.sh").read_text()
     assert 'KR_PB1_ENTRY_TIMING_MODE:-ENFORCE' in helper
     assert 'KR_PB1_ENTRY_TIMING_APPROVED:-1' in helper
-    assert 'KR_PB1_ENTRY_TIMING_SHADOW_ENABLED:-1' in helper
+    assert 'KR_PB1_ENTRY_TIMING_SHADOW_ENABLED=0' in helper
     assert 'KR_PB1_OPENING_OBSERVER_ENABLED:-1' in helper
     assert 'STRATEGY_ENV:-' in helper and 'KIS_ENV:-' in helper
     assert "KR_PB1_OPENING_OBSERVER_ENABLED=0" in helper
@@ -269,7 +269,7 @@ def test_verified_positive_pullback_rebound_roundtrips_from_collector_to_new_buy
     )["state"] != "READY_SHADOW"
 
 
-def test_practice_wsl_legacy_shadow_is_upgraded_but_emergency_off_survives():
+def test_practice_wsl_legacy_shadow_upgrades_and_emergency_off_halts_buy():
     """Read-only shell profile evaluation; neither code path runs a broker."""
     import os
     import subprocess
@@ -289,6 +289,8 @@ def test_practice_wsl_legacy_shadow_is_upgraded_but_emergency_off_survives():
             env=env, text=True, capture_output=True, check=True,
         )
     assert "RESULT:ENFORCE|1|1" in _run({}).stdout
+    assert "legacy_quote_shadow=DISABLED" in _run({}).stdout
+    assert "legacy_quote_shadow=DISABLED" in _run({"KR_PB1_ENTRY_TIMING_SHADOW_ENABLED": "1"}).stdout
     old_shadow = _run({"KR_PB1_ENTRY_TIMING_MODE": "SHADOW"})
     assert "legacy_SHADOW_to_ENFORCE=1" in old_shadow.stdout
     assert "RESULT:ENFORCE|1|1" in old_shadow.stdout
@@ -472,3 +474,79 @@ def test_observer_no_filename_uses_actual_repo_prep_artifacts_not_tmp_runtime(tm
         "final30_rows": 30, "contract_ok": True, "trade_can_proceed": True,
     }), encoding="utf-8")
     assert observer.final30_codes(trade_date=day) == codes
+
+
+@pytest.mark.parametrize("mode", ["SHADOW", "shadow", "OFF", "off", "TYPO"])
+def test_practice_pb1_never_uses_shadow_off_or_unknown_mode_to_authorize_buy(
+        monkeypatch, mode):
+    """An old .env must not bypass the mandatory completed 1m proof."""
+    import trader.pb1_engine as pb1
+    monkeypatch.setattr(pb1, "now_kst", lambda: CJ_BUY_TIME)
+    monkeypatch.setenv("KR_PB1_ENTRY_TIMING_MODE", mode)
+    monkeypatch.setenv("KR_PB1_ENTRY_TIMING_APPROVED", "1")
+
+    def no_legacy_quote_or_minute_read(**kw):
+        raise AssertionError("disabled timing mode must fail before broker/quote")
+    monkeypatch.setattr(pb1, "evaluate_proof_for_candidate", no_legacy_quote_or_minute_read)
+    engine = PB1Engine.__new__(PB1Engine)
+    engine.env = "practice"
+    engine._now_kst = CJ_BUY_TIME
+    cf = SimpleNamespace(
+        code="035760", setup_ok=True,
+        features={"entry_style_selected": "ENTRY_PULLBACK", "setup_ok": True,
+                  "trigger_ok": False},
+    )
+    decision = engine._resolve_entry_pre_submit(
+        cf=cf, stage="PB1-AM", order_price=45350.0, order_type="LIMIT",
+    )
+    assert decision.ok is False
+    assert decision.reason_codes == ["KR_ENTRY_TIMING_ENFORCE_REQUIRED"]
+    assert decision.blocking_stage == "pre_submit_timing"
+
+
+def test_practice_pb1_missing_timing_mode_defaults_to_enforce_not_shadow(monkeypatch):
+    """With absent env flags, proof absence blocks rather than becoming a BUY."""
+    import trader.pb1_engine as pb1
+    monkeypatch.setattr(pb1, "now_kst", lambda: CJ_BUY_TIME)
+    monkeypatch.delenv("KR_PB1_ENTRY_TIMING_MODE", raising=False)
+    monkeypatch.delenv("KR_PB1_ENTRY_TIMING_APPROVED", raising=False)
+    monkeypatch.setattr(
+        pb1, "evaluate_proof_for_candidate",
+        lambda **kw: {"state": "UNKNOWN",
+                      "reason": "NO_FRESH_VERIFIED_KIS_MINUTE_BAR_PROOF"},
+    )
+    engine = PB1Engine.__new__(PB1Engine)
+    engine.env = "practice"
+    engine._now_kst = CJ_BUY_TIME
+    cf = SimpleNamespace(
+        code="035760", setup_ok=True,
+        features={"entry_style_selected": "ENTRY_PULLBACK", "setup_ok": True,
+                  "trigger_ok": False},
+    )
+    decision = engine._resolve_entry_pre_submit(
+        cf=cf, stage="PB1-AM", order_price=45350.0, order_type="LIMIT",
+    )
+    assert decision.ok is False
+    assert decision.reason_codes == ["KR_ENTRY_TIMING_NOT_READY_OR_PRICE_TOO_HIGH"]
+    assert cf.features["entry_timing_evidence"]["mode"] == "ENFORCE"
+    assert cf.features["entry_timing_evidence"]["approved"] is True
+
+
+def test_practice_off_is_buy_halt_but_no_broker_order_or_proof_lookup(monkeypatch):
+    """OFF means deliberate safety halt, never unverified setup-only execution."""
+    import trader.pb1_engine as pb1
+    monkeypatch.setenv("KR_PB1_ENTRY_TIMING_MODE", "OFF")
+    monkeypatch.setenv("KR_PB1_ENTRY_TIMING_APPROVED", "1")
+    monkeypatch.setattr(pb1, "evaluate_proof_for_candidate",
+                        lambda **kw: pytest.fail("OFF must halt before timing read"))
+    e = PB1Engine.__new__(PB1Engine)
+    e.env = "practice"
+    e._now_kst = CJ_BUY_TIME
+    cf = SimpleNamespace(
+        code="035760", setup_ok=True,
+        features={"entry_style_selected": "ENTRY_PULLBACK", "setup_ok": True},
+    )
+    result = e._resolve_entry_pre_submit(
+        cf=cf, stage="PB1-AM", order_price=45350.0, order_type="LIMIT",
+    )
+    assert result.reason_codes == ["KR_ENTRY_TIMING_ENFORCE_REQUIRED"]
