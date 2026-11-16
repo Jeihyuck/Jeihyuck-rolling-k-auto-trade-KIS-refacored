@@ -332,12 +332,20 @@ def load_opening_proof(*, env: str, account_scope: str, code: str, now: datetime
         return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        stamp = datetime.fromisoformat(payload.get("as_of") or "").astimezone(KST)
+        if not isinstance(payload, dict):
+            return None
+        stamp = datetime.fromisoformat(payload.get("as_of") or "")
+        if stamp.tzinfo is None:
+            return None  # Never reinterpret a naive WSL timestamp as KST.
+        stamp = stamp.astimezone(KST)
         if (payload.get("version") != VERSION
+                or payload.get("source") != "KIS_FHKST03010200"
+                or not isinstance(payload.get("bars"), list)
+                or not isinstance(payload.get("source_conflicts", []), list)
                 or payload.get("code") != str(code).zfill(6)
                 or payload.get("env") != str(env).lower()
                 or payload.get("trade_date") != now.date().isoformat()
-                or stamp.tzinfo is None or stamp > now
+                or stamp > now
                 or (max_age_seconds is not None
                     and (now - stamp).total_seconds() > max_age_seconds)):
             return None
