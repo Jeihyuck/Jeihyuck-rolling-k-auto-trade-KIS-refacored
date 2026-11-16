@@ -349,3 +349,32 @@ def test_stale_tp_balance_refresh_failure_remains_fail_closed(monkeypatch):
     )
     assert result["action"] == "BLOCK"
     assert result["reason"] == "KR_TP_BALANCE_REFRESH_FAILED"
+
+
+def test_nov16_samsung_tp3_overrides_legacy_tp1_after_broker_proven_stages(monkeypatch):
+    """Observed Nov 16: prior TP1=8/Nov12, TP2=6/Nov13 from 33 BUY.
+
+    The legacy SWING_PCT_TP1 router's proposed 6 shares does not supersede
+    the explicitly amended ACTIVE_PRACTICE parity owner. Current broker
+    holding is 19 shares, so the next immutable stage is TP3 (3 shares).
+    No real broker order is submitted by this test.
+    """
+    pos = setup_contract(monkeypatch)
+    pos.update({"kis_qty": 19, "qty": 19, "orderable_qty": 19,
+                "avg_buy_price": 60200})
+    monkeypatch.setattr(router, "load_frozen_stage_states", lambda **kw: {
+        "TP1": {"status": "FILLED", "broker_fill_proven": True,
+                "target_qty": 8, "cumulative_filled_qty": 8},
+        "TP2": {"status": "FILLED", "broker_fill_proven": True,
+                "target_qty": 6, "cumulative_filled_qty": 6},
+        "TP3": {"status": "NOT_TRIGGERED"},
+    })
+    result = router.evaluate_active_kr_tp(
+        position=pos, engine=object(), kis=FakeKis(quote={"bid": 68600}),
+        env="practice", code="005930",
+        balance_snapshot=FakeBalance(
+            broker_qty=19, broker_orderable=19, broker_avg=60200),
+    )
+    assert result["action"] == "ACTIVE_TP"
+    assert result["stage"] == "TP3"
+    assert result["qty"] == 3
