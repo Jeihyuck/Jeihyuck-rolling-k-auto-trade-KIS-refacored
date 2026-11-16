@@ -5863,14 +5863,23 @@ class PB1Engine:
         ).strip().upper()
         if _timing_style in {"MOMENTUM", "PULLBACK", "BREAKOUT"}:
             _timing_style = "ENTRY_" + _timing_style
-        _timing_eligible = (
+        _timing_scope = (
             str(getattr(self, "STRATEGY_NAME", "")) == "pb1_pullback_close"
             and str(getattr(self, "env", "")).lower() == "practice"
             and not allow_add_to_existing
             and str(stage or "").upper() != "PB1-CLOSE"
             and _is_kr_stock_code(cf.code)
-            and _timing_style in KR_TIMING_STYLES
         )
+        _timing_eligible = _timing_scope and _timing_style in KR_TIMING_STYLES
+        if _timing_scope and not _timing_eligible:
+            # Unknown styles must not accidentally escape ENFORCE. Distinct
+            # strategy owners and independently approved PB1-CLOSE are excluded.
+            return UnifiedGateDecision(
+                ok=False,
+                reason_codes=["KR_ENTRY_TIMING_STYLE_UNSUPPORTED"],
+                blocking_stage="pre_submit_timing",
+                context={"code": cf.code, "style": _timing_style},
+            )
         # SHADOW/OFF/unknown cannot authorize a PB1 practice BUY.
         # OFF is a fail-closed emergency BUY halt, never a legacy bypass.
         if _timing_eligible and _timing_mode != "ENFORCE":
