@@ -115,6 +115,10 @@ class KisWebSocketPriceService:
         self._subscription_retry_after: dict[tuple[str, str], float] = {}
         self._subscription_retry_attempts: dict[tuple[str, str], int] = {}
         self._pending_unsubscribes: set[tuple[str, str]] = set()
+        # One broker-level appkey contention affects all subscription IDs;
+        # individual 1..15sec retries otherwise hammer KIS for each symbol.
+        self._appkey_busy_until: float = 0.0
+        self._appkey_busy_events: int = 0
 
     def enabled(self) -> bool:
         if os.getenv("PYTEST_CURRENT_TEST") and not _env_flag("KIS_WS_PRICE_TEST_ENABLE", False):
@@ -334,6 +338,8 @@ class KisWebSocketPriceService:
             "connections": self._connection_count,
             "reconnects": self._reconnect_count,
             "last_error": self._last_error,
+            "appkey_busy_events": self._appkey_busy_events,
+            "appkey_busy": time.monotonic() < self._appkey_busy_until,
         }
 
     def _ensure_started(self) -> None:
@@ -430,8 +436,9 @@ class KisWebSocketPriceService:
         subscription: tuple[str, str],
         *,
         now_mono: float | None = None,
+        appkey_conflict: bool = False,
     ) -> float:
-        """Back off one rejected subscription without starving other symbols."""
+        """Bound retries; appkey ownership errors pause every subscription."""
         now_value = time.monotonic() if now_mono is None else float(now_mono)
         base = max(0.1, _env_float("KIS_WS_SUBSCRIBE_RETRY_BASE_SEC", 1.0))
         max_delay = max(base, _env_float("KIS_WS_SUBSCRIBE_RETRY_MAX_SEC", 15.0))
@@ -439,6 +446,23 @@ class KisWebSocketPriceService:
             attempt = int(self._subscription_retry_attempts.get(subscription, 0) or 0) + 1
             self._subscription_retry_attempts[subscription] = attempt
             delay = min(max_delay, base * (2 ** max(0, attempt - 1)))
+            if appkey_conflict:
+                self._appkey_busy_events += 1
+                busy_base = max(30.0, _env_float(
+                    "KIS_WS_APPKEY_BUSY_BASE_SEC", 60.0,
+                ))
+                busy_max = max(busy_base, _env_float(
+                    "KIS_WS_APPKEY_BUSY_MAX_SEC", 300.0,
+                ))
+                cooldown = min(
+                    busy_max,
+                    busy_base * (2 ** min(self._appkey_busy_events - 1, 5)),
+                )
+                self._appkey_busy_until = max(
+                    self._appkey_busy_until, now_value + cooldown,
+                )
+                delay = max(delay, cooldown)
+                self._last_error = "KIS_WS_APPKEY_ALREADY_IN_USE"
             self._subscription_retry_after[subscription] = now_value + delay
             self._retry_subscriptions.add(subscription)
             self._broker_subscriptions_acked.discard(subscription)
@@ -460,6 +484,8 @@ class KisWebSocketPriceService:
     ) -> tuple[tuple[str, str], tuple[str, str]] | None:
         """Pick a ready symbol fairly; rejected symbols wait for their backoff."""
         with self._lock:
+            if self._appkey_busy_until > now_mono:
+                return None  # REST remains the freshness-checked fallback.
             retry_after = dict(self._subscription_retry_after)
         for logical_key, subscription in list(desired.items())[:max_subscriptions]:
             if logical_key in sent:
@@ -657,10 +683,18 @@ class KisWebSocketPriceService:
                     tr_id, tr_key, (payload.get("body") or {}).get("msg1"),
                 )
                 if tr_id and tr_key:
-                    delay = self._schedule_subscription_retry((tr_id, tr_key))
+                    appkey_conflict = "ALREADY IN USE" in str(
+                        (payload.get("body") or {}).get("msg1") or ""
+                    ).upper() and "APPKEY" in str(
+                        (payload.get("body") or {}).get("msg1") or ""
+                    ).upper()
+                    delay = self._schedule_subscription_retry(
+                        (tr_id, tr_key), appkey_conflict=appkey_conflict,
+                    )
                     logger.warning(
-                        "[KIS_WS][SUBSCRIBE_RETRY_BACKOFF] tr_id=%s tr_key=%s delay_sec=%.2f",
-                        tr_id, tr_key, delay,
+                        "[KIS_WS][SUBSCRIBE_RETRY_BACKOFF] tr_id=%s tr_key=%s "
+                        "delay_sec=%.2f appkey_contention=%d owner_unknown=1",
+                        tr_id, tr_key, delay, int(appkey_conflict),
                     )
                 else:
                     # Without a subscription identity, reconnect so the local
