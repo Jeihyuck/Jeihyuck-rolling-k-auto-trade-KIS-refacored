@@ -279,3 +279,36 @@ def test_actual_20261116_anonymous_appkey_collision_does_not_reconnect_loop():
         service._desired, set(), max_subscriptions=40,
         now_mono=time.monotonic(),
     ) is None
+
+
+def test_nano_order_price_evidence_records_signed_0p5pct_without_gate_relaxation(monkeypatch):
+    import trader.pb1_engine as pb1
+    now = datetime(2026, 11, 16, 9, 36, tzinfo=KST)
+    monkeypatch.setattr(pb1, "now_kst", lambda: now)
+    monkeypatch.setenv("KR_PB1_ENTRY_TIMING_MODE", "ENFORCE")
+    monkeypatch.setenv("KR_PB1_ENTRY_TIMING_APPROVED", "1")
+    monkeypatch.setattr(pb1, "evaluate_proof_for_candidate", lambda **kwargs: {
+        "state": "WAIT", "reason": "ORDER_PRICE_MOVED_FROM_CONFIRMED_BAR",
+        "reference_price": 10000.0, "latest_bar_ts": "2026-11-16T09:34:00+09:00",
+        "observed_volume_ratio": 1.4, "opening_count": 30,
+        "max_entry_price": None,
+    })
+    eng = pb1.PB1Engine.__new__(pb1.PB1Engine)
+    eng.env = "practice"
+    eng._now_kst = now
+    candidate = SimpleNamespace(
+        code="121600", setup_ok=True,
+        features={"entry_style_selected": "ENTRY_MOMENTUM",
+                  "setup_ok": True, "trigger_ok": False,
+                  "price_source": "prpr_slippage"},
+    )
+    decision = eng._resolve_entry_pre_submit(
+        cf=candidate, stage="PB1-AM", order_price=10050, order_type="LIMIT",
+    )
+    assert not decision.ok
+    proof = candidate.features["entry_timing_evidence"]
+    assert proof["reference_price"] == 10000.0
+    assert proof["signed_price_deviation_pct"] == 0.5
+    assert proof["order_price_source"] == "prpr_slippage"
+    assert proof["is_order_authorization"] is False
+    assert decision.reason_codes == ["KR_ENTRY_TIMING_NOT_READY_OR_PRICE_TOO_HIGH"]
