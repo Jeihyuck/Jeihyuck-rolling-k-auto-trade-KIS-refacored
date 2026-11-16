@@ -110,3 +110,76 @@ def resolve_bounded_prpr_limit(
         "price_floor": lower, "price_ceiling": upper,
         "signed_final_deviation_pct": round(100 * (proposed / reference - 1), 4),
     }
+
+
+def maybe_bound_pb1_prpr_fallback(
+    *, engine: Any, cf: Any, stage: str, order_type: str,
+    original_price: float, now: datetime,
+) -> dict[str, Any]:
+    """Opt in *only* the standard KR PB1 new LIMIT path, never other sleeves.
+
+    This pre-planning operation cannot authorize BUY. It may lower the
+    synthetic +0.5% limit if the original completed-1m decision at the
+    unadjusted native close was READY, and the latest KIS quote is fresh.
+    The normal pre-submit evaluator runs AGAIN at the final price.
+    """
+    import os
+    from trader.account_state import get_account_key
+    from trader.kr.opening_bar_contract import (
+        evaluate_proof_for_candidate, load_opening_proof,
+    )
+    features = getattr(cf, "features", None)
+    if not isinstance(features, dict):
+        return {"state": "NOT_APPLICABLE"}
+    symbol = str(getattr(cf, "code", "") or "").removeprefix("A").zfill(6)
+    if not (
+        str(getattr(engine, "STRATEGY_NAME", "")) == "pb1_pullback_close"
+        and str(getattr(engine, "env", "")).lower() == "practice"
+        and str(stage or "").upper() != "PB1-CLOSE"
+        and str(order_type or "").upper() == "LIMIT"
+        and len(symbol) == 6 and symbol.isdigit() and symbol != "122630"
+        and str(features.get("order_price_source") or "") == "prpr_slippage"
+        and str(os.getenv("KR_PB1_ENTRY_TIMING_MODE") or "").upper() == "ENFORCE"
+        and os.getenv("KR_PB1_ENTRY_TIMING_APPROVED") == "1"
+    ):
+        return {"state": "NOT_APPLICABLE"}
+    reference_price = _pos(original_price)
+    if reference_price is None or now.tzinfo is None:
+        return {"state": "BLOCK", "reason": "PRICE_INPUT_UNVERIFIED"}
+    account_scope = get_account_key(env="practice")
+    proof = load_opening_proof(
+        env="practice", account_scope=account_scope, code=symbol, now=now,
+    )
+    bars = (proof or {}).get("bars") or []
+    close = _pos(bars[-1].get("close")) if bars else None
+    if close is None:
+        return {"state": "BLOCK", "reason": "NATIVE_MINUTE_PROOF_UNAVAILABLE"}
+    if reference_price / close <= 1 + MAX_ORDER_PRICE_DEVIATION:
+        return {"state": "NOT_APPLICABLE"}
+    style = str(
+        features.get("entry_style_selected")
+        or features.get("entry_setup_family") or ""
+    ).upper()
+    if style in {"MOMENTUM", "BREAKOUT", "PULLBACK"}:
+        style = "ENTRY_" + style
+    timing = evaluate_proof_for_candidate(
+        env="practice", account_scope=account_scope, code=symbol,
+        now=now, style=style,
+        setup_ok=bool(features.get("setup_ok", getattr(cf, "setup_ok", False))),
+        trigger_ok=bool(features.get("trigger_ok")),
+        pivot=features.get("pivot"), order_price=close,
+    )
+    if timing.get("state") != "READY_SHADOW":
+        return {"state": "BLOCK", "reason": "TIMING_NOT_READY",
+                "signal_state": timing.get("state"),
+                "signal_reason": timing.get("reason")}
+    try:
+        quote = engine._get_price_snapshot_cached(symbol, market="J")
+    except Exception:
+        return {"state": "BLOCK", "reason": "QUOTE_FETCH_UNAVAILABLE"}
+    return resolve_bounded_prpr_limit(
+        code=symbol, original_price=reference_price,
+        timing=timing,
+        quote=quote if isinstance(quote, dict) else {},
+        observed_at=now,
+    )
