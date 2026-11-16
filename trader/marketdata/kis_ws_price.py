@@ -431,6 +431,31 @@ class KisWebSocketPriceService:
             raise RuntimeError(f"KIS approval_key missing rt={data.get('rt_cd')} msg={data.get('msg1')}")
         return approval
 
+    def _schedule_appkey_contention(self, *, now_mono: float | None = None) -> float:
+        """Broker-wide anonymous appkey collision: hold ALL subscriptions.
+
+        The real KIS error contains tr_id=(null), tr_key empty. It is not a
+        per-symbol rejection; reconnecting instantly just floods the broker.
+        Pause globally and requeue every previously sent symbol for a future
+        verified ACK. REST remains the existing freshness-checked fallback.
+        """
+        now_value = time.monotonic() if now_mono is None else float(now_mono)
+        with self._lock:
+            self._appkey_busy_events += 1
+            base = max(30.0, _env_float("KIS_WS_APPKEY_BUSY_BASE_SEC", 60.0))
+            cap = max(base, _env_float("KIS_WS_APPKEY_BUSY_MAX_SEC", 300.0))
+            delay = min(cap, base * (2 ** min(self._appkey_busy_events - 1, 5)))
+            self._appkey_busy_until = max(self._appkey_busy_until, now_value + delay)
+            for subscription in self._desired.values():
+                self._retry_subscriptions.add(subscription)
+                self._subscription_retry_after[subscription] = max(
+                    self._subscription_retry_after.get(subscription, 0.0),
+                    self._appkey_busy_until,
+                )
+            self._broker_subscriptions_acked.clear()
+            self._last_error = "KIS_WS_APPKEY_ALREADY_IN_USE"
+        return delay
+
     def _schedule_subscription_retry(
         self,
         subscription: tuple[str, str],
@@ -682,23 +707,27 @@ class KisWebSocketPriceService:
                     "[KIS_WS][SUBSCRIBE_FAIL] tr_id=%s tr_key=%s msg=%s action=RETRY",
                     tr_id, tr_key, (payload.get("body") or {}).get("msg1"),
                 )
-                if tr_id and tr_key:
-                    appkey_conflict = "ALREADY IN USE" in str(
-                        (payload.get("body") or {}).get("msg1") or ""
-                    ).upper() and "APPKEY" in str(
-                        (payload.get("body") or {}).get("msg1") or ""
-                    ).upper()
-                    delay = self._schedule_subscription_retry(
-                        (tr_id, tr_key), appkey_conflict=appkey_conflict,
-                    )
+                msg = str((payload.get("body") or {}).get("msg1") or "").upper()
+                appkey_conflict = "ALREADY IN USE" in msg and "APPKEY" in msg
+                if appkey_conflict:
+                    # KIS's observed 2026-11-16 reply carried no usable
+                    # subscription identity. Do NOT throw/reconnect in a loop.
+                    delay = self._schedule_appkey_contention()
                     logger.warning(
-                        "[KIS_WS][SUBSCRIBE_RETRY_BACKOFF] tr_id=%s tr_key=%s "
-                        "delay_sec=%.2f appkey_contention=%d owner_unknown=1",
-                        tr_id, tr_key, delay, int(appkey_conflict),
+                        "[KIS_WS][APPKEY_CONTENTION] identity_missing=%d "
+                        "retry_all_after_sec=%.1f owner_unverified=1",
+                        int(not (tr_id and tr_key)), delay,
+                    )
+                    return
+                if tr_id and tr_key:
+                    delay = self._schedule_subscription_retry((tr_id, tr_key))
+                    logger.warning(
+                        "[KIS_WS][SUBSCRIBE_RETRY_BACKOFF] tr_id=%s tr_key=%s delay_sec=%.2f",
+                        tr_id, tr_key, delay,
                     )
                 else:
-                    # Without a subscription identity, reconnect so the local
-                    # sent set is cleared and every desired symbol is retried.
+                    # Unknown non-appkey rejection cannot identify a safe
+                    # retry target, so reconnect with existing outer backoff.
                     raise RuntimeError(f"KIS WebSocket subscription rejected tr_id={tr_id or 'unknown'}")
             else:
                 tr_key = str((payload.get("header") or {}).get("tr_key") or "")
