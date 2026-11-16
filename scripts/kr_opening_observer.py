@@ -19,6 +19,7 @@ import time
 from trader.account_state import get_account_key
 from trader.kr.opening_bar_contract import (
     KST, save_opening_proof, load_opening_proof, inspect_completed_bar_coverage,
+    diagnose_native_bar_rows,
 )
 from trader.runtime_paths import repo_root
 from trader.time_utils import now_kst
@@ -246,6 +247,18 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
             raw = quote.get("raw") if isinstance(quote.get("raw"), dict) else {}
             quote_origin = str(quote.get("source") or raw.get("source") or "UNKNOWN")
             proof_now = now_kst()
+            native_diagnostic = diagnose_native_bar_rows(data, proof_now)
+            logger.info(
+                "[KR][OPENING_OBSERVER][KIS_NATIVE_BAR_AUDIT] code=%s "
+                "rows=%d valid_unique=%d duplicates=%d dropped=%s "
+                "first_valid=%s last_valid=%s no_trade_proven=0",
+                code, native_diagnostic["total_rows"],
+                native_diagnostic["valid_unique_minutes"],
+                native_diagnostic["duplicate_valid_rows"],
+                native_diagnostic["excluded_by_reason"],
+                native_diagnostic["first_valid_native"],
+                native_diagnostic["last_valid_native"],
+            )
             vwap, vwap_status = verified_native_kr_vwap(
                 quote, code=code, observed_at=proof_now,
             )
