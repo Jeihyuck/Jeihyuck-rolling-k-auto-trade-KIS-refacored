@@ -2,7 +2,9 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from trader.pb1_engine import PB1Engine
-from tests.kr.test_kr_entry_authoritative_gate_state import _build_candidate, _make_engine
+from tests.kr.test_kr_entry_authoritative_gate_state import (
+    _build_candidate, _make_engine, _install_native_minute_enforce_test_proof,
+)
 
 
 def test_kr_buy_block_boundaries(monkeypatch, caplog):
@@ -37,6 +39,9 @@ def test_central_pre_submit_blocks_actual_buy_call_at_0910(monkeypatch, caplog):
 
 
 def test_central_pre_submit_allows_actual_buy_call_at_0930(monkeypatch):
+    # 09:30 clears the opening clock block; independently the new ENFORCE
+    # native 1m proof is required before the downstream fake broker call.
+    _install_native_minute_enforce_test_proof(monkeypatch)
     monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda kis, code: (True, "ok"))
     engine = _make_engine()
     engine._now_kst = datetime(2026, 8, 24, 9, 30, tzinfo=ZoneInfo("Asia/Seoul"))
