@@ -161,3 +161,91 @@ def test_post_tick_reconcile_forces_current_only_even_when_legacy_default_full(m
     assert len(calls) == 1
     assert calls[0]["historical_recovery"] is False
     assert engine_obj._run_summary_payload["broker_truth_reconcile_degraded"] == 0
+
+
+def test_original_momentum_signal_and_final_swing_exit_contract_are_separate():
+    from trader.trade_plan import build_entry_exit_plan
+    from trader.kr.final_entry_contract_proof import (
+        build_final_entry_contract_proof,
+        verify_final_entry_contract_proof,
+    )
+
+    plan = build_entry_exit_plan(
+        code="093320", market="KR",
+        entry_style_selected="ENTRY_MOMENTUM_SWING",
+        entry_reason="ENTRY_MOMENTUM", entry_price=10000.0,
+    ).to_dict()
+    original = {"selected_style": "ENTRY_MOMENTUM",
+                "contract_trade_horizon": "DAY_TRADE"}
+    proof = build_final_entry_contract_proof(
+        code="093320", owner="PB1", plan=plan,
+        original_identity=original,
+    )
+    assert proof["original_selected_style"] == "ENTRY_MOMENTUM"
+    assert proof["original_trade_horizon"] == "DAY_TRADE"
+    assert proof["final_style"] == "ENTRY_MOMENTUM_SWING"
+    assert proof["trade_horizon"] == "SWING"
+    assert proof["exit_policy_family"] == "SWING_STAGED_EXIT"
+    assert verify_final_entry_contract_proof(plan=plan, proof=proof)
+    changed = {**plan, "trade_horizon": "DAY_TRADE"}
+    assert not verify_final_entry_contract_proof(plan=changed, proof=proof)
+    with pytest.raises(ValueError, match="OWNER"):
+        build_final_entry_contract_proof(
+            code="093320", owner="KR_INFINITE_V1", plan=plan,
+        )
+
+
+def test_pre_submit_rejects_modified_final_exit_contract_before_timing_or_broker():
+    from trader.pb1_engine import PB1Engine
+    from trader.trade_plan import build_entry_exit_plan
+    from trader.kr.final_entry_contract_proof import build_final_entry_contract_proof
+
+    plan = build_entry_exit_plan(
+        code="093320", market="KR",
+        entry_style_selected="ENTRY_MOMENTUM_SWING",
+        entry_reason="ENTRY_MOMENTUM", entry_price=10000,
+    ).to_dict()
+    proof = build_final_entry_contract_proof(
+        code="093320", owner="PB1", plan=plan,
+    )
+    wrong = {**plan, "exit_policy_family": "INTRADAY_PROFIT_PROTECT"}
+    candidate = SimpleNamespace(
+        code="093320",
+        features={"entry_exit_plan": wrong, "final_entry_contract_proof": proof},
+    )
+    eng = PB1Engine.__new__(PB1Engine)
+    result = eng._resolve_entry_pre_submit(
+        cf=candidate, stage="PB1-AM", order_price=10000, order_type="LIMIT",
+    )
+    assert result.ok is False
+    assert result.blocking_stage == "pre_submit_contract"
+    assert result.reason_codes == ["KR_FINAL_ENTRY_CONTRACT_PROOF_MISMATCH"]
+
+
+def test_ws_appkey_contention_backs_off_all_symbols_without_fabricating_quote():
+    import asyncio
+    import json
+    import time
+    from trader.marketdata.kis_ws_price import KisWebSocketPriceService
+
+    service = KisWebSocketPriceService()
+    before = time.monotonic()
+    asyncio.run(service._handle_message(None, json.dumps({
+        "header": {"tr_id": "H0STCNT0", "tr_key": "093320"},
+        "body": {"rt_cd": "1", "msg1": "ALREADY IN USE appkey"},
+    })))
+    assert service._appkey_busy_events == 1
+    assert service._appkey_busy_until >= before + 30
+    other = {("KR", "121600"): ("H0STCNT0", "121600")}
+    assert service._next_pending_subscription(
+        other, set(), max_subscriptions=40,
+        now_mono=time.monotonic(),
+    ) is None
+    assert service.get_fresh_quote(
+        "KR", "121600", max_age_sec=5.0,
+    ) is None
+    # After the circuit cooldown, unrelated subscriptions can be selected.
+    assert service._next_pending_subscription(
+        other, set(), max_subscriptions=40,
+        now_mono=service._appkey_busy_until + 0.1,
+    ) is not None
