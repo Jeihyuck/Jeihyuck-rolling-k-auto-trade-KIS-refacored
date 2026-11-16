@@ -417,7 +417,8 @@ def test_nano_0p5pct_artificial_limit_is_bounded_to_original_0p4pct_gate():
         "max_entry_price": 72800.0,
     }
     quote = {
-        "source": "KIS_REST_INQUIRE_PRICE", "requested_symbol": "121600",
+        "source": "KIS_REST_INQUIRE_PRICE",
+        "source_identity": "AUTHENTICATED_REST_REQUEST_BOUND", "market": "KR", "requested_symbol": "121600",
         "last": 72100.0, "received_at": now.timestamp() - 1,
         "stck_bsop_date": "20261116",
     }
@@ -518,7 +519,8 @@ def test_ready_native_pb1_can_reprice_fallback_but_never_authorize_buy(monkeypat
                          features={"order_price_source": "prpr_slippage",
                                    "entry_style_selected": "ENTRY_MOMENTUM",
                                    "setup_ok": True})
-    quote = {"source": "KIS_REST_INQUIRE_PRICE", "requested_symbol": "121600",
+    quote = {"source": "KIS_REST_INQUIRE_PRICE",
+        "source_identity": "AUTHENTICATED_REST_REQUEST_BOUND", "market": "KR", "requested_symbol": "121600",
              "last": 72100, "received_at": time.time()}
     eng = SimpleNamespace(env="practice", STRATEGY_NAME="pb1_pullback_close",
                           _get_price_snapshot_cached=lambda *a, **kw: quote)
@@ -565,6 +567,7 @@ def test_bounded_price_rejects_wrong_symbol_or_bad_source():
               "max_entry_price": 72500}
     quote = {"last": 72100, "received_at": now.timestamp() - 1,
              "source": "KIS_REST_INQUIRE_PRICE",
+        "source_identity": "AUTHENTICATED_REST_REQUEST_BOUND", "market": "KR",
              "requested_symbol": "121600"}
     wrong = resolve_bounded_prpr_limit(
         code="093320", original_price=72500, timing=timing,
@@ -578,3 +581,95 @@ def test_bounded_price_rejects_wrong_symbol_or_bad_source():
     )
     assert unknown["reason"] == "QUOTE_SOURCE_UNVERIFIED"
     assert unknown["new_limit"] is None
+
+
+
+@pytest.mark.parametrize("code,reference", [
+    ("005930", 50000.0), ("000660", 1050000.0),
+    ("093320", 72100.0), ("121600", 250000.0),
+    ("028050", 32000.0), ("035420", 220000.0),
+    ("066570", 85000.0), ("005380", 310000.0),
+])
+def test_price_repair_has_no_named_stock_exception(code, reference):
+    """All eligible KR PB1 equities take the same verified price ceiling."""
+    from trader.kr.entry_timing_price import resolve_bounded_prpr_limit
+    now = datetime(2026, 11, 16, 10, 20, tzinfo=KST)
+    quote = {
+        "source": "KIS_REST_INQUIRE_PRICE",
+        "source_identity": "AUTHENTICATED_REST_REQUEST_BOUND",
+        "market": "KR", "requested_symbol": code,
+        "last": reference, "received_at": now.timestamp() - 1,
+    }
+    proof = {
+        "state": "READY_SHADOW", "reference_price": reference,
+        "max_entry_price": reference * 1.008,
+    }
+    result = resolve_bounded_prpr_limit(
+        code=code, original_price=reference * 1.005,
+        timing=proof, quote=quote, observed_at=now,
+    )
+    assert result["state"] == "BOUNDED_LIMIT", (code, result)
+    assert result["new_limit"] > 0
+    assert abs(result["new_limit"] / reference - 1) <= 0.004 + 1e-10
+    assert result["new_limit"] <= proof["max_entry_price"]
+    assert result["not_order_authorization"] is True
+
+
+@pytest.mark.parametrize("bad,reason", [
+    ({"requested_symbol": None}, "QUOTE_SYMBOL_UNVERIFIED"),
+    ({"requested_symbol": ""}, "QUOTE_SYMBOL_UNVERIFIED"),
+    ({"requested_symbol": "005930"}, "QUOTE_SYMBOL_MISMATCH"),
+    ({"symbol": "005930"}, "QUOTE_SYMBOL_MISMATCH"),
+    ({"source_identity": ""}, "QUOTE_SOURCE_UNVERIFIED"),
+    ({"source_identity": "UNAUTHENTICATED_CACHE"}, "QUOTE_SOURCE_UNVERIFIED"),
+    ({"market": "US"}, "QUOTE_MARKET_UNVERIFIED"),
+])
+def test_price_repair_rejects_unproven_symbol_and_source(bad, reason):
+    from trader.kr.entry_timing_price import resolve_bounded_prpr_limit
+    now = datetime(2026, 11, 16, 10, 20, tzinfo=KST)
+    quote = {
+        "source": "KIS_REST_INQUIRE_PRICE",
+        "source_identity": "AUTHENTICATED_REST_REQUEST_BOUND",
+        "market": "KR", "requested_symbol": "121600",
+        "last": 72100, "received_at": now.timestamp() - 1,
+    }
+    quote.update(bad)
+    result = resolve_bounded_prpr_limit(
+        code="121600", original_price=72500,
+        timing={"state": "READY_SHADOW", "reference_price": 72100,
+                "max_entry_price": 72800},
+        quote=quote, observed_at=now,
+    )
+    assert result["state"] == "BLOCK"
+    assert result["reason"] == reason
+    assert result["new_limit"] is None
+
+
+@pytest.mark.parametrize("code", [
+    "005930", "000660", "093320", "121600", "028050", "035420"
+])
+def test_opening_bar_recovery_is_account_and_symbol_scoped_for_final30(
+        tmp_path, monkeypatch, code):
+    monkeypatch.setattr(opening, "runtime_path",
+                        lambda *parts: tmp_path.joinpath(*parts))
+    save(START + timedelta(minutes=18), candles(0, 18), code=code)
+    save(LATE, candles(17, 36), code=code)
+    proof = load(LATE, code=code)
+    assert proof is not None
+    assert len(proof["bars"]) == 36
+    assert len({b["timestamp"] for b in proof["bars"]}) == 36
+    assert opening.inspect_completed_bar_coverage(
+        rows=proof["bars"], now=LATE)["state"] == "COVERED"
+    assert load(LATE, account="different-account", code=code) is None
+    other = "121600" if code != "121600" else "093320"
+    assert load(LATE, code=other) is None
+
+
+def test_kr_ws_quote_carries_source_identity_and_parsed_symbol():
+    import time
+    from trader.marketdata.kis_ws_price import RealtimeQuote
+    quote = RealtimeQuote(market="KR", symbol="005930", last=50000,
+                          bid=49950, ask=50000, received_at=time.time()).as_dict()
+    assert quote["source"] == "KIS_WEBSOCKET"
+    assert quote["source_identity"] == "KIS_WS_PARSED_SYMBOL"
+    assert quote["requested_symbol"] == quote["symbol"] == "005930"
