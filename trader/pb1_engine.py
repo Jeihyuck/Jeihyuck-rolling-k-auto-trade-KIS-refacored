@@ -5914,7 +5914,26 @@ class PB1Engine:
                     "reason": str(_timing.get("reason") or "UNRECORDED"),
                     "latest_bar_ts": _timing.get("latest_bar_ts"),
                     "max_entry_price": _timing.get("max_entry_price"),
+                    # Persist source-native candle values for a reproducible
+                    # 0.5% slippage vs symmetric 0.4% gate investigation.
+                    # These observations do NOT relax or authorize BUY.
+                    "reference_price": _timing.get("reference_price"),
+                    "opening_count": _timing.get("opening_count"),
+                    "opening_high": _timing.get("opening_high"),
+                    "observed_volume_ratio": _timing.get("observed_volume_ratio"),
+                    "vwap_proven": _timing.get("vwap_proven"),
+                    "increasing_close": _timing.get("increasing_close"),
+                    "higher_lows": _timing.get("higher_lows"),
+                    "order_price_source": (cf.features or {}).get("price_source"),
+                    "order_type": str(order_type or ""),
                     "submitted_reference_price": float(order_price or 0),
+                    "signed_price_deviation_pct": (
+                        round(100.0 * (float(order_price) /
+                                       float(_timing["reference_price"]) - 1.0), 4)
+                        if isinstance(_timing.get("reference_price"), (int, float))
+                        and float(_timing["reference_price"]) > 0
+                        and float(order_price or 0) > 0 else None
+                    ),
                     "is_order_authorization": False,
                 }
             logger.info(
