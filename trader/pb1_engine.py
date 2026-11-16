@@ -11284,6 +11284,56 @@ class PB1Engine:
                     cf.features["price_source"] = source_key
                     logger.warning("[KR][PRICE_FALLBACK][USED] code=%s source=%s order_price=%s", display_code, source_key, record_price)
                     break
+        # Keep the 0.4% symmetric price gate while avoiding the mechanical
+        # +0.5% prpr buffer. Only verified, fresh, scope-matched KIS evidence
+        # can LOWER the final LIMIT; a missing/unsafe quote cannot reprice.
+        if isinstance(cf.features, dict) and cf.features.get("order_price_source") == "prpr_slippage":
+            from trader.kr.entry_timing_price import maybe_bound_pb1_prpr_fallback
+            try:
+                _price_proof = maybe_bound_pb1_prpr_fallback(
+                    engine=self, cf=cf, stage=stage,
+                    order_type=order_type,
+                    original_price=record_price,
+                    now=now_kst(),
+                )
+            except Exception as _bounded_exc:
+                logger.warning(
+                    "[KR][ENTRY][TIMING_BOUNDED_PRICE][NO_REPRICE] code=%s "
+                    "reason=PROOF_EVALUATION_ERROR error_type=%s "
+                    "action=EXISTING_ENFORCE_GATE_WILL_BLOCK_IF_REQUIRED",
+                    cf.code, type(_bounded_exc).__name__,
+                )
+                _price_proof = {"state": "BLOCK", "reason": "PROOF_EVALUATION_ERROR",
+                                "not_order_authorization": True}
+            if _price_proof.get("state") != "NOT_APPLICABLE":
+                cf.features["timing_bounded_price_evidence"] = _price_proof
+            if _price_proof.get("state") == "BOUNDED_LIMIT":
+                _old = float(record_price)
+                _bounded = float(_price_proof["new_limit"])
+                limit_price = record_price = _bounded
+                plan.update(
+                    limit_price=_bounded, order_price=_bounded,
+                    planned_value=_bounded * int(qty),
+                    price_source="timing_bounded_prpr_limit",
+                )
+                cf.features["limit_price"] = _bounded
+                cf.features["order_price"] = _bounded
+                cf.features["order_price_source"] = "timing_bounded_prpr_limit"
+                cf.planned_value = _bounded * int(qty)
+                logger.info(
+                    "[KR][ENTRY][TIMING_BOUNDED_PRICE] code=%s original=%.0f "
+                    "bounded=%.0f method=%s ref=%.0f quote_age_sec=%s "
+                    "max_price=%s cap_0p4_unchanged=1",
+                    cf.code, _old, _bounded,
+                    _price_proof.get("reason"), _price_proof.get("reference_price"),
+                    _price_proof.get("quote_age_sec"), _price_proof.get("price_ceiling"),
+                )
+            elif _price_proof.get("state") == "BLOCK":
+                logger.info(
+                    "[KR][ENTRY][TIMING_BOUNDED_PRICE][NO_REPRICE] code=%s "
+                    "reason=%s action=RETAIN_ORIGINAL_ENFORCE_GATE",
+                    cf.code, _price_proof.get("reason"),
+                )
         entry_exit_plan_dict, plan_entry_meta = self.ensure_entry_exit_plan(
             cf,
             entry_price=float(entry_price or cf.features.get("entry_price") or record_price or 0.0),
@@ -12592,56 +12642,6 @@ class PB1Engine:
             status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
             status["terminal_event"] = "FINAL_SKIP"
             return status
-        # Keep the 0.4% symmetric price gate while avoiding the mechanical
-        # +0.5% prpr buffer. Only verified, fresh, scope-matched KIS evidence
-        # can LOWER the final LIMIT; a missing/unsafe quote cannot reprice.
-        if isinstance(cf.features, dict) and cf.features.get("order_price_source") == "prpr_slippage":
-            from trader.kr.entry_timing_price import maybe_bound_pb1_prpr_fallback
-            try:
-                _price_proof = maybe_bound_pb1_prpr_fallback(
-                    engine=self, cf=cf, stage=stage,
-                    order_type=order_type,
-                    original_price=record_price,
-                    now=now_kst(),
-                )
-            except Exception as _bounded_exc:
-                logger.warning(
-                    "[KR][ENTRY][TIMING_BOUNDED_PRICE][NO_REPRICE] code=%s "
-                    "reason=PROOF_EVALUATION_ERROR error_type=%s "
-                    "action=EXISTING_ENFORCE_GATE_WILL_BLOCK_IF_REQUIRED",
-                    cf.code, type(_bounded_exc).__name__,
-                )
-                _price_proof = {"state": "BLOCK", "reason": "PROOF_EVALUATION_ERROR",
-                                "not_order_authorization": True}
-            if _price_proof.get("state") != "NOT_APPLICABLE":
-                cf.features["timing_bounded_price_evidence"] = _price_proof
-            if _price_proof.get("state") == "BOUNDED_LIMIT":
-                _old = float(record_price)
-                _bounded = float(_price_proof["new_limit"])
-                limit_price = record_price = _bounded
-                plan.update(
-                    limit_price=_bounded, order_price=_bounded,
-                    planned_value=_bounded * int(qty),
-                    price_source="timing_bounded_prpr_limit",
-                )
-                cf.features["limit_price"] = _bounded
-                cf.features["order_price"] = _bounded
-                cf.features["order_price_source"] = "timing_bounded_prpr_limit"
-                cf.planned_value = _bounded * int(qty)
-                logger.info(
-                    "[KR][ENTRY][TIMING_BOUNDED_PRICE] code=%s original=%.0f "
-                    "bounded=%.0f method=%s ref=%.0f quote_age_sec=%s "
-                    "max_price=%s cap_0p4_unchanged=1",
-                    cf.code, _old, _bounded,
-                    _price_proof.get("reason"), _price_proof.get("reference_price"),
-                    _price_proof.get("quote_age_sec"), _price_proof.get("price_ceiling"),
-                )
-            elif _price_proof.get("state") == "BLOCK":
-                logger.info(
-                    "[KR][ENTRY][TIMING_BOUNDED_PRICE][NO_REPRICE] code=%s "
-                    "reason=%s action=RETAIN_ORIGINAL_ENFORCE_GATE",
-                    cf.code, _price_proof.get("reason"),
-                )
         entry_exit_plan_dict, plan_entry_meta = self.ensure_entry_exit_plan(
             cf,
             entry_price=float(cf.features.get("entry_price") or cap or cf.features.get("close") or 0.0),
