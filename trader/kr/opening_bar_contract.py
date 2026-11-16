@@ -49,6 +49,68 @@ def _source_time(raw: dict, date_str: str) -> datetime | None:
         return None
 
 
+def diagnose_native_bar_rows(rows: list[dict], now: datetime) -> dict:
+    """Count exact reasons KIS minute source rows are NOT usable as proof.
+
+    Diagnostic only: no synthetic candles, volume, VWAP, timestamps or entry
+    authorization. Labels distinguish absent exchange dates from KIS's
+    genuine no-trade minute buckets and from strict OHLC rejection.
+    """
+    from collections import Counter
+
+    now = now.astimezone(KST)
+    now_minute = now.replace(second=0, microsecond=0)
+    counts: Counter[str] = Counter()
+    valid_minutes: set[str] = set()
+    duplicates = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            counts["ROW_NOT_MAPPING"] += 1
+            continue
+        raw_day = str(row.get("date") or "").replace("-", "").strip()
+        if not raw_day:
+            counts["SOURCE_DATE_MISSING"] += 1
+            continue
+        if raw_day != now.strftime("%Y%m%d"):
+            counts["SOURCE_DATE_MISMATCH"] += 1
+            continue
+        stamp = _source_time(row, now.date().isoformat())
+        if stamp is None:
+            counts["SOURCE_CLOCK_INVALID"] += 1
+            continue
+        if not dtime(9, 0) <= stamp.time() < dtime(15, 30):
+            counts["OUTSIDE_KRX_SESSION"] += 1
+            continue
+        if stamp + timedelta(minutes=1) > now_minute:
+            counts["CURRENT_OR_FUTURE_MINUTE"] += 1
+            continue
+        o, h, l, c, vol = [_positive(row.get(k)) for k in
+                            ("open", "high", "low", "close", "volume")]
+        if None in (o, h, l, c, vol):
+            counts["OHLCV_MISSING_OR_NONPOSITIVE"] += 1
+            continue
+        if not (l <= o <= h and l <= c <= h):
+            counts["OHLC_INCONSISTENT"] += 1
+            continue
+        key = stamp.isoformat()
+        if key in valid_minutes:
+            duplicates += 1
+        valid_minutes.add(key)
+        counts["VALID_COMPLETED_NATIVE_ROW"] += 1
+    return {
+        "total_rows": len(rows),
+        "valid_unique_minutes": len(valid_minutes),
+        "duplicate_valid_rows": duplicates,
+        "excluded_by_reason": {
+            k: int(v) for k, v in sorted(counts.items())
+            if k != "VALID_COMPLETED_NATIVE_ROW"
+        },
+        "first_valid_native": min(valid_minutes) if valid_minutes else None,
+        "last_valid_native": max(valid_minutes) if valid_minutes else None,
+        "no_trade_minutes_proven": False,
+    }
+
+
 def clean_completed_bars(rows: list[dict], now: datetime) -> list[dict]:
     """No invented OHLC, no previous date, future minute or missing volume."""
     now = now.astimezone(KST)
