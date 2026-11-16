@@ -10,7 +10,14 @@ from trader.marketdata.kis_ws_price import KisWebSocketPriceService
 
 @pytest.mark.parametrize('cap,holdings_count', [(2, 4), (40, 80)])
 @pytest.mark.parametrize('unsubscribe_reply', ['ack', 'reject', 'timeout'])
-def test_rebalance_observes_broker_slot_lifetime_and_recovers(monkeypatch, cap, holdings_count, unsubscribe_reply):
+def test_rebalance_observes_broker_slot_lifetime_and_recovers(monkeypatch, tmp_path, cap, holdings_count, unsubscribe_reply):
+    # The real WS process-owner lease requires a credential identity. Offline
+    # socket mocks must supply explicit synthetic appkeys instead of silently
+    # bypassing this production safety gate.
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("KIS_APP_KEY", "OFFLINE-WS-OWNER-TEST")
+    monkeypatch.setenv("KIS_APP_SECRET", "OFFLINE-ONLY")
+    monkeypatch.setenv("KIS_WS_OWNER_LOCK_DIR", str(tmp_path))
     service = KisWebSocketPriceService()
     monkeypatch.setattr(service, 'network_allowed', lambda _: True)
     monkeypatch.setattr(service, '_ensure_started', lambda: None)
