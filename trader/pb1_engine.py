@@ -7667,6 +7667,30 @@ class PB1Engine:
                 "policy_source": plan_dict.get("policy_source"),
                 "policy_version": plan_dict.get("policy_version"),
             }
+        # Separate the original setup signal from the authoritative final
+        # BUY->SELL contract. ENTRY_MOMENTUM -> ENTRY_MOMENTUM_SWING is
+        # legitimate only when the final SWING owner is explicit and frozen.
+        # Existing position contracts are never rewritten here.
+        if is_kr and is_practice:
+            from trader.kr.final_entry_contract_proof import (
+                build_final_entry_contract_proof,
+                verify_final_entry_contract_proof,
+            )
+            original_identity = dict(
+                features.get("entry_identity_proof") or {}
+            )
+            final_proof = build_final_entry_contract_proof(
+                code=cf.code, owner="PB1", plan=plan_dict,
+                original_identity=original_identity,
+            )
+            if not verify_final_entry_contract_proof(
+                plan=plan_dict, proof=final_proof,
+            ):
+                raise ValueError("KR_FINAL_ENTRY_CONTRACT_PROOF_INVALID")
+            features["original_entry_identity_proof"] = original_identity
+            features["final_entry_contract_proof"] = final_proof
+            meta["original_entry_identity_proof"] = original_identity
+            meta["final_entry_contract_proof"] = final_proof
         setattr(cf, "entry_exit_plan", plan_dict)
         features["entry_exit_plan"] = plan_dict
         logger.info(
