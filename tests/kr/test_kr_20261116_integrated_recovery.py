@@ -490,7 +490,6 @@ def test_bounded_price_never_turns_unready_momentum_into_buy(monkeypatch):
     )
     assert result["state"] == "BLOCK"
     assert result["reason"] == "TIMING_NOT_READY"
-    assert result["new_limit"] if False else True
     # Independent owners, earlier policy and CLOSE are never rewritten.
     assert ep.maybe_bound_pb1_prpr_fallback(
         engine=eng, cf=cf, stage="PB1-CLOSE", order_type="LIMIT",
