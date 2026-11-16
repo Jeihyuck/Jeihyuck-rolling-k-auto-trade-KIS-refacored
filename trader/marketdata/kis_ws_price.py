@@ -243,6 +243,10 @@ class KisWebSocketPriceService:
             return None
         key = (str(market or "").upper(), self._normalize_symbol(market, symbol))
         with self._lock:
+            # A rejected appkey invalidates the origin/ownership of all WS
+            # quotes, even ones that are younger than the usual TTL.
+            if time.monotonic() < self._appkey_busy_until:
+                return None
             quote = self._quotes.get(key)
         if not quote:
             return None
@@ -502,6 +506,9 @@ class KisWebSocketPriceService:
                     self._appkey_busy_until,
                 )
             self._broker_subscriptions_acked.clear()
+            # No stale websocket price may pass as executable KIS market data
+            # while ownership is contested. REST can be used independently.
+            self._quotes.clear()
             self._last_error = "KIS_WS_APPKEY_ALREADY_IN_USE"
         return delay
 
