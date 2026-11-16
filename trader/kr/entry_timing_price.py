@@ -181,5 +181,9 @@ def maybe_bound_pb1_prpr_fallback(
         code=symbol, original_price=reference_price,
         timing=timing,
         quote=quote if isinstance(quote, dict) else {},
-        observed_at=now,
+        # REST may take seconds after the minute proof was evaluated. Check
+        # quote age against its *actual receipt evaluation instant*, not the
+        # earlier bar-proof timestamp, to avoid classifying a newly fetched
+        # authenticated quote as time travelling / stale.
+        observed_at=datetime.now(KST),
     )
