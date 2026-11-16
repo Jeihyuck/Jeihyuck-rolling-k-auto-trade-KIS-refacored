@@ -313,6 +313,16 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
                             "reason": "CONFLICTING_NATIVE_COMPLETED_BAR"}
             if coverage["state"] == "COVERED":
                 coverage_ok += 1
+            elif observed_at.time() >= dtime(9, 30):
+                logger.warning(
+                    "[KR][OPENING_OBSERVER][COVERAGE_GAP] code=%s "
+                    "reason=%s native_rows=%s persisted_bars=%s "
+                    "opening_valid=%s opening_unobserved=%s "
+                    "unobserved_not_proven_missing=1",
+                    code, coverage["reason"], len(data), result["bars"],
+                    coverage.get("opening_valid_minutes"),
+                    coverage.get("opening_unobserved_minutes"),
+                )
             if not verified_vwap:
                 missing_vwap += 1
             logger.info(
