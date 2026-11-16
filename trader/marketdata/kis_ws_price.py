@@ -67,6 +67,10 @@ class RealtimeQuote:
             "stale": False,
             "quality": "fresh",
             "source": self.source,
+            # Provenance: self.symbol is parsed from the WS KIS trade frame,
+            # not inferred from the caller's requested symbol.
+            "source_identity": "KIS_WS_PARSED_SYMBOL",
+            "requested_symbol": self.symbol,
             "exchange": self.exchange,
             "raw": {
                 "source": self.source,
