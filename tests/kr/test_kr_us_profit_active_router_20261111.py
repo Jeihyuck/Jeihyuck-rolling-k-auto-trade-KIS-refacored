@@ -28,27 +28,28 @@ from trader.kr import us_profit_execution_router as router
 class FakeKis:
     env = "practice"
 
-    def __init__(self, quote=None):
+    def __init__(self, quote=None, code="005930"):
         self.quote = quote if quote is not None else {"bid": 109.0}
+        self.expected_code = code
         self.calls = 0
 
     def get_price_snapshot(self, code, market="J"):
-        assert (code, market) == ("005930", "J")
+        assert (code, market) == (self.expected_code, "J")
         self.calls += 1
         return self.quote
 
 
-def setup_contract(monkeypatch):
+def setup_contract(monkeypatch, *, code="005930"):
     monkeypatch.setenv("KIS_ENV", "practice")
     monkeypatch.setenv("KR_SWING_US_PROFIT_MODE", "ACTIVE_PRACTICE")
     c = build_new_swing_parity_contract(
         strategy_owner="PB1", exit_policy_family="SWING_STAGED_EXIT",
         trade_horizon="SWING", position_action="NEW_POSITION_BUY",
         account_id="practice:account", trading_epoch_id="epoch-1",
-        position_cycle_id="cycle-1", runner_version="US_V3", code="005930",
+        position_cycle_id="cycle-1", runner_version="US_V3", code=code,
     )
     pos = {
-        "code": "005930", "strategy": "pb1_pullback_close", "status": "OPEN",
+        "code": code, "strategy": "pb1_pullback_close", "status": "OPEN",
         "trade_horizon": "SWING", "exit_policy_family": "SWING_STAGED_EXIT",
         "holding_source": "kis_balance", "kis_qty": 100, "qty": 100,
         "orderable_qty": 100, "avg_buy_price": 100,
@@ -378,3 +379,37 @@ def test_nov16_samsung_tp3_overrides_legacy_tp1_after_broker_proven_stages(monke
     assert result["action"] == "ACTIVE_TP"
     assert result["stage"] == "TP3"
     assert result["qty"] == 3
+
+
+
+@pytest.mark.parametrize("code", [
+    "005930", "000660", "093320", "121600", "028050", "035420", "066570"
+])
+def test_active_tp_owner_contract_is_not_samsung_or_kinx_specific(monkeypatch, code):
+    """Existing ACTIVE PB1 TP stays stage-based for any matching KR owner."""
+    pos = setup_contract(monkeypatch, code=code)
+    kis = FakeKis(code=code)
+    result = router.evaluate_active_kr_tp(
+        position=pos, engine=object(), kis=kis, env="practice", code=code,
+        balance_snapshot=FakeBalance(),
+    )
+    assert result["action"] == "ACTIVE_TP", (code, result)
+    assert result["stage"] == "TP1"
+    assert result["qty"] == 25
+    assert result["code"] == code
+    assert result["position_cycle_id"] == "cycle-1"
+    assert kis.calls == 1
+
+
+@pytest.mark.parametrize("code", ["093320", "121600", "035420"])
+def test_tp_never_uses_another_symbols_frozen_contract(monkeypatch, code):
+    pos = setup_contract(monkeypatch)
+    pos["code"] = code
+    kis = FakeKis(code=code)
+    result = router.evaluate_active_kr_tp(
+        position=pos, engine=object(), kis=kis, env="practice", code=code,
+        balance_snapshot=FakeBalance(),
+    )
+    assert result["action"] == "BLOCK"
+    assert result["reason"] == "KR_TP_POLICY_OWNER_OR_CYCLE_CONFLICT"
+    assert kis.calls == 0
