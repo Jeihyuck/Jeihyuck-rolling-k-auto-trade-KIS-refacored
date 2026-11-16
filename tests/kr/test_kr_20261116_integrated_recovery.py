@@ -495,3 +495,40 @@ def test_bounded_price_never_turns_unready_momentum_into_buy(monkeypatch):
         engine=eng, cf=cf, stage="PB1-CLOSE", order_type="LIMIT",
         original_price=72500, now=now,
     )["state"] == "NOT_APPLICABLE"
+
+
+def test_ready_native_pb1_can_reprice_fallback_but_never_authorize_buy(monkeypatch):
+    import time
+    from trader.kr import entry_timing_price as ep
+    from trader.kr.opening_bar_contract import evaluate_price_aware_entry
+    now = datetime.now(KST)
+    monkeypatch.setenv("KR_PB1_ENTRY_TIMING_MODE", "ENFORCE")
+    monkeypatch.setenv("KR_PB1_ENTRY_TIMING_APPROVED", "1")
+    monkeypatch.setattr("trader.account_state.get_account_key", lambda env: "test-account")
+    monkeypatch.setattr("trader.kr.opening_bar_contract.load_opening_proof",
+                        lambda **kw: {"bars": [{"close": 72100.0}]})
+    monkeypatch.setattr("trader.kr.opening_bar_contract.evaluate_proof_for_candidate",
+                        lambda **kw: {
+                            "state": "READY_SHADOW",
+                            "reason": "MOMENTUM_PULLBACK_RECLAIM",
+                            "reference_price": 72100.0,
+                            "max_entry_price": 72800.0,
+                        })
+    cf = SimpleNamespace(code="121600", setup_ok=True,
+                         features={"order_price_source": "prpr_slippage",
+                                   "entry_style_selected": "ENTRY_MOMENTUM",
+                                   "setup_ok": True})
+    quote = {"source": "KIS_REST_INQUIRE_PRICE", "requested_symbol": "121600",
+             "last": 72100, "received_at": time.time()}
+    eng = SimpleNamespace(env="practice", STRATEGY_NAME="pb1_pullback_close",
+                          _get_price_snapshot_cached=lambda *a, **kw: quote)
+    decision = ep.maybe_bound_pb1_prpr_fallback(
+        engine=eng, cf=cf, stage="PB1-AM",
+        order_type="LIMIT", original_price=72500, now=now,
+    )
+    assert decision["state"] == "BOUNDED_LIMIT"
+    assert decision["new_limit"] == 72300
+    assert decision["not_order_authorization"] is True
+    assert cf.features["order_price_source"] == "prpr_slippage"
+    # Function proposes a limit; it intentionally never mutates the
+    # candidate or submits to the fake broker.
