@@ -158,8 +158,8 @@ def maybe_bound_pb1_prpr_fallback(
         and str(order_type or "").upper() == "LIMIT"
         and len(symbol) == 6 and symbol.isdigit() and symbol != "122630"
         and str(features.get("order_price_source") or "") == "prpr_slippage"
-        and str(os.getenv("KR_PB1_ENTRY_TIMING_MODE") or "").upper() == "ENFORCE"
-        and os.getenv("KR_PB1_ENTRY_TIMING_APPROVED") == "1"
+        and str(os.getenv("KR_PB1_ENTRY_TIMING_MODE") or "ENFORCE").upper() == "ENFORCE"
+        and os.getenv("KR_PB1_ENTRY_TIMING_APPROVED", "1") == "1"
     ):
         return {"state": "NOT_APPLICABLE"}
     reference_price = _pos(original_price)
