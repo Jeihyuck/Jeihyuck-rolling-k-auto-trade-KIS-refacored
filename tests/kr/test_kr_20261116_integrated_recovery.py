@@ -249,3 +249,33 @@ def test_ws_appkey_contention_backs_off_all_symbols_without_fabricating_quote():
         other, set(), max_subscriptions=40,
         now_mono=service._appkey_busy_until + 0.1,
     ) is not None
+
+
+def test_actual_20261116_anonymous_appkey_collision_does_not_reconnect_loop():
+    """Actual archive reports header tr_id='(null)', tr_key='', appkey in use."""
+    import asyncio
+    import json
+    import time
+    from trader.marketdata.kis_ws_price import KisWebSocketPriceService
+
+    service = KisWebSocketPriceService()
+    service._desired = {
+        ("KR", "093320"): ("H0STCNT0", "093320"),
+        ("KR", "121600"): ("H0STCNT0", "121600"),
+    }
+    # No socket is needed: unlike the old handler, this must not raise a
+    # reconnect-worthy RuntimeError for an anonymous broker-wide conflict.
+    asyncio.run(service._handle_message(None, json.dumps({
+        "header": {"tr_id": "(null)", "tr_key": ""},
+        "body": {"rt_cd": "1", "msg1": "ALREADY IN USE appkey"},
+    })))
+    assert service._appkey_busy_events == 1
+    assert service._appkey_busy_until >= time.monotonic() + 29
+    assert service._retry_subscriptions == {
+        ("H0STCNT0", "093320"), ("H0STCNT0", "121600")
+    }
+    assert service._broker_subscriptions_acked == set()
+    assert service._next_pending_subscription(
+        service._desired, set(), max_subscriptions=40,
+        now_mono=time.monotonic(),
+    ) is None
