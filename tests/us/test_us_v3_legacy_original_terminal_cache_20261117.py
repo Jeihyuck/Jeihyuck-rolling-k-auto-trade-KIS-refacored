@@ -41,13 +41,13 @@ def _probe(*, current_day="2026-11-16", source_day="2026-11-04",
     return run, calls
 
 
-def test_exact_previous_day_cancelled_partial_sell_cached_but_not_unsafe_open():
+def test_previous_day_cancelled_partial_sell_is_revalidated():
     run, calls = _probe()
     assert run()["classification"] == "PROVEN_CANCELLED"
     assert run()["cumulative_filled_qty"] == 4
-    assert calls == {"get": 1, "classify": 1}
+    assert calls == {"get": 2, "classify": 2}
     assert run()["classification"] == "PROVEN_CANCELLED"
-    assert calls == {"get": 1, "classify": 1}
+    assert calls == {"get": 3, "classify": 3}
 
 
 @pytest.mark.parametrize("classification", [
@@ -80,14 +80,14 @@ def test_broker_proof_cannot_cross_account_epoch_contract_or_symbol():
     assert [c["get"] for c in (a_calls,b_calls,c_calls,d_calls,e_calls)] == [1] * 5
     for runner in (a,b,c,d,e):
         runner()
-    assert [c["get"] for c in (a_calls,b_calls,c_calls,d_calls,e_calls)] == [1] * 5
+    assert [c["get"] for c in (a_calls,b_calls,c_calls,d_calls,e_calls)] == [2] * 5
 
 
 def test_original_buy_proof_requires_terminal_fill_not_cancelled():
     run, calls = _probe(side="BUY", classification="PROVEN_FILLED", qty=10, filled=10)
     run()
     run()
-    assert calls["get"] == 1
+    assert calls["get"] == 2
     rejected, other_calls = _probe(side="BUY", classification="PROVEN_CANCELLED", qty=10, filled=0)
     rejected()
     rejected()
@@ -112,12 +112,19 @@ def test_cumulative_quantity_disagreement_never_cached():
     assert fetches["count"] == 2
 
 
-def test_terminal_cache_bounded_and_preserves_current_trade_day_no_proof():
-    legacy._HISTORICAL_TERMINAL_MAX = 4
-    try:
-        for i in range(8):
-            run, _ = _probe(symbol=f"ANY{i:02d}")
-            run()
-        assert len(legacy._HISTORICAL_TERMINAL_CACHE) == 4
-    finally:
-        legacy._HISTORICAL_TERMINAL_MAX = 256
+def test_corrected_historical_broker_evidence_is_not_hidden_by_old_proof():
+    responses = iter(["PROVEN_CANCELLED", "OPEN"])
+    def get(day):
+        return next(responses)
+    def classify(status, **kwargs):
+        return {"classification": status, "cumulative_filled_qty": 4}
+    def check():
+        return legacy._classify_immutable_source_order(
+            classifier=classify, get_order_day=get,
+            day="2026-11-04", current_trade_date="2026-11-16",
+            source_account_hash="a" * 64, epoch="epoch", contract_sha="b" * 64,
+            symbol="XYZ", side="SELL", order_no="11", requested_qty=10,
+            cumulative_filled_qty=4,
+        )
+    assert check()["classification"] == "PROVEN_CANCELLED"
+    assert check()["classification"] == "OPEN"
