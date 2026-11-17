@@ -1274,9 +1274,71 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                                type(_audit_exc).__name__)
                 intent["meta"]["entry_decision_evidence_status"] = "AUDIT_UNVERIFIED"
         elif decision.action == Action.SELL:
-            # Do not fabricate an original BUY proof from holdings or balance.
-            # SELL evidence needs an EXACT filled original BUY digest.
+            # Only an actual KIS-filled BUY from THIS owner/account/epoch/cycle
+            # can bind a TQQQ SELL. An ACK, current balance or newest symbol
+            # snapshot is not original BUY evidence. Audit is never authority.
             intent["meta"]["exit_decision_evidence_status"] = "ENTRY_PROOF_REQUIRED"
+            _sha = _tqqq_evidence_code_sha()
+            if _sha and hasattr(repository, "load_verified_cycle_entry_evidence"):
+                try:
+                    from trader.us.decision_evidence_5w1h import (
+                        build_exit_evidence_from_entry, verify_exit_entry_link,
+                    )
+                    _entry = repository.load_verified_cycle_entry_evidence(
+                        cycle_id=lifecycle_id,
+                    )
+                    if isinstance(_entry, dict):
+                        _sell_ev = build_exit_evidence_from_entry(
+                            entry_evidence=_entry,
+                            decision_id="TQQQ_INFINITE:SELL:" + client_order_key,
+                            decision_at=decision_observed_at,
+                            decision_reason=str(decision.reason),
+                            current_facts={
+                                "decision_price_usd": broker.price,
+                                "broker_qty_before": broker.qty,
+                                "broker_avg_usd_before": broker.average_price,
+                                "quote_source": overlay.get("tqqq_quote_source"),
+                                "quote_asof": overlay.get("tqqq_quote_asof"),
+                                "quote_stale": quote_stale,
+                            },
+                            changed_since_entry={
+                                "entry_decision_price_usd":
+                                    (_entry.get("why") or {}).get("facts", {}).get("decision_price_usd"),
+                                "exit_decision_price_usd": broker.price,
+                                "original_buy_decision_id": _entry["what"]["decision_id"],
+                            },
+                            sizing={
+                                "qty": decision.qty,
+                                "limit_price": broker.price,
+                                "notional_usd": decision.notional,
+                                "profit_stage": profit_stage or "FULL_EXIT",
+                                "position_action": position_action,
+                            },
+                            market_context={
+                                "market_state": overlay.get("market_state"),
+                                "market_regime": overlay.get("market_regime"),
+                                "tqqq_effective_regime": regime,
+                            },
+                            execution_code_sha=_sha,
+                        )
+                        if not verify_exit_entry_link(_sell_ev, _entry):
+                            raise ValueError("TQQQ_EXIT_ORIGINAL_ENTRY_LINK_INVALID")
+                        intent["meta"]["exit_decision_evidence_5w1h"] = _sell_ev
+                        intent["meta"]["exit_decision_evidence_sha256"] = _sell_ev["sha256"]
+                        intent["meta"]["exit_decision_evidence_status"] = "VERIFIED"
+                        intent["meta"]["source_entry_decision_id"] = _entry["what"]["decision_id"]
+                        intent["meta"]["source_entry_decision_evidence_sha256"] = _entry["sha256"]
+                        intent["meta"]["entry_decision_evidence_5w1h"] = _entry
+                        intent["entry_decision_id"] = _entry["what"]["decision_id"]
+                except (TypeError, ValueError, KeyError) as _audit_exc:
+                    intent["meta"]["exit_decision_evidence_status"] = "ENTRY_LINK_UNVERIFIED"
+                    logger.warning(
+                        "[TQQQ_INF][5W1H][SELL_ORIGINAL_UNVERIFIED] type=%s "
+                        "action=BROKER_POLICY_UNCHANGED",
+                        type(_audit_exc).__name__,
+                    )
+            elif not _sha:
+                intent["meta"]["exit_decision_evidence_status"] = "CODE_SHA_UNVERIFIED"
 
         result = route(intent)
         if (decision.action == Action.SELL and state is not None
