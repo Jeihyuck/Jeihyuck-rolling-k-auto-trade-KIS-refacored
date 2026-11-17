@@ -517,10 +517,11 @@ class InfiniteRepository:
                         or not scope.get("account_id")):
                     return None
                 # Existing actual fill/intent rows may have NULL account_id.
-                # The authoritative hashed account scope is in the execution
-                # Claim, not in either optional legacy denormalized column.
-                # Require the exact attempt→claim join instead of pretending
-                # NULL proves an account or modifying immutable historical rows.
+                # The authoritative hashed account scope is in the Claim.
+                # LEFT joins are intentional: if the FIRST real KIS fill has
+                # no intent/claim, we must see and reject that row, NOT skip
+                # it and falsely promote a later ADD to an original BUY.
+                # This is read-only; never synthesize missing identities.
                 rows = conn.execute(text("""
                     SELECT f.trade_date,f.qty,f.side,f.order_no,
                            f.client_order_key,f.meta AS fill_meta,
@@ -534,14 +535,14 @@ class InfiniteRepository:
                            c.action_key AS claim_action_key,
                            a.attempt_id AS claim_attempt_id
                       FROM us_fills f
-                      JOIN us_order_intents i
+                      LEFT JOIN us_order_intents i
                         ON i.client_order_key=f.client_order_key
                        AND i.trading_epoch_id=f.trading_epoch_id
                        AND i.trade_date<=f.trade_date
                        AND i.symbol=f.symbol AND i.side=f.side
-                      JOIN us_execution_attempts a
+                      LEFT JOIN us_execution_attempts a
                         ON a.client_order_key=f.client_order_key
-                      JOIN us_execution_claims c
+                      LEFT JOIN us_execution_claims c
                         ON c.action_key=a.action_key
                        AND c.trading_epoch_id=f.trading_epoch_id
                        AND c.trade_date=i.trade_date
