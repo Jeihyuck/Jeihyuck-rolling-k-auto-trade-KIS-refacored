@@ -130,3 +130,26 @@ def acquire_observer_slot(*, environment: str, account_key: str,
             type(exc).__name__,
         )
         return False, "BUDGET_STATE_UNAVAILABLE"
+
+
+def acquire_observer_slot_bounded(*, environment: str, account_key: str,
+                                  max_wait_sec: float = 2.5,
+                                  poll_sec: float = 0.1) -> tuple[bool, str, float]:
+    """Allow a native 1m REST call followed by its essential VWAP quote.
+
+    Only the independent observer may use this bounded wait. Critical order
+    and balance calls bypass it. Priority broker traffic/invalid budget/IO
+    errors always defer immediately, without sleeping or retry storms.
+    """
+    started = time.monotonic()
+    end_at = started + max(0.0, float(max_wait_sec))
+    while True:
+        granted, reason = acquire_observer_slot(
+            environment=environment, account_key=account_key,
+        )
+        if granted or reason != "OBSERVER_RPS_LIMIT":
+            return granted, reason, time.monotonic() - started
+        remaining = end_at - time.monotonic()
+        if remaining <= 0:
+            return False, "OBSERVER_SLOT_WAIT_EXHAUSTED", time.monotonic() - started
+        time.sleep(min(remaining, max(0.01, float(poll_sec))))

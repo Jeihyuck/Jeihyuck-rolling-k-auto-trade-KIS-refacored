@@ -1705,15 +1705,26 @@ class KisAPI:
             and os.getenv("KR_PB1_KIS_OBSERVER_BUDGET_ENABLED", "0") == "1"
         ):
             from trader.kr.kis_observer_budget import (
-                acquire_observer_slot, note_critical_kr_call,
+                acquire_observer_slot_bounded, note_critical_kr_call,
             )
             if is_kr_observer and method.upper() == "GET" and (
                 "inquire-time-itemchartprice" in path_lower
                 or "inquire-price" in path_lower
             ):
-                granted, quota_reason = acquire_observer_slot(
+                # The next native VWAP quote is often immediately after
+                # the minute REST call. A short observer-local wait protects
+                # its own 0.5RPS budget without starving quote verification.
+                # Protected BUY/SELL/balance traffic never waits here.
+                granted, quota_reason, budget_wait_sec = acquire_observer_slot_bounded(
                     environment="practice", account_key=account_key,
+                    max_wait_sec=2.5,
                 )
+                if budget_wait_sec > 0.02:
+                    logger.info(
+                        "[KR][KIS_BUDGET][OBSERVER_SLOT_WAIT] endpoint=%s "
+                        "wait_sec=%.2f granted=%s",
+                        endpoint_name, budget_wait_sec, int(granted),
+                    )
                 if not granted:
                     logger.info(
                         "[KR][KIS_BUDGET][OBSERVER_DEFER] endpoint=%s reason=%s "
