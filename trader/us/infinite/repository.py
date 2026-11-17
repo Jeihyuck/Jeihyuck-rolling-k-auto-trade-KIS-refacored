@@ -519,9 +519,9 @@ class InfiniteRepository:
                            i.meta AS intent_meta
                       FROM us_fills f
                       JOIN us_order_intents i
-                        ON i.trade_date=f.trade_date
-                       AND i.client_order_key=f.client_order_key
+                        ON i.client_order_key=f.client_order_key
                        AND i.trading_epoch_id=f.trading_epoch_id
+                       AND i.trade_date<=f.trade_date
                      WHERE f.symbol='TQQQ' AND f.side='BUY'
                        AND f.trading_epoch_id=:epoch
                        AND f.client_order_key LIKE :prefix
