@@ -129,3 +129,57 @@ def test_bad_prep_contract_never_seeds_collection(seed_prep):
     )
     assert pq.collection_priorities(date=date, account_scope="scope",
                                     now=moment())["state"] == "INVALID_PREP"
+
+
+def test_six_slot_hot_warm_cold_capacity_and_poll_gaps():
+    """Deterministic ideal-cycle replay, NOT evidence of broker bar freshness."""
+    state = {
+        "hot": [f"{n:06d}" for n in range(1, 6)],
+        "warm": [f"{n:06d}" for n in range(6, 11)],
+        "cold": [f"{n:06d}" for n in range(11, 31)],
+    }
+    schedule = pq.CandidateSchedule(max_batch=6, hot_sec=45,
+                                    warm_sec=180, cold_sec=600)
+    current = moment(9, 0)
+    before = schedule.diagnostics(state, current, interval_sec=45)
+    assert before["tiers"]["hot"]["never_polled"] == 5
+    assert before["tiers"]["cold"]["never_polled"] == 20
+    assert before["overcommitted"] is True
+    assert before["all_180s_possible_at_slot_capacity"] is False
+    assert before["polls_not_proofs"] is True
+
+    latest = {}
+    gaps = {"hot": [], "warm": [], "cold": []}
+    for tick in range(90):
+        now = current + timedelta(seconds=45 * tick)
+        selected = schedule.select(state, now)
+        assert len(selected) <= 6
+        assert len(selected) == len(set(selected))
+        for tier, codes in state.items():
+            for code in selected:
+                if code not in codes:
+                    continue
+                if code in latest:
+                    gaps[tier].append((now - latest[code]).total_seconds())
+                latest[code] = now
+    assert len(latest) == 30
+    # HOT remains high priority; 2 WARM slots remove the old deterministic
+    # 225s gap. COLD is best effort, not a promise of 180s broker freshness.
+    assert max(gaps["hot"]) <= 90
+    assert max(gaps["warm"]) <= 180
+    assert max(gaps["cold"]) <= 720
+
+
+def test_hot_overcrowding_reports_capacity_while_retaining_fail_closed_ttl():
+    state = {
+        "hot": [f"{n:06d}" for n in range(1, 17)],
+        "warm": [f"{n:06d}" for n in range(17, 21)],
+        "cold": [f"{n:06d}" for n in range(21, 31)],
+    }
+    schedule = pq.CandidateSchedule(max_batch=6, hot_sec=45,
+                                    warm_sec=180, cold_sec=600)
+    diag = schedule.diagnostics(state, moment(9, 0), interval_sec=45)
+    assert diag["overcommitted"]
+    # The scheduler prioritizes collection only: a late KIS bar still fails
+    # the unchanged 180s entry gate, regardless of poll scheduling.
+    assert schedule.select(state, moment(9, 0))
