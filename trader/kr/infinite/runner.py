@@ -235,23 +235,71 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
             return RunResult(Decision(Action.WAIT, "KR_INF_NEW_CYCLE_NOT_YET_ELIGIBLE",
                                       next_status=Status.COMPLETE), state)
 
-        # Exit-only and already-held ticks never need buying-power data.  This
-        # avoids a second KIS transaction endpoint call (EGW00215) on the hot
-        # sell/reconcile path; cash is fetched only for a possible new cycle.
+        # Protective SELL and every wait/block decision must remain independent
+        # of the extra orderable-cash endpoint (EGW00215).  Previously
+        # already-held positions received cash=0 unconditionally, so a valid
+        # adaptive ADD could never pass buy_quantity() and instead reported
+        # INSUFFICIENT_STRATEGY_CAPITAL, even with unspent sleeve capital.
+        # First evaluate eligibility with at most the remaining *sleeve* cap;
+        # only a genuine add-on BUY/RECOVERY candidate triggers one KIS cash
+        # request. The second evaluation always uses actual broker buying power.
         cash = (executor.orderable_cash(config.symbol, position.current_price)
                 if allow_entry and position.qty == 0 else 0.0)
         now_kst = now_kst_value or datetime.now(ZoneInfo("Asia/Seoul"))
         if now_kst.tzinfo is None:
             now_kst = now_kst.replace(tzinfo=ZoneInfo("Asia/Seoul"))
         minutes_since_open = (now_kst.hour * 60 + now_kst.minute + now_kst.second / 60) - (9 * 60)
-        decision = evaluate(config=config, state=state, position=position, trade_date=day,
-                            market_state=market_state, orderable_cash=cash, pending_buy=pending_buy,
-                            pending_sell=pending_sell, existing_intent_keys=existing_keys,
-                            regime_data_quality=quality,
-                            trading_days_since_last_buy=trading_days_since(state.last_buy_date if state else None, day),
-                            allow_entry=allow_entry,
-                            best_ask=position.current_price,
-                            minutes_since_open=minutes_since_open)
+        decision_args = dict(
+            config=config, state=state, position=position, trade_date=day,
+            market_state=market_state, pending_buy=pending_buy,
+            pending_sell=pending_sell, existing_intent_keys=existing_keys,
+            regime_data_quality=quality,
+            trading_days_since_last_buy=trading_days_since(
+                state.last_buy_date if state else None, day,
+            ),
+            allow_entry=allow_entry, best_ask=position.current_price,
+            minutes_since_open=minutes_since_open,
+        )
+        if allow_entry and position.qty > 0 and state is not None:
+            sleeve_remaining = max(
+                0.0, float(state.allocated_capital_krw) - float(state.filled_notional),
+            )
+            preview_cash = max(0.0, min(float(state.unit_krw), sleeve_remaining))
+            if preview_cash >= position.current_price:
+                preview = evaluate(orderable_cash=preview_cash, **decision_args)
+                if preview.action in {Action.BUY, Action.RECOVERY}:
+                    # No SELL remains actionable at this point; the preview
+                    # has already run the owner's full exit-first policy.
+                    # Never authorize entry from the preview quantity alone.
+                    min_cash_budget = max(
+                        1.0,
+                        float(os.getenv("KR_INF_CASH_GATE_MIN_REMAINING_SEC", "8") or "8"),
+                    )
+                    remaining = kr_tick_remaining_sec()
+                    if remaining != float("inf") and remaining < min_cash_budget:
+                        return RunResult(
+                            Decision(Action.WAIT, "KR_INF_BUY_CASH_PROOF_DEFERRED"),
+                            state,
+                        )
+                    try:
+                        cash = executor.orderable_cash(config.symbol, position.current_price)
+                    except Exception as cash_exc:
+                        logger.warning(
+                            "[KR_INF][ADD_BUY_CASH][UNVERIFIED] "
+                            "symbol=%s type=%s action=NO_BUY_NO_RETRY",
+                            config.symbol, type(cash_exc).__name__,
+                        )
+                        return RunResult(
+                            Decision(Action.WAIT, "KR_INF_BUYING_POWER_UNVERIFIED"),
+                            state,
+                        )
+                    logger.info(
+                        "[KR_INF][ADD_BUY_CASH][KIS_VERIFIED] "
+                        "symbol=%s cash=%.0f sleeve_remaining=%.0f "
+                        "unit_cap=%.0f action=REEVALUATE_OWNER_POLICY",
+                        config.symbol, cash, sleeve_remaining, preview_cash,
+                    )
+        decision = evaluate(orderable_cash=cash, **decision_args)
         if decision.metadata and state is not None:
             durable = {key: value for key, value in decision.metadata.items()
                        if key not in {"profit_stage", "desired_profit_stage", "tp1_sold_qty", "remaining_qty"}}
