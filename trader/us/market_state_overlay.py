@@ -1272,6 +1272,40 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
                                          or p.get("quote_asof"))
                     received_quote_time = (p.get("quote_received_at") or p.get("resolved_quote_received_at"))
                     source_quote_name = (p.get("quote_source") or p.get("resolved_quote_source") or "UNKNOWN")
+                    # A new decision timestamp cannot resurrect a price that
+                    # came from a known stale/future quote. Unknown source time
+                    # stays explicitly UNKNOWN and still needs the existing
+                    # mandatory fresh native KIS quote before any TP POST.
+                    if source_quote_time not in (None, ""):
+                        try:
+                            if isinstance(source_quote_time, (int, float)):
+                                quote_at = _decision_datetime.fromtimestamp(
+                                    float(source_quote_time), tz=_decision_timezone.utc
+                                )
+                            else:
+                                quote_at = _decision_datetime.fromisoformat(
+                                    str(source_quote_time).replace("Z", "+00:00")
+                                )
+                            if quote_at.tzinfo is None or quote_at.utcoffset() is None:
+                                raise ValueError("quote_source_time_has_no_timezone")
+                            quote_age = (
+                                decision_at.astimezone(_decision_timezone.utc)
+                                - quote_at.astimezone(_decision_timezone.utc)
+                            ).total_seconds()
+                            if not 0 <= quote_age <= 5:
+                                logger.warning(
+                                    "[US_PROFIT_CAPTURE][DECISION_QUOTE_STALE] "
+                                    "symbol=%s stage=%s quote_age_sec=%.3f action=BLOCK_NO_ORDER",
+                                    sym, stage, quote_age,
+                                )
+                                break
+                        except (TypeError, ValueError, OverflowError, OSError):
+                            logger.warning(
+                                "[US_PROFIT_CAPTURE][DECISION_QUOTE_TIME_UNVERIFIED] "
+                                "symbol=%s stage=%s action=BLOCK_NO_ORDER",
+                                sym, stage,
+                            )
+                            break
                     pending_intent = ({"symbol": sym, "side": "SELL", "strategy_owner": "US_STANDARD", "qty": qty, "quantity": qty, "limit_price": price, "notional_usd": qty * price, "reason": reason, "client_order_key": order_key, "position_lifecycle_id": lifecycle, **({"partial_exit_allowed": contract_partial_exit_allowed} if contract_sha is not None else {}), "meta": {"reason": reason, "profit_capture_stage": stage, "position_lifecycle_id": lifecycle, "broker_avg_price": str(broker_avg), **avg_provenance, "return_rate_at_decision": str(return_rate), "tp_threshold_fraction": str(threshold), "profit_capture_sell_fraction": str(sell_pct), "profit_capture_runner_min_remain_pct": str(local_runner_min), "profit_capture_stage_target_qty": stage_target_qty, "profit_capture_stage_filled_qty": stage_filled_qty, "profit_capture_decision_holding_qty": q, "runner_remaining_pct": (q - qty) / q, "market_state": overlay.get("market_state"), "last_profit_capture_at": decision_at.astimezone(_decision_timezone.utc).isoformat(), "decision_at": decision_at.astimezone(_decision_timezone.utc).isoformat(), "decision_quote_price": str(executable), "decision_quote_source_at": str(source_quote_time) if source_quote_time else None, "decision_quote_received_at": str(received_quote_time) if received_quote_time else None, "decision_quote_source": str(source_quote_name), "source_entry_contract_sha256": contract_sha, "source_entry_contract_version": entry_contract.get("version") if contract_sha else None, "exit_rule_source": ("ENTRY_EXIT_CONTRACT_V3" if entry_contract.get("version") == "us_entry_exit_contract_v3" else "ENTRY_EXIT_CONTRACT_V2") if contract_sha else "LEGACY_GLOBAL_TP", "partial_exit_scope": "PROFIT_CAPTURE_STAGE" if contract_sha else "LEGACY_GLOBAL_TP", **({"partial_exit_allowed": contract_partial_exit_allowed} if contract_partial_exit_allowed is not None else {})}})
                     # Preserve the already-resolved original BUY scope through
                     # the TP intent and durable order. Never pick one side of
