@@ -233,6 +233,8 @@ def test_kr_infinite_reserved_122630_is_not_recovered_as_pb1_policy(monkeypatch)
         truth, "schema_for_engine",
         lambda _: SimpleNamespace(positions=positions),
     )
+    monkeypatch.setattr(truth, "active_trading_epoch_id", lambda *args, **kwargs: None)
+    monkeypatch.setattr(truth, "trading_epoch_enforced", lambda: False)
     fake_engine = FakeEngine()
     result = truth._recover_proven_policy_positions(
         engine=fake_engine, env="practice",
