@@ -3459,6 +3459,11 @@ def route_order(
                         )
                     else:
                         _tp_pre_io_stage_released = True
+                        # The original intent is terminal. Never advertise a
+                        # blind retry of its old decision, even though KIS POST
+                        # was proven absent. Only a fresh strategy evaluation
+                        # may create a new stage attempt and price/clock proof.
+                        terminal_pre_io_intent = True
                         logger.warning(
                             "[US_PROFIT_CAPTURE][PRE_IO_ABORT_RELEASED] symbol=%s "
                             "stage=%s intent=BLOCKED action=REEVALUATE_NEXT_TICK",
