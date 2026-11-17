@@ -164,6 +164,49 @@ def verify_us_entry_exit_contract(contract: Any) -> bool:
     return True
 
 
+def explain_us_entry_exit_contract_integrity(*sources: Any) -> str:
+    """Read-only reason for frozen contract failure; never repair/re-sign it.
+
+    Preserve the strict original BUY policy. A matching declared vs nested
+    digest is NOT proof the signed payload itself still hashes correctly.
+    """
+    if _is_infinite_sleeve_context(*sources):
+        return "OWNER_SCOPE_TQQQ_INFINITE_CONFLICT"
+    seen = False
+    for source in sources:
+        obj = _dict(source)
+        for container in (obj, _dict(obj.get("meta"))):
+            candidate = container.get("entry_exit_contract")
+            digest = str(container.get("entry_exit_contract_sha256") or "")
+            version = str(container.get("entry_exit_contract_version") or "")
+            if candidate is None and not digest and not version:
+                continue
+            seen = True
+            contract = _dict(candidate)
+            if not contract:
+                return "CLAIMED_CONTRACT_MISSING_OR_INVALID_SHAPE"
+            if contract.get("version") not in {
+                US_ENTRY_EXIT_CONTRACT_VERSION, US_SWING_V3_CONTRACT_VERSION,
+            }:
+                return "UNSUPPORTED_FROZEN_CONTRACT_VERSION"
+            if contract.get("strategy_owner") != "US_STANDARD":
+                return "OWNER_NOT_US_STANDARD"
+            if not isinstance(contract.get("management"), dict):
+                return "MANAGEMENT_NOT_OBJECT"
+            if not isinstance(contract.get("entry_provenance"), dict):
+                return "ORIGINAL_ENTRY_PROVENANCE_NOT_OBJECT"
+            signed = str(contract.get("sha256") or "")
+            if digest and digest != signed:
+                return "DECLARED_DIGEST_CONFLICT_WITH_FROZEN_CONTRACT"
+            payload = {k: v for k, v in contract.items() if k != "sha256"}
+            if not signed or signed != _sha(payload):
+                return "SIGNED_PAYLOAD_HASH_MISMATCH"
+            if not verify_us_entry_exit_contract(contract):
+                return "SIGNED_POLICY_SCHEMA_INVARIANT_FAIL"
+            return "VALID"
+    return "CLAIMED_CONTRACT_NOT_FOUND" if seen else "NONE"
+
+
 def us_entry_exit_contract_integrity_state(*sources: Any) -> str:
     """Return NONE, VALID, or INVALID for claimed v2/v3 contracts."""
     foreign_owner = _is_infinite_sleeve_context(*sources)
