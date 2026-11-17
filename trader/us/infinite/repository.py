@@ -501,6 +501,7 @@ class InfiniteRepository:
         """
         from trader.us.decision_evidence_5w1h import verify_decision_evidence
         from trader.us.utils.order_no import normalize_us_order_no
+        from trader.us.db.repos import _us_execution_claim_scope
 
         cycle = str(cycle_id or "").strip()
         if not cycle:
@@ -508,27 +509,53 @@ class InfiniteRepository:
         try:
             with self.engine.connect() as conn:
                 epoch = self._epoch_id(conn, required=True)
-                if not epoch:
+                scope = _us_execution_claim_scope()
+                if (not epoch
+                        or str(scope.get("env") or "").lower() != "practice"
+                        or str(scope.get("market") or "").upper() != "US"
+                        or str(scope.get("trading_epoch_id") or "") != str(epoch)
+                        or not scope.get("account_id")):
                     return None
+                # Existing actual fill/intent rows may have NULL account_id.
+                # The authoritative hashed account scope is in the execution
+                # Claim, not in either optional legacy denormalized column.
+                # Require the exact attempt→claim join instead of pretending
+                # NULL proves an account or modifying immutable historical rows.
                 rows = conn.execute(text("""
                     SELECT f.trade_date,f.qty,f.side,f.order_no,
                            f.client_order_key,f.meta AS fill_meta,
                            f.account_id AS fill_account_id,
                            i.account_id AS intent_account_id,
                            i.strategy AS intent_strategy,
-                           i.meta AS intent_meta
+                           i.meta AS intent_meta,
+                           c.account_id AS claim_account_id,
+                           c.lifecycle_id AS claim_lifecycle,
+                           c.strategy_owner AS claim_owner,
+                           c.action_key AS claim_action_key,
+                           a.attempt_id AS claim_attempt_id
                       FROM us_fills f
                       JOIN us_order_intents i
                         ON i.client_order_key=f.client_order_key
                        AND i.trading_epoch_id=f.trading_epoch_id
                        AND i.trade_date<=f.trade_date
                        AND i.symbol=f.symbol AND i.side=f.side
+                      JOIN us_execution_attempts a
+                        ON a.client_order_key=f.client_order_key
+                      JOIN us_execution_claims c
+                        ON c.action_key=a.action_key
+                       AND c.trading_epoch_id=f.trading_epoch_id
+                       AND c.trade_date=i.trade_date
+                       AND c.env='practice' AND c.market='US'
+                       AND c.strategy_owner='TQQQ_INFINITE'
+                       AND c.lifecycle_id=:cycle
+                       AND c.account_id=:account
                      WHERE f.symbol='TQQQ' AND f.side='BUY'
                        AND f.trading_epoch_id=:epoch
                        AND f.client_order_key LIKE :prefix
                      ORDER BY f.trade_date ASC,f.filled_at ASC,f.created_at ASC
                      LIMIT 512
-                """), {"epoch": str(epoch),
+                """), {"epoch": str(epoch), "cycle": cycle,
+                       "account": str(scope["account_id"]),
                        "prefix": "TQQQ_INF_V3:" + cycle + ":%"}).mappings().all()
             first = None
             first_key = ""
@@ -546,15 +573,24 @@ class InfiniteRepository:
                 # original decision. Never skip an unproven first BUY and
                 # call a later ADD a verified original entry.
                 meta = self._json_object(row.get("intent_meta"))
-                account = str(row.get("intent_account_id") or "").strip()
+                expected_account = str(scope["account_id"])
+                # NULL optional columns are allowed only when the actual
+                # durable claim certifies exact account/epoch/owner/cycle.
+                # Non-NULL conflicting denormalized account data is fatal.
                 if (str(row.get("intent_strategy") or "") != "TQQQ_INFINITE_V3"
                         or str(meta.get("strategy_owner") or "") != "TQQQ_INFINITE"
                         or str(meta.get("cycle_id") or "") != cycle
                         or str(meta.get("position_lifecycle_id") or "") != cycle
                         or str(meta.get("book") or "") != "TQQQ_INFINITE"
-                        or not account
-                        or account != str(row.get("fill_account_id") or "").strip()
-                        or not normalize_us_order_no(row.get("order_no"))):
+                        or str(row.get("claim_owner") or "") != "TQQQ_INFINITE"
+                        or str(row.get("claim_lifecycle") or "") != cycle
+                        or str(row.get("claim_account_id") or "") != expected_account
+                        or not str(row.get("claim_attempt_id") or "")
+                        or not normalize_us_order_no(row.get("order_no"))
+                        or (row.get("intent_account_id") not in (None, "")
+                            and str(row["intent_account_id"]) != expected_account)
+                        or (row.get("fill_account_id") not in (None, "")
+                            and str(row["fill_account_id"]) != expected_account)):
                     return None
                 try:
                     shares = int(row["qty"])
