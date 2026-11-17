@@ -301,6 +301,7 @@ def test_pre_submit_tp_block_releases_only_after_exact_durable_proof():
     release.assert_called_once_with(
         trade_date=DATE, symbol="HCA", stage="tp1",
         position_lifecycle_id="cycle-hca-1", client_order_key="tp-key",
+        close_intent=True, failure_code="PROVEN_PRE_HTTP_ABORT",
     )
 
 

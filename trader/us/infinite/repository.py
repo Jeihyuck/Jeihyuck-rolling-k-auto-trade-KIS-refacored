@@ -492,6 +492,137 @@ class InfiniteRepository:
                     )
                 """), {"attribution": attribution})
 
+    def load_verified_cycle_entry_evidence(self, *, cycle_id: str) -> dict | None:
+        """Read ONLY an original, KIS-actual BUY 5W1H for this TQQQ cycle.
+
+        A filled BUY alone cannot manufacture missing decision evidence.
+        No account/epoch/owner/cycle fallback or latest-symbol substitution.
+        This is audit-only and never grants a broker SELL authorization.
+        """
+        from trader.us.decision_evidence_5w1h import verify_decision_evidence
+        from trader.us.utils.order_no import normalize_us_order_no
+        from trader.us.db.repos import _us_execution_claim_scope
+
+        cycle = str(cycle_id or "").strip()
+        if not cycle:
+            return None
+        try:
+            with self.engine.connect() as conn:
+                epoch = self._epoch_id(conn, required=True)
+                scope = _us_execution_claim_scope()
+                if (not epoch
+                        or str(scope.get("env") or "").lower() != "practice"
+                        or str(scope.get("market") or "").upper() != "US"
+                        or str(scope.get("trading_epoch_id") or "") != str(epoch)
+                        or not scope.get("account_id")):
+                    return None
+                # Existing actual fill/intent rows may have NULL account_id.
+                # The authoritative hashed account scope is in the Claim.
+                # LEFT joins are intentional: if the FIRST real KIS fill has
+                # no intent/claim, we must see and reject that row, NOT skip
+                # it and falsely promote a later ADD to an original BUY.
+                # This is read-only; never synthesize missing identities.
+                rows = conn.execute(text("""
+                    SELECT f.trade_date,f.qty,f.side,f.order_no,
+                           f.client_order_key,f.meta AS fill_meta,
+                           f.account_id AS fill_account_id,
+                           i.account_id AS intent_account_id,
+                           i.strategy AS intent_strategy,
+                           i.meta AS intent_meta,
+                           c.account_id AS claim_account_id,
+                           c.lifecycle_id AS claim_lifecycle,
+                           c.strategy_owner AS claim_owner,
+                           c.action_key AS claim_action_key,
+                           a.attempt_id AS claim_attempt_id
+                      FROM us_fills f
+                      LEFT JOIN us_order_intents i
+                        ON i.client_order_key=f.client_order_key
+                       AND i.trading_epoch_id=f.trading_epoch_id
+                       AND i.trade_date<=f.trade_date
+                       AND i.symbol=f.symbol AND i.side=f.side
+                      LEFT JOIN us_execution_attempts a
+                        ON a.client_order_key=f.client_order_key
+                      LEFT JOIN us_execution_claims c
+                        ON c.action_key=a.action_key
+                       AND c.trading_epoch_id=f.trading_epoch_id
+                       AND c.trade_date=i.trade_date
+                       AND c.env='practice' AND c.market='US'
+                       AND c.strategy_owner='TQQQ_INFINITE'
+                       AND c.lifecycle_id=:cycle
+                       AND c.account_id=:account
+                     WHERE f.symbol='TQQQ' AND f.side='BUY'
+                       AND f.trading_epoch_id=:epoch
+                       AND f.client_order_key LIKE :prefix
+                     ORDER BY f.trade_date ASC,f.filled_at ASC,f.created_at ASC
+                     LIMIT 512
+                """), {"epoch": str(epoch), "cycle": cycle,
+                       "account": str(scope["account_id"]),
+                       "prefix": "TQQQ_INF_V3:" + cycle + ":%"}).mappings().all()
+            first = None
+            first_key = ""
+            for row in rows:
+                key = str(row.get("client_order_key") or "")
+                if not key.startswith("TQQQ_INF_V3:" + cycle + ":"):
+                    continue
+                fill_meta = self._json_object(row.get("fill_meta"))
+                if (str(fill_meta.get("fill_evidence_type") or "")
+                        != "KIS_ORDER_CUMULATIVE_ACTUAL"
+                        or fill_meta.get("is_synthetic") is True
+                        or fill_meta.get("accounting_active") is False):
+                    continue
+                # The earliest actual BUY in this cycle MUST have a verified
+                # original decision. Never skip an unproven first BUY and
+                # call a later ADD a verified original entry.
+                meta = self._json_object(row.get("intent_meta"))
+                expected_account = str(scope["account_id"])
+                # NULL optional columns are allowed only when the actual
+                # durable claim certifies exact account/epoch/owner/cycle.
+                # Non-NULL conflicting denormalized account data is fatal.
+                if (str(row.get("intent_strategy") or "") != "TQQQ_INFINITE_V3"
+                        or str(meta.get("strategy_owner") or "") != "TQQQ_INFINITE"
+                        or str(meta.get("cycle_id") or "") != cycle
+                        or str(meta.get("position_lifecycle_id") or "") != cycle
+                        or str(meta.get("book") or "") != "TQQQ_INFINITE"
+                        or str(row.get("claim_owner") or "") != "TQQQ_INFINITE"
+                        or str(row.get("claim_lifecycle") or "") != cycle
+                        or str(row.get("claim_account_id") or "") != expected_account
+                        or not str(row.get("claim_attempt_id") or "")
+                        or not normalize_us_order_no(row.get("order_no"))
+                        or (row.get("intent_account_id") not in (None, "")
+                            and str(row["intent_account_id"]) != expected_account)
+                        or (row.get("fill_account_id") not in (None, "")
+                            and str(row["fill_account_id"]) != expected_account)):
+                    return None
+                try:
+                    shares = int(row["qty"])
+                    if shares <= 0 or float(row["qty"]) != shares:
+                        return None
+                except (ValueError, TypeError, OverflowError):
+                    return None
+                evidence = meta.get("entry_decision_evidence_5w1h")
+                if not verify_decision_evidence(evidence):
+                    return None if first is None else first
+                what = evidence.get("what") or {}
+                who = evidence.get("who") or {}
+                if (what.get("side") != "BUY" or what.get("symbol") != "TQQQ"
+                        or what.get("position_lifecycle_id") != cycle
+                        or what.get("decision_id") != "TQQQ_INFINITE:BUY:" + key
+                        or who.get("strategy_owner") != "TQQQ_INFINITE"
+                        or meta.get("entry_decision_evidence_sha256") != evidence["sha256"]):
+                    return None if first is None else first
+                if first is None:
+                    first, first_key = evidence, key
+                elif first_key == key and first["sha256"] != evidence["sha256"]:
+                    return None  # conflicting proof for the original actual BUY
+            return first
+        except Exception as exc:
+            logger.warning(
+                "[TQQQ_INF][5W1H][ORIGINAL_LOOKUP_UNVERIFIED] error_type=%s",
+                type(exc).__name__,
+            )
+            return None
+
+
     def fill_accounting(self, state: InfiniteState, trading_date: date) -> tuple[float, float, float, date | None, float | None]:
         """Return cycle BUY total, today's BUY total, cycle SELL total, last BUY date and first fill price."""
         start = state.cycle_start_date or trading_date

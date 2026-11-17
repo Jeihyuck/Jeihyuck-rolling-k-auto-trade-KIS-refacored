@@ -1247,7 +1247,8 @@ def prepare_exit_position_snapshots(
             _snapshot_start_mono = time.monotonic()
             _quote_elapsed_ms = 0.0
             _state_elapsed_ms = 0.0
-            # Reset for each symbol: never leak the previous ticker's quote.
+            _risk_elapsed_ms = 0.0
+            _hwm_elapsed_ms = 0.0
             price_data = None
             pos = dict(original_pos or {})
 
@@ -1256,11 +1257,11 @@ def prepare_exit_position_snapshots(
                 try:
                     logger.info(
                         "[US_EXIT][SNAPSHOT_OUTCOME] symbol=%s owner=%s lifecycle=%s "
-                        "outcome=%s reason=%s total_ms=%.2f quote_ms=%.2f state_ms=%.2f",
+                        "outcome=%s reason=%s total_ms=%.2f quote_ms=%.2f state_ms=%.2f risk_ms=%.2f hwm_ms=%.2f",
                         symbol, pos.get("strategy_owner") or pos.get("owner") or "",
                         pos.get("position_lifecycle_id") or "",
                         outcome, reason, (time.monotonic() - _snapshot_start_mono) * 1000.0,
-                        _quote_elapsed_ms, _state_elapsed_ms,
+                        _quote_elapsed_ms, _state_elapsed_ms, _risk_elapsed_ms, _hwm_elapsed_ms,
                     )
                 except Exception:
                     pass
@@ -1283,6 +1284,7 @@ def prepare_exit_position_snapshots(
                 )
                 exchange = "NASDAQ"
             _quote_started_mono = time.monotonic()
+            price_data = None  # isolate each symbol's quote evidence
             try:
                 if hasattr(provider, "get_current_price"):
                     price_data = (
@@ -1327,17 +1329,28 @@ def prepare_exit_position_snapshots(
                 _observe_snapshot_outcome("SKIP", "quote_exception")
                 continue
             _quote_elapsed_ms = (time.monotonic() - _quote_started_mono) * 1000.0
-            # Evidence is descriptive, not a broker authorization: preserve
-            # source/exchange timestamps only if supplied by the price reader.
-            # Receipt time is not the quote's market-asof time.
+            # Preserve the quote actually used for the exit decision. The
+            # source timestamp may be absent; never substitute tick-start
+            # time as if it were broker quote provenance.
+            if isinstance(price_data, dict):
+                _quoted = price_data
+                pos["resolved_quote_source"] = str(
+                    _quoted.get("_quote_source") or _quoted.get("source") or "UNKNOWN"
+                )
+                pos["resolved_quote_asof"] = (
+                    _quoted.get("_quote_asof_epoch")
+                    or _quoted.get("asof_epoch")
+                    or _quoted.get("asof")
+                )
+                pos["resolved_quote_received_at"] = datetime.now(timezone.utc).isoformat()
             _quote_fields = price_data if isinstance(price_data, dict) else {}
             pos["exit_quote_evidence"] = {
                 "price": current_price,
-                "source": str(_quote_fields.get("source") or _quote_fields.get("_quote_source") or "UNVERIFIED"),
-                "asof": str(_quote_fields.get("asof") or _quote_fields.get("_stale_date") or "") or None,
-                "asof_epoch": _quote_fields.get("asof_epoch") or _quote_fields.get("_quote_asof_epoch"),
+                "source": str(_quote_fields.get("_quote_source") or _quote_fields.get("source") or "UNVERIFIED"),
+                "asof": str(_quote_fields.get("asof") or "") or None,
+                "asof_epoch": _quote_fields.get("_quote_asof_epoch") or _quote_fields.get("asof_epoch"),
                 "received_at_utc": datetime.now(timezone.utc).isoformat(),
-                "quality": str(_quote_fields.get("quality") or _quote_fields.get("_quote_quality") or "UNVERIFIED"),
+                "quality": str(_quote_fields.get("_quote_quality") or _quote_fields.get("quality") or "UNVERIFIED"),
             }
             if current_price <= 0:
                 logger.debug("[US_EXIT][SKIP] symbol=%s reason=price_nonpositive price=%.4f", symbol, current_price)
@@ -1346,17 +1359,20 @@ def prepare_exit_position_snapshots(
             _state_started_mono = time.monotonic()
             entry_price_for_state = _resolve_position_entry_price(pos)
             if entry_price_for_state > 0 and current_price > 0:
+                _risk_start_mono = time.monotonic()
                 try:
                     from trader.us.db.repos import update_us_soft_stop_risk_state
                     from trader.us.entry_exit_contract import (
                         contract_exit_config,
                         us_entry_exit_contract_integrity_state,
+                        explain_us_entry_exit_contract_integrity,
                     )
                     integrity = us_entry_exit_contract_integrity_state(pos, pos.get("meta"))
                     if integrity == "INVALID":
                         logger.error(
-                            "[US_RISK_STATE][ENTRY_CONTRACT_INTEGRITY_FAIL] symbol=%s action=skip_soft_stop_state_mutation",
-                            symbol,
+                            "[US_RISK_STATE][ENTRY_CONTRACT_INTEGRITY_FAIL] "
+                            "symbol=%s reason=%s action=skip_soft_stop_state_mutation",
+                            symbol, explain_us_entry_exit_contract_integrity(pos, pos.get("meta")),
                         )
                         raise ValueError("invalid_entry_exit_contract")
                     frozen_risk_cfg = contract_exit_config(pos)
@@ -1398,8 +1414,11 @@ def prepare_exit_position_snapshots(
                         pos["first_soft_stop_price"] = soft_exec.get("first_soft_stop_price")
                 except Exception as exc:
                     logger.warning("[US_RISK_STATE][UPDATE_WARN] symbol=%s err=%s", symbol, exc)
+                finally:
+                    _risk_elapsed_ms = (time.monotonic() - _risk_start_mono) * 1000.0
 
             if entry_price_for_state > 0 and current_price > 0:
+                _hwm_start_mono = time.monotonic()
                 try:
                     from trader.us.position_lifecycle_state import update_us_position_high_watermark
                     lifecycle_id = pos.get("position_lifecycle_id") or ((pos.get("risk_state") or {}).get("state") or {}).get("lifecycle", {}).get("lifecycle_id")
@@ -1419,6 +1438,8 @@ def prepare_exit_position_snapshots(
                         pos["position_lifecycle_id"] = high_state.get("lifecycle_id")
                 except Exception as exc:
                     logger.warning("[US_POSITION][HIGH_WATERMARK][UPDATE_WARN] symbol=%s err=%s", symbol, exc)
+                finally:
+                    _hwm_elapsed_ms = (time.monotonic() - _hwm_start_mono) * 1000.0
             if entry_price_for_state > 0:
                 pos["resolved_pnl_pct"] = (current_price - entry_price_for_state) / entry_price_for_state
             pos["resolved_current_price"] = current_price
@@ -1440,6 +1461,9 @@ def prepare_exit_position_snapshots(
                     "exit_quote_evidence": pos.get("exit_quote_evidence"),
                     "current_price_usd": current_price,
                     "current_price": current_price,
+                    "resolved_quote_source": pos.get("resolved_quote_source"),
+                    "resolved_quote_asof": pos.get("resolved_quote_asof"),
+                    "resolved_quote_received_at": pos.get("resolved_quote_received_at"),
                 })
             _state_elapsed_ms = (time.monotonic() - _state_started_mono) * 1000.0
             _observe_snapshot_outcome("READY")

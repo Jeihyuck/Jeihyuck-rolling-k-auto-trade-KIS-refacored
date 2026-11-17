@@ -4494,3 +4494,181 @@ def test_pg_authoritative_balance_survives_optional_lineage_query_exception(
     assert latest["meta"].get("lineage_identity_status") not in {
         "VERIFIED_CURRENT_EPOCH_CONTINUITY", "VERIFIED_ORIGINAL_KIS_BUY",
     }
+
+
+def test_v3_atomic_pre_http_tp_stage_and_intent_under_same_pg_commit(
+    pg_engine, monkeypatch,
+):
+    """A proven unsent US_STANDARD TP releases its stage and intent together.
+
+    A late DB error *after* the intent UPDATE rolls back both transitions.
+    Unknown ACK, foreign owner, OPEN attempt or unmatched intent are fenced.
+    No KIS connection or broker POST is made.
+    """
+    import json
+    import pytest
+    from sqlalchemy import text
+    from trader.us.db import repos
+
+    day, sym, lifecycle = "2026-11-09", "XYZ", "v3-cycle-atomic"
+    epoch, account = "v3-atomic-epoch", "v3-atomic-account"
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda conn, required=False: epoch)
+    monkeypatch.setattr(repos, "_us_execution_claim_scope", lambda: {
+        "env": "practice", "trading_epoch_id": epoch, "account_id": account,
+    })
+
+    def seed(suffix, *, broker_possible=False, foreign_owner=False,
+             active=False, bad_intent=False, broker_open=False):
+        key = f"US_PC_v3_ATOMIC_{suffix}"
+        aid = f"v3-atomic-{suffix}-attempt"
+        cycle = f"{lifecycle}-{suffix}"
+        with pg_engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO us_execution_claims
+                    (action_key,env,account_id,market,trading_epoch_id,
+                     strategy_owner,lifecycle_id,action,target_qty,
+                     action_state,active_attempt_id,trade_date)
+                VALUES (:key,'practice',:account,'US',:epoch,:owner,
+                        :cycle,'tp3',2,:claim_state,:active,:day)
+            """), {"key": key, "account": account, "epoch": epoch,
+                   "owner": "TQQQ_INFINITE" if foreign_owner else "US_STANDARD",
+                   "cycle": cycle, "claim_state": "IN_FLIGHT" if active else "OPEN",
+                   "active": aid if active else None, "day": day})
+            conn.execute(text("""
+                INSERT INTO us_execution_attempts
+                    (attempt_id,action_key,attempt_no,requested_qty,client_order_key,
+                     attempt_state,authoritative)
+                VALUES (:aid,:key,1,2,:key,'ABANDONED_PRE_SUBMIT',true)
+            """), {"aid": aid, "key": key})
+            conn.execute(text("""
+                INSERT INTO us_order_intents
+                    (trade_date,client_order_key,symbol,exchange,side,qty,
+                     status,trading_epoch_id,meta)
+                VALUES (:day,:key,:sym,'NASDAQ','SELL',2,'PENDING',
+                        :epoch,CAST(:meta AS jsonb))
+            """), {"day": day, "key": key, "sym": sym, "epoch": epoch,
+                   "meta": json.dumps({
+                       "submit_attempt_id": "wrong-id" if bad_intent else aid,
+                       "strategy_owner": "US_STANDARD",
+                       "position_lifecycle_id": cycle,
+                       "profit_capture_stage": "tp3",
+                   })})
+            for kind in (("BROKER_SUBMIT_ABORTED_PRE_IO", "BROKER_ACK_RECEIVED")
+                         if broker_possible else ("BROKER_SUBMIT_ABORTED_PRE_IO",)):
+                conn.execute(text("""
+                    INSERT INTO us_order_events
+                        (event_id,trade_date,event_type,event_timestamp,
+                         client_order_key,submit_attempt_id,symbol,side,
+                         requested_qty,idempotency_key,trading_epoch_id,
+                         profit_capture_stage)
+                    VALUES (gen_random_uuid(),:day,:kind,now(),:key,:aid,
+                            :sym,'SELL',2,:idem,:epoch,'tp3')
+                """), {"day": day, "kind": kind, "key": key, "aid": aid,
+                       "sym": sym, "epoch": epoch,
+                       "idem": f"{key}:{kind}"})
+            if broker_open:
+                conn.execute(text("""
+                    INSERT INTO us_orders
+                      (trade_date,client_order_key,symbol,exchange,side,
+                       qty_requested,status,dry_run,trading_epoch_id)
+                    VALUES (:day,:key,:sym,'NASDAQ','SELL',2,'OPEN',false,:epoch)
+                """), {"day": day, "key": key, "sym": sym, "epoch": epoch})
+        repos.mark_us_profit_capture_stage(
+            day, sym, "tp3", order_key=key, qty=2,
+            position_lifecycle_id=cycle, status="PENDING",
+        )
+        return key, cycle
+
+    def attempt(key, cycle):
+        return repos.release_us_profit_capture_pre_http_abort(
+            trade_date=day, symbol=sym, stage="tp3",
+            position_lifecycle_id=cycle, client_order_key=key,
+            close_intent=True, failure_code="US_TP_DECISION_EXPIRED_BEFORE_HTTP",
+        )
+
+    # Test each scope independently because stage rows are unique per day,
+    # symbol, lifecycle and TP stage.
+    safe_key, safe_cycle = seed("safe")
+    assert attempt(safe_key, safe_cycle) is True
+    with pg_engine.connect() as conn:
+        intent = conn.execute(text(
+            "SELECT status,meta FROM us_order_intents WHERE client_order_key=:key"
+        ), {"key":safe_key}).mappings().one()
+        stage = conn.execute(text(
+            "SELECT stage_status FROM us_profit_capture_lifecycle "
+            "WHERE client_order_key=:key"
+        ), {"key":safe_key}).scalar_one()
+    assert intent["status"] == "BLOCKED"
+    assert intent["meta"]["pre_io_abort_stage"] == "BEFORE_KIS_HTTP"
+    assert stage == "NOT_TRIGGERED"
+
+    # Same target on a different trade_date has its own independent stage.
+    # Existing stage-scope test covers duplicate concurrent attempts; here
+    # force a failing stage write after the conditional intent UPDATE.
+    with pg_engine.begin() as conn:
+        conn.execute(text("DELETE FROM us_profit_capture_lifecycle WHERE client_order_key=:key"),
+                     {"key":safe_key})
+        conn.execute(text("UPDATE us_order_intents SET status='PENDING' WHERE client_order_key=:key"),
+                     {"key":safe_key})
+    repos.mark_us_profit_capture_stage(
+        day, sym, "tp3", order_key=safe_key, qty=2,
+        position_lifecycle_id=safe_cycle, status="PENDING",
+    )
+    original = repos.mark_us_profit_capture_stage
+    monkeypatch.setattr(repos, "mark_us_profit_capture_stage",
+                        lambda *args, **kwargs: (_ for _ in ()).throw(
+                            RuntimeError("simulated stage commit failure")))
+    with pytest.raises(RuntimeError, match="simulated stage commit failure"):
+        attempt(safe_key, safe_cycle)
+    monkeypatch.setattr(repos, "mark_us_profit_capture_stage", original)
+    with pg_engine.connect() as conn:
+        intent_status = conn.execute(text(
+            "SELECT status FROM us_order_intents WHERE client_order_key=:key"
+        ), {"key":safe_key}).scalar_one()
+        stage_status = conn.execute(text(
+            "SELECT stage_status FROM us_profit_capture_lifecycle WHERE client_order_key=:key"
+        ), {"key":safe_key}).scalar_one()
+    assert intent_status == "PENDING"
+    assert stage_status == "PENDING"
+
+    # Silent no-op is equally unsafe: absence of an exception is not proof
+    # the stage left PENDING. The canonical release MUST detect it and roll
+    # the already-updated intent back in the same DB transaction.
+    monkeypatch.setattr(repos, "mark_us_profit_capture_stage",
+                        lambda *args, **kwargs: None)
+    with pytest.raises(
+        RuntimeError, match="US_TP_PRE_IO_ATOMIC_POSTCONDITION_UNVERIFIED_ROLLBACK"
+    ):
+        attempt(safe_key, safe_cycle)
+    monkeypatch.setattr(repos, "mark_us_profit_capture_stage", original)
+    with pg_engine.connect() as conn:
+        after_noop = conn.execute(text(
+            "SELECT status FROM us_order_intents WHERE client_order_key=:key"
+        ), {"key": safe_key}).scalar_one()
+        after_stage_noop = conn.execute(text(
+            "SELECT stage_status FROM us_profit_capture_lifecycle "
+            "WHERE client_order_key=:key"
+        ), {"key": safe_key}).scalar_one()
+    assert (after_noop, after_stage_noop) == ("PENDING", "PENDING")
+
+    # A distinct economic lifecycle per case means one rejected symbol does
+    # not corrupt another stage. All unsafe attempts remain PENDING in both
+    # ledgers and are never silently rearmed.
+    for suffix, options in (
+        ("broker_ack", {"broker_possible": True}),
+        ("foreign_owner", {"foreign_owner": True}),
+        ("active_claim", {"active": True}),
+        ("tampered_intent", {"bad_intent": True}),
+        ("open_broker_order", {"broker_open": True}),
+    ):
+        key, cycle = seed(suffix, **options)
+        assert attempt(key, cycle) is False, suffix
+        with pg_engine.connect() as conn:
+            intent_status = conn.execute(text(
+                "SELECT status FROM us_order_intents WHERE client_order_key=:key"
+            ), {"key": key}).scalar_one()
+            stage_status = conn.execute(text(
+                "SELECT stage_status FROM us_profit_capture_lifecycle "
+                "WHERE client_order_key=:key"
+            ), {"key": key}).scalar_one()
+        assert (intent_status, stage_status) == ("PENDING", "PENDING"), suffix

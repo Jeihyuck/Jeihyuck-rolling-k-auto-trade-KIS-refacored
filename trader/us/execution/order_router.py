@@ -3436,23 +3436,38 @@ def route_order(
                         intent.get("meta"),
                         client_order_key=str(order_key or ""),
                     )
+                    # The stage and its original durable intent must leave
+                    # PENDING together, under one PG transaction. A failed or
+                    # unknown proof fences this attempt without creating POST.
                     restored = release_us_profit_capture_pre_http_abort(
                         trade_date=str(trade_date or ""),
                         symbol=symbol_upper, stage=tp_stage,
                         position_lifecycle_id=_tp_ledger_cycle,
                         client_order_key=str(order_key or ""),
+                        close_intent=True,
+                        failure_code=(
+                            failure_code if failure_code != "pre_http_setup_failed"
+                            else "PRE_HTTP_SETUP_FAILED"
+                        ),
                     )
                     if not restored:
                         requires_reconcile = True
                         logger.error(
-                            "[US_PROFIT_CAPTURE][PRE_IO_ABORT_NOT_RELEASED] symbol=%s stage=%s "
-                            "action=RECONCILE_ONLY", symbol_upper, tp_stage,
+                            "[US_PROFIT_CAPTURE][ATOMIC_PRE_IO_RELEASE_UNVERIFIED] "
+                            "symbol=%s stage=%s action=RECONCILE_ONLY",
+                            symbol_upper, tp_stage,
                         )
                     else:
                         _tp_pre_io_stage_released = True
+                        # The original intent is terminal. Never advertise a
+                        # blind retry of its old decision, even though KIS POST
+                        # was proven absent. Only a fresh strategy evaluation
+                        # may create a new stage attempt and price/clock proof.
+                        terminal_pre_io_intent = True
                         logger.warning(
-                            "[US_PROFIT_CAPTURE][PRE_IO_ABORT_RELEASED] symbol=%s stage=%s "
-                            "action=REEVALUATE_NEXT_TICK", symbol_upper, tp_stage,
+                            "[US_PROFIT_CAPTURE][PRE_IO_ABORT_RELEASED] symbol=%s "
+                            "stage=%s intent=BLOCKED action=REEVALUATE_NEXT_TICK",
+                            symbol_upper, tp_stage,
                         )
                 except Exception as tp_abort_exc:
                     requires_reconcile = True

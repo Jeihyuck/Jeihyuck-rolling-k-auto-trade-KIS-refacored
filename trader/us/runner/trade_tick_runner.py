@@ -1480,6 +1480,8 @@ def release_proven_tp_pre_submit_block(
             stage=stage,
             position_lifecycle_id=ledger_lifecycle,
             client_order_key=key,
+            close_intent=True,
+            failure_code="PROVEN_PRE_HTTP_ABORT",
         )
     except Exception as exc:
         logger.error(
@@ -2802,6 +2804,7 @@ def run_trade_tick(
     # entry_price가 없으면 fail-closed SELL intent 생성 (US_EXIT_FAIL_CLOSED_ON_PNL_MISSING 기본값=1)
     _exit_trade_date = trade_date if isinstance(trade_date, str) else str(trade_date)
     _exit_engine_started = time.monotonic()
+    _exit_resolver_started = time.monotonic()
     try:
         from trader.us.pb1.us_exit_position_resolver import enrich_us_positions_for_exit
         from trader.us.strategy_ownership import exclude_non_standard
@@ -2829,6 +2832,12 @@ def run_trade_tick(
         )
     except Exception as _resolve_exc:
         logger.warning("[US_EXIT][POSITION_RESOLVE][WARN] resolver failed: %s", _resolve_exc)
+    finally:
+        # A nested phase of exit_engine_ms, never sum it twice into Tick total.
+        _exit_resolver_ms = (time.monotonic() - _exit_resolver_started) * 1000.0
+        tick_context.metrics["exit_resolver_ms"] = _exit_resolver_ms
+        logger.info("[US_EXIT][RESOLVER_LATENCY] positions=%d elapsed_ms=%.2f",
+                    len(current_positions or []), _exit_resolver_ms)
 
     # Process-local earliest readiness; observation only, never persisted.
     _sell_signal_ready_by_symbol: dict[str, float] = {}
@@ -3265,9 +3274,9 @@ def run_trade_tick(
             current_positions, market_state_overlay, existing_sell_symbols,
             now=now, trade_date=trade_date,
             defer_pending_until_claim=(real_order_mode and not offline),
-            # 'now' is the Tick-start market clock, not the live TP signal
-            # readiness time. Keep replay deterministic, live time exact.
-            decision_clock_real_time=(real_order_mode and not offline and not force_now),
+            # Tick-start calendar time is not the end of TP evaluation.
+            decision_clock=(lambda: datetime.now(timezone.utc))
+                if (real_order_mode and not offline and not force_now) else None,
         )
         if profit_capture_intents:
             exit_intents.extend(profit_capture_intents)
@@ -4306,8 +4315,10 @@ def run_trade_tick(
         }
         for blocked_buy in market_state_blocked_buys:
             if blocked_buy.get("symbol") in eligible_symbols:
-                logger.error(
-                    "[US_ENTRY][MARKET_FILTER_INVARIANT_FAIL] symbol=%s prefilter=allowed postfilter=%s",
+                # An updated live risk snapshot can veto a prefiltered symbol.
+                # A legitimate late veto does not invalidate other candidates.
+                logger.info(
+                    "[US_ENTRY][MARKET_FILTER_FINAL_BLOCK] symbol=%s prefilter=allowed postfilter=%s",
                     blocked_buy.get("symbol"), blocked_buy.get("reason"),
                 )
         from trader.us.position_trend_state import filter_add_to_existing_by_trend_state
@@ -4320,17 +4331,19 @@ def run_trade_tick(
         postfilter_blocked_candidates.extend({**item, "block_stage": "postfilter_market_state"} for item in market_state_blocked_buys)
         postfilter_blocked_candidates.extend({**item, "block_stage": "postfilter_position_trend"} for item in trend_blocked_buys)
         if postfilter_blocked_candidates:
-            # Per-symbol risk rejections are NOT evidence of a broken global
-            # market contract. The postfilter has already removed each denied
-            # candidate. Keep independently validated survivors; they must
-            # still pass the regular preflight/risk/broker gates below.
-            # Missing or contradictory account-wide market proof remains
-            # fail-closed for every US_STANDARD BUY.
-            _global_filter_unverified = is_us_global_postfilter_contract_unverified(market_state_overlay)
-            if _global_filter_unverified:
+            # The final filters already removed only vetoed symbols. Preserve
+            # the verified peers unless there is an explicit *global* failure.
+            _risk_global_failure = (
+                is_us_global_postfilter_contract_unverified(market_state_overlay)
+                or market_state_overlay.get("intraday_error_reason") == "LIVE_RISK_EVALUATION_FAILED"
+                or market_state_overlay.get("risk_contract_invalid") is True
+                or any(item.get("reason") in {
+                    "GLOBAL_RISK_CONTRACT_INVALID", "RISK_SNAPSHOT_ID_CONFLICT",
+                } for item in postfilter_blocked_candidates)
+            )
+            if _risk_global_failure:
                 logger.error(
-                    "[US_ENTRY][CANDIDATE_FILTER_INVARIANT_FAIL] "
-                    "scope=GLOBAL_RISK_CONTRACT action=BLOCK_ALL_STANDARD_BUYS blocked=%s",
+                    "[US_ENTRY][CANDIDATE_FILTER_GLOBAL_INVARIANT_FAIL] blocked=%s action=DROP_ALL_BUYS",
                     postfilter_blocked_candidates,
                 )
                 entry_eval_error_count += 1
@@ -4339,11 +4352,8 @@ def run_trade_tick(
                 entry_intents = []
             else:
                 logger.info(
-                    "[US_ENTRY][POSTFILTER_CANDIDATE_BLOCKS] "
-                    "scope=PER_SYMBOL action=KEEP_VERIFIED_SURVIVORS blocked=%d kept=%d "
-                    "details=%s",
-                    len(postfilter_blocked_candidates), len(entry_intents),
-                    postfilter_blocked_candidates,
+                    "[US_ENTRY][CANDIDATE_FILTER_LOCAL_BLOCK] blocked=%s kept=%d",
+                    postfilter_blocked_candidates, len(entry_intents),
                 )
         logger.info("[US_ENTRY][MARKET_STATE_FILTER] kept=%d blocked=%d blocked_entries=%s", len(entry_intents), len(market_state_blocked_buys), market_state_blocked_buys)
     except Exception as _cluster_guard_filter_exc:

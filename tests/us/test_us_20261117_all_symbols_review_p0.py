@@ -175,7 +175,7 @@ class _PreIoDb:
     def execute(self, statement, params):
         sql = str(statement).lower()
         if "from us_profit_capture_lifecycle" in sql:
-            if "select stage_status, state" in sql:
+            if "select stage_status, client_order_key" in sql:
                 return _RowSet(one={"stage_status": "NOT_TRIGGERED" if self.stage_released else "PENDING", "state": {}})
             return _RowSet(one={"stage_status": "PENDING",
                                 "cumulative_filled_qty": 0, "requested_qty": 2})
@@ -190,7 +190,7 @@ class _PreIoDb:
             return _RowSet(rows=[{
                 "attempt_state": "ABANDONED_PRE_SUBMIT", "authoritative": True,
                 "requested_qty": 2, "action_key": "action",
-                "action": "TP1", "target_qty": 2,
+                "action": "tp1", "target_qty": 2,
                 "filled_qty_before_attempt": 0,
                 "lifecycle_id": "cycle-1",
                 "account_id": "account-1", "action_state": "OPEN",
@@ -202,7 +202,7 @@ class _PreIoDb:
             if self.updated:
                 return _RowSet(one={"status": "BLOCKED", "meta": {"pre_io_abort_attempt_id": self.intent_attempt}})
             return _RowSet(one={"status": "PENDING",
-                                "meta": {"submit_attempt_id": self.intent_attempt}})
+                                "meta": {"submit_attempt_id": self.intent_attempt, "profit_capture_stage": "tp1", "strategy_owner": "US_STANDARD"}})
         if "update us_order_intents" in sql:
             self.updated.append(params)
             return _RowSet(rowcount=1)
@@ -240,12 +240,14 @@ def _run_proven_abort(db, *, mark_failure=None):
     with (
         patch.object(repos, "_get_engine_or_none", return_value=db),
         patch.object(repos, "_active_us_epoch", return_value="epoch-1"),
+        patch.object(repos, "_us_execution_claim_scope", return_value={"env": "practice", "trading_epoch_id": "epoch-1", "account_id": "account-1"}),
         patch.object(repos, "load_us_profit_capture_state", return_value=state),
         patch.object(repos, "mark_us_profit_capture_stage", side_effect=mark_stage) as mark,
     ):
         result = repos.release_us_profit_capture_pre_http_abort(
             trade_date="2026-11-16", symbol="NOVA", stage="tp1",
             position_lifecycle_id="cycle-1", client_order_key="US_PC_TEST_NOVA",
+            close_intent=True,
         )
     return result, mark
 

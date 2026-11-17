@@ -1102,6 +1102,27 @@ def run_trade_session(
         contract_for_revision = prep_guard_result.get("contract") if isinstance(prep_guard_result.get("contract"), dict) else {}
         expected_revision = str(contract_for_revision.get("run_revision") or contract_for_revision.get("git_commit_sha") or prep_guard_result.get("run_revision") or "").strip()
         revision_guard = verify_run_revision(trade_date, current_revision, expected_revision=expected_revision or None)
+        from trader.us.run_manifest import verified_execution_revision
+        _verified_code_sha = verified_execution_revision(
+            actual_git_head=_git_value(["rev-parse", "HEAD"]),
+            session_revision=str(current_revision),
+            expected_revision=expected_revision or None,
+            revision_guard_ok=bool(revision_guard.get("ok")),
+        )
+        # The child Tick process inherits only an evidence-verified SHA.
+        # This never overrides the immutable PREP/entry permission gates.
+        if _verified_code_sha:
+            os.environ["US_PINNED_CODE_SHA"] = _verified_code_sha
+            logger.info("[US_5W1H][CODE_SHA_PINNED] sha=%s source=actual_git_head_and_prep_guard",
+                        _verified_code_sha)
+        else:
+            os.environ.pop("US_PINNED_CODE_SHA", None)
+            logger.warning(
+                "[US_5W1H][CODE_SHA_UNVERIFIED] session_revision=%s "
+                "prep_revision=%s action=AUDIT_MISSING_POLICY_UNCHANGED",
+                current_revision, expected_revision or "UNKNOWN",
+            )
+        prep_guard_result["verified_code_sha_for_audit"] = _verified_code_sha or None
         prep_guard_result["prep_revision"] = (
             revision_guard.get("expected_revision")
             or (revision_guard.get("manifest") or {}).get("run_revision")

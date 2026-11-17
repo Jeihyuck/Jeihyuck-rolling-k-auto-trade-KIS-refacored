@@ -1224,8 +1224,64 @@ def save_order_intent(intent: dict, trade_date: str | None = None) -> bool:
                     "portfolio_epoch_id": portfolio, "position_cycle_id": cycle,
                     "position_lifecycle_id": cycle,
                 })
+            # P0 BUY original identity: the native armed US path must
+            # persist the exact Claim-scoped account hash in the first
+            # durable intent, not solely in later attempt/outbox rows.
+            # Historical NULL fields stay immutable; no backfill here.
+            native_buy_scope = None
+            if (
+                str(intent.get("side") or "BUY").upper() == "BUY"
+                and os.getenv("WSL_RUN_MARKET", "").upper() == "US"
+                and os.getenv("KIS_ENV", "").strip().lower() == "practice"
+                and os.getenv("US_ORDER_ARMED", "0").strip().lower()
+                    in {"1", "true", "yes", "on"}
+            ):
+                native_buy_scope = _us_execution_claim_scope()
+                if (
+                    native_buy_scope.get("env") != "practice"
+                    or native_buy_scope.get("market") != "US"
+                    or str(native_buy_scope.get("trading_epoch_id") or "")
+                        != str(trading_epoch_id or "")
+                    or not native_buy_scope.get("account_id")
+                    or not trading_epoch_id
+                ):
+                    raise RuntimeError("US_BUY_INTENT_CLAIM_SCOPE_NOT_VERIFIED")
+                account_hash = str(native_buy_scope["account_id"])
+                supplied = str(
+                    intent.get("broker_account_hash")
+                    or intent_meta_to_store.get("broker_account_hash") or ""
+                )
+                if supplied and supplied != account_hash:
+                    raise RuntimeError("US_BUY_INTENT_ACCOUNT_SCOPE_CONFLICT")
+                if "account_id" in params:
+                    if str(params["account_id"]) != account_hash:
+                        raise RuntimeError("US_BUY_INTENT_ACCOUNT_ID_CONFLICT")
+                else:
+                    if sql.count("trading_epoch_id, meta)") != 1:
+                        raise RuntimeError("US_BUY_INTENT_EPOCH_INSERT_UNVERIFIED")
+                    sql = sql.replace(
+                        "trading_epoch_id, meta)",
+                        "trading_epoch_id, account_id, meta)",
+                    ).replace(
+                        ":trading_epoch_id,\n                            CAST(:meta",
+                        ":trading_epoch_id, :account_id,\n                            CAST(:meta",
+                    )
+                    params["account_id"] = account_hash
+                intent_meta_to_store["broker_account_hash"] = account_hash
             params["meta"] = _json_param(intent_meta_to_store)
             conn.execute(text(sql), params)
+            if native_buy_scope is not None:
+                stored_account = conn.execute(text("""
+                    SELECT account_id FROM us_order_intents
+                     WHERE client_order_key=:cok AND trade_date=:td
+                       AND symbol=:symbol AND side='BUY'
+                       AND trading_epoch_id=:epoch
+                """), {
+                    "cok": intent.get("client_order_key"), "td": td,
+                    "symbol": intent.get("symbol"), "epoch": trading_epoch_id,
+                }).scalar_one_or_none()
+                if str(stored_account or "") != str(native_buy_scope["account_id"]):
+                    raise RuntimeError("US_BUY_INTENT_ACCOUNT_NOT_DURABLE_ROLLBACK")
             if standard_buy:
                 persisted = conn.execute(
                     text("SELECT meta FROM us_order_intents WHERE client_order_key=:cok"),
@@ -2736,6 +2792,23 @@ def _normalize_risk_state(symbol: str, trade_date: str, state: dict | None) -> d
 
 
 def _ensure_us_position_risk_state_table(conn) -> None:
+    """Avoid one redundant CREATE TABLE round trip for every risk/HWM read.
+
+    A successful schema check is cached only on the *physical pooled DBAPI
+    connection*, never across different account/engine connections or process
+    restarts. CI and explicit operator schema checks still perform the DDL
+    every time. Any failed DDL must never set the ready bit. Missing tables
+    after a schema change fail in the normal read/write path, not fail open.
+    """
+    info = getattr(conn, "info", None)
+    cache_ok = (
+        isinstance(info, dict)
+        and not os.getenv("PBCORE_TEST_POSTGRES_URL")
+        and os.getenv("US_RISK_STATE_FORCE_SCHEMA_DDL", "0") != "1"
+    )
+    ready_key = "us_position_risk_state_schema_ready_v3"
+    if cache_ok and info.get(ready_key) is True:
+        return
     conn.execute(text("""
         CREATE TABLE IF NOT EXISTS us_position_risk_state (
             trading_epoch_id TEXT NOT NULL,
@@ -2752,6 +2825,8 @@ def _ensure_us_position_risk_state_table(conn) -> None:
             PRIMARY KEY (trading_epoch_id, trade_date, symbol)
         )
     """))
+    if cache_ok:
+        info[ready_key] = True
 
 
 def load_us_position_risk_state(symbol: str, trade_date: str) -> dict:
@@ -3856,6 +3931,7 @@ def verify_us_tp_claim_stage_at_http_boundary(
 def release_us_profit_capture_pre_http_abort(
     *, trade_date: str, symbol: str, stage: str,
     position_lifecycle_id: str, client_order_key: str,
+    close_intent: bool = False, failure_code: str = "PROVEN_PRE_HTTP_ABORT",
 ) -> bool:
     """Clear a TP intent-only PENDING *only* after proven no-HTTP abort.
 
@@ -3990,65 +4066,93 @@ def release_us_profit_capture_pre_http_abort(
                 or str((current.get("meta") or {}).get("last_status") or "") not in {"PENDING", "SUBMITTED"}
                 or (current.get(f"{stg}_broker_order_no") and not partial_stage)):
             return False
-        # This TP stage and its underlying order intent are one lifecycle.
-        # The old path marked the stage FAILED but left us_order_intents
-        # PENDING forever (Nov-16 PG): subsequent new attempts collided with
-        # that orphaned identity. Close BOTH inside this SAME transaction,
-        # only after exact durable journal/Attempt/Claim proof of no POST.
-        intent_row = conn.execute(text("""
-            SELECT status, meta
-              FROM us_order_intents
-             WHERE trade_date=:td AND client_order_key=:key
-               AND symbol=:sym AND side='SELL' AND trading_epoch_id=:epoch
-             FOR UPDATE
-        """), params).mappings().one_or_none()
-        if not intent_row:
-            logger.error("[US_TP][PRE_IO_INTENT_UNVERIFIED] symbol=%s stage=%s reason=missing_intent", sym, stg)
-            return False
-        intent_meta = _parse_json_meta(intent_row["meta"])
-        if (str(intent_meta.get("submit_attempt_id") or "") != attempt_id
-                or str(intent_row["status"] or "").upper() != "PENDING"):
-            logger.error("[US_TP][PRE_IO_INTENT_UNVERIFIED] symbol=%s stage=%s reason=intent_attempt_or_status_mismatch", sym, stg)
-            return False
-        marked = conn.execute(text("""
-            UPDATE us_order_intents
-               SET status='BLOCKED',
-                   meta=COALESCE(meta, '{}'::jsonb) || CAST(:patch AS jsonb)
-             WHERE trade_date=:td AND client_order_key=:key
-               AND symbol=:sym AND side='SELL'
-               AND trading_epoch_id=:epoch AND status='PENDING'
-        """), {**params, "patch": _json_param({
-            "pre_io_abort_attempt_id": attempt_id,
-            "pre_io_abort_stage": "BEFORE_KIS_HTTP",
-            "pre_io_abort_evidence": "BROKER_SUBMIT_ABORTED_PRE_IO",
-        })})
-        if marked.rowcount != 1:
-            raise RuntimeError("US_TP_PRE_IO_INTENT_ATOMIC_CLOSE_FAILED")
+        if close_intent:
+            # A previously separated intent close could commit after the
+            # stage was released, leaving PENDING and failing the next claim.
+            # Both exact transitions must now be one PostgreSQL transaction.
+            import re as _re
+            if (not order_key.startswith("US_PC_")
+                    or not _re.fullmatch(r"[A-Z0-9_]{1,100}", str(failure_code or ""))):
+                return False
+            scope = _us_execution_claim_scope()
+            attempt_scope = attempt[0]
+            if (str(scope.get("env") or "").lower() != "practice"
+                    or str(scope.get("trading_epoch_id") or "") != str(epoch_id)
+                    or not scope.get("account_id")
+                    or str(attempt_scope.get("account_id") or "") != str(scope["account_id"])
+                    or str(attempt_scope.get("lifecycle_id") or "") != lifecycle
+                    or str(attempt_scope.get("action") or "").lower() != stg):
+                return False
+            intent_row = conn.execute(text("""
+                SELECT status, meta
+                  FROM us_order_intents
+                 WHERE trade_date=:td AND client_order_key=:key
+                   AND symbol=:sym AND side='SELL'
+                   AND trading_epoch_id=:epoch
+                 FOR UPDATE
+            """), params).mappings().one_or_none()
+            if not intent_row or str(intent_row.get("status") or "") != "PENDING":
+                return False
+            intent_meta = _parse_json_meta(intent_row.get("meta"))
+            if (str(intent_meta.get("submit_attempt_id") or "") != attempt_id
+                    or str(intent_meta.get("profit_capture_stage") or "").lower() != stg
+                    or str(intent_meta.get("strategy_owner") or "US_STANDARD").upper() != "US_STANDARD"
+                    or (intent_meta.get("position_lifecycle_id")
+                        and str(intent_meta["position_lifecycle_id"]) != lifecycle)):
+                return False
+            updated = conn.execute(text("""
+                UPDATE us_order_intents
+                   SET status='BLOCKED',
+                       meta=COALESCE(meta, '{}'::jsonb) || CAST(:patch AS jsonb)
+                 WHERE trade_date=:td AND client_order_key=:key
+                   AND symbol=:sym AND side='SELL' AND trading_epoch_id=:epoch
+                   AND status='PENDING'
+            """), {**params, "patch": _json_param({
+                "pre_io_abort_attempt_id": attempt_id,
+                "pre_io_abort_stage": "BEFORE_KIS_HTTP",
+                "pre_io_abort_code": failure_code,
+            })})
+            if updated.rowcount != 1:
+                return False
         mark_us_profit_capture_stage(
             trade_date, sym, stg, order_key=order_key,
             position_lifecycle_id=lifecycle, status="FAILED",
             evidence_type="BROKER_SUBMIT_ABORTED_PRE_IO", _conn=conn,
         )
-        # A no-op stage update must roll back the already closed intent.
-        verified = conn.execute(text("""
-            SELECT stage_status, state FROM us_profit_capture_lifecycle
-             WHERE trade_date=:td AND symbol=:sym AND stage=:stage
-               AND position_lifecycle_id=:lifecycle AND client_order_key=:key
-               AND trading_epoch_id=:epoch FOR UPDATE
-        """), params).mappings().one_or_none()
-        closed = conn.execute(text("""
-            SELECT status, meta FROM us_order_intents
-             WHERE trade_date=:td AND client_order_key=:key AND symbol=:sym
-               AND side='SELL' AND trading_epoch_id=:epoch FOR UPDATE
-        """), params).mappings().one_or_none()
-        stage_state = _parse_json_meta(verified.get("state")) if verified else {}
-        if (not verified or str(verified.get("stage_status") or "") != "NOT_TRIGGERED"
-                or not closed or str(closed.get("status") or "") != "BLOCKED"
-                or str(_parse_json_meta(closed.get("meta")).get(
-                    "pre_io_abort_attempt_id") or "") != attempt_id
-                or bool(stage_state.get(f"{stg}_pending"))
-                or bool(stage_state.get(f"{stg}_done"))):
-            raise RuntimeError("US_TP_PRE_IO_ATOMIC_POSTCONDITION_UNVERIFIED_ROLLBACK")
+        # The routine above has legacy early-return cases (missing stage,
+        # invalid lifecycle) and its normal return is None. A successful
+        # function call is NOT proof the original TP stage was released.
+        # Recheck both durable rows while holding the same row locks. Raising
+        # (rather than returning False) is essential AFTER any UPDATE:
+        # SQLAlchemy engine.begin() must roll back the closed intent too.
+        if close_intent:
+            verified = conn.execute(text("""
+                SELECT stage_status, client_order_key, trading_epoch_id, state
+                  FROM us_profit_capture_lifecycle
+                 WHERE trade_date=:td AND symbol=:sym AND stage=:stage
+                   AND position_lifecycle_id=:lifecycle
+                   AND client_order_key=:key AND trading_epoch_id=:epoch
+                 FOR UPDATE
+            """), params).mappings().one_or_none()
+            closed = conn.execute(text("""
+                SELECT status, meta FROM us_order_intents
+                 WHERE trade_date=:td AND client_order_key=:key
+                   AND symbol=:sym AND side='SELL'
+                   AND trading_epoch_id=:epoch
+                 FOR UPDATE
+            """), params).mappings().one_or_none()
+            stage_state = _parse_json_meta(verified.get("state")) if verified else {}
+            if (not verified
+                    or str(verified.get("stage_status") or "") != "NOT_TRIGGERED"
+                    or not closed
+                    or str(closed.get("status") or "") != "BLOCKED"
+                    or str(_parse_json_meta(closed.get("meta")).get(
+                        "pre_io_abort_attempt_id") or "") != attempt_id
+                    or bool(stage_state.get(f"{stg}_pending"))
+                    or bool(stage_state.get(f"{stg}_done"))):
+                raise RuntimeError(
+                    "US_TP_PRE_IO_ATOMIC_POSTCONDITION_UNVERIFIED_ROLLBACK"
+                )
         return True
 
 
@@ -4112,6 +4216,15 @@ def update_us_soft_stop_risk_state(
 ) -> dict:
     """Increment/reset and persist per-symbol soft-stop state."""
     key_symbol = _risk_state_key(symbol, trade_date)[1]
+    # An armed US order path cannot use memory-only soft-stop confirmations.
+    # Their loss after restart would make otherwise protected SELL unsafe.
+    require_durable = (
+        os.getenv("WSL_RUN_MARKET", "").upper() == "US"
+        and os.getenv("KIS_ENV", "").strip().lower() in {"practice", "real", "live"}
+        and os.getenv("US_ORDER_ARMED", "0").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+    )
     previous = load_us_position_risk_state(key_symbol, trade_date)
     now_iso = (now if now.tzinfo else now.replace(tzinfo=timezone.utc)).isoformat()
     previous_state = dict(previous.get("state") or {})
@@ -4144,7 +4257,14 @@ def update_us_soft_stop_risk_state(
             "last_pnl_pct": float(pnl_pct),
             "updated_at": now_iso,
         }
-        save_us_position_risk_state(key_symbol, trade_date, state)
+        if not save_us_position_risk_state(
+            key_symbol, trade_date, state, require_durable=require_durable,
+        ) and require_durable:
+            logger.error(
+                "[US_RISK_STATE][DURABLE_STATE_NOT_SAVED] symbol=%s trade_date=%s "
+                "action=NO_SOFT_STOP_CONFIRMATION", key_symbol, trade_date,
+            )
+            raise RuntimeError("US_SOFT_STOP_DURABLE_STATE_WRITE_FAILED")
         logger.info(
             "[US_RISK_STATE][SOFT_STOP] symbol=%s trade_date=%s count=%d pnl_pct=%.4f price=%.4f action=increment",
             key_symbol, trade_date, state["soft_stop_breach_count"], pnl_pct, current_price,
@@ -4162,7 +4282,14 @@ def update_us_soft_stop_risk_state(
         "last_pnl_pct": float(pnl_pct),
         "updated_at": now_iso,
     }
-    save_us_position_risk_state(key_symbol, trade_date, state)
+    if not save_us_position_risk_state(
+        key_symbol, trade_date, state, require_durable=require_durable,
+    ) and require_durable:
+        logger.error(
+            "[US_RISK_STATE][DURABLE_STATE_NOT_SAVED] symbol=%s trade_date=%s "
+            "action=NO_SOFT_STOP_CONFIRMATION", key_symbol, trade_date,
+        )
+        raise RuntimeError("US_SOFT_STOP_DURABLE_STATE_WRITE_FAILED")
     logger.info(
         "[US_RISK_STATE][SOFT_STOP_RESET] symbol=%s trade_date=%s pnl_pct=%.4f price=%.4f action=reset",
         key_symbol, trade_date, pnl_pct, current_price,
