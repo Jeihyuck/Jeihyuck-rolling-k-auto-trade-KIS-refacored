@@ -260,7 +260,13 @@ def test_kr_infinite_profit_sell_ack_or_intermediate_fill_stays_pending(armed_pr
         assert result.state.metadata["pending_profit_stage"].endswith("_SUBMITTED")
 
 
-def test_kr_infinite_terminal_profit_fill_rearms_exactly_once(armed_practice_env):
+def test_kr_infinite_terminal_profit_fill_rearms_without_duplicate_sell(armed_practice_env):
+    """After TP1, the existing owner policy may independently permit an ADD.
+
+    Enabling verified KIS cash makes the old expectation of no BUY obsolete:
+    current price equals cost, the normal cadence has elapsed, and a sleeve
+    unit is available. A second TP1 SELL or unlimited same-day ADD is not.
+    """
     kis = FakeKIS(qty=100, average=100, price=110, fill_qty=50)
     repo = FakeRepository(active())
     first = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME,
@@ -268,9 +274,16 @@ def test_kr_infinite_terminal_profit_fill_rearms_exactly_once(armed_practice_env
     kis.price = 100
     second = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME,
                       trade_date=DAY, kis_env="practice")
+    third = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME,
+                     trade_date=DAY, kis_env="practice")
 
+    assert first.decision.action == Action.SELL_PARTIAL
     assert first.state.status == second.state.status == Status.ACTIVE
-    assert len(kis.orders) == 1
+    assert second.decision.reason == "ADAPTIVE_ADD_BUY"
+    assert second.decision.action == Action.BUY
+    assert third.decision.action == Action.WAIT
+    assert third.decision.reason == "DAILY_BUY_LIMIT"
+    assert kis.orders == [("SELL", 50), ("BUY", 300)]
 
 
 def test_kr_infinite_invalid_price_blocks_without_exception(armed_practice_env):
