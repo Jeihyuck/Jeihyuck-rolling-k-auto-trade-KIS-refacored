@@ -3247,6 +3247,9 @@ def run_trade_tick(
             current_positions, market_state_overlay, existing_sell_symbols,
             now=now, trade_date=trade_date,
             defer_pending_until_claim=(real_order_mode and not offline),
+            # Tick-start calendar time is not the end of TP evaluation.
+            decision_clock=(lambda: datetime.now(timezone.utc))
+                if (real_order_mode and not offline) else None,
         )
         if profit_capture_intents:
             exit_intents.extend(profit_capture_intents)
@@ -4285,8 +4288,10 @@ def run_trade_tick(
         }
         for blocked_buy in market_state_blocked_buys:
             if blocked_buy.get("symbol") in eligible_symbols:
-                logger.error(
-                    "[US_ENTRY][MARKET_FILTER_INVARIANT_FAIL] symbol=%s prefilter=allowed postfilter=%s",
+                # An updated live risk snapshot can veto a prefiltered symbol.
+                # A legitimate late veto does not invalidate other candidates.
+                logger.info(
+                    "[US_ENTRY][MARKET_FILTER_FINAL_BLOCK] symbol=%s prefilter=allowed postfilter=%s",
                     blocked_buy.get("symbol"), blocked_buy.get("reason"),
                 )
         from trader.us.position_trend_state import filter_add_to_existing_by_trend_state
@@ -4299,14 +4304,29 @@ def run_trade_tick(
         postfilter_blocked_candidates.extend({**item, "block_stage": "postfilter_market_state"} for item in market_state_blocked_buys)
         postfilter_blocked_candidates.extend({**item, "block_stage": "postfilter_position_trend"} for item in trend_blocked_buys)
         if postfilter_blocked_candidates:
-            logger.error(
-                "[US_ENTRY][CANDIDATE_FILTER_INVARIANT_FAIL] blocked=%s",
-                postfilter_blocked_candidates,
+            # The final filters already removed only vetoed symbols. Preserve
+            # the verified peers unless there is an explicit *global* failure.
+            _risk_global_failure = (
+                market_state_overlay.get("intraday_error_reason") == "LIVE_RISK_EVALUATION_FAILED"
+                or market_state_overlay.get("risk_contract_invalid") is True
+                or any(item.get("reason") in {
+                    "GLOBAL_RISK_CONTRACT_INVALID", "RISK_SNAPSHOT_ID_CONFLICT",
+                } for item in postfilter_blocked_candidates)
             )
-            entry_eval_error_count += 1
-            entry_degraded = True
-            entry_degraded_reason = "candidate_filter_invariant_fail"
-            entry_intents = []
+            if _risk_global_failure:
+                logger.error(
+                    "[US_ENTRY][CANDIDATE_FILTER_GLOBAL_INVARIANT_FAIL] blocked=%s action=DROP_ALL_BUYS",
+                    postfilter_blocked_candidates,
+                )
+                entry_eval_error_count += 1
+                entry_degraded = True
+                entry_degraded_reason = "candidate_filter_invariant_fail"
+                entry_intents = []
+            else:
+                logger.info(
+                    "[US_ENTRY][CANDIDATE_FILTER_LOCAL_BLOCK] blocked=%s kept=%d",
+                    postfilter_blocked_candidates, len(entry_intents),
+                )
         logger.info("[US_ENTRY][MARKET_STATE_FILTER] kept=%d blocked=%d blocked_entries=%s", len(entry_intents), len(market_state_blocked_buys), market_state_blocked_buys)
     except Exception as _cluster_guard_filter_exc:
         # Never route unfiltered standard BUY intents after a market/risk
