@@ -8,6 +8,10 @@ on:
       - "trader/kr/kis_observer_budget.py"
       - "trader/kis_wrapper.py"
       - "trader/pb1_engine.py"
+      - "trader/pb1_runner.py"
+      - "trader/kr/broker_truth_hardening.py"
+      - "trader/reconcile_kis.py"
+      - "tests/kr/test_kr_pb1_current_only_original_balance_proof.py"
       - "scripts/kr_opening_observer.py"
       - "scripts/wsl/kr-entry-timing-activation.sh"
       - "tests/kr/test_kr_pb1_minute_*.py"
@@ -41,7 +45,8 @@ jobs:
       - name: Compile and shell-validate modified runtime
         run: |
           python -m py_compile trader/kr/entry_priority_queue.py trader/kr/kis_observer_budget.py \
-            trader/kr/opening_bar_contract.py trader/kis_wrapper.py trader/pb1_engine.py scripts/kr_opening_observer.py
+            trader/kr/opening_bar_contract.py trader/kis_wrapper.py trader/pb1_engine.py scripts/kr_opening_observer.py \
+            trader/kr/broker_truth_hardening.py trader/reconcile_kis.py trader/pb1_runner.py
           bash -n scripts/wsl/kr-entry-timing-activation.sh scripts/wsl/run-kr-am.sh scripts/wsl/run-kr-afternoon.sh
       - name: Native minute offline incident & integration regressions
         run: |
@@ -51,5 +56,9 @@ jobs:
             tests/kr/test_kr_pb1_kis_observer_budget.py \
             tests/kr/test_kr_pb1_minute_incident_replay.py \
             tests/kr/test_kr_pb1_minute_egw_final_retry.py \
+            tests/kr/test_kr_pb1_current_only_original_balance_proof.py \
+            tests/kr/test_kr_balance_freshness_provenance_20261106.py \
+            tests/kr/test_kr_20261116_integrated_recovery.py \
+            tests/kr/test_kr_runtime_integrity_p0_20260922.py \
             tests/kr/test_kr_20261029_price_aware_opening.py \
             tests/kr/test_kr_20261110_timing_activation_cjenm.py
