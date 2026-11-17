@@ -1247,6 +1247,8 @@ def prepare_exit_position_snapshots(
             _snapshot_start_mono = time.monotonic()
             _quote_elapsed_ms = 0.0
             _state_elapsed_ms = 0.0
+            _risk_elapsed_ms = 0.0
+            _hwm_elapsed_ms = 0.0
             pos = dict(original_pos or {})
 
             def _observe_snapshot_outcome(outcome: str, reason: str = "") -> None:
@@ -1254,11 +1256,11 @@ def prepare_exit_position_snapshots(
                 try:
                     logger.info(
                         "[US_EXIT][SNAPSHOT_OUTCOME] symbol=%s owner=%s lifecycle=%s "
-                        "outcome=%s reason=%s total_ms=%.2f quote_ms=%.2f state_ms=%.2f",
+                        "outcome=%s reason=%s total_ms=%.2f quote_ms=%.2f state_ms=%.2f risk_ms=%.2f hwm_ms=%.2f",
                         symbol, pos.get("strategy_owner") or pos.get("owner") or "",
                         pos.get("position_lifecycle_id") or "",
                         outcome, reason, (time.monotonic() - _snapshot_start_mono) * 1000.0,
-                        _quote_elapsed_ms, _state_elapsed_ms,
+                        _quote_elapsed_ms, _state_elapsed_ms, _risk_elapsed_ms, _hwm_elapsed_ms,
                     )
                 except Exception:
                     pass
@@ -1347,6 +1349,7 @@ def prepare_exit_position_snapshots(
             _state_started_mono = time.monotonic()
             entry_price_for_state = _resolve_position_entry_price(pos)
             if entry_price_for_state > 0 and current_price > 0:
+                _risk_start_mono = time.monotonic()
                 try:
                     from trader.us.db.repos import update_us_soft_stop_risk_state
                     from trader.us.entry_exit_contract import (
@@ -1399,8 +1402,11 @@ def prepare_exit_position_snapshots(
                         pos["first_soft_stop_price"] = soft_exec.get("first_soft_stop_price")
                 except Exception as exc:
                     logger.warning("[US_RISK_STATE][UPDATE_WARN] symbol=%s err=%s", symbol, exc)
+                finally:
+                    _risk_elapsed_ms = (time.monotonic() - _risk_start_mono) * 1000.0
 
             if entry_price_for_state > 0 and current_price > 0:
+                _hwm_start_mono = time.monotonic()
                 try:
                     from trader.us.position_lifecycle_state import update_us_position_high_watermark
                     lifecycle_id = pos.get("position_lifecycle_id") or ((pos.get("risk_state") or {}).get("state") or {}).get("lifecycle", {}).get("lifecycle_id")
@@ -1420,6 +1426,8 @@ def prepare_exit_position_snapshots(
                         pos["position_lifecycle_id"] = high_state.get("lifecycle_id")
                 except Exception as exc:
                     logger.warning("[US_POSITION][HIGH_WATERMARK][UPDATE_WARN] symbol=%s err=%s", symbol, exc)
+                finally:
+                    _hwm_elapsed_ms = (time.monotonic() - _hwm_start_mono) * 1000.0
             if entry_price_for_state > 0:
                 pos["resolved_pnl_pct"] = (current_price - entry_price_for_state) / entry_price_for_state
             pos["resolved_current_price"] = current_price
