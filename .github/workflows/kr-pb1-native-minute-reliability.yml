@@ -12,6 +12,7 @@ on:
       - "trader/kr/broker_truth_hardening.py"
       - "trader/reconcile_kis.py"
       - "tests/kr/test_kr_pb1_current_only_original_balance_proof.py"
+      - "tests/kr/test_kr_pb1_kis_http_audit.py"
       - "scripts/kr_opening_observer.py"
       - "scripts/wsl/kr-entry-timing-activation.sh"
       - "tests/kr/test_kr_pb1_minute_*.py"
@@ -57,6 +58,7 @@ jobs:
             tests/kr/test_kr_pb1_minute_incident_replay.py \
             tests/kr/test_kr_pb1_minute_egw_final_retry.py \
             tests/kr/test_kr_pb1_current_only_original_balance_proof.py \
+            tests/kr/test_kr_pb1_kis_http_audit.py \
             tests/kr/test_kr_balance_freshness_provenance_20261106.py \
             tests/kr/test_kr_20261116_integrated_recovery.py \
             tests/kr/test_kr_runtime_integrity_p0_20260922.py \
