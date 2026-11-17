@@ -334,12 +334,21 @@ def save_opening_proof(*, env: str, account_scope: str, code: str,
     # pass. clean_completed_bars alone uses the last row for each minute.
     seen_this_pass: dict[str, dict] = {}
     intra_pass_conflicts: set[str] = set()
+    # These IDs are generated at the successful authenticated KIS HTTP
+    # response boundary, not from OHLCV contents or by this persistence layer.
+    # The same cached/native-format response cannot advance a quarantine
+    # multiple times, even across process restarts or spaced calls.
+    http_observation_ids: dict[str, set[str]] = {}
     for raw in raw_bars:
         for one in clean_completed_bars([raw], now):
             key = one["timestamp"]
             if key in seen_this_pass and seen_this_pass[key] != one:
                 intra_pass_conflicts.add(key)
             seen_this_pass[key] = one
+            response_id = raw.get("_kis_http_observation_id")
+            if (isinstance(response_id, str) and len(response_id) == 32
+                    and all(char in "0123456789abcdef" for char in response_id)):
+                http_observation_ids.setdefault(key, set()).add(response_id)
 
     path = _evidence_file(env, account_scope, code, now)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -377,19 +386,30 @@ def save_opening_proof(*, env: str, account_scope: str, code: str,
                         pass
                     separated = (last_stamp is None or
                                  (now - last_stamp).total_seconds() >= 60)
-                    count = int(prev.get("stable_native_reads") or 0) if identical else 0
+                    # Pre-upgrade counters with no authenticated HTTP receipt
+                    # are not independent proof and must be revalidated.
+                    counted_ids = list(prev.get("counted_http_observation_ids") or []) if identical else []
+                    distinct_ids = sorted(
+                        candidate_id for candidate_id in http_observation_ids.get(key, set())
+                        if candidate_id not in counted_ids
+                    )
                     first_at = str(prev.get("first_candidate_seen") or "") if identical else now.isoformat()
-                    if separated and key not in intra_pass_conflicts:
-                        count += 1
+                    if separated and key not in intra_pass_conflicts and distinct_ids:
+                        # At most one confirmation per store pass, and only
+                        # one confirmed ID for each separate KIS HTTP response.
+                        counted_ids.append(distinct_ids[0])
                         last_counted = now.isoformat()
                     else:
                         last_counted = str(prev.get("last_counted_at") or "") if identical else ""
+                    count = len(counted_ids)
                     observations[key] = {
                         "original": prev.get("original") or current or bar,
                         "candidate": bar, "first_candidate_seen": first_at,
                         "last_observed_at": now.isoformat(),
                         "last_counted_at": last_counted,
                         "stable_native_reads": count,
+                        "counted_http_observation_ids": counted_ids,
+                        "unverified_native_replay": not bool(distinct_ids),
                         "source": "KIS_FHKST03010200",
                         "intra_pass_conflict": key in intra_pass_conflicts,
                     }
@@ -403,6 +423,7 @@ def save_opening_proof(*, env: str, account_scope: str, code: str,
                             "minute": key, "original": observations[key]["original"],
                             "accepted": bar, "confirmed_native_reads": count,
                             "first_seen": first_at, "resolved_at": now.isoformat(),
+                            "distinct_http_responses": len(counted_ids),
                             "resolution": "THREE_SPACED_KIS_NATIVE_CONFIRMATIONS",
                         })
                         merged[key] = bar
