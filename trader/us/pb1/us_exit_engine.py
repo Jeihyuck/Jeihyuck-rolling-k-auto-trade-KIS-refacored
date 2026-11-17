@@ -1281,6 +1281,7 @@ def prepare_exit_position_snapshots(
                 )
                 exchange = "NASDAQ"
             _quote_started_mono = time.monotonic()
+            price_data = None  # isolate each symbol's quote evidence
             try:
                 if hasattr(provider, "get_current_price"):
                     price_data = (
@@ -1328,7 +1329,7 @@ def prepare_exit_position_snapshots(
             # Preserve the quote actually used for the exit decision. The
             # source timestamp may be absent; never substitute tick-start
             # time as if it were broker quote provenance.
-            if isinstance(locals().get("price_data"), dict):
+            if isinstance(price_data, dict):
                 _quoted = price_data
                 pos["resolved_quote_source"] = str(
                     _quoted.get("_quote_source") or _quoted.get("source") or "UNKNOWN"
