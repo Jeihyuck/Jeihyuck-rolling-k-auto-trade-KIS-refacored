@@ -6856,9 +6856,22 @@ def run_once(
                         elif kis is not None:
                             logger.info("[KR_BALANCE][PRECHECK_STALE] age_sec=%.1f action=FORCE_FRESH_BROKER_BALANCE", age_sec)
                             fresh = kis.get_balance_cached(force=True)
-                            if not isinstance(fresh, dict) or not isinstance(fresh.get("output1"), list) or not fresh.get("output2"):
+                            if (not isinstance(fresh, dict)
+                                    or not isinstance(fresh.get("output1"), list)
+                                    or not fresh.get("output2")
+                                    or fresh.get("rt_cd") not in (None, "0", 0)):
                                 raise RuntimeError("KR_BALANCE_FRESH_RESPONSE_INCOMPLETE")
-                            balance_snapshot_raw = {**fresh, "_kr_verified_fresh_at_kst": now_kst().isoformat()}
+                            # Do not stamp this runner's wall clock. Rebuild
+                            # trust exclusively from the original successful
+                            # KIS wrapper HTTP balance-fetch timestamp.
+                            fresh_at = getattr(kis, "_balance_cache_at", None)
+                            if (not isinstance(fresh_at, datetime)
+                                    or fresh_at.tzinfo is None
+                                    or not 0 <= (now_kst() - fresh_at).total_seconds() <= 20):
+                                raise RuntimeError("KR_BALANCE_ORIGINAL_FETCH_TIME_UNVERIFIED")
+                            balance_snapshot_raw = dict(fresh)
+                            balance_snapshot_raw.pop("_kr_verified_fresh_at_kst", None)
+                            balance_snapshot_raw["_kr_verified_fresh_at_kst"] = fresh_at.isoformat()
                             balance_source = "KIS_FORCE_REFRESH_STALE_PRECHECK"
                             balance_state = BALANCE_STATE_OK
                     except Exception as _balance_refresh_exc:
