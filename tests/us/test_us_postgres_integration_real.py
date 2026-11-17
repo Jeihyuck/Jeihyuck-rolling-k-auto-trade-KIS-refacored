@@ -4631,6 +4631,26 @@ def test_v3_atomic_pre_http_tp_stage_and_intent_under_same_pg_commit(
     assert intent_status == "PENDING"
     assert stage_status == "PENDING"
 
+    # Silent no-op is equally unsafe: absence of an exception is not proof
+    # the stage left PENDING. The canonical release MUST detect it and roll
+    # the already-updated intent back in the same DB transaction.
+    monkeypatch.setattr(repos, "mark_us_profit_capture_stage",
+                        lambda *args, **kwargs: None)
+    with pytest.raises(
+        RuntimeError, match="US_TP_PRE_IO_ATOMIC_POSTCONDITION_UNVERIFIED_ROLLBACK"
+    ):
+        attempt(safe_key, safe_cycle)
+    monkeypatch.setattr(repos, "mark_us_profit_capture_stage", original)
+    with pg_engine.connect() as conn:
+        after_noop = conn.execute(text(
+            "SELECT status FROM us_order_intents WHERE client_order_key=:key"
+        ), {"key": safe_key}).scalar_one()
+        after_stage_noop = conn.execute(text(
+            "SELECT stage_status FROM us_profit_capture_lifecycle "
+            "WHERE client_order_key=:key"
+        ), {"key": safe_key}).scalar_one()
+    assert (after_noop, after_stage_noop) == ("PENDING", "PENDING")
+
     # A distinct economic lifecycle per case means one rejected symbol does
     # not corrupt another stage. All unsafe attempts remain PENDING in both
     # ledgers and are never silently rearmed.
