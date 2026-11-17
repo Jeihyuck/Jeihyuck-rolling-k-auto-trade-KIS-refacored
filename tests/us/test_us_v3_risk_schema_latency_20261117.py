@@ -74,3 +74,48 @@ def test_schema_connection_without_info_preserves_legacy_behavior(monkeypatch):
     repos._ensure_us_position_risk_state_table(conn)
     repos._ensure_us_position_risk_state_table(conn)
     assert conn.calls == 2
+
+
+@pytest.mark.parametrize("pnl", [-0.04, 0.01])
+def test_armed_us_stop_state_save_failure_fences_confirmation(monkeypatch, pnl):
+    from datetime import datetime, timezone
+
+    monkeypatch.setenv("WSL_RUN_MARKET", "US")
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("US_ORDER_ARMED", "1")
+    monkeypatch.setattr(repos, "load_us_position_risk_state", lambda *args: {})
+    durable = []
+    def unavailable(*args, **kwargs):
+        durable.append(kwargs.get("require_durable"))
+        return False
+    monkeypatch.setattr(repos, "save_us_position_risk_state", unavailable)
+
+    with pytest.raises(RuntimeError, match="US_SOFT_STOP_DURABLE_STATE_WRITE_FAILED"):
+        repos.update_us_soft_stop_risk_state(
+            symbol="ANY_US_SYMBOL", trade_date="2026-11-16",
+            pnl_pct=pnl, current_price=96.0 if pnl < 0 else 101.0,
+            now=datetime(2026, 11, 16, 16, 30, tzinfo=timezone.utc),
+            soft_stop_pct=0.03,
+        )
+    assert durable == [True]
+
+
+def test_offline_stop_state_replay_preserves_memory_mode(monkeypatch):
+    from datetime import datetime, timezone
+    monkeypatch.setenv("WSL_RUN_MARKET", "US")
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("US_ORDER_ARMED", "0")
+    monkeypatch.setattr(repos, "load_us_position_risk_state", lambda *args: {})
+    seen = []
+    monkeypatch.setattr(
+        repos, "save_us_position_risk_state",
+        lambda *args, **kwargs: (seen.append(kwargs) or False)
+    )
+    result = repos.update_us_soft_stop_risk_state(
+        symbol="ANY_US_SYMBOL", trade_date="2026-11-16",
+        pnl_pct=-0.04, current_price=96.0,
+        now=datetime(2026, 11, 16, 16, 30, tzinfo=timezone.utc),
+        soft_stop_pct=0.03,
+    )
+    assert result["soft_stop_breach_count"] == 1
+    assert seen == [{"require_durable": False}]
