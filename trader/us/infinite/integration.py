@@ -29,38 +29,19 @@ logger = logging.getLogger(__name__)
 
 
 def _tqqq_evidence_code_sha() -> str:
-    """Read the exact pinned SHA or a bounded local Git HEAD; never invent it.
+    """Require a verified execution pin, not an arbitrary local Git HEAD.
 
-    This is audit metadata, not a permission gate and never performs network I/O.
+    The US session runner validates actual HEAD against the pinned PREP
+    revision before exporting US_PINNED_CODE_SHA to the Tick child. A direct
+    Tick without this proof stays visibly AUDIT_UNVERIFIED. GitHub Actions
+    SHA is accepted only inside a GitHub Actions checkout.
     """
     import re
-    for key in ("US_PINNED_CODE_SHA", "GITHUB_SHA"):
-        value = str(os.getenv(key) or "").strip()
-        if re.fullmatch(r"[0-9a-fA-F]{40}", value):
-            return value
-    return _tqqq_local_git_head()
 
-
-from functools import lru_cache
-
-
-@lru_cache(maxsize=1)
-def _tqqq_local_git_head() -> str:
-    import re
-    import subprocess
-    from pathlib import Path
-    try:
-        root = Path(__file__).resolve().parents[3]
-        result = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=0.3, check=False,
-        )
-        sha = str(result.stdout or "").strip()
-        return sha if result.returncode == 0 and re.fullmatch(
-            r"[0-9a-fA-F]{40}", sha
-        ) else ""
-    except (OSError, ValueError, subprocess.TimeoutExpired):
-        return ""
+    verified = str(os.getenv("US_PINNED_CODE_SHA") or "").strip()
+    if not verified and os.getenv("GITHUB_ACTIONS") == "true":
+        verified = str(os.getenv("GITHUB_SHA") or "").strip()
+    return verified.lower() if re.fullmatch(r"[0-9a-fA-F]{40}", verified) else ""
 
 
 _TQQQ_TTL_TERMINAL_STATUSES = {"CANCELLED", "REJECTED", "EXPIRED", "FILLED"}
