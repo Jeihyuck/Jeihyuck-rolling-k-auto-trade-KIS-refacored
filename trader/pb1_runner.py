@@ -212,6 +212,34 @@ def _normalize_warning_counts(raw: dict[str, Any] | None) -> dict[str, int]:
     return counts
 
 
+def _accumulate_kr_tick_skip_observations(
+    session_metrics: dict[str, int], tick_metrics: dict[str, Any]
+) -> None:
+    """Separate per-order skip counts from engine terminal skip *events*.
+
+    The legacy per-tick metrics may omit `skipped` even when the engine
+    logged FINAL_SKIP. FINAL_SKIP does not prove any particular number of
+    broker orders were skipped, so never manufacture an order count from it.
+    """
+    if "skipped" in tick_metrics or "skipped_count" in tick_metrics:
+        raw_count = tick_metrics.get("skipped", tick_metrics.get("skipped_count"))
+        session_metrics["skipped"] = int(session_metrics.get("skipped", 0)) + max(
+            0, int(raw_count or 0)
+        )
+        session_metrics["skipped_order_observed_ticks"] = int(
+            session_metrics.get("skipped_order_observed_ticks", 0)
+        ) + 1
+    else:
+        session_metrics["skipped_order_unobserved_ticks"] = int(
+            session_metrics.get("skipped_order_unobserved_ticks", 0)
+        ) + 1
+    event = str(tick_metrics.get("terminal_event") or "").strip().upper()
+    if event == "FINAL_SKIP":
+        session_metrics["terminal_final_skip_ticks"] = int(
+            session_metrics.get("terminal_final_skip_ticks", 0)
+        ) + 1
+
+
 def _count_kr_tick_attempt(session_metrics: dict[str, int]) -> None:
     """Count a tick at entry, not only after run_once returns successfully.
 
@@ -8569,6 +8597,13 @@ def run_once(
         "order_candidates": int((getattr(engine_runner, "_run_summary_payload", {}) or {}).get("order_candidates", 0)),
         "api_submitted": int((getattr(engine_runner, "_run_summary_payload", {}) or {}).get("api_submitted", (getattr(engine_runner, "_run_summary_payload", {}) or {}).get("submitted", 0))),
         "degraded": bool(getattr(result, "status", "") == "DEGRADED_POSTPROCESS"),
+        # A terminal tick skip is NOT the number of skipped *order intents*.
+        # Carry both evidence types separately; absent order-skip count is
+        # unknown, not a verified zero.
+        "terminal_event": str(
+            (getattr(engine_runner, "_run_summary_payload", {}) or {}).get("terminal_event")
+            or ""
+        ),
         "warning_counts": _normalize_warning_counts(getattr(result, "warning_counts", None)),
         "terminal_state": getattr(result, "terminal_state", None),
     }
@@ -8898,6 +8933,9 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             "partial_filled_confirmed": 0,
             "rejected": 0,
             "skipped": 0,
+            "skipped_order_observed_ticks": 0,
+            "skipped_order_unobserved_ticks": 0,
+            "terminal_final_skip_ticks": 0,
         }
         # A loop owns no PB1Engine instance: every tick creates and finalizes one
         # inside run_once. Preserve only its returned summary for session markers.
@@ -9068,7 +9106,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 # reconciled ``filled`` counter below.
                 session_metrics["accepted"] += int(last_tick_metrics.get("accepted", tick_buy_ack) or 0)
                 session_metrics["rejected"] += int(last_tick_metrics.get("rejected", 0) or 0)
-                session_metrics["skipped"] += int(last_tick_metrics.get("skipped", last_tick_metrics.get("skipped_count", 0)) or 0)
+                _accumulate_kr_tick_skip_observations(session_metrics, last_tick_metrics)
                 session_metrics["filled_confirmed"] += int(last_tick_metrics.get("filled", 0) or 0)
                 logger.info(
                     "[PB1][TICK][DONE] kind=%s now=%s result_status=%s",
@@ -9456,6 +9494,13 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             "filled_confirmed": int(session_metrics.get("filled_confirmed", 0) or 0),
             "rejected": int(session_metrics.get("rejected", 0) or 0),
             "skipped": int(session_metrics.get("skipped", 0) or 0),
+            "skipped_order_observed_ticks": int(session_metrics.get("skipped_order_observed_ticks", 0)),
+            "skipped_order_unobserved_ticks": int(session_metrics.get("skipped_order_unobserved_ticks", 0)),
+            "terminal_final_skip_ticks": int(session_metrics.get("terminal_final_skip_ticks", 0)),
+            "skipped_order_count_complete": (
+                int(session_metrics.get("skipped_order_unobserved_ticks", 0)) == 0
+                and int(session_metrics.get("ticks_completed", 0)) > 0
+            ),
         }, engine=engine, env=ctx.env, start_at=session_started_at, end_at=_get_now_kst())
     finally:
         _finish_session_guard(
