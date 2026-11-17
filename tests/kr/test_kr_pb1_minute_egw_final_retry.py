@@ -59,3 +59,36 @@ def test_single_request_observer_egw002_fails_closed_without_final_backoff(monke
     # KIS returned an explicit rate-limit denial; never classify it as BUY
     # consent or generate extra HTTP from the low-priority observer.
     assert api.session.request.call_count == 1
+
+
+def test_successful_native_http_receipts_are_unique_across_read_calls():
+    """Two authenticated native-format GETs cannot accidentally share identity."""
+    body = {
+        "rt_cd": "0", "output2": [{
+            "stck_bsop_date": "20261117",
+            "stck_cntg_hour": "092600", "stck_prpr": "10010",
+            "cntg_vol": "120", "stck_oprc": "10000",
+            "stck_hgpr": "10020", "stck_lwpr": "9990",
+        }],
+    }
+    resp = SimpleNamespace(
+        status_code=200, json=lambda: body,
+        raise_for_status=lambda: None,
+    )
+    api = object.__new__(kw.KisAPI)
+    api.env = "practice"
+    api._limiter = SimpleNamespace(wait=lambda *a, **kw: None)
+    api._headers = lambda tr: {}
+    calls = []
+    def fake_request(*args, **kwargs):
+        calls.append((args, kwargs))
+        return resp
+    api._safe_request = fake_request
+    first = api.get_intraday_candles_today("012750", start_hhmm="092700", attempts=1)
+    second = api.get_intraday_candles_today("012750", start_hhmm="092700", attempts=1)
+    assert len(calls) == 2
+    assert len(first) == len(second) == 1
+    identity1 = first[0]["_kis_http_observation_id"]
+    identity2 = second[0]["_kis_http_observation_id"]
+    assert len(identity1) == len(identity2) == 32
+    assert identity1 != identity2
