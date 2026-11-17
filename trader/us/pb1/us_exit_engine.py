@@ -1325,6 +1325,20 @@ def prepare_exit_position_snapshots(
                 _observe_snapshot_outcome("SKIP", "quote_exception")
                 continue
             _quote_elapsed_ms = (time.monotonic() - _quote_started_mono) * 1000.0
+            # Preserve the quote actually used for the exit decision. The
+            # source timestamp may be absent; never substitute tick-start
+            # time as if it were broker quote provenance.
+            if isinstance(locals().get("price_data"), dict):
+                _quoted = price_data
+                pos["resolved_quote_source"] = str(
+                    _quoted.get("_quote_source") or _quoted.get("source") or "UNKNOWN"
+                )
+                pos["resolved_quote_asof"] = (
+                    _quoted.get("_quote_asof_epoch")
+                    or _quoted.get("asof_epoch")
+                    or _quoted.get("asof")
+                )
+                pos["resolved_quote_received_at"] = datetime.now(timezone.utc).isoformat()
             if current_price <= 0:
                 logger.debug("[US_EXIT][SKIP] symbol=%s reason=price_nonpositive price=%.4f", symbol, current_price)
                 _observe_snapshot_outcome("SKIP", "price_nonpositive")
@@ -1425,6 +1439,9 @@ def prepare_exit_position_snapshots(
                     "resolved_current_price": current_price,
                     "current_price_usd": current_price,
                     "current_price": current_price,
+                    "resolved_quote_source": pos.get("resolved_quote_source"),
+                    "resolved_quote_asof": pos.get("resolved_quote_asof"),
+                    "resolved_quote_received_at": pos.get("resolved_quote_received_at"),
                 })
             _state_elapsed_ms = (time.monotonic() - _state_started_mono) * 1000.0
             _observe_snapshot_outcome("READY")
