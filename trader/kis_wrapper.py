@@ -16,6 +16,7 @@ import json
 import time
 import random
 import logging
+import hashlib
 import math
 import threading
 import uuid
@@ -1815,13 +1816,59 @@ class KisAPI:
                         "action=CONTINUE_ORIGINAL_BROKER_REQUEST",
                         type(_latency_exc).__name__,
                     )
-                resp = self.session.request(
-                    method,
-                    url,
-                    timeout=request_timeout,
-                    **kwargs,
+                # One source event per *actual* HTTP attempt. The receipt
+                # identifier is created only at the network boundary, never
+                # when an OHLCV response is replayed from memory or disk.
+                native_request_id = uuid.uuid4().hex
+                native_audit = (
+                    str(self.env or "").lower() == "practice"
+                    and os.getenv("KR_KIS_NATIVE_HTTP_AUDIT", "1") == "1"
                 )
+                audit_scope = (
+                    hashlib.sha256(
+                        f"{self.env}:{self.CANO}:{self.ACNT_PRDT_CD}".encode("utf-8")
+                    ).hexdigest()[:12] if native_audit else ""
+                )
+                if native_audit:
+                    logger.info(
+                        "[KR_KIS_HTTP][ATTEMPT] rid=%s pid=%s scope=%s "
+                        "method=%s endpoint=%s category=%s observer=%s",
+                        native_request_id, os.getpid(), audit_scope,
+                        method.upper(), endpoint_name, endpoint_category,
+                        int(bool(is_kr_observer)),
+                    )
+                try:
+                    resp = self.session.request(
+                        method,
+                        url,
+                        timeout=request_timeout,
+                        **kwargs,
+                    )
+                except Exception as native_exc:
+                    if native_audit:
+                        logger.warning(
+                            "[KR_KIS_HTTP][NETWORK_ERROR] rid=%s endpoint=%s "
+                            "type=%s elapsed_sec=%.3f",
+                            native_request_id, endpoint_name,
+                            type(native_exc).__name__,
+                            max(0.0, time.monotonic() - start_ts),
+                        )
+                    raise
+                # This attribute is data provenance only, not broker ACK or
+                # entry authorization. If attachment fails, native conflict
+                # confirmations will remain UNKNOWN/fail-closed.
+                try:
+                    setattr(resp, "_nullim_http_request_id", native_request_id)
+                except (AttributeError, TypeError):
+                    pass
                 status = resp.status_code
+                if native_audit:
+                    logger.info(
+                        "[KR_KIS_HTTP][RESPONSE] rid=%s endpoint=%s "
+                        "status=%s elapsed_sec=%.3f",
+                        native_request_id, endpoint_name, status,
+                        max(0.0, time.monotonic() - start_ts),
+                    )
                 elapsed_ms = (time.monotonic() - start_ts) * 1000
                 params = kwargs.get("params", {}) or {}
                 json_data = kwargs.get("json", {}) or {}
@@ -1912,6 +1959,14 @@ class KisAPI:
                     msg_cd = str(body.get("msg_cd") or "").strip()
                     msg_text = str(body.get("msg1") or "").lower()
                     rt_cd = str(body.get("rt_cd") or "").strip()
+                    if native_audit:
+                        logger.info(
+                            "[KR_KIS_HTTP][BROKER_RESULT] rid=%s endpoint=%s "
+                            "http=%s rt_cd=%s msg_cd=%s egw002=%s",
+                            native_request_id, endpoint_name, status,
+                            rt_cd or "UNKNOWN", msg_cd or "NONE",
+                            int(_is_egw002_error(body, msg_cd)),
+                        )
                     
                     # ✅ EGW002 (초당 거래건수 초과) 전용 처리: exponential backoff + circuit breaker
                     if _is_egw002_error(body, msg_cd):
@@ -3756,7 +3811,15 @@ class KisAPI:
                     # It permits conflict recovery to require three DISTINCT
                     # network observations rather than three reuses of one
                     # in-memory/native-format response.
-                    native_http_observation_id = uuid.uuid4().hex
+                    native_http_observation_id = str(
+                        getattr(resp, "_nullim_http_request_id", "") or ""
+                    )
+                    if not native_http_observation_id:
+                        logger.warning(
+                            "[KR][NATIVE_MINUTE][HTTP_SOURCE_UNVERIFIED] code=%s "
+                            "action=DO_NOT_COUNT_AS_INDEPENDENT_CONFLICT_CONFIRMATION",
+                            iscd,
+                        )
                     rows: List[Dict[str, Any]] = []
                     for r in arr:
                         try:
