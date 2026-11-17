@@ -1005,7 +1005,7 @@ def resolve_profit_capture_stage_quantity(
     return min(runner_capacity, stage_qty)
 
 
-def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_sell_symbols: set[str] | None = None, now=None, trade_date: str | None = None, profit_capture_state: dict[str, dict] | None = None, *, defer_pending_until_claim: bool = False) -> list[dict]:
+def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_sell_symbols: set[str] | None = None, now=None, trade_date: str | None = None, profit_capture_state: dict[str, dict] | None = None, *, defer_pending_until_claim: bool = False, decision_clock_real_time: bool = False) -> list[dict]:
     from decimal import Decimal
     from trader.us.profit_capture import authoritative_broker_avg, as_decimal, calc_return_rate
     from trader.us.strategy_ownership import exclude_non_standard
@@ -1125,7 +1125,10 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
             continue
         try:
             executable = as_decimal(price, name="executable_price")
-            broker_avg, avg_provenance = authoritative_broker_avg(p, now=now)
+            # Live broker-average freshness must be checked against the current
+            # wall clock, not the (possibly old) Tick-start market clock.
+            broker_avg_eval_at = datetime.now(timezone.utc) if decision_clock_real_time else now
+            broker_avg, avg_provenance = authoritative_broker_avg(p, now=broker_avg_eval_at)
             return_rate = calc_return_rate(executable, broker_avg)
         except ValueError as exc:
             logger.warning("[US_PROFIT_CAPTURE][DECISION] symbol=%s decision=BLOCK reason=%s", sym, exc)
@@ -1251,7 +1254,19 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
                         from uuid import uuid4
                         native_tp_attempt_id = str(uuid4())
                         order_key = f"{order_key}_A{native_tp_attempt_id.replace('-', '')[:16]}"
-                    pending_intent = ({"symbol": sym, "side": "SELL", "strategy_owner": "US_STANDARD", "qty": qty, "quantity": qty, "limit_price": price, "notional_usd": qty * price, "reason": reason, "client_order_key": order_key, "position_lifecycle_id": lifecycle, **({"partial_exit_allowed": contract_partial_exit_allowed} if contract_sha is not None else {}), "meta": {"reason": reason, "profit_capture_stage": stage, "position_lifecycle_id": lifecycle, "broker_avg_price": str(broker_avg), **avg_provenance, "return_rate_at_decision": str(return_rate), "tp_threshold_fraction": str(threshold), "profit_capture_sell_fraction": str(sell_pct), "profit_capture_runner_min_remain_pct": str(local_runner_min), "profit_capture_stage_target_qty": stage_target_qty, "profit_capture_stage_filled_qty": stage_filled_qty, "profit_capture_decision_holding_qty": q, "runner_remaining_pct": (q - qty) / q, "market_state": overlay.get("market_state"), "last_profit_capture_at": (now or datetime.now(timezone.utc)).isoformat(), "source_entry_contract_sha256": contract_sha, "source_entry_contract_version": entry_contract.get("version") if contract_sha else None, "exit_rule_source": ("ENTRY_EXIT_CONTRACT_V3" if entry_contract.get("version") == "us_entry_exit_contract_v3" else "ENTRY_EXIT_CONTRACT_V2") if contract_sha else "LEGACY_GLOBAL_TP", "partial_exit_scope": "PROFIT_CAPTURE_STAGE" if contract_sha else "LEGACY_GLOBAL_TP", **({"partial_exit_allowed": contract_partial_exit_allowed} if contract_partial_exit_allowed is not None else {})}})
+                    # Live TP decisions must use the time the signal is selected,
+                    # not the Tick-start `now` (which may be minutes old after
+                    # exit/market-state I/O). Replay/offline retains its injected
+                    # deterministic clock. A fresh timestamp NEVER substitutes
+                    # for the separate native KIS quote/threshold check.
+                    signal_decision_at = (
+                        datetime.now(timezone.utc) if decision_clock_real_time
+                        else (now or datetime.now(timezone.utc))
+                    ).isoformat()
+                    signal_quote_proof = p.get("exit_quote_evidence")
+                    if not isinstance(signal_quote_proof, dict):
+                        signal_quote_proof = {}
+                    pending_intent = ({"symbol": sym, "side": "SELL", "strategy_owner": "US_STANDARD", "qty": qty, "quantity": qty, "limit_price": price, "notional_usd": qty * price, "reason": reason, "client_order_key": order_key, "position_lifecycle_id": lifecycle, **({"partial_exit_allowed": contract_partial_exit_allowed} if contract_sha is not None else {}), "meta": {"reason": reason, "profit_capture_stage": stage, "position_lifecycle_id": lifecycle, "broker_avg_price": str(broker_avg), **avg_provenance, "return_rate_at_decision": str(return_rate), "tp_threshold_fraction": str(threshold), "profit_capture_sell_fraction": str(sell_pct), "profit_capture_runner_min_remain_pct": str(local_runner_min), "profit_capture_stage_target_qty": stage_target_qty, "profit_capture_stage_filled_qty": stage_filled_qty, "profit_capture_decision_holding_qty": q, "runner_remaining_pct": (q - qty) / q, "market_state": overlay.get("market_state"), "last_profit_capture_at": signal_decision_at, "decision_price": price, "decision_quote_evidence": {"price": price, "source": signal_quote_proof.get("source", "UNVERIFIED"), "asof": signal_quote_proof.get("asof"), "asof_epoch": signal_quote_proof.get("asof_epoch"), "received_at_utc": signal_quote_proof.get("received_at_utc"), "quality": signal_quote_proof.get("quality", "UNVERIFIED")}, "source_entry_contract_sha256": contract_sha, "source_entry_contract_version": entry_contract.get("version") if contract_sha else None, "exit_rule_source": ("ENTRY_EXIT_CONTRACT_V3" if entry_contract.get("version") == "us_entry_exit_contract_v3" else "ENTRY_EXIT_CONTRACT_V2") if contract_sha else "LEGACY_GLOBAL_TP", "partial_exit_scope": "PROFIT_CAPTURE_STAGE" if contract_sha else "LEGACY_GLOBAL_TP", **({"partial_exit_allowed": contract_partial_exit_allowed} if contract_partial_exit_allowed is not None else {})}})
                     # Preserve the already-resolved original BUY scope through
                     # the TP intent and durable order. Never pick one side of
                     # a conflicting top-level/metadata identity.

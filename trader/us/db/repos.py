@@ -3990,11 +3990,65 @@ def release_us_profit_capture_pre_http_abort(
                 or str((current.get("meta") or {}).get("last_status") or "") not in {"PENDING", "SUBMITTED"}
                 or (current.get(f"{stg}_broker_order_no") and not partial_stage)):
             return False
+        # This TP stage and its underlying order intent are one lifecycle.
+        # The old path marked the stage FAILED but left us_order_intents
+        # PENDING forever (Nov-16 PG): subsequent new attempts collided with
+        # that orphaned identity. Close BOTH inside this SAME transaction,
+        # only after exact durable journal/Attempt/Claim proof of no POST.
+        intent_row = conn.execute(text("""
+            SELECT status, meta
+              FROM us_order_intents
+             WHERE trade_date=:td AND client_order_key=:key
+               AND symbol=:sym AND side='SELL' AND trading_epoch_id=:epoch
+             FOR UPDATE
+        """), params).mappings().one_or_none()
+        if not intent_row:
+            logger.error("[US_TP][PRE_IO_INTENT_UNVERIFIED] symbol=%s stage=%s reason=missing_intent", sym, stg)
+            return False
+        intent_meta = _parse_json_meta(intent_row["meta"])
+        if (str(intent_meta.get("submit_attempt_id") or "") != attempt_id
+                or str(intent_row["status"] or "").upper() != "PENDING"):
+            logger.error("[US_TP][PRE_IO_INTENT_UNVERIFIED] symbol=%s stage=%s reason=intent_attempt_or_status_mismatch", sym, stg)
+            return False
+        marked = conn.execute(text("""
+            UPDATE us_order_intents
+               SET status='BLOCKED',
+                   meta=COALESCE(meta, '{}'::jsonb) || CAST(:patch AS jsonb)
+             WHERE trade_date=:td AND client_order_key=:key
+               AND symbol=:sym AND side='SELL'
+               AND trading_epoch_id=:epoch AND status='PENDING'
+        """), {**params, "patch": _json_param({
+            "pre_io_abort_attempt_id": attempt_id,
+            "pre_io_abort_stage": "BEFORE_KIS_HTTP",
+            "pre_io_abort_evidence": "BROKER_SUBMIT_ABORTED_PRE_IO",
+        })})
+        if marked.rowcount != 1:
+            raise RuntimeError("US_TP_PRE_IO_INTENT_ATOMIC_CLOSE_FAILED")
         mark_us_profit_capture_stage(
             trade_date, sym, stg, order_key=order_key,
             position_lifecycle_id=lifecycle, status="FAILED",
             evidence_type="BROKER_SUBMIT_ABORTED_PRE_IO", _conn=conn,
         )
+        # A no-op stage update must roll back the already closed intent.
+        verified = conn.execute(text("""
+            SELECT stage_status, state FROM us_profit_capture_lifecycle
+             WHERE trade_date=:td AND symbol=:sym AND stage=:stage
+               AND position_lifecycle_id=:lifecycle AND client_order_key=:key
+               AND trading_epoch_id=:epoch FOR UPDATE
+        """), params).mappings().one_or_none()
+        closed = conn.execute(text("""
+            SELECT status, meta FROM us_order_intents
+             WHERE trade_date=:td AND client_order_key=:key AND symbol=:sym
+               AND side='SELL' AND trading_epoch_id=:epoch FOR UPDATE
+        """), params).mappings().one_or_none()
+        stage_state = _parse_json_meta(verified.get("state")) if verified else {}
+        if (not verified or str(verified.get("stage_status") or "") != "NOT_TRIGGERED"
+                or not closed or str(closed.get("status") or "") != "BLOCKED"
+                or str(_parse_json_meta(closed.get("meta")).get(
+                    "pre_io_abort_attempt_id") or "") != attempt_id
+                or bool(stage_state.get(f"{stg}_pending"))
+                or bool(stage_state.get(f"{stg}_done"))):
+            raise RuntimeError("US_TP_PRE_IO_ATOMIC_POSTCONDITION_UNVERIFIED_ROLLBACK")
         return True
 
 

@@ -402,6 +402,7 @@ def test_pg_proven_same_attempt_pre_io_abort_releases_only_locked_tp(
     """Real migrated PG: journal + Claim release + exact TP row, no broker."""
     from datetime import date, datetime, timezone
     from uuid import uuid4
+    from sqlalchemy import text
     from trader.execution_claims import DurableExecutionClaimRepo
     from trader.execution_state import SemanticActionIdentity
     from trader.us.db.execution_claim_schema import (
@@ -455,10 +456,39 @@ def test_pg_proven_same_attempt_pre_io_abort_releases_only_locked_tp(
         "payload": {"strategy_owner": "US_STANDARD"},
         "idempotency_key": "pg-us353-proven-abort",
     })
+    # The stage must remain pending if the original intent is missing.
+    assert not repos.release_us_profit_capture_pre_http_abort(
+        trade_date=td, symbol="GILD", stage="tp1",
+        position_lifecycle_id=lifecycle, client_order_key=key,
+    )
+    with pg_engine.begin() as conn:
+        conn.execute(text("""INSERT INTO us_order_intents
+            (trade_date, client_order_key, symbol, exchange, side, qty,
+             status, trading_epoch_id, meta)
+            VALUES (:td, :key, 'GILD', 'NASDAQ', 'SELL', 5, 'PENDING',
+                    :epoch, jsonb_build_object('submit_attempt_id', :attempt))
+        """), {"td": td, "key": key, "epoch": epoch, "attempt": attempt_id})
+    # If the stage write silently fails, closing the intent must roll back.
+    with monkeypatch.context() as patcher:
+        patcher.setattr(repos, "mark_us_profit_capture_stage", lambda *a, **kw: None)
+        with pytest.raises(RuntimeError, match="ATOMIC_POSTCONDITION"):
+            repos.release_us_profit_capture_pre_http_abort(
+                trade_date=td, symbol="GILD", stage="tp1",
+                position_lifecycle_id=lifecycle, client_order_key=key,
+            )
+    with pg_engine.connect() as conn:
+        assert conn.execute(text("""SELECT status FROM us_order_intents
+            WHERE trade_date=:td AND client_order_key=:key
+        """), {"td": td, "key": key}).scalar_one() == "PENDING"
     assert repos.release_us_profit_capture_pre_http_abort(
         trade_date=td, symbol="GILD", stage="tp1",
         position_lifecycle_id=lifecycle, client_order_key=key,
     )
+    with pg_engine.connect() as conn:
+        status = conn.execute(text("""SELECT status FROM us_order_intents
+            WHERE trade_date=:td AND client_order_key=:key
+        """), {"td": td, "key": key}).scalar_one()
+    assert status == "BLOCKED"
     assert not repos.release_us_profit_capture_pre_http_abort(
         trade_date=td, symbol="GILD", stage="tp1",
         position_lifecycle_id=lifecycle, client_order_key=key,

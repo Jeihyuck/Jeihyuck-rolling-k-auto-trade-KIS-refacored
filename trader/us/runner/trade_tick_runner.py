@@ -44,6 +44,24 @@ def calculate_latency_accounting(total_ms: float, stage_metrics: dict[str, float
     return round(accounted, 3), round(total - accounted, 3)
 
 
+def is_us_global_postfilter_contract_unverified(overlay: dict | None) -> bool:
+    """Only a genuinely unverified account-wide risk state fences all BUYs.
+
+    Individual per-symbol metadata, trend, cluster or rotation denials have
+    already been removed by their respective filters and cannot suppress
+    independently verified survivors.
+    """
+    if not isinstance(overlay, dict):
+        return True
+    return bool(
+        str(overlay.get("intraday_market_overlay") or "").upper()
+            == "INTRADAY_DATA_UNKNOWN"
+        or overlay.get("intraday_overlay_available") is False
+        or overlay.get("intraday_error_reason")
+        or overlay.get("global_risk_integrity_failed") is True
+    )
+
+
 def is_recoverable_order_route_budget_error(exc: BaseException) -> bool:
     """Classify local/shared tick-budget exhaustion as recoverable routing deferral."""
     text = str(exc or "").lower()
@@ -3247,6 +3265,9 @@ def run_trade_tick(
             current_positions, market_state_overlay, existing_sell_symbols,
             now=now, trade_date=trade_date,
             defer_pending_until_claim=(real_order_mode and not offline),
+            # 'now' is the Tick-start market clock, not the live TP signal
+            # readiness time. Keep replay deterministic, live time exact.
+            decision_clock_real_time=(real_order_mode and not offline and not force_now),
         )
         if profit_capture_intents:
             exit_intents.extend(profit_capture_intents)
@@ -4299,14 +4320,31 @@ def run_trade_tick(
         postfilter_blocked_candidates.extend({**item, "block_stage": "postfilter_market_state"} for item in market_state_blocked_buys)
         postfilter_blocked_candidates.extend({**item, "block_stage": "postfilter_position_trend"} for item in trend_blocked_buys)
         if postfilter_blocked_candidates:
-            logger.error(
-                "[US_ENTRY][CANDIDATE_FILTER_INVARIANT_FAIL] blocked=%s",
-                postfilter_blocked_candidates,
-            )
-            entry_eval_error_count += 1
-            entry_degraded = True
-            entry_degraded_reason = "candidate_filter_invariant_fail"
-            entry_intents = []
+            # Per-symbol risk rejections are NOT evidence of a broken global
+            # market contract. The postfilter has already removed each denied
+            # candidate. Keep independently validated survivors; they must
+            # still pass the regular preflight/risk/broker gates below.
+            # Missing or contradictory account-wide market proof remains
+            # fail-closed for every US_STANDARD BUY.
+            _global_filter_unverified = is_us_global_postfilter_contract_unverified(market_state_overlay)
+            if _global_filter_unverified:
+                logger.error(
+                    "[US_ENTRY][CANDIDATE_FILTER_INVARIANT_FAIL] "
+                    "scope=GLOBAL_RISK_CONTRACT action=BLOCK_ALL_STANDARD_BUYS blocked=%s",
+                    postfilter_blocked_candidates,
+                )
+                entry_eval_error_count += 1
+                entry_degraded = True
+                entry_degraded_reason = "candidate_filter_invariant_fail"
+                entry_intents = []
+            else:
+                logger.info(
+                    "[US_ENTRY][POSTFILTER_CANDIDATE_BLOCKS] "
+                    "scope=PER_SYMBOL action=KEEP_VERIFIED_SURVIVORS blocked=%d kept=%d "
+                    "details=%s",
+                    len(postfilter_blocked_candidates), len(entry_intents),
+                    postfilter_blocked_candidates,
+                )
         logger.info("[US_ENTRY][MARKET_STATE_FILTER] kept=%d blocked=%d blocked_entries=%s", len(entry_intents), len(market_state_blocked_buys), market_state_blocked_buys)
     except Exception as _cluster_guard_filter_exc:
         # Never route unfiltered standard BUY intents after a market/risk
