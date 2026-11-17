@@ -4494,3 +4494,116 @@ def test_pg_authoritative_balance_survives_optional_lineage_query_exception(
     assert latest["meta"].get("lineage_identity_status") not in {
         "VERIFIED_CURRENT_EPOCH_CONTINUITY", "VERIFIED_ORIGINAL_KIS_BUY",
     }
+
+
+def test_v3_proven_unsent_tp_sell_intent_postgres_terminalization(pg_engine, monkeypatch):
+    """Prove a TP SELL PENDING intent only closes after exact pre-HTTP evidence.
+
+    Production code is exercised against real local PostgreSQL. No KIS POST.
+    """
+    import json
+    from sqlalchemy import text
+    from trader.us.db import repos
+
+    monkeypatch.setattr(repos, "_active_us_epoch",
+                        lambda conn, required=True: "v3-epoch")
+
+    def seed(label, *, broker_possible=False, active=False,
+             verified=True, order=False, owner="US_STANDARD",
+             action="tp3"):
+        key = "US_PC_v3_" + label
+        attempt = "v3-attempt-" + label
+        with pg_engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO us_execution_claims
+                    (action_key,env,account_id,market,trading_epoch_id,
+                     strategy_owner,lifecycle_id,action,target_qty,
+                     action_state,active_attempt_id,trade_date)
+                VALUES (:key,'practice','v3-practice-account','US',
+                        'v3-epoch',:owner,'v3-cycle-1',:action,2,
+                        :state,:active,'2026-11-09')
+            """), {"key": key, "owner": owner, "action": action,
+                   "state": "IN_FLIGHT" if active else "OPEN",
+                   "active": attempt if active else None})
+            conn.execute(text("""
+                INSERT INTO us_execution_attempts
+                    (attempt_id,action_key,attempt_no,requested_qty,
+                     client_order_key,attempt_state,authoritative)
+                VALUES (:attempt,:key,1,2,:key,'ABANDONED_PRE_SUBMIT',:verified)
+            """), {"attempt": attempt, "key": key, "verified": verified})
+            conn.execute(text("""
+                INSERT INTO us_order_intents
+                    (trade_date,client_order_key,symbol,exchange,side,qty,
+                     status,trading_epoch_id,meta)
+                VALUES ('2026-11-09',:key,'XYZ','NASDAQ','SELL',2,'PENDING',
+                        'v3-epoch',CAST(:meta AS jsonb))
+            """), {"key": key, "meta": json.dumps({
+                "submit_attempt_id": attempt, "strategy_owner": "US_STANDARD",
+                "position_lifecycle_id": "v3-cycle-1",
+                "profit_capture_stage": "tp3",
+            })})
+            for event in (
+                ("BROKER_SUBMIT_ABORTED_PRE_IO", "BROKER_ACK_RECEIVED")
+                if broker_possible else ("BROKER_SUBMIT_ABORTED_PRE_IO",)
+            ):
+                conn.execute(text("""
+                    INSERT INTO us_order_events
+                      (event_id,trade_date,event_type,event_timestamp,
+                       client_order_key,submit_attempt_id,symbol,side,
+                       requested_qty,idempotency_key,trading_epoch_id)
+                    VALUES (gen_random_uuid(),'2026-11-09',:event,now(),
+                            :key,:attempt,'XYZ','SELL',2,:idem,'v3-epoch')
+                """), {"event": event, "key": key, "attempt": attempt,
+                       "idem": key + ":" + event})
+            if order:
+                conn.execute(text("""
+                    INSERT INTO us_orders
+                      (trade_date,client_order_key,symbol,exchange,side,
+                       qty_requested,status,dry_run,trading_epoch_id)
+                    VALUES ('2026-11-09',:key,'XYZ','NASDAQ','SELL',2,
+                            'OPEN',false,'v3-epoch')
+                """), {"key": key})
+        return key, attempt
+
+    good, good_attempt = seed("safe")
+    unsafe = [
+        seed("ack", broker_possible=True),
+        seed("active", active=True),
+        seed("unverified", verified=False),
+        seed("open_order", order=True),
+        seed("foreign_owner", owner="TQQQ_INFINITE"),
+        seed("wrong_action", action="tp2"),
+    ]
+    assert repos.close_proven_unsent_us_sell_intent(
+        client_order_key=good, attempt_id=good_attempt,
+        trade_date="2026-11-09",
+        failure_code="US_TP_DECISION_EXPIRED_BEFORE_HTTP",
+    )
+    assert repos.close_proven_unsent_us_sell_intent(
+        client_order_key=good, attempt_id=good_attempt,
+        trade_date="2026-11-09",
+        failure_code="US_TP_DECISION_EXPIRED_BEFORE_HTTP",
+    )
+    assert not repos.close_proven_unsent_us_sell_intent(
+        client_order_key=good, attempt_id="forged",
+        trade_date="2026-11-09",
+        failure_code="US_TP_DECISION_EXPIRED_BEFORE_HTTP",
+    )
+    for key, attempt in unsafe:
+        assert not repos.close_proven_unsent_us_sell_intent(
+            client_order_key=key, attempt_id=attempt,
+            trade_date="2026-11-09",
+            failure_code="US_TP_DECISION_EXPIRED_BEFORE_HTTP",
+        ), key
+    with pg_engine.connect() as conn:
+        rows = dict(conn.execute(text("""
+            SELECT client_order_key, status
+            FROM us_order_intents WHERE client_order_key LIKE 'US_PC_v3_%'
+        """)).all())
+        meta = conn.execute(text("""
+            SELECT meta FROM us_order_intents WHERE client_order_key=:key
+        """), {"key": good}).scalar_one()
+    assert rows[good] == "BLOCKED"
+    assert all(rows[key] == "PENDING" for key, _ in unsafe)
+    assert meta["pre_io_abort_stage"] == "BEFORE_KIS_HTTP"
+    assert meta["pre_io_abort_attempt_id"] == good_attempt
