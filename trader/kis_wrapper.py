@@ -18,6 +18,7 @@ import random
 import logging
 import math
 import threading
+import uuid
 import copy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -3738,6 +3739,12 @@ class KisAPI:
 
                 arr = data.get("output2") or []
                 if resp.status_code == 200 and arr:
+                    # A fresh ID is minted only at this successful KIS HTTP
+                    # response boundary (never from cached candle contents).
+                    # It permits conflict recovery to require three DISTINCT
+                    # network observations rather than three reuses of one
+                    # in-memory/native-format response.
+                    native_http_observation_id = uuid.uuid4().hex
                     rows: List[Dict[str, Any]] = []
                     for r in arr:
                         try:
@@ -3749,6 +3756,7 @@ class KisAPI:
                                     "time": str(hhmmss),
                                     "price": float(price),
                                     "volume": float(vol),
+                                    "_kis_http_observation_id": native_http_observation_id,
                                 }
                                 # Preserve actual minute OHLCV when the native
                                 # KIS payload supplies them. Never synthesize
