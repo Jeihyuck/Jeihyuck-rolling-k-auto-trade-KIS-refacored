@@ -4029,6 +4029,26 @@ def release_us_profit_capture_pre_http_abort(
             position_lifecycle_id=lifecycle, status="FAILED",
             evidence_type="BROKER_SUBMIT_ABORTED_PRE_IO", _conn=conn,
         )
+        # A no-op stage update must roll back the already closed intent.
+        verified = conn.execute(text("""
+            SELECT stage_status, state FROM us_profit_capture_lifecycle
+             WHERE trade_date=:td AND symbol=:sym AND stage=:stage
+               AND position_lifecycle_id=:lifecycle AND client_order_key=:key
+               AND trading_epoch_id=:epoch FOR UPDATE
+        """), params).mappings().one_or_none()
+        closed = conn.execute(text("""
+            SELECT status, meta FROM us_order_intents
+             WHERE trade_date=:td AND client_order_key=:key AND symbol=:sym
+               AND side='SELL' AND trading_epoch_id=:epoch FOR UPDATE
+        """), params).mappings().one_or_none()
+        stage_state = _parse_json_meta(verified.get("state")) if verified else {}
+        if (not verified or str(verified.get("stage_status") or "") != "NOT_TRIGGERED"
+                or not closed or str(closed.get("status") or "") != "BLOCKED"
+                or str(_parse_json_meta(closed.get("meta")).get(
+                    "pre_io_abort_attempt_id") or "") != attempt_id
+                or bool(stage_state.get(f"{stg}_pending"))
+                or bool(stage_state.get(f"{stg}_done"))):
+            raise RuntimeError("US_TP_PRE_IO_ATOMIC_POSTCONDITION_UNVERIFIED_ROLLBACK")
         return True
 
 
