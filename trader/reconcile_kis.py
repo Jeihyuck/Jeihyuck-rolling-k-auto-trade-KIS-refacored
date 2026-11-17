@@ -3366,18 +3366,48 @@ def reconcile_kis(
     _kr_reconcile_started = time.monotonic()
     fresh_balance_proven = False
     try:
-        snapshot = balance_snapshot or kis.get_balance_cached(force=True)
+        # An injected cached balance without a trusted verified timestamp is
+        # never promoted to today's broker truth. Conversely, explicitly
+        # expose WHY all current-only ticks fail the provenance check; a
+        # boolean alone obscures missing KIS timestamps vs a true API outage.
+        snapshot = balance_snapshot if balance_snapshot is not None else kis.get_balance_cached(force=True)
         if not isinstance(snapshot, dict):
             raise RuntimeError("KR_BALANCE_SNAPSHOT_NOT_DICT")
+        native_status = snapshot.get("rt_cd")
+        broker_response_ok = native_status is None or str(native_status) == "0"
+        has_holdings = isinstance(snapshot.get("output1"), list)
+        has_summary = bool(snapshot.get("output2"))
+        proof_source = "INJECTED_TICK_SNAPSHOT" if balance_snapshot is not None else "FORCED_KIS_BALANCE"
+        age = None
         if balance_snapshot is None:
-            fresh_balance_proven = isinstance(snapshot.get("output1"), list) and bool(snapshot.get("output2"))
+            fresh_balance_proven = bool(broker_response_ok and has_holdings and has_summary)
+            proof_reason = "VERIFIED_FORCED_KIS" if fresh_balance_proven else "BROKER_BALANCE_RESPONSE_INVALID"
         else:
             try:
                 at = datetime.fromisoformat(str(snapshot.get("_kr_verified_fresh_at_kst") or ""))
-                age = (now_kst() - at).total_seconds()
-                fresh_balance_proven = bool(at.tzinfo and 0 <= age <= 20 and isinstance(snapshot.get("output1"), list))
-            except (TypeError, ValueError):
+                if at.tzinfo is None:
+                    proof_reason = "INJECTED_FRESH_TIMESTAMP_UNATTESTED"
+                else:
+                    age = (now_kst() - at).total_seconds()
+                    proof_reason = ("VERIFIED_INJECTED_FRESH"
+                                    if 0 <= age <= 20 and broker_response_ok and has_holdings
+                                    else "INJECTED_FRESHNESS_OR_RESPONSE_INVALID")
+                fresh_balance_proven = bool(
+                    at.tzinfo and age is not None and 0 <= age <= 20
+                    and broker_response_ok and has_holdings
+                )
+            except (TypeError, ValueError, OverflowError):
+                proof_reason = "INJECTED_FRESH_TIMESTAMP_MISSING_OR_INVALID"
                 fresh_balance_proven = False
+        logger.info(
+            "[KR_RECONCILE][CURRENT_ONLY_BALANCE_PROVENANCE] source=%s fresh=%s "
+            "reason=%s native_status_ok=%s holdings_type_valid=%s "
+            "summary_present=%s injected_age_sec=%s historical_recovery=%s",
+            proof_source, int(fresh_balance_proven), proof_reason,
+            int(broker_response_ok), int(has_holdings), int(has_summary),
+            round(age, 3) if age is not None else None,
+            int(bool(historical_recovery)),
+        )
         holdings_rows = snapshot.get("output1") or []
     except KisTemporaryError as exc:
         holdings_error = str(exc)
