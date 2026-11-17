@@ -282,7 +282,7 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
                             state,
                         )
                     try:
-                        cash = executor.orderable_cash(config.symbol, position.current_price)
+                        cash = executor.verified_add_orderable_cash(config.symbol, position.current_price)
                     except Exception as cash_exc:
                         logger.warning(
                             "[KR_INF][ADD_BUY_CASH][UNVERIFIED] "
