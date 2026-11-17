@@ -3610,7 +3610,7 @@ class KisAPI:
         except Exception:
             return candles
 
-    def get_intraday_candles_today(self, code: str, start_hhmm: str = "090000") -> List[Dict[str, Any]]:
+    def get_intraday_candles_today(self, code: str, start_hhmm: str = "090000", *, attempts: int = 3) -> List[Dict[str, Any]]:
         """KIS 주식당일분봉조회 (FHKST03010200 / inquire-time-itemchartprice)
         - FID_COND_MRKT_DIV_CODE: 'J'
         - FID_INPUT_ISCD: 6자리 종목코드('A' 제거)
@@ -3640,7 +3640,10 @@ class KisAPI:
                 "fid_etc_cls_code": "",
             }
 
-            for attempt in range(1, 4):
+            # The read-only priority observer may opt into one bounded
+            # attempt; all existing KIS callers keep the original default
+            # three-attempt contract.
+            for attempt in range(1, max(1, min(3, int(attempts))) + 1):
                 try:
                     resp = self._safe_request(
                         "GET", url, headers=headers, params=params, timeout=(3.0, 7.0)

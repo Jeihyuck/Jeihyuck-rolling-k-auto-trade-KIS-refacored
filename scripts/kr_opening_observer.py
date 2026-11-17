@@ -23,6 +23,7 @@ from trader.kr.opening_bar_contract import (
 )
 from trader.runtime_paths import repo_root
 from trader.time_utils import now_kst
+from trader.kr.entry_priority_queue import CandidateSchedule, collection_priorities
 
 logger = logging.getLogger(__name__)
 
@@ -222,15 +223,54 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
             # the opening anchor and the latest anchor; a fixed 09:00 query
             # alone cannot prove a post-09:30 rebound. Never fill gaps with
             # synthetic open/high/low/close or an inferred business date.
-            anchors = (
-                ("092900", observed_at.strftime("%H%M%S"))
-                if observed_at.time() >= dtime(9, 30)
-                else (observed_at.strftime("%H%M%S"),)
+            # Opening proof is durable.  Do not re-download the entire
+            # 09:00-09:29 interval on every minute-data refresh.  Only the
+            # genuine latest completed minute is needed in steady state.
+            stored = load_opening_proof(
+                env="practice", account_scope=scope, code=code, now=observed_at,
+                max_age_seconds=None,
             )
+            opening_coverage = (
+                inspect_completed_bar_coverage(rows=stored["bars"], now=observed_at)
+                if stored else {"opening_count": 0, "opening_valid_minutes": []}
+            )
+            valid_opening = opening_coverage.get("opening_valid_minutes") or []
+            opening_ready = (
+                len(valid_opening) >= 25
+                and valid_opening[0] <= "09:03"
+                and valid_opening[-1] >= "09:26"
+            )
+            repair_due = (
+                observed_at.time() >= dtime(9, 30)
+                and (not opening_ready or bool((stored or {}).get("source_conflicts")))
+                and _repair_opening_due(code)
+            )
+            anchors = (
+                ["092900", "091500", observed_at.strftime("%H%M%S")]
+                if repair_due else [observed_at.strftime("%H%M%S")]
+            )
+            anchors = list(dict.fromkeys(anchors))
+            if repair_due:
+                logger.info(
+                    "[KR][OPENING_OBSERVER][REPAIR_REQUEST] code=%s "
+                    "opening_count=%s anchors=%s bounded_backoff=1",
+                    code, opening_coverage.get("opening_count"), anchors,
+                )
             data: list[dict] = []
             for anchor in dict.fromkeys(anchors):
                 try:
-                    rows = kis.get_intraday_candles_today(code, start_hhmm=anchor)
+                    try:
+                        rows = kis.get_intraday_candles_today(
+                            code, start_hhmm=anchor, attempts=1,
+                        )
+                    except TypeError as exc:
+                        # Compatible with existing strictly read-only test KIS
+                        # adapters that predate the optional attempts argument.
+                        if "unexpected keyword argument 'attempts'" not in str(exc):
+                            raise
+                        rows = kis.get_intraday_candles_today(
+                            code, start_hhmm=anchor,
+                        )
                     if isinstance(rows, list):
                         data.extend(row for row in rows if isinstance(row, dict))
                 except Exception as minute_exc:
@@ -282,46 +322,20 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
             coverage = inspect_completed_bar_coverage(
                 rows=persisted["bars"], now=proof_now,
             )
-            if (coverage["reason"] == "OPENING_BARS_MISSING_OR_INCOMPLETE"
-                    and observed_at.time() >= dtime(9, 30)
-                    and _repair_opening_due(code)):
-                # An extra native early-session read can recover partial KIS
-                # pages without inventing zero-volume or missing-time candles.
-                try:
-                    repair_rows = kis.get_intraday_candles_today(
-                        code, start_hhmm="091500",
-                    )
-                    if isinstance(repair_rows, list) and repair_rows:
-                        result = save_opening_proof(
-                            env="practice", account_scope=scope, code=code,
-                            now=proof_now,
-                            raw_bars=[r for r in repair_rows if isinstance(r, dict)],
-                            vwap=vwap if verified_vwap else None,
-                            vwap_source=("KIS_NATIVE_WEIGHTED_AVG"
-                                         if verified_vwap else "UNKNOWN"),
-                        )
-                        persisted = load_opening_proof(
-                            env="practice", account_scope=scope, code=code,
-                            now=proof_now,
-                        )
-                        if persisted is None:
-                            raise RuntimeError("OPENING_REPAIR_READBACK_FAILED")
-                        coverage = inspect_completed_bar_coverage(
-                            rows=persisted["bars"], now=proof_now,
-                        )
-                    logger.info(
-                        "[KR][OPENING_OBSERVER][REPAIR] code=%s anchor=091500 "
-                        "raw_rows=%s opening_count=%s reason=%s retries_bounded=1",
-                        code, len(repair_rows) if isinstance(repair_rows, list) else 0,
-                        coverage["opening_count"], coverage["reason"],
-                    )
-                except Exception as repair_exc:
-                    logger.warning(
-                        "[KR][OPENING_OBSERVER][REPAIR_FAIL] code=%s type=%s "
-                        "action=KEEP_OLD_VERIFIED_PROOF",
-                        code, type(repair_exc).__name__,
-                    )
+            # Recovery anchors were scheduled *before* the native requests.
+            # Never block steady-state HOT refresh with a second full repair.
+            if result.get("resolved_conflicts"):
+                logger.warning(
+                    "[KR][OPENING_OBSERVER][CONFLICT_RESOLVED] code=%s minutes=%s "
+                    "source=THREE_SPACED_KIS_NATIVE_CONFIRMATIONS audit_persisted=1",
+                    code, result["resolved_conflicts"],
+                )
             if persisted.get("source_conflicts"):
+                logger.warning(
+                    "[KR][OPENING_OBSERVER][CONFLICT_QUARANTINE] code=%s minutes=%s "
+                    "unverified_buy_blocked=1",
+                    code, persisted.get("source_conflicts"),
+                )
                 coverage = {**coverage, "state": "UNKNOWN",
                             "reason": "CONFLICTING_NATIVE_COMPLETED_BAR"}
             if coverage["state"] == "COVERED":
@@ -395,7 +409,7 @@ def main() -> None:
     parser.add_argument("--loop", action="store_true")
     parser.add_argument("--final30-file")
     parser.add_argument("--date")
-    parser.add_argument("--interval-sec", type=float, default=120.0)
+    parser.add_argument("--interval-sec", type=float, default=45.0)
     args = parser.parse_args()
     if args.once == args.loop:
         parser.error("select exactly one of --once or --loop")
@@ -407,18 +421,43 @@ def main() -> None:
     if args.once:
         print(json.dumps(run_once(kis=kis, codes=codes, observed_at=now_kst()), ensure_ascii=False))
         return
+    # The legacy --once path remains a full read-only 30-name diagnostic.
+    # Production --loop uses a bounded priority queue; the code never
+    # deletes a name from Final30 or uses collection status to authorize BUY.
+    schedule = CandidateSchedule(max_batch=6)
+    scope = get_account_key(env="practice")
     while True:
         now = now_kst()
         if now.date().isoformat() != today or now.time() > dtime(15, 5):
             break
         if now.time() < dtime(9, 0):
-            # An AM wrapper may start before the cash session: wake near 09:00
-            # rather than sleeping the entire polling interval before the
-            # first native opening-minute collection.
             time.sleep(2.0)
             continue
         cycle_started = time.monotonic()
-        result = run_once(kis=kis, codes=codes, observed_at=now)
+        try:
+            priority = collection_priorities(date=today, account_scope=scope, now=now)
+            if priority["state"] == "INVALID_PREP":
+                logger.error("[KR][OPENING_OBSERVER][WAIT_PREP] verified_final30=0")
+                time.sleep(10.0)
+                continue
+            selected = schedule.select(priority, now)
+            if not selected:
+                time.sleep(min(10.0, max(2.0, float(args.interval_sec) / 3.0)))
+                continue
+            logger.info(
+                "[KR][OPENING_OBSERVER][QUEUE] source=%s hot=%s warm=%s cold=%s "
+                "selected=%s full_universe=%s order_authorization=0",
+                priority["state"], len(priority["hot"]), len(priority["warm"]),
+                len(priority["cold"]), selected, len(codes),
+            )
+            result = run_once(kis=kis, codes=selected, observed_at=now)
+        except Exception:
+            logger.exception(
+                "[KR][OPENING_OBSERVER][CYCLE_FAIL] action=RETRY_READ_ONLY "
+                "sell_path_independent=1"
+            )
+            time.sleep(5.0)
+            continue
         elapsed = time.monotonic() - cycle_started
         logger.info(
             "[KR][OPENING_OBSERVER][PASS] completed=%s unknown=%s "
@@ -427,12 +466,9 @@ def main() -> None:
             result["completed"], result["unknown"], result["coverage_ok"],
             result["vwap_unverified"], result["symbol_scan_p95_sec"],
             result["symbol_scan_max_sec"], elapsed,
-            max(60.0, float(args.interval_sec)),
+            max(15.0, float(args.interval_sec)),
         )
-        # Schedule from the *start* of the last 30-symbol scan, not from
-        # its end. Otherwise every proof expires during the guaranteed
-        # 'cycle work + 180sec sleep' blind spot while the BUY gate is ON.
-        time.sleep(max(1.0, max(60.0, float(args.interval_sec)) - elapsed))
+        time.sleep(max(1.0, max(15.0, float(args.interval_sec)) - elapsed))
 
 
 if __name__ == "__main__":

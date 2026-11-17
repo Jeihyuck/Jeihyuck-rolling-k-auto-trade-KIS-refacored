@@ -19773,6 +19773,40 @@ class PB1Engine:
             buyable_gate_context: dict[str, dict[str, Any]] = {}
             self._buyable_gate_context = buyable_gate_context
             today_buy_codes: set[str] = set()
+            # Only PB1 practice standard BUY publishes pre-minute priorities.
+            # No minute proof is needed to enter this *read-only collector*
+            # queue: avoid the circular "no bars -> no candidate -> no bars".
+            if (
+                str(getattr(self, "STRATEGY_NAME", "")) == "pb1_pullback_close"
+                and str(self.env or "").lower() == "practice"
+                and self._is_kr_equity_context()
+                and self.phase in {"entry", "pm_entry"}
+                and not allow_add_to_existing
+            ):
+                try:
+                    from trader.kr.entry_priority_queue import publish_pb1_priority
+                    _priority_status = publish_pb1_priority(
+                        date=str(self._today),
+                        account_scope=get_account_key(env=self.env),
+                        eligible_codes=[cf.code for cf in ok_after_risk],
+                        held_codes=[c for c in held_codes if c],
+                        allow_add_to_existing=False,
+                        stage=self._entry_stage_name(),
+                    )
+                    logger.info(
+                        "[KR][ENTRY_TIMING][PRIORITY_PUBLISH] state=%s "
+                        "hot=%s warm=%s collection_only=1",
+                        _priority_status.get("state"),
+                        _priority_status.get("hot"), _priority_status.get("warm"),
+                    )
+                except Exception as _priority_err:
+                    # The observer safely falls back to validated PREP Final30.
+                    # A collector/publisher failure cannot delay protective SELL.
+                    logger.warning(
+                        "[KR][ENTRY_TIMING][PRIORITY_PUBLISH_FAIL] type=%s "
+                        "fallback=VERIFIED_PREP_COLLECTION_ONLY",
+                        type(_priority_err).__name__,
+                    )
             buyable_gate_max_sec = self._buyable_gate_max_sec()
             buyable_gate_fail_open = self._buyable_gate_fail_open_enabled()
             logger.info("[PB1][STAGE][START] stage=buyable_gate")
