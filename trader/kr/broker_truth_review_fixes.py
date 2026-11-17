@@ -277,7 +277,9 @@ def _recover_proven_policy_positions_fixed(
     holdings_rows: list[dict] | None,
 ) -> dict[str, Any]:
     """Recover POLICY_MISSING only into one exact, unambiguous OPEN row."""
-    schema = schema_for_engine(engine)
+    # This function is installed on the PB1 base runtime: its schema authority
+    # must be identical to that of the calling base guard (and injected tests).
+    schema = base.schema_for_engine(engine)
     kis = base._holdings_index(holdings_rows)
     recovered: list[str] = []
     review: list[str] = []
