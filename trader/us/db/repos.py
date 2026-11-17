@@ -1224,8 +1224,64 @@ def save_order_intent(intent: dict, trade_date: str | None = None) -> bool:
                     "portfolio_epoch_id": portfolio, "position_cycle_id": cycle,
                     "position_lifecycle_id": cycle,
                 })
+            # P0 BUY original identity: the native armed US path must
+            # persist the exact Claim-scoped account hash in the first
+            # durable intent, not solely in later attempt/outbox rows.
+            # Historical NULL fields stay immutable; no backfill here.
+            native_buy_scope = None
+            if (
+                str(intent.get("side") or "BUY").upper() == "BUY"
+                and os.getenv("WSL_RUN_MARKET", "").upper() == "US"
+                and os.getenv("KIS_ENV", "").strip().lower() == "practice"
+                and os.getenv("US_ORDER_ARMED", "0").strip().lower()
+                    in {"1", "true", "yes", "on"}
+            ):
+                native_buy_scope = _us_execution_claim_scope()
+                if (
+                    native_buy_scope.get("env") != "practice"
+                    or native_buy_scope.get("market") != "US"
+                    or str(native_buy_scope.get("trading_epoch_id") or "")
+                        != str(trading_epoch_id or "")
+                    or not native_buy_scope.get("account_id")
+                    or not trading_epoch_id
+                ):
+                    raise RuntimeError("US_BUY_INTENT_CLAIM_SCOPE_NOT_VERIFIED")
+                account_hash = str(native_buy_scope["account_id"])
+                supplied = str(
+                    intent.get("broker_account_hash")
+                    or intent_meta_to_store.get("broker_account_hash") or ""
+                )
+                if supplied and supplied != account_hash:
+                    raise RuntimeError("US_BUY_INTENT_ACCOUNT_SCOPE_CONFLICT")
+                if "account_id" in params:
+                    if str(params["account_id"]) != account_hash:
+                        raise RuntimeError("US_BUY_INTENT_ACCOUNT_ID_CONFLICT")
+                else:
+                    if sql.count("trading_epoch_id, meta)") != 1:
+                        raise RuntimeError("US_BUY_INTENT_EPOCH_INSERT_UNVERIFIED")
+                    sql = sql.replace(
+                        "trading_epoch_id, meta)",
+                        "trading_epoch_id, account_id, meta)",
+                    ).replace(
+                        ":trading_epoch_id,\n                            CAST(:meta",
+                        ":trading_epoch_id, :account_id,\n                            CAST(:meta",
+                    )
+                    params["account_id"] = account_hash
+                intent_meta_to_store["broker_account_hash"] = account_hash
             params["meta"] = _json_param(intent_meta_to_store)
             conn.execute(text(sql), params)
+            if native_buy_scope is not None:
+                stored_account = conn.execute(text("""
+                    SELECT account_id FROM us_order_intents
+                     WHERE client_order_key=:cok AND trade_date=:td
+                       AND symbol=:symbol AND side='BUY'
+                       AND trading_epoch_id=:epoch
+                """), {
+                    "cok": intent.get("client_order_key"), "td": td,
+                    "symbol": intent.get("symbol"), "epoch": trading_epoch_id,
+                }).scalar_one_or_none()
+                if str(stored_account or "") != str(native_buy_scope["account_id"]):
+                    raise RuntimeError("US_BUY_INTENT_ACCOUNT_NOT_DURABLE_ROLLBACK")
             if standard_buy:
                 persisted = conn.execute(
                     text("SELECT meta FROM us_order_intents WHERE client_order_key=:cok"),
