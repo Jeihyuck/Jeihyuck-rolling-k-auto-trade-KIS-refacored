@@ -283,3 +283,56 @@ def test_health_flags_db_kis_qty_mismatch_and_previous_day_open_ack() -> None:
     assert health["stale_open_order_count"] == 1
     assert health["stale_open_orders"][0]["code"] == "122630"
     assert health["stale_open_orders"][0]["status"] == "ACKED"
+
+
+def test_current_only_policy_recovery_does_not_adopt_historical_epoch(monkeypatch):
+    """A stale OPEN PB1 legacy row cannot be adopted into the active epoch."""
+    from trader.kr import broker_truth_hardening as truth
+
+    engine = _db()
+    schema = schema_for_engine(engine)
+    _, cycle_id, portfolio_id = _ids()
+    historical_epoch = str(uuid4())
+    live_epoch = str(uuid4())
+    with engine.begin() as conn:
+        conn.execute(
+            sa.insert(schema.positions).values(
+                position_id=str(uuid4()),
+                position_cycle_id=cycle_id,
+                portfolio_epoch_id=portfolio_id,
+                trading_epoch_id=historical_epoch,
+                opened_at=now_kst(),
+                position_origin="IMPORTED",
+                env="practice",
+                strategy=STRATEGY,
+                sid=1, mode=1, code="000660",
+                market="KOSPI", qty=2,
+                avg_buy_price=250000.0,
+                total_cost=500000.0,
+                realized_pnl=0.0, status="OPEN",
+                entry_thesis="POLICY_MISSING",
+                exit_policy_family="POLICY_MISSING",
+                entry_meta_json={},
+                entry_exit_plan_json={},
+                position_meta={"holding_age_unknown": True},
+            )
+        )
+    monkeypatch.setattr(truth, "trading_epoch_enforced", lambda: True)
+    monkeypatch.setattr(
+        truth, "active_trading_epoch_id",
+        lambda *args, **kwargs: live_epoch,
+    )
+    report = truth._recover_proven_policy_positions(
+        engine=engine,
+        env="practice",
+        strategy=STRATEGY,
+        holdings_rows=[{"pdno": "000660", "hldg_qty": "2"}],
+    )
+    assert report["recovered"] == []
+    assert report["review_required"] == []
+    assert report["foreign_owner_review_required"] == []
+    with engine.connect() as conn:
+        rows = conn.execute(sa.select(schema.positions)).mappings().all()
+    assert len(rows) == 1
+    assert rows[0]["exit_policy_family"] == "POLICY_MISSING"
+    assert str(rows[0]["trading_epoch_id"]) == historical_epoch
