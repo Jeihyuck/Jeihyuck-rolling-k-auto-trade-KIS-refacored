@@ -84,7 +84,7 @@ def test_source_quote_time_is_unknown_not_fabricated_from_decision():
 
 def test_filter_isolates_candidate_veto_and_preserves_independent_peer():
     overlay = {
-        "market_state": "NORMAL", "market_regime": "NEUTRAL",
+        "market_state": "NORMAL", "market_regime": "RISK_ON",
         "allow_new_buy": True, "allow_ai_tech_buy": True,
         "intraday_market_overlay": "NORMAL",
         "intraday_rotation_overlay": "INTRADAY_SEMI_CRASH",
@@ -103,7 +103,7 @@ def test_filter_isolates_candidate_veto_and_preserves_independent_peer():
 
 def test_global_market_crash_remains_closed_for_all_standard_candidates():
     overlay = {
-        "market_state": "NORMAL", "market_regime": "NEUTRAL",
+        "market_state": "NORMAL", "market_regime": "RISK_ON",
         "allow_new_buy": True, "allow_ai_tech_buy": True,
         "intraday_market_overlay": "INTRADAY_MARKET_CRASH",
     }
