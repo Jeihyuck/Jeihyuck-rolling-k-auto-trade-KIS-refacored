@@ -3449,11 +3449,35 @@ def route_order(
                             "action=RECONCILE_ONLY", symbol_upper, tp_stage,
                         )
                     else:
-                        _tp_pre_io_stage_released = True
-                        logger.warning(
-                            "[US_PROFIT_CAPTURE][PRE_IO_ABORT_RELEASED] symbol=%s stage=%s "
-                            "action=REEVALUATE_NEXT_TICK", symbol_upper, tp_stage,
+                        # The TP stage is now available, but its original
+                        # persisted intent can remain PENDING and poison a
+                        # new exact-stage semantic decision. Close that intent
+                        # only with its OWN durable pre-I/O abort, released
+                        # claim, exact attempt identity and no KIS order row.
+                        from trader.us.db.repos import close_proven_unsent_us_sell_intent
+                        _closed_tp_intent = close_proven_unsent_us_sell_intent(
+                            client_order_key=str(order_key or ""),
+                            attempt_id=str(intent["submit_attempt_id"]),
+                            trade_date=str(trade_date),
+                            failure_code=(
+                                failure_code if failure_code != "pre_http_setup_failed"
+                                else "PRE_HTTP_SETUP_FAILED"
+                            ),
                         )
+                        if not _closed_tp_intent:
+                            requires_reconcile = True
+                            logger.error(
+                                "[US_PROFIT_CAPTURE][PRE_IO_INTENT_CLOSE_UNVERIFIED] "
+                                "symbol=%s stage=%s action=FENCE_WITHOUT_RESUBMIT",
+                                symbol_upper, tp_stage,
+                            )
+                        else:
+                            _tp_pre_io_stage_released = True
+                            logger.warning(
+                                "[US_PROFIT_CAPTURE][PRE_IO_ABORT_RELEASED] symbol=%s stage=%s "
+                                "intent=BLOCKED action=REEVALUATE_NEXT_TICK",
+                                symbol_upper, tp_stage,
+                            )
                 except Exception as tp_abort_exc:
                     requires_reconcile = True
                     logger.error(
