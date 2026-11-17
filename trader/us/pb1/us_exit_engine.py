@@ -1355,12 +1355,14 @@ def prepare_exit_position_snapshots(
                     from trader.us.entry_exit_contract import (
                         contract_exit_config,
                         us_entry_exit_contract_integrity_state,
+                        explain_us_entry_exit_contract_integrity,
                     )
                     integrity = us_entry_exit_contract_integrity_state(pos, pos.get("meta"))
                     if integrity == "INVALID":
                         logger.error(
-                            "[US_RISK_STATE][ENTRY_CONTRACT_INTEGRITY_FAIL] symbol=%s action=skip_soft_stop_state_mutation",
-                            symbol,
+                            "[US_RISK_STATE][ENTRY_CONTRACT_INTEGRITY_FAIL] "
+                            "symbol=%s reason=%s action=skip_soft_stop_state_mutation",
+                            symbol, explain_us_entry_exit_contract_integrity(pos, pos.get("meta")),
                         )
                         raise ValueError("invalid_entry_exit_contract")
                     frozen_risk_cfg = contract_exit_config(pos)
