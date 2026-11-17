@@ -14,12 +14,70 @@ from __future__ import annotations
 
 import hashlib
 import os
+import threading
+from collections import OrderedDict
 from datetime import date
 from typing import Any
 
 from sqlalchemy import text
 
 from trader.us.execution.us_legacy_carry_in_review import SYMBOLS
+
+# Only fully KIS-verified, previous-day terminal original orders are cached.
+# This never caches live holdings, orderable quantity or current-day orders.
+_HISTORICAL_TERMINAL_CACHE = OrderedDict()
+_HISTORICAL_TERMINAL_LOCK = threading.RLock()
+_HISTORICAL_TERMINAL_MAX = 256
+
+
+def _classify_immutable_source_order(
+    *, classifier, get_order_day, day: str, current_trade_date: str,
+    source_account_hash: str, epoch: str, contract_sha: str,
+    symbol: str, order_no: str, side: str, requested_qty: int,
+    cumulative_filled_qty: int,
+) -> dict:
+    """Reuse only exact historical terminal broker evidence under full scope.
+
+    A current-day, OPEN/UNKNOWN or unverified order cannot be cached. The
+    canonical router still requires fresh KIS balance/order GET per attempt,
+    again just before native HTTP; this cache is NEVER submit authority.
+    """
+    day_key, today_key = str(day or "")[:10], str(current_trade_date or "")[:10]
+    order_key = str(order_no or "").strip()
+    requested, filled = int(requested_qty), int(cumulative_filled_qty)
+    if not day_key or not today_key or not order_key or requested <= 0 or filled < 0:
+        raise ValueError("US_LEGACY_HISTORICAL_ORDER_IDENTITY_INVALID")
+    cacheable = (
+        len(day_key) == 10 and len(today_key) == 10
+        and day_key[4:5] == "-" and day_key[7:8] == "-"
+        and today_key[4:5] == "-" and today_key[7:8] == "-"
+        and day_key < today_key
+        and bool(source_account_hash and epoch and contract_sha)
+    )
+    key = (source_account_hash, epoch, contract_sha, symbol, day_key,
+           order_key, side, requested, filled)
+    if cacheable:
+        with _HISTORICAL_TERMINAL_LOCK:
+            hit = _HISTORICAL_TERMINAL_CACHE.get(key)
+            if hit is not None:
+                _HISTORICAL_TERMINAL_CACHE.move_to_end(key)
+                return dict(hit)
+    evidence = classifier(
+        get_order_day(day), order_no=order_no, symbol=symbol,
+        expected_qty=requested, trade_date=day, side=side,
+    )
+    status = evidence.get("classification") if isinstance(evidence, dict) else None
+    actual_filled = evidence.get("cumulative_filled_qty") if isinstance(evidence, dict) else None
+    terminal = (status == "PROVEN_FILLED" if side == "BUY"
+                else status in {"PROVEN_FILLED", "PROVEN_CANCELLED"})
+    if cacheable and terminal and actual_filled == filled:
+        with _HISTORICAL_TERMINAL_LOCK:
+            _HISTORICAL_TERMINAL_CACHE[key] = dict(evidence)
+            _HISTORICAL_TERMINAL_CACHE.move_to_end(key)
+            while len(_HISTORICAL_TERMINAL_CACHE) > _HISTORICAL_TERMINAL_MAX:
+                _HISTORICAL_TERMINAL_CACHE.popitem(last=False)
+    return evidence
+
 
 ORIGINAL_BUY_SQL = """
 SELECT trade_date,order_no,qty_requested,qty_filled,status,meta
@@ -366,19 +424,27 @@ def prove_and_bind_legacy_nine_sell(
             if not isinstance(cache[d],list):
                 raise ValueError("KIS_ORIGINAL_DAY_INCOMPLETE")
             return cache[d]
-        buy_proof=classify_original_order(
-            get_order_day(evidence["source_buy_day"]),
-            order_no=evidence["source_buy_order"],symbol=symbol,
-            expected_qty=evidence["source_buy_qty"],
-            trade_date=evidence["source_buy_day"],side="BUY",
+        def check_historical_source(*, day, order_no, qty, filled, side):
+            return _classify_immutable_source_order(
+                classifier=classify_original_order, get_order_day=get_order_day,
+                day=day, current_trade_date=trade_date,
+                source_account_hash=hashed, epoch=active_epoch,
+                contract_sha=evidence["v2_sha"], symbol=symbol,
+                order_no=order_no, side=side,
+                requested_qty=qty, cumulative_filled_qty=filled,
+            )
+        buy_proof=check_historical_source(
+            day=evidence["source_buy_day"],
+            order_no=evidence["source_buy_order"],
+            qty=evidence["source_buy_qty"],
+            filled=evidence["source_buy_qty"], side="BUY",
         )
         if (buy_proof["classification"]!="PROVEN_FILLED"
                 or buy_proof.get("cumulative_filled_qty")!=evidence["source_buy_qty"]):
             return False,"ORIGINAL_KIS_BUY_NOT_PROVEN",None
         for day,no,req,filled in evidence["prior_sell_proofs"]:
-            status=classify_original_order(
-                get_order_day(day),order_no=no,symbol=symbol,
-                expected_qty=req,trade_date=day,side="SELL",
+            status=check_historical_source(
+                day=day, order_no=no, qty=req, filled=filled, side="SELL",
             )
             if (status["classification"] not in {"PROVEN_FILLED","PROVEN_CANCELLED"}
                     or status.get("cumulative_filled_qty")!=filled):
@@ -386,17 +452,15 @@ def prove_and_bind_legacy_nine_sell(
         for day,no,req,filled in evidence["zero_fill_sell_proofs"]:
             # Source-day broker cancelled + zero cumulative fill is the
             # only proof accepted for a local zero-fill SELL.
-            zero_status=classify_original_order(
-                get_order_day(day),order_no=no,symbol=symbol,
-                expected_qty=req,trade_date=day,side="SELL",
+            zero_status=check_historical_source(
+                day=day, order_no=no, qty=req, filled=0, side="SELL",
             )
             if (zero_status["classification"]!="PROVEN_CANCELLED"
                     or zero_status.get("cumulative_filled_qty")!=0):
                 return False,"ORIGINAL_KIS_ZERO_FILL_SELL_NOT_CANCELLED",None
         for day,no,req,filled in evidence["old_unresolved"]:
-            status=classify_original_order(
-                get_order_day(day),order_no=no,symbol=symbol,
-                expected_qty=req,trade_date=day,side="SELL",
+            status=check_historical_source(
+                day=day, order_no=no, qty=req, filled=filled, side="SELL",
             )
             if (status["classification"] not in {"PROVEN_FILLED","PROVEN_CANCELLED"}
                     or status.get("cumulative_filled_qty")!=filled):
