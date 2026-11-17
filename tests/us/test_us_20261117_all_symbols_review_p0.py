@@ -168,12 +168,15 @@ class _PreIoDb:
         self.intent_attempt = intent_attempt
         self.include_broker_possible = include_broker_possible
         self.updated = []
+        self.stage_released = False
         self.committed = False
         self.rolled_back = False
 
     def execute(self, statement, params):
         sql = str(statement).lower()
         if "from us_profit_capture_lifecycle" in sql:
+            if "select stage_status, state" in sql:
+                return _RowSet(one={"stage_status": "NOT_TRIGGERED" if self.stage_released else "PENDING", "state": {}})
             return _RowSet(one={"stage_status": "PENDING",
                                 "cumulative_filled_qty": 0, "requested_qty": 2})
         if "from us_order_events" in sql:
@@ -196,6 +199,8 @@ class _PreIoDb:
         if "from us_orders" in sql:
             return _RowSet(one=None)
         if "select status, meta" in sql and "from us_order_intents" in sql:
+            if self.updated:
+                return _RowSet(one={"status": "BLOCKED", "meta": {"pre_io_abort_attempt_id": self.intent_attempt}})
             return _RowSet(one={"status": "PENDING",
                                 "meta": {"submit_attempt_id": self.intent_attempt}})
         if "update us_order_intents" in sql:
@@ -228,11 +233,15 @@ def _run_proven_abort(db, *, mark_failure=None):
             "meta": {"last_status": "PENDING"},
         }
     }
+    def mark_stage(*args, **kwargs):
+        if mark_failure:
+            raise mark_failure
+        db.stage_released = True
     with (
         patch.object(repos, "_get_engine_or_none", return_value=db),
         patch.object(repos, "_active_us_epoch", return_value="epoch-1"),
         patch.object(repos, "load_us_profit_capture_state", return_value=state),
-        patch.object(repos, "mark_us_profit_capture_stage", side_effect=mark_failure) as mark,
+        patch.object(repos, "mark_us_profit_capture_stage", side_effect=mark_stage) as mark,
     ):
         result = repos.release_us_profit_capture_pre_http_abort(
             trade_date="2026-11-16", symbol="NOVA", stage="tp1",
