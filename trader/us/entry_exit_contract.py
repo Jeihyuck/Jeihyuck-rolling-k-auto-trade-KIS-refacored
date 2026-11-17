@@ -170,6 +170,11 @@ def explain_us_entry_exit_contract_integrity(*sources: Any) -> str:
     Preserve the strict original BUY policy. A matching declared vs nested
     digest is NOT proof the signed payload itself still hashes correctly.
     """
+    # Match the authoritative verifier's precedence: a valid nested frozen
+    # contract can coexist with a top-level digest-only wrapper. Diagnostics
+    # must not falsely classify this as missing while trading sees VALID.
+    if us_entry_exit_contract_integrity_state(*sources) == "VALID":
+        return "VALID"
     if _is_infinite_sleeve_context(*sources):
         return "OWNER_SCOPE_TQQQ_INFINITE_CONFLICT"
     seen = False
