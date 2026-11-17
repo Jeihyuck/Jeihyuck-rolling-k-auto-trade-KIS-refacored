@@ -3745,7 +3745,12 @@ class KisAPI:
                     continue
 
                 arr = data.get("output2") or []
-                if resp.status_code == 200 and arr:
+                # HTTP 200 is not broker attestation when KIS rt_cd is
+                # nonzero or absent. Do not mint a trusted response receipt
+                # or release a source conflict from an error-body payload.
+                if (resp.status_code == 200
+                        and str(data.get("rt_cd") or "") == "0"
+                        and isinstance(arr, list) and arr):
                     # A fresh ID is minted only at this successful KIS HTTP
                     # response boundary (never from cached candle contents).
                     # It permits conflict recovery to require three DISTINCT
