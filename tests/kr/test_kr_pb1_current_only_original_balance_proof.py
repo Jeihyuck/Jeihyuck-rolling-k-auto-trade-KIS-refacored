@@ -195,6 +195,7 @@ def test_kr_infinite_reserved_122630_is_not_recovered_as_pb1_policy(monkeypatch)
     """Wrongly PB1-tagged historical row may not adopt KR_INFINITE's broker 11 shares."""
     import sqlalchemy as sa
     from trader.kr.infinite import SYMBOL, STRATEGY_ID
+    from trader.kr import broker_truth_review_fixes as installed_review
 
     positions = sa.table(
         "positions",
@@ -229,12 +230,13 @@ def test_kr_infinite_reserved_122630_is_not_recovered_as_pb1_policy(monkeypatch)
         def connect(self):
             return self.connection
 
-    monkeypatch.setattr(
-        truth, "schema_for_engine",
-        lambda _: SimpleNamespace(positions=positions),
-    )
-    monkeypatch.setattr(truth, "active_trading_epoch_id", lambda *args, **kwargs: None)
-    monkeypatch.setattr(truth, "trading_epoch_enforced", lambda: False)
+    for module in (truth, installed_review):
+        monkeypatch.setattr(
+            module, "schema_for_engine",
+            lambda _: SimpleNamespace(positions=positions),
+        )
+        monkeypatch.setattr(module, "active_trading_epoch_id", lambda *args, **kwargs: None)
+        monkeypatch.setattr(module, "trading_epoch_enforced", lambda: False)
     fake_engine = FakeEngine()
     result = truth._recover_proven_policy_positions(
         engine=fake_engine, env="practice",
