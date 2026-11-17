@@ -246,7 +246,7 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
                 and _repair_opening_due(code)
             )
             anchors = (
-                ["092900", "091500", observed_at.strftime("%H%M%S")]
+                ["092900", observed_at.strftime("%H%M%S")]
                 if repair_due else [observed_at.strftime("%H%M%S")]
             )
             anchors = list(dict.fromkeys(anchors))
@@ -322,8 +322,52 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
             coverage = inspect_completed_bar_coverage(
                 rows=persisted["bars"], now=proof_now,
             )
-            # Recovery anchors were scheduled *before* the native requests.
-            # Never block steady-state HOT refresh with a second full repair.
+            # The opening anchor can cover up to the early session; only
+            # request the 09:15 repair anchor if that first replay still left
+            # unobserved original minutes. A full proof needs no extra read.
+            if (coverage["reason"] == "OPENING_BARS_MISSING_OR_INCOMPLETE"
+                    and repair_due):
+                try:
+                    try:
+                        repair_rows = kis.get_intraday_candles_today(
+                            code, start_hhmm="091500", attempts=1,
+                        )
+                    except TypeError as exc:
+                        if "unexpected keyword argument 'attempts'" not in str(exc):
+                            raise
+                        repair_rows = kis.get_intraday_candles_today(
+                            code, start_hhmm="091500",
+                        )
+                    if isinstance(repair_rows, list) and repair_rows:
+                        result = save_opening_proof(
+                            env="practice", account_scope=scope, code=code,
+                            now=proof_now,
+                            raw_bars=[row for row in repair_rows if isinstance(row, dict)],
+                            vwap=vwap if verified_vwap else None,
+                            vwap_source=("KIS_NATIVE_WEIGHTED_AVG"
+                                         if verified_vwap else "UNKNOWN"),
+                        )
+                        persisted = load_opening_proof(
+                            env="practice", account_scope=scope, code=code,
+                            now=proof_now,
+                        )
+                        if persisted is None:
+                            raise RuntimeError("OPENING_REPAIR_READBACK_FAILED")
+                        coverage = inspect_completed_bar_coverage(
+                            rows=persisted["bars"], now=proof_now,
+                        )
+                    logger.info(
+                        "[KR][OPENING_OBSERVER][REPAIR] code=%s anchor=091500 "
+                        "native_rows=%s opening_count=%s reason=%s",
+                        code, len(repair_rows) if isinstance(repair_rows, list) else 0,
+                        coverage["opening_count"], coverage["reason"],
+                    )
+                except Exception as repair_exc:
+                    logger.warning(
+                        "[KR][OPENING_OBSERVER][REPAIR_FAIL] code=%s type=%s "
+                        "action=KEEP_OLD_VERIFIED_PROOF",
+                        code, type(repair_exc).__name__,
+                    )
             if result.get("resolved_conflicts"):
                 logger.warning(
                     "[KR][OPENING_OBSERVER][CONFLICT_RESOLVED] code=%s minutes=%s "

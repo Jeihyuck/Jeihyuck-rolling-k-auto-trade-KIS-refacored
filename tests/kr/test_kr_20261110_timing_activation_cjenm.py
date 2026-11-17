@@ -95,7 +95,7 @@ def test_cj_declining_minute_bar_hypothesis_waits_not_buy():
     }
 
 
-def test_kis_observer_uses_opening_and_current_anchors_without_making_up_dates(monkeypatch):
+def test_kis_observer_reuses_verified_opening_and_fetches_only_latest(monkeypatch):
     import scripts.kr_opening_observer as obs
     called = []
     bars = _synthetic_cj_decline()
@@ -103,7 +103,7 @@ def test_kis_observer_uses_opening_and_current_anchors_without_making_up_dates(m
     monkeypatch.setattr(obs, "now_kst", lambda: datetime(2026, 11, 10, 9, 35, tzinfo=KST))
     def _save(**kwargs):
         captured = kwargs["raw_bars"]
-        assert len(captured) == 60
+        assert len(captured) == 30
         assert all(row.get("date") == "20261110" for row in captured)
         return {"bars": 35, "new_bars": 35, "reused_bars": 0,
                 "source_conflicts": [], "path": "/tmp/test-observer",
@@ -129,7 +129,7 @@ def test_kis_observer_uses_opening_and_current_anchors_without_making_up_dates(m
         kis=ReadOnlyKis(), codes=["035760"],
         observed_at=datetime(2026, 11, 10, 9, 35, tzinfo=KST), sleep_between=0,
     )
-    assert called == ["092900", "093500"]
+    assert called == ["093500"]
     assert result["completed"] == 1
 
 
@@ -388,13 +388,13 @@ def test_observer_poll_period_is_start_to_start_and_below_proof_ttl():
     assert "cycle_started = time.monotonic()" in source
     assert "elapsed = time.monotonic() - cycle_started" in source
     assert "float(args.interval_sec)) - elapsed" in source
-    assert 'default=120.0' in source
-    assert "KR_PB1_OPENING_OBSERVER_INTERVAL_SEC:-120" in helper
-    # With 75s elapsed scanning 30 tickers, next cycle starts at T+120,
-    # rather than at T+195 where all 180s proofs are guaranteed stale.
-    scan_duration_sec, interval_sec, proof_ttl_sec = 75.0, 120.0, 180.0
+    assert 'default=45.0' in source
+    assert "KR_PB1_OPENING_OBSERVER_INTERVAL_SEC:-45" in helper
+    # For an ordinary six-name batch, start-to-start remains T+45,
+    # rather than adding the full interval to the scan time.
+    scan_duration_sec, interval_sec, proof_ttl_sec = 20.0, 45.0, 180.0
     subsequent_start = scan_duration_sec + max(1.0, interval_sec - scan_duration_sec)
-    assert subsequent_start == 120.0
+    assert subsequent_start == 45.0
     assert subsequent_start < proof_ttl_sec
 
 
