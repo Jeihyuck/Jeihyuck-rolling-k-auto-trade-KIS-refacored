@@ -59,6 +59,8 @@ jobs:
             tests/kr/test_kr_pb1_minute_incident_replay.py \
             tests/kr/test_kr_pb1_minute_egw_final_retry.py \
             tests/kr/test_kr_pb1_current_only_original_balance_proof.py \
+            tests/kr/test_kr_broker_truth_hardening.py \
+            tests/kr/infinite/test_v3_contract.py \
             tests/kr/test_kr_pb1_kis_http_audit.py \
             tests/kr/test_kr_session_metrics_accumulator.py \
             tests/kr/test_kr_balance_freshness_provenance_20261106.py \
