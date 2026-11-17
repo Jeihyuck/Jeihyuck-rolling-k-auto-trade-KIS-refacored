@@ -1125,7 +1125,10 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
             continue
         try:
             executable = as_decimal(price, name="executable_price")
-            broker_avg, avg_provenance = authoritative_broker_avg(p, now=now)
+            # Live broker-average freshness must be checked against the current
+            # wall clock, not the (possibly old) Tick-start market clock.
+            broker_avg_eval_at = datetime.now(timezone.utc) if decision_clock_real_time else now
+            broker_avg, avg_provenance = authoritative_broker_avg(p, now=broker_avg_eval_at)
             return_rate = calc_return_rate(executable, broker_avg)
         except ValueError as exc:
             logger.warning("[US_PROFIT_CAPTURE][DECISION] symbol=%s decision=BLOCK reason=%s", sym, exc)
