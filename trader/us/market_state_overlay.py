@@ -1005,7 +1005,14 @@ def resolve_profit_capture_stage_quantity(
     return min(runner_capacity, stage_qty)
 
 
-def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_sell_symbols: set[str] | None = None, now=None, trade_date: str | None = None, profit_capture_state: dict[str, dict] | None = None, *, defer_pending_until_claim: bool = False) -> list[dict]:
+def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_sell_symbols: set[str] | None = None, now=None, trade_date: str | None = None, profit_capture_state: dict[str, dict] | None = None, *, defer_pending_until_claim: bool = False, decision_clock=None) -> list[dict]:
+    """Evaluate frozen TP with a clock captured when an executable decision is formed.
+
+    ``now`` retains the tick's market-calendar/replay semantics. It must not be
+    mistaken for the execution decision timestamp on a slow live tick.
+    ``decision_clock`` is an explicit injectable UTC clock for broker-capable
+    calls; offline/replay callers retain their prior deterministic ``now``.
+    """
     from decimal import Decimal
     from trader.us.profit_capture import authoritative_broker_avg, as_decimal, calc_return_rate
     from trader.us.strategy_ownership import exclude_non_standard
@@ -1251,7 +1258,21 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
                         from uuid import uuid4
                         native_tp_attempt_id = str(uuid4())
                         order_key = f"{order_key}_A{native_tp_attempt_id.replace('-', '')[:16]}"
-                    pending_intent = ({"symbol": sym, "side": "SELL", "strategy_owner": "US_STANDARD", "qty": qty, "quantity": qty, "limit_price": price, "notional_usd": qty * price, "reason": reason, "client_order_key": order_key, "position_lifecycle_id": lifecycle, **({"partial_exit_allowed": contract_partial_exit_allowed} if contract_sha is not None else {}), "meta": {"reason": reason, "profit_capture_stage": stage, "position_lifecycle_id": lifecycle, "broker_avg_price": str(broker_avg), **avg_provenance, "return_rate_at_decision": str(return_rate), "tp_threshold_fraction": str(threshold), "profit_capture_sell_fraction": str(sell_pct), "profit_capture_runner_min_remain_pct": str(local_runner_min), "profit_capture_stage_target_qty": stage_target_qty, "profit_capture_stage_filled_qty": stage_filled_qty, "profit_capture_decision_holding_qty": q, "runner_remaining_pct": (q - qty) / q, "market_state": overlay.get("market_state"), "last_profit_capture_at": (now or datetime.now(timezone.utc)).isoformat(), "source_entry_contract_sha256": contract_sha, "source_entry_contract_version": entry_contract.get("version") if contract_sha else None, "exit_rule_source": ("ENTRY_EXIT_CONTRACT_V3" if entry_contract.get("version") == "us_entry_exit_contract_v3" else "ENTRY_EXIT_CONTRACT_V2") if contract_sha else "LEGACY_GLOBAL_TP", "partial_exit_scope": "PROFIT_CAPTURE_STAGE" if contract_sha else "LEGACY_GLOBAL_TP", **({"partial_exit_allowed": contract_partial_exit_allowed} if contract_partial_exit_allowed is not None else {})}})
+                    # The TP threshold/quantity/claim eligibility has just been
+                    # evaluated. Capture decision time *here*, never from the
+                    # earlier tick/session market-calendar timestamp.
+                    from datetime import datetime as _decision_datetime, timezone as _decision_timezone
+                    decision_at = decision_clock() if callable(decision_clock) else (now or _decision_datetime.now(_decision_timezone.utc))
+                    if not isinstance(decision_at, _decision_datetime) or decision_at.tzinfo is None or decision_at.utcoffset() is None:
+                        logger.error("[US_PROFIT_CAPTURE][DECISION_CLOCK_UNVERIFIED] symbol=%s stage=%s action=BLOCK_NO_ORDER", sym, stage)
+                        break
+                    # Quote source time may legitimately be unavailable. Never
+                    # fabricate a provider timestamp from decision_at.
+                    source_quote_time = (p.get("quote_source_at") or p.get("quote_asof")
+                                         or p.get("resolved_quote_asof") or p.get("asof"))
+                    received_quote_time = (p.get("quote_received_at") or p.get("resolved_quote_received_at"))
+                    source_quote_name = (p.get("quote_source") or p.get("resolved_quote_source") or "UNKNOWN")
+                    pending_intent = ({"symbol": sym, "side": "SELL", "strategy_owner": "US_STANDARD", "qty": qty, "quantity": qty, "limit_price": price, "notional_usd": qty * price, "reason": reason, "client_order_key": order_key, "position_lifecycle_id": lifecycle, **({"partial_exit_allowed": contract_partial_exit_allowed} if contract_sha is not None else {}), "meta": {"reason": reason, "profit_capture_stage": stage, "position_lifecycle_id": lifecycle, "broker_avg_price": str(broker_avg), **avg_provenance, "return_rate_at_decision": str(return_rate), "tp_threshold_fraction": str(threshold), "profit_capture_sell_fraction": str(sell_pct), "profit_capture_runner_min_remain_pct": str(local_runner_min), "profit_capture_stage_target_qty": stage_target_qty, "profit_capture_stage_filled_qty": stage_filled_qty, "profit_capture_decision_holding_qty": q, "runner_remaining_pct": (q - qty) / q, "market_state": overlay.get("market_state"), "last_profit_capture_at": decision_at.astimezone(_decision_timezone.utc).isoformat(), "decision_at": decision_at.astimezone(_decision_timezone.utc).isoformat(), "decision_quote_price": str(executable), "decision_quote_source_at": str(source_quote_time) if source_quote_time else None, "decision_quote_received_at": str(received_quote_time) if received_quote_time else None, "decision_quote_source": str(source_quote_name), "source_entry_contract_sha256": contract_sha, "source_entry_contract_version": entry_contract.get("version") if contract_sha else None, "exit_rule_source": ("ENTRY_EXIT_CONTRACT_V3" if entry_contract.get("version") == "us_entry_exit_contract_v3" else "ENTRY_EXIT_CONTRACT_V2") if contract_sha else "LEGACY_GLOBAL_TP", "partial_exit_scope": "PROFIT_CAPTURE_STAGE" if contract_sha else "LEGACY_GLOBAL_TP", **({"partial_exit_allowed": contract_partial_exit_allowed} if contract_partial_exit_allowed is not None else {})}})
                     # Preserve the already-resolved original BUY scope through
                     # the TP intent and durable order. Never pick one side of
                     # a conflicting top-level/metadata identity.
