@@ -960,6 +960,9 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                             entry_allowed=entry_allowed, buy_multiplier=multiplier,
                             regime_reserve_permission=regime_reserve_permission,
                             effective_regime_name=regime)
+        # This is the actual owner decision instant, not the earlier session
+        # timestamp or a later order/router completion time.
+        decision_observed_at = datetime.now(timezone.utc).isoformat()
         if decision.metadata and state is not None:
             durable = {key: value for key, value in decision.metadata.items()
                        if key not in {"profit_stage", "desired_profit_stage", "tp1_sold_qty", "remaining_qty"}}
@@ -1195,6 +1198,72 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                      **({"tqqq_defensive_micro_first_buy_evidence": dict(decision.metadata)}
                         if decision.reason == "DEFENSIVE_MICRO_FIRST_BUY" else {})},
         }
+        # TQQQ has its own owner/policy. Record the *actual* strategy
+        # decision in the same durable intent the normal router will persist.
+        # Audit is read-only for authorization; missing code revision must
+        # remain explicitly unverified rather than a fabricated digest.
+        if decision.action == Action.BUY:
+            try:
+                import re
+                from trader.us.decision_evidence_5w1h import build_decision_evidence
+                _code_sha = str(
+                    os.getenv("US_PINNED_CODE_SHA") or os.getenv("GITHUB_SHA") or ""
+                ).strip()
+                if not re.fullmatch(r"[a-fA-F0-9]{40}", _code_sha):
+                    intent["meta"]["entry_decision_evidence_status"] = "CODE_SHA_UNVERIFIED"
+                    logger.warning("[TQQQ_INF][5W1H][CODE_SHA_UNVERIFIED] "
+                                   "symbol=TQQQ action=AUDIT_MISSING_NOT_BROKER_BLOCK")
+                else:
+                    _ev = build_decision_evidence(
+                        decision_id="TQQQ_INFINITE:BUY:" + client_order_key,
+                        side="BUY", strategy_owner="TQQQ_INFINITE",
+                        symbol=config.symbol, decision_at=decision_observed_at,
+                        policy_version=str(config.policy_version),
+                        code_sha=_code_sha,
+                        position_lifecycle_id=lifecycle_id,
+                        decision_reason=str(decision.reason),
+                        facts={
+                            "decision_price_usd": broker.price,
+                            "broker_qty_before": broker.qty,
+                            "broker_avg_usd_before": broker.average_price,
+                            "quote_source": overlay.get("tqqq_quote_source"),
+                            "quote_asof": overlay.get("tqqq_quote_asof"),
+                            "quote_stale": quote_stale,
+                            "entry_allowed": entry_allowed,
+                        },
+                        thresholds={
+                            "max_daily_buy_usd": config.max_daily_buy_usd,
+                            "max_total_capital_usd": config.max_total_capital_usd,
+                        },
+                        market_context={
+                            "market_state": overlay.get("market_state"),
+                            "market_regime": overlay.get("market_regime"),
+                            "tqqq_effective_regime": regime,
+                        },
+                        sizing={
+                            "qty": decision.qty,
+                            "limit_price": broker.price,
+                            "notional_usd": decision.notional,
+                            "position_action": position_action,
+                            "buy_multiplier": multiplier,
+                            "daily_buy_filled_before": daily,
+                            "pending_buy_notional_before": pending_buy_notional,
+                        },
+                    )
+                    intent["meta"]["entry_decision_evidence_5w1h"] = _ev
+                    intent["meta"]["entry_decision_evidence_sha256"] = _ev["sha256"]
+                    intent["meta"]["entry_decision_evidence_status"] = "VERIFIED"
+                    intent["entry_decision_id"] = _ev["what"]["decision_id"]
+            except (TypeError, ValueError, OverflowError) as _audit_exc:
+                logger.warning("[TQQQ_INF][5W1H][CAPTURE_FAILED] type=%s "
+                               "action=BROKER_POLICY_UNCHANGED",
+                               type(_audit_exc).__name__)
+                intent["meta"]["entry_decision_evidence_status"] = "AUDIT_UNVERIFIED"
+        elif decision.action == Action.SELL:
+            # Do not fabricate an original BUY proof from holdings or balance.
+            # SELL evidence needs an EXACT filled original BUY digest.
+            intent["meta"]["exit_decision_evidence_status"] = "ENTRY_PROOF_REQUIRED"
+
         result = route(intent)
         if (decision.action == Action.SELL and state is not None
                 and str(result.get("status") or "").upper() in {"ACK", "ACCEPTED", "SUBMITTED", "PENDING"}):
