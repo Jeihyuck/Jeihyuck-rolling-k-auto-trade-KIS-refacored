@@ -56,13 +56,13 @@ def manifest_path(date: str, account_scope: str) -> Path:
             ("pb1-" + _scope_digest(account_scope) + ".json"))
 
 
-def _prep_snapshot(date: str) -> dict | None:
+def _prep_snapshot(date: str, filename: str | None = None) -> dict | None:
     """Validate PREP source and its sibling contract before trusting priorities.
 
     This only validates *collection* scope.  The canonical Final30 and the PB1
     entry engine retain their independent (stronger) trading contracts.
     """
-    path = final30_path(date)
+    path = Path(filename) if filename else final30_path(date)
     if not path.is_file():
         return None
     contract_paths = (path.with_name("prep_contract.json"),
@@ -199,14 +199,15 @@ def publish_pb1_priority(*, date: str, account_scope: str,
 
 
 def collection_priorities(*, date: str, account_scope: str,
-                          now: datetime | None = None) -> dict:
+                          now: datetime | None = None,
+                          final30_file: str | None = None) -> dict:
     """Return a verified PB1 priority or safe PREP-seeded/fair rotation.
 
     Expired/tampered/wrong-account/date/SHA manifests never authorize trades.
     A PREP fallback only changes how an independent *read-only* collector works.
     """
     now = (now or datetime.now(KST)).astimezone(KST)
-    prep = _prep_snapshot(date)
+    prep = _prep_snapshot(date, filename=final30_file)
     if prep is None or now.date().isoformat() != date:
         return {"state": "INVALID_PREP", "hot": [], "warm": [], "cold": []}
     raw = None
