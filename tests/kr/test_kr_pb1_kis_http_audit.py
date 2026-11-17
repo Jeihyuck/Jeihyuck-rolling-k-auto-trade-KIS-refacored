@@ -80,3 +80,42 @@ def test_egw002_is_recorded_once_per_http_attempt_even_when_original_logs_repeat
     assert caplog.text.count("[KR_KIS_HTTP][RESPONSE]") == 1
     assert caplog.text.count("[KR_KIS_HTTP][BROKER_RESULT]") == 1
     assert "msg_cd=EGW00201 egw002=1" in caplog.text
+
+
+def test_orderable_cash_provenance_rejects_diag_stub_even_when_cash_positive():
+    """Simulated data looks like KIS cash but cannot authorize Infinite ADD."""
+    api = object.__new__(kw.KisAPI)
+    api._last_cash = None
+    api._orderable_cash_cache = None
+    api._orderable_cash_cache_at = None
+    api._write_orderable_cash_status = lambda **kwargs: None
+    api._inquire_psbl_order = lambda *args: {
+        "rt_cd": "0", "_diag_stub": True,
+        "output": {"ord_psbl_cash": "4000000"},
+    }
+    amount, metadata = api.get_orderable_cash("122630", 63000)
+    assert amount == 4000000
+    assert metadata["native_source_verified"] is False
+    from trader.kr.infinite.executor import KISExecutor
+    with pytest.raises(RuntimeError, match="CASH_UNVERIFIED"):
+        KISExecutor(api, "practice").verified_add_orderable_cash("122630", 63000)
+
+
+def test_orderable_cash_provenance_accepts_only_native_kis_psbl_field():
+    api = object.__new__(kw.KisAPI)
+    api._last_cash = None
+    api._orderable_cash_cache = None
+    api._orderable_cash_cache_at = None
+    api._write_orderable_cash_status = lambda **kwargs: None
+    api._inquire_psbl_order = lambda *args: {
+        "rt_cd": "0",
+        "output": {"ord_psbl_cash": "741311", "dnca_tot_amt": "15000000"},
+    }
+    from trader.kr.infinite.executor import KISExecutor
+    amount, metadata = api.get_orderable_cash("122630", 63000)
+    assert amount == 741311
+    assert metadata["selected_key"] == "ord_psbl_cash"
+    assert metadata["native_source_verified"] is True
+    assert KISExecutor(api, "practice").verified_add_orderable_cash(
+        "122630", 63000
+    ) == 741311.0
