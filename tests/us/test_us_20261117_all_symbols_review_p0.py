@@ -142,3 +142,129 @@ def test_per_symbol_metadata_mismatch_does_not_change_other_candidates():
     assert [row["symbol"] for row in kept] == ["BETA"]
     assert blocked[0]["reason"] == "ENTRY_METADATA_INVARIANT_FAIL"
     assert not is_us_global_postfilter_contract_unverified(overlay)
+
+
+class _RowSet:
+    def __init__(self, *, one=None, rows=None, rowcount=0):
+        self.one = one
+        self.rows = rows if rows is not None else []
+        self.rowcount = rowcount
+
+    def mappings(self):
+        return self
+
+    def one_or_none(self):
+        return self.one
+
+    def all(self):
+        return self.rows
+
+    def scalar_one_or_none(self):
+        return self.one
+
+
+class _PreIoDb:
+    def __init__(self, *, intent_attempt="attempt-1", include_broker_possible=False):
+        self.intent_attempt = intent_attempt
+        self.include_broker_possible = include_broker_possible
+        self.updated = []
+        self.committed = False
+        self.rolled_back = False
+
+    def execute(self, statement, params):
+        sql = str(statement).lower()
+        if "from us_profit_capture_lifecycle" in sql:
+            return _RowSet(one={"stage_status": "PENDING",
+                                "cumulative_filled_qty": 0, "requested_qty": 2})
+        if "from us_order_events" in sql:
+            rows = [{"event_type": "BROKER_SUBMIT_ABORTED_PRE_IO",
+                     "submit_attempt_id": "attempt-1"}]
+            if self.include_broker_possible:
+                rows.append({"event_type": "BROKER_CALL_STARTED",
+                             "submit_attempt_id": "attempt-1"})
+            return _RowSet(rows=rows)
+        if "from us_execution_attempts a" in sql:
+            return _RowSet(rows=[{
+                "attempt_state": "ABANDONED_PRE_SUBMIT", "authoritative": True,
+                "requested_qty": 2, "action_key": "action",
+                "action": "TP1", "target_qty": 2,
+                "filled_qty_before_attempt": 0,
+                "lifecycle_id": "cycle-1",
+                "account_id": "account-1", "action_state": "OPEN",
+                "active_attempt_id": None,
+            }])
+        if "from us_orders" in sql:
+            return _RowSet(one=None)
+        if "select status, meta" in sql and "from us_order_intents" in sql:
+            return _RowSet(one={"status": "PENDING",
+                                "meta": {"submit_attempt_id": self.intent_attempt}})
+        if "update us_order_intents" in sql:
+            self.updated.append(params)
+            return _RowSet(rowcount=1)
+        raise AssertionError("Unexpected SQL in pre-HTTP release test: " + sql[:130])
+
+    def begin(self):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def transaction():
+            try:
+                yield self
+            except Exception:
+                self.rolled_back = True
+                raise
+            else:
+                self.committed = True
+        return transaction()
+
+
+def _run_proven_abort(db, *, mark_failure=None):
+    from trader.us.db import repos
+    state = {
+        "NOVA": {
+            "tp1_order_key": "US_PC_TEST_NOVA",
+            "tp1_pending": True,
+            "tp1_done": False,
+            "meta": {"last_status": "PENDING"},
+        }
+    }
+    with (
+        patch.object(repos, "_get_engine_or_none", return_value=db),
+        patch.object(repos, "_active_us_epoch", return_value="epoch-1"),
+        patch.object(repos, "load_us_profit_capture_state", return_value=state),
+        patch.object(repos, "mark_us_profit_capture_stage", side_effect=mark_failure) as mark,
+    ):
+        result = repos.release_us_profit_capture_pre_http_abort(
+            trade_date="2026-11-16", symbol="NOVA", stage="tp1",
+            position_lifecycle_id="cycle-1", client_order_key="US_PC_TEST_NOVA",
+        )
+    return result, mark
+
+
+def test_proven_pre_http_abort_closes_intent_and_stage_in_one_transaction():
+    db = _PreIoDb()
+    result, mark = _run_proven_abort(db)
+    assert result is True
+    assert db.committed and not db.rolled_back
+    assert len(db.updated) == 1
+    assert db.updated[0]["epoch"] == "epoch-1"
+    mark.assert_called_once()
+
+
+def test_pre_http_abort_never_releases_foreign_attempt_or_post_possible():
+    for db in (
+        _PreIoDb(intent_attempt="foreign-attempt"),
+        _PreIoDb(include_broker_possible=True),
+    ):
+        result, mark = _run_proven_abort(db)
+        assert result is False
+        assert not db.updated
+        mark.assert_not_called()
+
+
+def test_pre_http_abort_intent_and_stage_roll_back_together_on_failure():
+    db = _PreIoDb()
+    with pytest.raises(RuntimeError, match="injected_stage_failure"):
+        _run_proven_abort(db, mark_failure=RuntimeError("injected_stage_failure"))
+    assert db.rolled_back and not db.committed
+    assert len(db.updated) == 1  # transaction rollback, not a committed UPDATE
