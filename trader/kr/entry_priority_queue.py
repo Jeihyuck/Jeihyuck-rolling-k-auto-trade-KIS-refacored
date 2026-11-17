@@ -243,7 +243,13 @@ def collection_priorities(*, date: str, account_scope: str,
 
 
 class CandidateSchedule:
-    """Single collector queue with bounded batch size and cold starvation guard."""
+    """Fair read-only poll planner; a poll attempt is NOT a fresh KIS proof.
+
+    HOT is prioritized, but a busy HOT5 must not turn WARM5 into a
+    deterministic 225-second polling gap with a 180-second proof TTL.
+    This is a scheduling improvement, not a guarantee that REST calls
+    succeed or that every Final30 symbol remains fresh.
+    """
 
     def __init__(self, *, max_batch: int = 10,
                  hot_sec: int = 45, warm_sec: int = 180, cold_sec: int = 600):
@@ -252,6 +258,40 @@ class CandidateSchedule:
         self.max_batch = max(3, int(max_batch))
         self.periods = {"hot": max(15, hot_sec),
                         "warm": max(60, warm_sec), "cold": max(120, cold_sec)}
+
+    def diagnostics(self, snapshot: dict, now: datetime,
+                    *, interval_sec: float = 45.0) -> dict:
+        """Poll-debt/capacity telemetry only; never authorizes an entry.
+
+        The 180-second bound applies to *verified broker data*, not to an
+        attempted poll. Real HTTP duration, failures and retries may make
+        actual throughput lower than this theoretical slot upper bound.
+        """
+        now = now.astimezone(KST)
+        tiers = {}
+        total = 0
+        configured_demand = 0.0
+        for tier in ("hot", "warm", "cold"):
+            codes = _unique(snapshot.get(tier) or [])
+            total += len(codes)
+            configured_demand += len(codes) / float(self.periods[tier])
+            ages = [(now - self.last_attempt[c]).total_seconds()
+                    for c in codes if c in self.last_attempt]
+            tiers[tier] = {
+                "count": len(codes),
+                "never_polled": len(codes) - len(ages),
+                "overdue_poll": sum(age >= self.periods[tier] for age in ages),
+                "max_poll_age_sec": max(ages) if ages else None,
+            }
+        capacity = self.max_batch / max(1.0, float(interval_sec))
+        return {
+            "tiers": tiers,
+            "theoretical_polls_per_sec": capacity,
+            "configured_demand_per_sec": configured_demand,
+            "overcommitted": configured_demand > capacity,
+            "all_180s_possible_at_slot_capacity": total / 180.0 <= capacity,
+            "polls_not_proofs": True,
+        }
 
     def select(self, snapshot: dict, now: datetime) -> list[str]:
         now = now.astimezone(KST)
@@ -267,18 +307,32 @@ class CandidateSchedule:
                 self.last_tier[code] = category
             items.sort(key=lambda x: (-x[0], x[1]))
             due[category] = items
-        # Reserve a slot for WARM *and* COLD.  A continuously busy
-        # five-name HOT queue cannot starve every other Final30 member.
-        chosen = [c for _, c in due["hot"][:max(1, self.max_batch - 2)]]
-        for category in ("warm", "cold"):
-            if due[category] and len(chosen) < self.max_batch:
-                chosen.append(due[category][0][1])
-        for category in ("hot", "warm", "cold"):
-            for _, c in due[category]:
-                if len(chosen) >= self.max_batch:
-                    break
-                if c not in chosen:
-                    chosen.append(c)
-        for c in chosen:
-            self.last_attempt[c] = now
+
+        # For a six-symbol cycle reserve 3 HOT / 2 WARM / 1 COLD,
+        # rather than 4/1/1. This prevents a fixed WARM5 225s gap
+        # without reducing the HOT5 maximum planned gap (<=90s in
+        # an ideal uninterrupted 45s-cycle simulation). Reserve
+        # proportionally for other batch sizes and reallocate idle slots.
+        hot_quota = max(1, self.max_batch // 2)
+        warm_quota = max(1, self.max_batch - hot_quota - 1)
+        quotas = {"hot": hot_quota, "warm": warm_quota, "cold": 1}
+        chosen: list[str] = []
+        for tier in ("hot", "warm", "cold"):
+            chosen.extend(c for _, c in due[tier][:quotas[tier]]
+                          if c not in chosen)
+
+        # Fill spare capacity with the most urgent due poll, with
+        # the original HOT preference on equal deadline debt.
+        remaining = []
+        for tier_index, tier in enumerate(("hot", "warm", "cold")):
+            for age, code in due[tier]:
+                if code in chosen:
+                    continue
+                deadline = min(self.periods[tier], 180) if tier != "cold" else self.periods[tier]
+                urgency = float("inf") if age == float("inf") else age - deadline
+                remaining.append((-urgency, tier_index, code))
+        remaining.sort()
+        chosen.extend(code for _, _, code in remaining[:self.max_batch - len(chosen)])
+        for code in chosen:
+            self.last_attempt[code] = now
         return chosen
