@@ -2837,6 +2837,23 @@ def _normalize_risk_state(symbol: str, trade_date: str, state: dict | None) -> d
 
 
 def _ensure_us_position_risk_state_table(conn) -> None:
+    """Avoid one redundant CREATE TABLE round trip for every risk/HWM read.
+
+    A successful schema check is cached only on the *physical pooled DBAPI
+    connection*, never across different account/engine connections or process
+    restarts. CI and explicit operator schema checks still perform the DDL
+    every time. Any failed DDL must never set the ready bit. Missing tables
+    after a schema change fail in the normal read/write path, not fail open.
+    """
+    info = getattr(conn, "info", None)
+    cache_ok = (
+        isinstance(info, dict)
+        and not os.getenv("PBCORE_TEST_POSTGRES_URL")
+        and os.getenv("US_RISK_STATE_FORCE_SCHEMA_DDL", "0") != "1"
+    )
+    ready_key = "us_position_risk_state_schema_ready_v3"
+    if cache_ok and info.get(ready_key) is True:
+        return
     conn.execute(text("""
         CREATE TABLE IF NOT EXISTS us_position_risk_state (
             trading_epoch_id TEXT NOT NULL,
@@ -2853,6 +2870,8 @@ def _ensure_us_position_risk_state_table(conn) -> None:
             PRIMARY KEY (trading_epoch_id, trade_date, symbol)
         )
     """))
+    if cache_ok:
+        info[ready_key] = True
 
 
 def load_us_position_risk_state(symbol: str, trade_date: str) -> dict:
