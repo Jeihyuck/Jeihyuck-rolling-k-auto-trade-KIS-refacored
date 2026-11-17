@@ -1965,12 +1965,21 @@ class KisAPI:
                         # symbol may not black out unrelated price candidates.
                         _rate_code = str((kwargs.get("params") or {}).get("fid_input_iscd") or "").strip().lstrip("A")
                         _price_cache.open_circuit(code=_rate_code or None, rate_limited=True)
-                        # Exponential backoff
+                        # Only sleep if a retry will really occur.  The
+                        # read-only observer deliberately uses attempts=1:
+                        # the old code spent 2-10 seconds sleeping *after*
+                        # that final rejected response, delaying other
+                        # candidates without making any new KIS request.
+                        if i >= attempts:
+                            logger.info(
+                                "[KIS][EGW002][FINAL_NO_SLEEP] endpoint=%s "
+                                "attempts=%s observer=%s action=DEFER_TO_NEXT_CYCLE",
+                                endpoint_name, attempts, int(bool(is_kr_observer)),
+                            )
+                            raise KisTemporaryError(f"EGW002 msg_cd={msg_cd}")
                         if _egw002_backoff_sleep(attempt=i) <= 0:
                             raise KisTemporaryError("KR_TICK_DEADLINE_EXHAUSTED_BEFORE_EGW002_RETRY")
-                        if i < attempts:
-                            continue
-                        raise KisTemporaryError(f"EGW002 msg_cd={msg_cd}")
+                        continue
                     
                     if is_order_endpoint(url) and _is_kis_tick_size_error_body(body):
                         logger.error(
