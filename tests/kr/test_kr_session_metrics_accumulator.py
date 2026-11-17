@@ -112,3 +112,15 @@ def test_explicit_order_skip_counter_accumulates_without_conflating_terminal_eve
     assert summary["terminal_final_skip_ticks"] == 1
     assert summary["skipped_order_observed_ticks"] == 2
     assert summary.get("skipped_order_unobserved_ticks", 0) == 0
+
+
+def test_unknown_terminal_event_does_not_prove_zero_final_skips():
+    from trader.pb1_runner import _accumulate_kr_tick_skip_observations
+
+    metrics = {}
+    _accumulate_kr_tick_skip_observations(metrics, {})
+    assert metrics.get("terminal_final_skip_ticks", 0) == 0
+    assert metrics["terminal_event_unobserved_ticks"] == 1
+    assert metrics["skipped_order_unobserved_ticks"] == 1
+    # This zero is merely "not observed", not authoritative evidence that
+    # no per-order or terminal skips happened in the engine.
