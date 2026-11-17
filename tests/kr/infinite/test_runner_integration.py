@@ -32,7 +32,12 @@ class FakeKIS:
         return {"output1": holdings, "output2": {"tot_evlu_amt": "4000000"}}
 
     def get_current_price(self, symbol): return self.price
-    def get_orderable_cash(self, symbol, price): return 4_000_000, {}
+    def get_orderable_cash(self, symbol, price):
+        return 4_000_000, {
+            "native_source_verified": True, "source": "psbl_order",
+            "selected_key": "ord_psbl_cash",
+            "raw_fields": {"ord_psbl_cash": "4000000"},
+        }
 
     def buy_stock_limit(self, symbol, qty, price):
         self.events.append("submit"); self.orders.append(("BUY", qty)); self.last_side = "BUY"
@@ -751,7 +756,11 @@ def test_held_infinite_cash_http_failure_keeps_order_unsubmitted(armed_practice_
 
 def test_held_infinite_actual_broker_cash_zero_is_not_fabricated(armed_practice_env):
     kis = FakeKIS(qty=100, average=100, price=99)
-    kis.get_orderable_cash = lambda *args: (0, {"rt_cd": "0"})
+    kis.get_orderable_cash = lambda *args: (0, {
+        "native_source_verified": True, "source": "psbl_order",
+        "selected_key": "ord_psbl_cash",
+        "raw_fields": {"ord_psbl_cash": "0"},
+    })
     repo = FakeRepository(active())
     result = run_once(
         config=config(), kis=kis, repository=repo,
@@ -759,5 +768,31 @@ def test_held_infinite_actual_broker_cash_zero_is_not_fabricated(armed_practice_
     )
     assert result.decision.action == Action.WAIT
     assert result.decision.reason == "INSUFFICIENT_STRATEGY_CAPITAL"
+    assert not kis.orders
+    assert not repo.intents
+
+
+@pytest.mark.parametrize("source,field,verified", [
+    ("psbl_order_cache", "ord_psbl_cash", False),
+    ("balance_out2", "dnca_tot_amt", False),
+    ("psbl_order", "dnca_tot_amt", True),
+    ("psbl_order", "ord_psbl_cash", False),
+])
+def test_held_infinite_rejects_cached_or_fallback_cash_without_order(
+    armed_practice_env, source, field, verified,
+):
+    kis, repo = FakeKIS(qty=100, average=100, price=99), FakeRepository(active())
+    kis.get_orderable_cash = lambda *args: (4_000_000, {
+        "native_source_verified": verified, "source": source,
+        "selected_key": field,
+        "raw_fields": {field: "4000000"},
+    })
+    result = run_once(
+        config=config(), kis=kis, repository=repo,
+        regime_provider=REGIME, trade_date=DAY, kis_env="practice",
+    )
+    assert (result.decision.action, result.decision.reason) == (
+        Action.WAIT, "KR_INF_BUYING_POWER_UNVERIFIED",
+    )
     assert not kis.orders
     assert not repo.intents
