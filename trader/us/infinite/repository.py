@@ -492,6 +492,94 @@ class InfiniteRepository:
                     )
                 """), {"attribution": attribution})
 
+    def load_verified_cycle_entry_evidence(self, *, cycle_id: str) -> dict | None:
+        """Read ONLY an original, KIS-actual BUY 5W1H for this TQQQ cycle.
+
+        A filled BUY alone cannot manufacture missing decision evidence.
+        No account/epoch/owner/cycle fallback or latest-symbol substitution.
+        This is audit-only and never grants a broker SELL authorization.
+        """
+        from trader.us.decision_evidence_5w1h import verify_decision_evidence
+        from trader.us.utils.order_no import normalize_us_order_no
+
+        cycle = str(cycle_id or "").strip()
+        if not cycle:
+            return None
+        try:
+            with self.engine.connect() as conn:
+                epoch = self._epoch_id(conn, required=True)
+                if not epoch:
+                    return None
+                rows = conn.execute(text("""
+                    SELECT f.trade_date,f.qty,f.side,f.order_no,
+                           f.client_order_key,f.meta AS fill_meta,
+                           f.account_id AS fill_account_id,
+                           i.account_id AS intent_account_id,
+                           i.strategy AS intent_strategy,
+                           i.meta AS intent_meta
+                      FROM us_fills f
+                      JOIN us_order_intents i
+                        ON i.trade_date=f.trade_date
+                       AND i.client_order_key=f.client_order_key
+                       AND i.trading_epoch_id=f.trading_epoch_id
+                     WHERE f.symbol='TQQQ' AND f.side='BUY'
+                       AND f.trading_epoch_id=:epoch
+                       AND f.client_order_key LIKE :prefix
+                     ORDER BY f.trade_date ASC,f.filled_at ASC,f.created_at ASC
+                     LIMIT 512
+                """), {"epoch": str(epoch),
+                       "prefix": "TQQQ_INF_V3:" + cycle + ":%"}).mappings().all()
+            first = None
+            for row in rows:
+                key = str(row.get("client_order_key") or "")
+                fill_meta = self._json_object(row.get("fill_meta"))
+                meta = self._json_object(row.get("intent_meta"))
+                if (not key.startswith("TQQQ_INF_V3:" + cycle + ":")
+                        or str(row.get("intent_strategy") or "") != "TQQQ_INFINITE_V3"
+                        or str(meta.get("strategy_owner") or "") != "TQQQ_INFINITE"
+                        or str(meta.get("cycle_id") or "") != cycle
+                        or str(meta.get("position_lifecycle_id") or "") != cycle
+                        or str(meta.get("book") or "") != "TQQQ_INFINITE"
+                        or str(fill_meta.get("fill_evidence_type") or "")
+                            != "KIS_ORDER_CUMULATIVE_ACTUAL"
+                        or fill_meta.get("is_synthetic") is True
+                        or fill_meta.get("accounting_active") is False
+                        or not normalize_us_order_no(row.get("order_no"))):
+                    continue
+                account = str(row.get("intent_account_id") or "").strip()
+                if not account or account != str(row.get("fill_account_id") or "").strip():
+                    continue
+                try:
+                    shares = int(row["qty"])
+                    if shares <= 0 or float(row["qty"]) != shares:
+                        continue
+                except (ValueError, TypeError, OverflowError):
+                    continue
+                evidence = meta.get("entry_decision_evidence_5w1h")
+                if not verify_decision_evidence(evidence):
+                    continue
+                what = evidence.get("what") or {}
+                who = evidence.get("who") or {}
+                if (what.get("side") != "BUY" or what.get("symbol") != "TQQQ"
+                        or what.get("position_lifecycle_id") != cycle
+                        or what.get("decision_id") != "TQQQ_INFINITE:BUY:" + key
+                        or who.get("strategy_owner") != "TQQQ_INFINITE"
+                        or meta.get("entry_decision_evidence_sha256") != evidence["sha256"]):
+                    continue
+                if first is None:
+                    first = evidence
+                elif first.get("what", {}).get("decision_id") == what.get("decision_id"):
+                    if first["sha256"] != evidence["sha256"]:
+                        return None  # two conflicting digests for one filled BUY
+            return first
+        except Exception as exc:
+            logger.warning(
+                "[TQQQ_INF][5W1H][ORIGINAL_LOOKUP_UNVERIFIED] error_type=%s",
+                type(exc).__name__,
+            )
+            return None
+
+
     def fill_accounting(self, state: InfiniteState, trading_date: date) -> tuple[float, float, float, date | None, float | None]:
         """Return cycle BUY total, today's BUY total, cycle SELL total, last BUY date and first fill price."""
         start = state.cycle_start_date or trading_date
