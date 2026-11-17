@@ -4217,11 +4217,48 @@ def get_balance_state(
         # A marker received *inside* a cached snapshot is not independent
         # evidence. Rebuild it exclusively from the wrapper's original fetch.
         balance_snapshot_raw.pop("_kr_verified_fresh_at_kst", None)
+        # The wrapper cache has no automatic age cutoff. A 60s multi-tick
+        # KR session can otherwise reuse one pre-open snapshot forever and
+        # mark every CURRENT_ONLY tick as broker-unverified. Only the real
+        # KisAPI client may force refresh here; synthetic/mock adapter
+        # tests continue to expose an absent native timestamp as unproven.
+        verified_at = getattr(kis, "_balance_cache_at", None)
+        original_age = (
+            (now_kst() - verified_at).total_seconds()
+            if isinstance(verified_at, datetime) and verified_at.tzinfo
+            else float("inf")
+        )
+        if not 0 <= original_age <= 20 and isinstance(kis, KisAPI):
+            logger.warning(
+                "[KR_BALANCE][STALE_WRAPPER_CACHE_REFRESH] source=%s "
+                "original_age_sec=%s action=FORCE_NATIVE_BALANCE_OR_FAIL_CLOSED",
+                balance_source, round(original_age, 3) if original_age != float("inf") else None,
+            )
+            balance_snapshot_raw, balance_source, raw_snapshot = kis.get_balance_cached(
+                force=True, return_source=True, return_raw=True,
+            )
+            balance_snapshot_raw = _deepcopy_json(balance_snapshot_raw)
+            raw_snapshot = _deepcopy_json(raw_snapshot)
+            if (not isinstance(balance_snapshot_raw, dict)
+                    or not isinstance(balance_snapshot_raw.get("output1"), list)
+                    or not isinstance(balance_snapshot_raw.get("output2"), dict)
+                    or balance_snapshot_raw.get("rt_cd") not in (None, "0", 0)):
+                raise KisBalanceUnavailable("forced_balance_refresh_invalid_original_response")
+            balance_snapshot_raw.pop("_kr_verified_fresh_at_kst", None)
+            verified_at = getattr(kis, "_balance_cache_at", None)
+            if (not isinstance(verified_at, datetime)
+                    or verified_at.tzinfo is None
+                    or not 0 <= (now_kst() - verified_at).total_seconds() <= 20):
+                raise KisBalanceUnavailable("forced_balance_original_fetch_time_unverified")
+            logger.info(
+                "[KR_BALANCE][STALE_WRAPPER_CACHE_REFRESH][OK] "
+                "source=%s native_age_sec=%.3f",
+                balance_source, (now_kst() - verified_at).total_seconds(),
+            )
         # Only the KIS wrapper's timestamp from a successful original HTTP
-        # balance fetch may certify freshness.  In particular, a cached or
+        # balance fetch may certify freshness. In particular, a cached or
         # precheck snapshot must not become "fresh" merely because this runner
         # reads or copies it on a later tick.
-        verified_at = getattr(kis, "_balance_cache_at", None)
         if (
             balance_source in {"api", "wrapper_cache"}
             and isinstance(verified_at, datetime)
