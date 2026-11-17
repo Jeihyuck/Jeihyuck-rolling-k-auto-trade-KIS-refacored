@@ -81,7 +81,11 @@ def test_successful_native_http_receipts_are_unique_across_read_calls():
     api._headers = lambda tr: {}
     calls = []
     def fake_request(*args, **kwargs):
+        # An offline _safe_request stub must explicitly carry a simulated
+        # network-bound receipt; the production KIS wrapper creates it only
+        # after session.request() actually returns.
         calls.append((args, kwargs))
+        resp._nullim_http_request_id = f"{len(calls):032x}"
         return resp
     api._safe_request = fake_request
     first = api.get_intraday_candles_today("012750", start_hhmm="092700", attempts=1)
