@@ -3267,7 +3267,7 @@ def run_trade_tick(
             defer_pending_until_claim=(real_order_mode and not offline),
             # 'now' is the Tick-start market clock, not the live TP signal
             # readiness time. Keep replay deterministic, live time exact.
-            decision_clock_real_time=(real_order_mode and not offline),
+            decision_clock_real_time=(real_order_mode and not offline and not force_now),
         )
         if profit_capture_intents:
             exit_intents.extend(profit_capture_intents)
