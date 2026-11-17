@@ -117,3 +117,24 @@ def test_global_market_crash_remains_closed_for_all_standard_candidates():
     assert len(blocked) == 2
     assert all(row["reason"] == "INTRADAY_MARKET_CRASH_ENTRY_BLOCK"
                for row in blocked)
+
+
+@pytest.mark.parametrize("asof", [
+    (DECIDED - timedelta(seconds=6)).isoformat(),
+    (DECIDED + timedelta(seconds=1)).isoformat(),
+    DECIDED.replace(tzinfo=None).isoformat(),
+    "malformed_quote_time",
+])
+def test_fresh_decision_clock_cannot_authorize_stale_or_unverified_quote(asof):
+    pos = {"symbol": "XYZ", "qty": 20, "entry_price": 100.0,
+           "current_price": 110.0, "position_lifecycle_id": "cycle-xyz",
+           "resolved_quote_asof": asof}
+    with patch("trader.us.profit_capture.authoritative_broker_avg",
+               return_value=(Decimal("100"), {"broker_avg_price_source": "KIS"})):
+        assert build_profit_capture_intents(
+            [pos], {"profit_capture_enabled": True},
+            now=TICK_STARTED, trade_date=TRADE_DATE,
+            profit_capture_state={"XYZ": {}},
+            defer_pending_until_claim=True,
+            decision_clock=lambda: DECIDED,
+        ) == []
