@@ -281,6 +281,7 @@ def _recover_proven_policy_positions_fixed(
     kis = base._holdings_index(holdings_rows)
     recovered: list[str] = []
     review: list[str] = []
+    foreign_owner_review: list[str] = []
     with engine.connect() as conn:
         active_epoch = active_trading_epoch_id(
             conn, env=env, account_id=get_account_key(env=env),
@@ -308,6 +309,20 @@ def _recover_proven_policy_positions_fixed(
         by_code.setdefault(base._normalize_code(position.get("code")), []).append(position)
 
     for code, code_positions in sorted(by_code.items()):
+        # 122630 is owned by KR_INFINITE_V1. This *installed* review guard
+        # replaces the base function; retain the reserved-owner protection
+        # here too, before looking for any PB1 fills or rewriting policies.
+        if code == base.KR_INFINITE_SYMBOL:
+            review.append(code)
+            foreign_owner_review.append(code)
+            logger.error(
+                "[KR_BROKER_TRUTH][FOREIGN_STRATEGY_OWNER_REVIEW] "
+                "code=%s declared_owner=%s reserved_owner=%s "
+                "broker_qty=%s action=NO_PB1_RECOVERY",
+                code, strategy, base.KR_INFINITE_STRATEGY_ID,
+                int((kis.get(code) or {}).get("qty") or 0),
+            )
+            continue
         if len(code_positions) != 1:
             review.append(code)
             logger.error(
@@ -572,7 +587,12 @@ def _recover_proven_policy_positions_fixed(
             source_cycle,
         )
 
-    return {"recovered": recovered, "review_required": sorted(set(review))}
+    # Preserve the established result contract for non-reserved PB1 symbols.
+    # The extra explicit RED owner marker is present only for 122630.
+    result = {"recovered": recovered, "review_required": sorted(set(review))}
+    if foreign_owner_review:
+        result["foreign_owner_review_required"] = sorted(set(foreign_owner_review))
+    return result
 
 
 def _health_after_reconcile_fixed(*, engine, env: str, strategy: str, holdings_rows: list[dict] | None) -> dict[str, Any]:
@@ -582,17 +602,27 @@ def _health_after_reconcile_fixed(*, engine, env: str, strategy: str, holdings_r
     mismatches: list[dict[str, Any]] = []
     duplicate_open_lifecycles: list[dict[str, Any]] = []
     with engine.connect() as conn:
+        # CURRENT_ONLY health must not report historic epochs as if they
+        # belonged to the active trading cycle. Keep legacy no-epoch behavior.
+        active_epoch = active_trading_epoch_id(
+            conn, env=env, account_id=get_account_key(env=env),
+            required=trading_epoch_enforced(),
+        )
+        position_predicate = sa.and_(
+            schema.positions.c.env == env,
+            schema.positions.c.strategy == strategy,
+            schema.positions.c.status == "OPEN",
+            schema.positions.c.qty > 0,
+        )
+        if active_epoch is not None:
+            position_predicate = sa.and_(
+                position_predicate,
+                schema.positions.c.trading_epoch_id == active_epoch,
+            )
         positions = [
             dict(row)
             for row in conn.execute(
-                sa.select(schema.positions).where(
-                    sa.and_(
-                        schema.positions.c.env == env,
-                        schema.positions.c.strategy == strategy,
-                        schema.positions.c.status == "OPEN",
-                        schema.positions.c.qty > 0,
-                    )
-                )
+                sa.select(schema.positions).where(position_predicate)
             ).mappings().all()
         ]
 
@@ -624,6 +654,8 @@ def _health_after_reconcile_fixed(*, engine, env: str, strategy: str, holdings_r
     try:
         for order in OrdersRepo(engine).get_open_orders(env, include_stale=True) or []:
             if str(order.get("strategy") or "") != strategy:
+                continue
+            if active_epoch is not None and str(order.get("trading_epoch_id") or "") != str(active_epoch):
                 continue
             created_day = base._date_of(order.get("created_at"))
             if created_day is not None and created_day < today:

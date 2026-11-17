@@ -317,24 +317,42 @@ def _evidence_file(env: str, account_scope: str, code: str, now: datetime) -> Pa
 def save_opening_proof(*, env: str, account_scope: str, code: str,
                        now: datetime, raw_bars: list[dict], vwap: float | None,
                        vwap_source: str) -> dict:
-    """Merge only attested same-day completed KIS bars, under a process lock.
+    """Merge attested native complete minutes with durable conflict quarantine.
 
-    A partial REST response must not erase earlier valid completed candles.
-    A historic proof may contribute *candles*, never fresh VWAP or freshness.
-    Divergent values for an immutable completed minute are quarantined; do
-    not fabricate a preferred price or authorize BUY on conflicting evidence.
+    Previously stored opening bars can be reused, but never synthesized.
+    A revision to a completed minute is quarantined until THREE matching
+    KIS-native completed-minute observations at least 60 seconds apart
+    confirm a single value over >=120 seconds.  Intra-response conflicts
+    cannot satisfy that proof.  Every resolution retains its audit trail.
     """
     import tempfile
+    import fcntl
 
     now = now.astimezone(KST)
     new_bars = clean_completed_bars(raw_bars, now)
+    # Detect contradictory native OHLCV versions in a *single* REST collection
+    # pass. clean_completed_bars alone uses the last row for each minute.
+    seen_this_pass: dict[str, dict] = {}
+    intra_pass_conflicts: set[str] = set()
+    # These IDs are generated at the successful authenticated KIS HTTP
+    # response boundary, not from OHLCV contents or by this persistence layer.
+    # The same cached/native-format response cannot advance a quarantine
+    # multiple times, even across process restarts or spaced calls.
+    http_observation_ids: dict[str, set[str]] = {}
+    for raw in raw_bars:
+        for one in clean_completed_bars([raw], now):
+            key = one["timestamp"]
+            if key in seen_this_pass and seen_this_pass[key] != one:
+                intra_pass_conflicts.add(key)
+            seen_this_pass[key] = one
+            response_id = raw.get("_kis_http_observation_id")
+            if (isinstance(response_id, str) and len(response_id) == 32
+                    and all(char in "0123456789abcdef" for char in response_id)):
+                http_observation_ids.setdefault(key, set()).add(response_id)
+
     path = _evidence_file(env, account_scope, code, now)
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_suffix(".lock")
-
-    # Both the AM and PM observer may run during a handoff. The lock file is
-    # stable across os.replace; locking the replaced proof inode is unsafe.
-    import fcntl
     with lock_path.open("a+b") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
@@ -345,17 +363,84 @@ def save_opening_proof(*, env: str, account_scope: str, code: str,
             old_bars = clean_completed_bars((previous or {}).get("bars") or [], now)
             merged = {bar["timestamp"]: bar for bar in old_bars}
             conflicts = set((previous or {}).get("source_conflicts") or [])
+            observations = dict((previous or {}).get("conflict_observations") or {})
+            resolved_history = list((previous or {}).get("resolved_source_conflicts") or [])
+            resolved_this_pass: list[str] = []
             added = 0
+
             for bar in new_bars:
                 key = bar["timestamp"]
-                if key in merged and merged[key] != bar:
+                current = merged.get(key)
+                changed = current is not None and current != bar
+                quarantined = changed or key in conflicts or key in intra_pass_conflicts
+                if quarantined:
                     conflicts.add(key)
-                    # The old verified evidence is preserved, but cannot be
-                    # used to authorize an entry until the conflict is resolved.
+                    prev = observations.get(key) or {}
+                    identical = prev.get("candidate") == bar
+                    last_stamp = None
+                    try:
+                        last_stamp = datetime.fromisoformat(
+                            str(prev.get("last_counted_at") or "")
+                        )
+                    except (ValueError, TypeError):
+                        pass
+                    separated = (last_stamp is None or
+                                 (now - last_stamp).total_seconds() >= 60)
+                    # Pre-upgrade counters with no authenticated HTTP receipt
+                    # are not independent proof and must be revalidated.
+                    counted_ids = list(prev.get("counted_http_observation_ids") or []) if identical else []
+                    distinct_ids = sorted(
+                        candidate_id for candidate_id in http_observation_ids.get(key, set())
+                        if candidate_id not in counted_ids
+                    )
+                    first_at = str(prev.get("first_candidate_seen") or "") if identical else now.isoformat()
+                    if separated and key not in intra_pass_conflicts and distinct_ids:
+                        # At most one confirmation per store pass, and only
+                        # one confirmed ID for each separate KIS HTTP response.
+                        counted_ids.append(distinct_ids[0])
+                        last_counted = now.isoformat()
+                    else:
+                        last_counted = str(prev.get("last_counted_at") or "") if identical else ""
+                    count = len(counted_ids)
+                    observations[key] = {
+                        "original": prev.get("original") or current or bar,
+                        "candidate": bar, "first_candidate_seen": first_at,
+                        "last_observed_at": now.isoformat(),
+                        "last_counted_at": last_counted,
+                        "stable_native_reads": count,
+                        "counted_http_observation_ids": counted_ids,
+                        "unverified_native_replay": not bool(distinct_ids),
+                        "source": "KIS_FHKST03010200",
+                        "intra_pass_conflict": key in intra_pass_conflicts,
+                    }
+                    try:
+                        span = (now - datetime.fromisoformat(first_at)).total_seconds()
+                    except (TypeError, ValueError):
+                        span = 0
+                    if (count >= 3 and span >= 120
+                            and key not in intra_pass_conflicts):
+                        resolved_history.append({
+                            "minute": key, "original": observations[key]["original"],
+                            "accepted": bar, "confirmed_native_reads": count,
+                            "first_seen": first_at, "resolved_at": now.isoformat(),
+                            "distinct_http_responses": len(counted_ids),
+                            "resolution": "THREE_SPACED_KIS_NATIVE_CONFIRMATIONS",
+                        })
+                        merged[key] = bar
+                        conflicts.discard(key)
+                        observations.pop(key, None)
+                        resolved_this_pass.append(key)
+                    elif current is None:
+                        # Retain an untrusted copy only for forensic diagnosis.
+                        # A conflict flag still prohibits BUY with this proof.
+                        merged[key] = bar
                     continue
-                if key not in merged:
+                if current is None:
                     added += 1
                 merged[key] = bar
+
+            # An unresolved conflicting native minute remains a hard block
+            # through process restarts, even if no new data arrived this pass.
             bars = [merged[key] for key in sorted(merged)]
             payload = {
                 "version": VERSION, "env": str(env).lower(),
@@ -370,13 +455,13 @@ def save_opening_proof(*, env: str, account_scope: str, code: str,
                 "vwap": _positive(vwap),
                 "vwap_source": vwap_source if _positive(vwap) else "UNKNOWN",
                 "source_conflicts": sorted(conflicts),
+                "conflict_observations": observations,
+                "resolved_source_conflicts": resolved_history[-100:],
             }
             canonical = json.dumps(
                 payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
             )
             payload["sha256"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-            # Use a unique temp path + fsync to prevent partial proof exposure
-            # across concurrent collectors, cancellation and WSL restarts.
             temp_name = None
             try:
                 with tempfile.NamedTemporaryFile(
@@ -395,10 +480,13 @@ def save_opening_proof(*, env: str, account_scope: str, code: str,
                 "path": str(path), "bars": len(bars),
                 "new_bars": len(new_bars), "reused_bars": len(old_bars),
                 "added_bars": added, "source_conflicts": sorted(conflicts),
+                "resolved_conflicts": resolved_this_pass,
+                "intra_pass_conflicts": sorted(intra_pass_conflicts),
                 "sha256": payload["sha256"],
             }
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
 
 
 def load_opening_proof(*, env: str, account_scope: str, code: str, now: datetime,

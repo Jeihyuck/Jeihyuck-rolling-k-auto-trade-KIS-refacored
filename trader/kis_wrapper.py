@@ -16,8 +16,10 @@ import json
 import time
 import random
 import logging
+import hashlib
 import math
 import threading
+import uuid
 import copy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -1670,6 +1672,16 @@ class KisAPI:
             attempts = max(self._safe_attempts, 1)
         if no_retry_inquire_investor:
             attempts = 1
+        # The independent KR minute observer must never hold KIS's quota
+        # with nested retries. All non-observer callers preserve their
+        # original retries and broker submission semantics.
+        is_kr_observer = (
+            str(os.getenv("KR_PB1_OBSERVER_ONLY") or "") == "1"
+            and str(self.env or "").lower() == "practice"
+            and str(os.getenv("KR_PB1_KIS_OBSERVER_BUDGET_ENABLED") or "") == "1"
+        )
+        if is_kr_observer and method.upper() == "GET":
+            attempts = 1
         start_ts = time.monotonic()
         auth_refreshed = False
         reset_done = False
@@ -1687,6 +1699,47 @@ class KisAPI:
             endpoint_category = "price"
         gate = get_kis_gate()
         account_key = f"{str(self.CANO or '').strip()}:{str(self.ACNT_PRDT_CD or '').strip()}"
+        # Coordinate with the *low-priority collector* across WSL processes.
+        # Critical order/balance requests NEVER wait for or acquire an
+        # observer slot. Its notice is best-effort and nonblocking.
+        if (
+            str(self.env or "").lower() == "practice"
+            and os.getenv("KR_PB1_KIS_OBSERVER_BUDGET_ENABLED", "0") == "1"
+        ):
+            from trader.kr.kis_observer_budget import (
+                acquire_observer_slot_bounded, note_critical_kr_call,
+            )
+            if is_kr_observer and method.upper() == "GET" and (
+                "inquire-time-itemchartprice" in path_lower
+                or "inquire-price" in path_lower
+            ):
+                # The next native VWAP quote is often immediately after
+                # the minute REST call. A short observer-local wait protects
+                # its own 0.5RPS budget without starving quote verification.
+                # Protected BUY/SELL/balance traffic never waits here.
+                granted, quota_reason, budget_wait_sec = acquire_observer_slot_bounded(
+                    environment="practice", account_key=account_key,
+                    max_wait_sec=2.5,
+                )
+                if budget_wait_sec > 0.02:
+                    logger.info(
+                        "[KR][KIS_BUDGET][OBSERVER_SLOT_WAIT] endpoint=%s "
+                        "wait_sec=%.2f granted=%s",
+                        endpoint_name, budget_wait_sec, int(granted),
+                    )
+                if not granted:
+                    logger.info(
+                        "[KR][KIS_BUDGET][OBSERVER_DEFER] endpoint=%s reason=%s "
+                        "priority_order_not_waiting=1",
+                        endpoint_name, quota_reason,
+                    )
+                    raise KisTemporaryError(
+                        "KR_PB1_OBSERVER_SHARED_BUDGET_" + quota_reason,
+                    )
+            elif not is_kr_observer and endpoint_category in {"order", "balance"}:
+                note_critical_kr_call(
+                    environment="practice", account_key=account_key,
+                )
         wait_limiter = gate.acquire(
             environment=str(self.env or "practice"),
             account_key=account_key,
@@ -1763,13 +1816,59 @@ class KisAPI:
                         "action=CONTINUE_ORIGINAL_BROKER_REQUEST",
                         type(_latency_exc).__name__,
                     )
-                resp = self.session.request(
-                    method,
-                    url,
-                    timeout=request_timeout,
-                    **kwargs,
+                # One source event per *actual* HTTP attempt. The receipt
+                # identifier is created only at the network boundary, never
+                # when an OHLCV response is replayed from memory or disk.
+                native_request_id = uuid.uuid4().hex
+                native_audit = (
+                    str(self.env or "").lower() == "practice"
+                    and os.getenv("KR_KIS_NATIVE_HTTP_AUDIT", "1") == "1"
                 )
+                audit_scope = (
+                    hashlib.sha256(
+                        f"{self.env}:{self.CANO}:{self.ACNT_PRDT_CD}".encode("utf-8")
+                    ).hexdigest()[:12] if native_audit else ""
+                )
+                if native_audit:
+                    logger.info(
+                        "[KR_KIS_HTTP][ATTEMPT] rid=%s pid=%s scope=%s "
+                        "method=%s endpoint=%s category=%s observer=%s",
+                        native_request_id, os.getpid(), audit_scope,
+                        method.upper(), endpoint_name, endpoint_category,
+                        int(bool(is_kr_observer)),
+                    )
+                try:
+                    resp = self.session.request(
+                        method,
+                        url,
+                        timeout=request_timeout,
+                        **kwargs,
+                    )
+                except Exception as native_exc:
+                    if native_audit:
+                        logger.warning(
+                            "[KR_KIS_HTTP][NETWORK_ERROR] rid=%s endpoint=%s "
+                            "type=%s elapsed_sec=%.3f",
+                            native_request_id, endpoint_name,
+                            type(native_exc).__name__,
+                            max(0.0, time.monotonic() - start_ts),
+                        )
+                    raise
+                # This attribute is data provenance only, not broker ACK or
+                # entry authorization. If attachment fails, native conflict
+                # confirmations will remain UNKNOWN/fail-closed.
+                try:
+                    setattr(resp, "_nullim_http_request_id", native_request_id)
+                except (AttributeError, TypeError):
+                    pass
                 status = resp.status_code
+                if native_audit:
+                    logger.info(
+                        "[KR_KIS_HTTP][RESPONSE] rid=%s endpoint=%s "
+                        "status=%s elapsed_sec=%.3f",
+                        native_request_id, endpoint_name, status,
+                        max(0.0, time.monotonic() - start_ts),
+                    )
                 elapsed_ms = (time.monotonic() - start_ts) * 1000
                 params = kwargs.get("params", {}) or {}
                 json_data = kwargs.get("json", {}) or {}
@@ -1860,6 +1959,14 @@ class KisAPI:
                     msg_cd = str(body.get("msg_cd") or "").strip()
                     msg_text = str(body.get("msg1") or "").lower()
                     rt_cd = str(body.get("rt_cd") or "").strip()
+                    if native_audit:
+                        logger.info(
+                            "[KR_KIS_HTTP][BROKER_RESULT] rid=%s endpoint=%s "
+                            "http=%s rt_cd=%s msg_cd=%s egw002=%s",
+                            native_request_id, endpoint_name, status,
+                            rt_cd or "UNKNOWN", msg_cd or "NONE",
+                            int(_is_egw002_error(body, msg_cd)),
+                        )
                     
                     # ✅ EGW002 (초당 거래건수 초과) 전용 처리: exponential backoff + circuit breaker
                     if _is_egw002_error(body, msg_cd):
@@ -1914,12 +2021,21 @@ class KisAPI:
                         # symbol may not black out unrelated price candidates.
                         _rate_code = str((kwargs.get("params") or {}).get("fid_input_iscd") or "").strip().lstrip("A")
                         _price_cache.open_circuit(code=_rate_code or None, rate_limited=True)
-                        # Exponential backoff
+                        # Only sleep if a retry will really occur.  The
+                        # read-only observer deliberately uses attempts=1:
+                        # the old code spent 2-10 seconds sleeping *after*
+                        # that final rejected response, delaying other
+                        # candidates without making any new KIS request.
+                        if i >= attempts:
+                            logger.info(
+                                "[KIS][EGW002][FINAL_NO_SLEEP] endpoint=%s "
+                                "attempts=%s observer=%s action=DEFER_TO_NEXT_CYCLE",
+                                endpoint_name, attempts, int(bool(is_kr_observer)),
+                            )
+                            raise KisTemporaryError(f"EGW002 msg_cd={msg_cd}")
                         if _egw002_backoff_sleep(attempt=i) <= 0:
                             raise KisTemporaryError("KR_TICK_DEADLINE_EXHAUSTED_BEFORE_EGW002_RETRY")
-                        if i < attempts:
-                            continue
-                        raise KisTemporaryError(f"EGW002 msg_cd={msg_cd}")
+                        continue
                     
                     if is_order_endpoint(url) and _is_kis_tick_size_error_body(body):
                         logger.error(
@@ -2296,6 +2412,16 @@ class KisAPI:
             cash, meta = self._parse_cash_from_psbl_order(resp)
             cash_meta.update(meta)
             cash_meta["source"] = "psbl_order"
+            # Provenance is only diagnostic metadata: legacy cash fallback
+            # remains unchanged. Dedicated KR_INFINITE add-buy entry requires
+            # this to be True AND an orderable field, never balance/cached cash.
+            cash_meta["native_source_verified"] = bool(
+                isinstance(resp, dict)
+                and str(resp.get("rt_cd") or "") == "0"
+                and not any(bool(resp.get(key)) for key in (
+                    "_diag_stub", "_kis_disabled", "_stub",
+                ))
+            )
             raw_fields = cash_meta.get("raw_fields") or {}
             logger.info(
                 "[CASH][PSBL] ord_psbl_cash=%s ord_psbl_amt=%s",
@@ -3610,7 +3736,7 @@ class KisAPI:
         except Exception:
             return candles
 
-    def get_intraday_candles_today(self, code: str, start_hhmm: str = "090000") -> List[Dict[str, Any]]:
+    def get_intraday_candles_today(self, code: str, start_hhmm: str = "090000", *, attempts: int = 3) -> List[Dict[str, Any]]:
         """KIS 주식당일분봉조회 (FHKST03010200 / inquire-time-itemchartprice)
         - FID_COND_MRKT_DIV_CODE: 'J'
         - FID_INPUT_ISCD: 6자리 종목코드('A' 제거)
@@ -3640,7 +3766,11 @@ class KisAPI:
                 "fid_etc_cls_code": "",
             }
 
-            for attempt in range(1, 4):
+            # The read-only priority observer may opt into one bounded
+            # attempt; all existing KIS callers keep the original default
+            # three-attempt contract.
+            native_max_attempts = max(1, min(3, int(attempts)))
+            for attempt in range(1, native_max_attempts + 1):
                 try:
                     resp = self._safe_request(
                         "GET", url, headers=headers, params=params, timeout=(3.0, 7.0)
@@ -3651,30 +3781,57 @@ class KisAPI:
                 except requests.exceptions.SSLError as e:
                     last_err = e
                     logger.warning("[NET:SSL_ERROR] INTRADAY %s attempt=%s %s", iscd, attempt, e)
-                    time.sleep(0.4 * attempt)
+                    if attempt < native_max_attempts:
+                        time.sleep(0.4 * attempt)
                     continue
                 except requests.exceptions.RequestException as e:
                     last_err = e
                     logger.warning("[NET:REQ_ERROR] INTRADAY %s attempt=%s %s", iscd, attempt, e)
-                    time.sleep(0.4 * attempt)
+                    if attempt < native_max_attempts:
+                        time.sleep(0.4 * attempt)
                     continue
                 except ValueError as e:
                     last_err = e
                     logger.warning("[NET:JSON_DECODE] INTRADAY %s attempt=%s %s", iscd, attempt, e)
-                    time.sleep(0.35 + random.uniform(0, 0.15))
+                    if attempt < native_max_attempts:
+                        time.sleep(0.35 + random.uniform(0, 0.15))
                     continue
                 except Exception as e:
                     last_err = e
                     logger.warning("[NET:UNEXPECTED] INTRADAY %s attempt=%s %s", iscd, attempt, e)
-                    time.sleep(0.4 * attempt)
+                    if attempt < native_max_attempts:
+                        time.sleep(0.4 * attempt)
                     continue
 
                 if "초당 거래건수" in str(data.get("msg1") or ""):
-                    time.sleep(0.35 + random.uniform(0, 0.15))
+                    # Final rejection never sleeps. Next cycle or
+                    # account-wide throttle may retry without blocking an
+                    # unrelated broker-protective SELL.
+                    if attempt < native_max_attempts:
+                        time.sleep(0.35 + random.uniform(0, 0.15))
                     continue
 
                 arr = data.get("output2") or []
-                if resp.status_code == 200 and arr:
+                # HTTP 200 is not broker attestation when KIS rt_cd is
+                # nonzero or absent. Do not mint a trusted response receipt
+                # or release a source conflict from an error-body payload.
+                if (resp.status_code == 200
+                        and str(data.get("rt_cd") or "") == "0"
+                        and isinstance(arr, list) and arr):
+                    # A fresh ID is minted only at this successful KIS HTTP
+                    # response boundary (never from cached candle contents).
+                    # It permits conflict recovery to require three DISTINCT
+                    # network observations rather than three reuses of one
+                    # in-memory/native-format response.
+                    native_http_observation_id = str(
+                        getattr(resp, "_nullim_http_request_id", "") or ""
+                    )
+                    if not native_http_observation_id:
+                        logger.warning(
+                            "[KR][NATIVE_MINUTE][HTTP_SOURCE_UNVERIFIED] code=%s "
+                            "action=DO_NOT_COUNT_AS_INDEPENDENT_CONFLICT_CONFIRMATION",
+                            iscd,
+                        )
                     rows: List[Dict[str, Any]] = []
                     for r in arr:
                         try:
@@ -3686,6 +3843,7 @@ class KisAPI:
                                     "time": str(hhmmss),
                                     "price": float(price),
                                     "volume": float(vol),
+                                    "_kis_http_observation_id": native_http_observation_id,
                                 }
                                 # Preserve actual minute OHLCV when the native
                                 # KIS payload supplies them. Never synthesize
@@ -3717,7 +3875,8 @@ class KisAPI:
                     f"BAD_RESP rt_cd={data.get('rt_cd')} msg={data.get('msg1')}"
                 )
                 logger.warning("[INTRADAY_BAD_RESP] %s %s", iscd, data)
-                time.sleep(0.4 + random.uniform(0, 0.2))
+                if attempt < native_max_attempts:
+                    time.sleep(0.4 + random.uniform(0, 0.2))
 
         if last_err:
             raise last_err

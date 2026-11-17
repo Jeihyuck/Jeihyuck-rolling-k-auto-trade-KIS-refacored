@@ -32,7 +32,12 @@ class FakeKIS:
         return {"output1": holdings, "output2": {"tot_evlu_amt": "4000000"}}
 
     def get_current_price(self, symbol): return self.price
-    def get_orderable_cash(self, symbol, price): return 4_000_000, {}
+    def get_orderable_cash(self, symbol, price):
+        return 4_000_000, {
+            "native_source_verified": True, "source": "psbl_order",
+            "selected_key": "ord_psbl_cash",
+            "raw_fields": {"ord_psbl_cash": "4000000"},
+        }
 
     def buy_stock_limit(self, symbol, qty, price):
         self.events.append("submit"); self.orders.append(("BUY", qty)); self.last_side = "BUY"
@@ -255,7 +260,13 @@ def test_kr_infinite_profit_sell_ack_or_intermediate_fill_stays_pending(armed_pr
         assert result.state.metadata["pending_profit_stage"].endswith("_SUBMITTED")
 
 
-def test_kr_infinite_terminal_profit_fill_rearms_exactly_once(armed_practice_env):
+def test_kr_infinite_terminal_profit_fill_rearms_without_duplicate_sell(armed_practice_env):
+    """After TP1, the existing owner policy may independently permit an ADD.
+
+    Enabling verified KIS cash makes the old expectation of no BUY obsolete:
+    current price equals cost, the normal cadence has elapsed, and a sleeve
+    unit is available. A second TP1 SELL or unlimited same-day ADD is not.
+    """
     kis = FakeKIS(qty=100, average=100, price=110, fill_qty=50)
     repo = FakeRepository(active())
     first = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME,
@@ -263,9 +274,16 @@ def test_kr_infinite_terminal_profit_fill_rearms_exactly_once(armed_practice_env
     kis.price = 100
     second = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME,
                       trade_date=DAY, kis_env="practice")
+    third = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME,
+                     trade_date=DAY, kis_env="practice")
 
+    assert first.decision.action == Action.SELL_PARTIAL
     assert first.state.status == second.state.status == Status.ACTIVE
-    assert len(kis.orders) == 1
+    assert second.decision.reason == "ADAPTIVE_ADD_BUY"
+    assert second.decision.action == Action.BUY
+    assert third.decision.action == Action.WAIT
+    assert third.decision.reason == "DAILY_BUY_LIMIT"
+    assert kis.orders == [("SELL", 50), ("BUY", 300)]
 
 
 def test_kr_infinite_invalid_price_blocks_without_exception(armed_practice_env):
@@ -672,3 +690,122 @@ def test_complete_cycle_no_reentry_without_owner_market_permission(armed_practic
     assert result.decision.reason == "KR_INF_NEW_CYCLE_NOT_YET_ELIGIBLE"
     assert repo.state.cycle_id == prior.cycle_id
     assert not repo.intents and not kis.orders
+
+
+def test_held_infinite_eligible_add_fetches_verified_kis_cash_only_once(armed_practice_env):
+    """The owner strategy can add its next unit without bypassing native cash proof."""
+    kis, repo = FakeKIS(qty=100, average=100, price=99), FakeRepository(active())
+    original = kis.get_orderable_cash
+    seen = []
+    def capture(symbol, price):
+        seen.append((symbol, price))
+        return original(symbol, price)
+    kis.get_orderable_cash = capture
+    result = run_once(
+        config=config(), kis=kis, repository=repo,
+        regime_provider=REGIME, trade_date=DAY, kis_env="practice",
+    )
+    assert result.decision.action == Action.BUY
+    assert result.decision.reason == "ADAPTIVE_ADD_BUY"
+    assert result.submitted
+    assert seen == [("122630", 99)]
+    assert kis.orders == [("BUY", 303)]  # min(30k unit, 4m KIS cash) / 99
+    assert len(repo.intents) == 1
+
+
+@pytest.mark.parametrize("price,regime,last_buy,reason", [
+    (101, "KR_NORMAL", date(2026, 8, 10), "PRICE_ABOVE_NORMAL_AVG"),
+    (99, "KR_NORMAL", DAY, "DAILY_BUY_LIMIT"),
+    (70, "KR_DEFENSE_CRASH", date(2026, 8, 10), "BUY_PAUSED_BY_REGIME"),
+])
+def test_held_infinite_non_buy_policy_does_not_fetch_cash(
+    armed_practice_env, price, regime, last_buy, reason,
+):
+    kis = FakeKIS(qty=100, average=100, price=price)
+    def forbidden(*args, **kwargs):
+        raise AssertionError("cash query is not allowed when owner blocks entry")
+    kis.get_orderable_cash = forbidden
+    repo = FakeRepository(active(last_buy_date=last_buy))
+    result = run_once(
+        config=config(), kis=kis, repository=repo,
+        regime_provider=lambda: (regime, "OK"),
+        trade_date=DAY, kis_env="practice",
+    )
+    assert result.decision.action == Action.WAIT
+    assert result.decision.reason == reason
+    assert not kis.orders
+
+
+def test_held_infinite_protective_tp_sell_preempts_cash_http(armed_practice_env):
+    kis = FakeKIS(qty=100, average=100, price=110)
+    def forbidden(*args, **kwargs):
+        raise AssertionError("protective SELL must never wait on buying power")
+    kis.get_orderable_cash = forbidden
+    repo = FakeRepository(active())
+    result = run_once(
+        config=config(), kis=kis, repository=repo,
+        regime_provider=REGIME, trade_date=DAY, kis_env="practice",
+    )
+    assert result.decision.action == Action.SELL_PARTIAL
+    assert kis.orders == [("SELL", 50)]
+
+
+def test_held_infinite_cash_http_failure_keeps_order_unsubmitted(armed_practice_env):
+    kis = FakeKIS(qty=100, average=100, price=99)
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("KIS_ORDERABLE_CASH_RATE_LIMITED")
+    kis.get_orderable_cash = unavailable
+    repo = FakeRepository(active())
+    result = run_once(
+        config=config(), kis=kis, repository=repo,
+        regime_provider=REGIME, trade_date=DAY, kis_env="practice",
+    )
+    assert (result.decision.action, result.decision.reason) == (
+        Action.WAIT, "KR_INF_BUYING_POWER_UNVERIFIED",
+    )
+    assert not kis.orders
+    assert not repo.intents
+
+
+def test_held_infinite_actual_broker_cash_zero_is_not_fabricated(armed_practice_env):
+    kis = FakeKIS(qty=100, average=100, price=99)
+    kis.get_orderable_cash = lambda *args: (0, {
+        "native_source_verified": True, "source": "psbl_order",
+        "selected_key": "ord_psbl_cash",
+        "raw_fields": {"ord_psbl_cash": "0"},
+    })
+    repo = FakeRepository(active())
+    result = run_once(
+        config=config(), kis=kis, repository=repo,
+        regime_provider=REGIME, trade_date=DAY, kis_env="practice",
+    )
+    assert result.decision.action == Action.WAIT
+    assert result.decision.reason == "INSUFFICIENT_STRATEGY_CAPITAL"
+    assert not kis.orders
+    assert not repo.intents
+
+
+@pytest.mark.parametrize("source,field,verified", [
+    ("psbl_order_cache", "ord_psbl_cash", False),
+    ("balance_out2", "dnca_tot_amt", False),
+    ("psbl_order", "dnca_tot_amt", True),
+    ("psbl_order", "ord_psbl_cash", False),
+])
+def test_held_infinite_rejects_cached_or_fallback_cash_without_order(
+    armed_practice_env, source, field, verified,
+):
+    kis, repo = FakeKIS(qty=100, average=100, price=99), FakeRepository(active())
+    kis.get_orderable_cash = lambda *args: (4_000_000, {
+        "native_source_verified": verified, "source": source,
+        "selected_key": field,
+        "raw_fields": {field: "4000000"},
+    })
+    result = run_once(
+        config=config(), kis=kis, repository=repo,
+        regime_provider=REGIME, trade_date=DAY, kis_env="practice",
+    )
+    assert (result.decision.action, result.decision.reason) == (
+        Action.WAIT, "KR_INF_BUYING_POWER_UNVERIFIED",
+    )
+    assert not kis.orders
+    assert not repo.intents

@@ -1,0 +1,74 @@
+name: KR PB1 Native Minute Reliability
+on:
+  pull_request:
+    branches: [dual-agent]
+    paths:
+      - "trader/kr/opening_bar_contract.py"
+      - "trader/kr/entry_priority_queue.py"
+      - "trader/kr/kis_observer_budget.py"
+      - "trader/kis_wrapper.py"
+      - "trader/pb1_engine.py"
+      - "trader/pb1_runner.py"
+      - "trader/kr/broker_truth_hardening.py"
+      - "trader/kr/infinite/runner.py"
+      - "trader/kr/infinite/executor.py"
+      - "tests/kr/infinite/test_runner_integration.py"
+      - "trader/reconcile_kis.py"
+      - "tests/kr/test_kr_pb1_current_only_original_balance_proof.py"
+      - "tests/kr/test_kr_pb1_kis_http_audit.py"
+      - "tests/kr/test_kr_session_metrics_accumulator.py"
+      - "scripts/kr_opening_observer.py"
+      - "scripts/wsl/kr-entry-timing-activation.sh"
+      - "tests/kr/test_kr_pb1_minute_*.py"
+      - "tests/kr/test_kr_pb1_kis_observer_budget.py"
+      - ".github/workflows/kr-pb1-native-minute-reliability.yml"
+  workflow_dispatch:
+
+jobs:
+  minute-native-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      STRATEGY_ENV: practice
+      KIS_ENV: practice
+      MARKET: KR
+      REGION: KR
+      PB1_MARKET_SCOPE: KRX
+      ALLOW_REAL_ORDER: "0"
+      DISABLE_LIVE_TRADING: "1"
+      NO_TRADE: "1"
+      PYTHONPATH: "."
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install offline dependencies
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip install pytest pytest-mock
+      - name: Compile and shell-validate modified runtime
+        run: |
+          python -m py_compile trader/kr/entry_priority_queue.py trader/kr/kis_observer_budget.py \
+            trader/kr/opening_bar_contract.py trader/kis_wrapper.py trader/pb1_engine.py scripts/kr_opening_observer.py \
+            trader/kr/broker_truth_hardening.py trader/reconcile_kis.py trader/pb1_runner.py trader/kr/infinite/runner.py trader/kr/infinite/executor.py
+          bash -n scripts/wsl/kr-entry-timing-activation.sh scripts/wsl/run-kr-am.sh scripts/wsl/run-kr-afternoon.sh
+      - name: Native minute offline incident & integration regressions
+        run: |
+          python -m pytest -q \
+            tests/kr/test_kr_pb1_minute_priority_queue.py \
+            tests/kr/test_kr_pb1_minute_native_conflicts.py \
+            tests/kr/test_kr_pb1_kis_observer_budget.py \
+            tests/kr/test_kr_pb1_minute_incident_replay.py \
+            tests/kr/test_kr_pb1_minute_egw_final_retry.py \
+            tests/kr/test_kr_pb1_current_only_original_balance_proof.py \
+            tests/kr/test_kr_broker_truth_hardening.py \
+            tests/kr/infinite/test_v3_contract.py \
+            tests/kr/infinite/test_runner_integration.py \
+            tests/kr/test_kr_pb1_kis_http_audit.py \
+            tests/kr/test_kr_session_metrics_accumulator.py \
+            tests/kr/test_kr_balance_freshness_provenance_20261106.py \
+            tests/kr/test_kr_20261116_integrated_recovery.py \
+            tests/kr/test_kr_runtime_integrity_p0_20260922.py \
+            tests/kr/test_kr_20261029_price_aware_opening.py \
+            tests/kr/test_kr_20261110_timing_activation_cjenm.py

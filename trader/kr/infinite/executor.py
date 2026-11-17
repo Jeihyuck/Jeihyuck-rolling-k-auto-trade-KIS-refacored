@@ -49,6 +49,29 @@ class KISExecutor:
     def orderable_cash(self, symbol: str, price: float) -> float:
         return float(self.kis.get_orderable_cash(symbol, price)[0])
 
+    def verified_add_orderable_cash(self, symbol: str, price: float) -> float:
+        """For an already-held Infinite BUY, require native KIS PSBL source.
+
+        The generic KIS helper may return last known cash, cached PSBL cash
+        or balance's gross cash on request failure. Such values are not
+        evidence of this order's actual buying power. No new order is
+        permitted from any fallback; protected SELL does not call here.
+        """
+        cash, proof = self.kis.get_orderable_cash(symbol, price)
+        if (not isinstance(proof, dict)
+                or proof.get("native_source_verified") is not True
+                or proof.get("source") != "psbl_order"
+                or proof.get("selected_key") not in {"ord_psbl_cash", "ord_psbl_amt"}
+                or not isinstance(proof.get("raw_fields"), dict)):
+            raise RuntimeError("KR_INF_NATIVE_PSBL_ORDERABLE_CASH_UNVERIFIED")
+        raw = proof["raw_fields"].get(proof["selected_key"])
+        if raw in (None, ""):
+            raise RuntimeError("KR_INF_NATIVE_PSBL_ORDERABLE_FIELD_MISSING")
+        amount = float(cash)
+        if not (amount >= 0 and amount < float("inf")):
+            raise RuntimeError("KR_INF_NATIVE_PSBL_ORDERABLE_CASH_INVALID")
+        return amount
+
     def submit(self, decision: Decision, symbol: str) -> tuple[str | None, dict]:
         if decision.action in {Action.BUY, Action.RECOVERY}:
             response = self.kis.buy_stock_limit(symbol, decision.qty, int(decision.notional / decision.qty))

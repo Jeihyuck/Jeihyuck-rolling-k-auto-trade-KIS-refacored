@@ -212,6 +212,42 @@ def _normalize_warning_counts(raw: dict[str, Any] | None) -> dict[str, int]:
     return counts
 
 
+def _accumulate_kr_tick_skip_observations(
+    session_metrics: dict[str, int], tick_metrics: dict[str, Any]
+) -> None:
+    """Separate per-order skip counts from engine terminal skip *events*.
+
+    The legacy per-tick metrics may omit `skipped` even when the engine
+    logged FINAL_SKIP. FINAL_SKIP does not prove any particular number of
+    broker orders were skipped, so never manufacture an order count from it.
+    """
+    if "skipped" in tick_metrics or "skipped_count" in tick_metrics:
+        raw_count = tick_metrics.get("skipped", tick_metrics.get("skipped_count"))
+        session_metrics["skipped"] = int(session_metrics.get("skipped", 0)) + max(
+            0, int(raw_count or 0)
+        )
+        session_metrics["skipped_order_observed_ticks"] = int(
+            session_metrics.get("skipped_order_observed_ticks", 0)
+        ) + 1
+    else:
+        session_metrics["skipped_order_unobserved_ticks"] = int(
+            session_metrics.get("skipped_order_unobserved_ticks", 0)
+        ) + 1
+    event = str(tick_metrics.get("terminal_event") or "").strip().upper()
+    if event:
+        session_metrics["terminal_event_observed_ticks"] = int(
+            session_metrics.get("terminal_event_observed_ticks", 0)
+        ) + 1
+    else:
+        session_metrics["terminal_event_unobserved_ticks"] = int(
+            session_metrics.get("terminal_event_unobserved_ticks", 0)
+        ) + 1
+    if event == "FINAL_SKIP":
+        session_metrics["terminal_final_skip_ticks"] = int(
+            session_metrics.get("terminal_final_skip_ticks", 0)
+        ) + 1
+
+
 def _count_kr_tick_attempt(session_metrics: dict[str, int]) -> None:
     """Count a tick at entry, not only after run_once returns successfully.
 
@@ -4217,11 +4253,48 @@ def get_balance_state(
         # A marker received *inside* a cached snapshot is not independent
         # evidence. Rebuild it exclusively from the wrapper's original fetch.
         balance_snapshot_raw.pop("_kr_verified_fresh_at_kst", None)
+        # The wrapper cache has no automatic age cutoff. A 60s multi-tick
+        # KR session can otherwise reuse one pre-open snapshot forever and
+        # mark every CURRENT_ONLY tick as broker-unverified. Only the real
+        # KisAPI client may force refresh here; synthetic/mock adapter
+        # tests continue to expose an absent native timestamp as unproven.
+        verified_at = getattr(kis, "_balance_cache_at", None)
+        original_age = (
+            (now_kst() - verified_at).total_seconds()
+            if isinstance(verified_at, datetime) and verified_at.tzinfo
+            else float("inf")
+        )
+        if not 0 <= original_age <= 20 and isinstance(kis, KisAPI):
+            logger.warning(
+                "[KR_BALANCE][STALE_WRAPPER_CACHE_REFRESH] source=%s "
+                "original_age_sec=%s action=FORCE_NATIVE_BALANCE_OR_FAIL_CLOSED",
+                balance_source, round(original_age, 3) if original_age != float("inf") else None,
+            )
+            balance_snapshot_raw, balance_source, raw_snapshot = kis.get_balance_cached(
+                force=True, return_source=True, return_raw=True,
+            )
+            balance_snapshot_raw = _deepcopy_json(balance_snapshot_raw)
+            raw_snapshot = _deepcopy_json(raw_snapshot)
+            if (not isinstance(balance_snapshot_raw, dict)
+                    or not isinstance(balance_snapshot_raw.get("output1"), list)
+                    or not isinstance(balance_snapshot_raw.get("output2"), dict)
+                    or balance_snapshot_raw.get("rt_cd") not in (None, "0", 0)):
+                raise KisBalanceUnavailable("forced_balance_refresh_invalid_original_response")
+            balance_snapshot_raw.pop("_kr_verified_fresh_at_kst", None)
+            verified_at = getattr(kis, "_balance_cache_at", None)
+            if (not isinstance(verified_at, datetime)
+                    or verified_at.tzinfo is None
+                    or not 0 <= (now_kst() - verified_at).total_seconds() <= 20):
+                raise KisBalanceUnavailable("forced_balance_original_fetch_time_unverified")
+            logger.info(
+                "[KR_BALANCE][STALE_WRAPPER_CACHE_REFRESH][OK] "
+                "source=%s native_age_sec=%.3f",
+                balance_source, (now_kst() - verified_at).total_seconds(),
+            )
         # Only the KIS wrapper's timestamp from a successful original HTTP
-        # balance fetch may certify freshness.  In particular, a cached or
+        # balance fetch may certify freshness. In particular, a cached or
         # precheck snapshot must not become "fresh" merely because this runner
         # reads or copies it on a later tick.
-        verified_at = getattr(kis, "_balance_cache_at", None)
         if (
             balance_source in {"api", "wrapper_cache"}
             and isinstance(verified_at, datetime)
@@ -6856,9 +6929,22 @@ def run_once(
                         elif kis is not None:
                             logger.info("[KR_BALANCE][PRECHECK_STALE] age_sec=%.1f action=FORCE_FRESH_BROKER_BALANCE", age_sec)
                             fresh = kis.get_balance_cached(force=True)
-                            if not isinstance(fresh, dict) or not isinstance(fresh.get("output1"), list) or not fresh.get("output2"):
+                            if (not isinstance(fresh, dict)
+                                    or not isinstance(fresh.get("output1"), list)
+                                    or not fresh.get("output2")
+                                    or fresh.get("rt_cd") not in (None, "0", 0)):
                                 raise RuntimeError("KR_BALANCE_FRESH_RESPONSE_INCOMPLETE")
-                            balance_snapshot_raw = {**fresh, "_kr_verified_fresh_at_kst": now_kst().isoformat()}
+                            # Do not stamp this runner's wall clock. Rebuild
+                            # trust exclusively from the original successful
+                            # KIS wrapper HTTP balance-fetch timestamp.
+                            fresh_at = getattr(kis, "_balance_cache_at", None)
+                            if (not isinstance(fresh_at, datetime)
+                                    or fresh_at.tzinfo is None
+                                    or not 0 <= (now_kst() - fresh_at).total_seconds() <= 20):
+                                raise RuntimeError("KR_BALANCE_ORIGINAL_FETCH_TIME_UNVERIFIED")
+                            balance_snapshot_raw = dict(fresh)
+                            balance_snapshot_raw.pop("_kr_verified_fresh_at_kst", None)
+                            balance_snapshot_raw["_kr_verified_fresh_at_kst"] = fresh_at.isoformat()
                             balance_source = "KIS_FORCE_REFRESH_STALE_PRECHECK"
                             balance_state = BALANCE_STATE_OK
                     except Exception as _balance_refresh_exc:
@@ -8519,6 +8605,13 @@ def run_once(
         "order_candidates": int((getattr(engine_runner, "_run_summary_payload", {}) or {}).get("order_candidates", 0)),
         "api_submitted": int((getattr(engine_runner, "_run_summary_payload", {}) or {}).get("api_submitted", (getattr(engine_runner, "_run_summary_payload", {}) or {}).get("submitted", 0))),
         "degraded": bool(getattr(result, "status", "") == "DEGRADED_POSTPROCESS"),
+        # A terminal tick skip is NOT the number of skipped *order intents*.
+        # Carry both evidence types separately; absent order-skip count is
+        # unknown, not a verified zero.
+        "terminal_event": str(
+            (getattr(engine_runner, "_run_summary_payload", {}) or {}).get("terminal_event")
+            or ""
+        ),
         "warning_counts": _normalize_warning_counts(getattr(result, "warning_counts", None)),
         "terminal_state": getattr(result, "terminal_state", None),
     }
@@ -8848,6 +8941,11 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             "partial_filled_confirmed": 0,
             "rejected": 0,
             "skipped": 0,
+            "skipped_order_observed_ticks": 0,
+            "skipped_order_unobserved_ticks": 0,
+            "terminal_final_skip_ticks": 0,
+            "terminal_event_observed_ticks": 0,
+            "terminal_event_unobserved_ticks": 0,
         }
         # A loop owns no PB1Engine instance: every tick creates and finalizes one
         # inside run_once. Preserve only its returned summary for session markers.
@@ -9018,7 +9116,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 # reconciled ``filled`` counter below.
                 session_metrics["accepted"] += int(last_tick_metrics.get("accepted", tick_buy_ack) or 0)
                 session_metrics["rejected"] += int(last_tick_metrics.get("rejected", 0) or 0)
-                session_metrics["skipped"] += int(last_tick_metrics.get("skipped", last_tick_metrics.get("skipped_count", 0)) or 0)
+                _accumulate_kr_tick_skip_observations(session_metrics, last_tick_metrics)
                 session_metrics["filled_confirmed"] += int(last_tick_metrics.get("filled", 0) or 0)
                 logger.info(
                     "[PB1][TICK][DONE] kind=%s now=%s result_status=%s",
@@ -9406,6 +9504,19 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             "filled_confirmed": int(session_metrics.get("filled_confirmed", 0) or 0),
             "rejected": int(session_metrics.get("rejected", 0) or 0),
             "skipped": int(session_metrics.get("skipped", 0) or 0),
+            "skipped_order_observed_ticks": int(session_metrics.get("skipped_order_observed_ticks", 0)),
+            "skipped_order_unobserved_ticks": int(session_metrics.get("skipped_order_unobserved_ticks", 0)),
+            "terminal_final_skip_ticks": int(session_metrics.get("terminal_final_skip_ticks", 0)),
+            "terminal_event_observed_ticks": int(session_metrics.get("terminal_event_observed_ticks", 0)),
+            "terminal_event_unobserved_ticks": int(session_metrics.get("terminal_event_unobserved_ticks", 0)),
+            "terminal_final_skip_count_complete": (
+                int(session_metrics.get("terminal_event_unobserved_ticks", 0)) == 0
+                and int(session_metrics.get("ticks_completed", 0)) > 0
+            ),
+            "skipped_order_count_complete": (
+                int(session_metrics.get("skipped_order_unobserved_ticks", 0)) == 0
+                and int(session_metrics.get("ticks_completed", 0)) > 0
+            ),
         }, engine=engine, env=ctx.env, start_at=session_started_at, end_at=_get_now_kst())
     finally:
         _finish_session_guard(

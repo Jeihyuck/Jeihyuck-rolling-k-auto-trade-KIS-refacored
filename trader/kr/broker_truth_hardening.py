@@ -31,6 +31,7 @@ from trader.db.repos import FillsRepo, OrdersRepo, PositionsRepo
 from trader.db.trading_epoch import active_trading_epoch_id, trading_epoch_enforced
 from trader.db.schema import schema_for_engine
 from trader.time_utils import now_kst
+from trader.kr.infinite import STRATEGY_ID as KR_INFINITE_STRATEGY_ID, SYMBOL as KR_INFINITE_SYMBOL
 from trader.kis_wrapper import (
     get_kr_tick_deadline,
     kr_tick_remaining_sec,
@@ -311,18 +312,31 @@ def _recover_proven_policy_positions(
     kis = _holdings_index(holdings_rows)
     recovered: list[str] = []
     review: list[str] = []
+    foreign_owner_review: list[str] = []
+    # A CURRENT_ONLY post-tick pass must not adopt positions from historic
+    # epochs into the active PB1 strategy. Economic/historical corrections
+    # belong to the AM/CLOSE recovery lane. Match _health_after_reconcile's
+    # existing active-epoch scoping, preserving legacy DB behavior when no
+    # enforced active epoch is available.
+    active_epoch = active_trading_epoch_id(
+        engine,
+        env=env,
+        account_id=get_account_key(env=env),
+        required=trading_epoch_enforced(),
+    )
+    position_scope = [
+        schema.positions.c.env == env,
+        schema.positions.c.strategy == strategy,
+        schema.positions.c.status == "OPEN",
+        schema.positions.c.qty > 0,
+    ]
+    if active_epoch:
+        position_scope.append(schema.positions.c.trading_epoch_id == active_epoch)
     with engine.connect() as conn:
         positions = [
             dict(row)
             for row in conn.execute(
-                sa.select(schema.positions).where(
-                    sa.and_(
-                        schema.positions.c.env == env,
-                        schema.positions.c.strategy == strategy,
-                        schema.positions.c.status == "OPEN",
-                        schema.positions.c.qty > 0,
-                    )
-                )
+                sa.select(schema.positions).where(sa.and_(*position_scope))
             ).mappings().all()
         ]
 
@@ -330,6 +344,21 @@ def _recover_proven_policy_positions(
         code = _normalize_code(position.get("code"))
         broker_qty = int((kis.get(code) or {}).get("qty") or 0)
         if broker_qty <= 0:
+            continue
+        # KODEX Leverage is reserved for a *different* strategy owner.
+        # A historical/mislabelled PB1 row is not evidence that PB1 owns
+        # the current 122630 broker position. Do not query PB1 fills to
+        # synthesize a PB1 TP/exit plan or mutate the Infinite sleeve.
+        # Preserve an explicit RED review instead of silently clearing debt.
+        if code == KR_INFINITE_SYMBOL:
+            review.append(code)
+            foreign_owner_review.append(code)
+            logger.error(
+                "[KR_BROKER_TRUTH][FOREIGN_STRATEGY_OWNER_REVIEW] "
+                "code=%s broker_qty=%s declared_owner=%s reserved_owner=%s "
+                "action=NO_PB1_RECOVERY_KEEP_BROKER_POSITION_UNCHANGED",
+                code, broker_qty, strategy, KR_INFINITE_STRATEGY_ID,
+            )
             continue
         family = str(position.get("exit_policy_family") or "").strip().upper()
         if family and family != "POLICY_MISSING":
@@ -456,7 +485,11 @@ def _recover_proven_policy_positions(
             source_cycle,
         )
 
-    return {"recovered": recovered, "review_required": review}
+    return {
+        "recovered": recovered,
+        "review_required": review,
+        "foreign_owner_review_required": foreign_owner_review,
+    }
 
 
 def _health_after_reconcile(*, engine, env: str, strategy: str, holdings_rows: list[dict] | None) -> dict[str, Any]:
@@ -609,6 +642,59 @@ def _reserved_engine_deadline(outer_deadline: float | None, *, now_mono: float |
     return candidate
 
 
+def _valid_original_kr_balance_snapshot(snapshot: Any, *, at: datetime | None = None) -> bool:
+    """Accept only the original authenticated KIS balance fetch timestamp.
+
+    Never infer a new source time from when a dict was copied/reused.  A
+    wrapper-cache hit that is older than 20s is not current broker truth.
+    This check authorizes current-only *reconciliation evidence*, not an order.
+    """
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("output1"), list):
+        return False
+    if not snapshot.get("output2") or snapshot.get("rt_cd") not in (None, "0", 0):
+        return False
+    raw = snapshot.get("_kr_verified_fresh_at_kst")
+    try:
+        original_at = at if at is not None else datetime.fromisoformat(str(raw or ""))
+        if not isinstance(original_at, datetime) or original_at.tzinfo is None:
+            return False
+        age = (now_kst() - original_at).total_seconds()
+        return 0 <= age <= 20
+    except (ValueError, TypeError, OverflowError):
+        return False
+
+
+def _attest_newly_forced_kr_balance(snapshot: dict, kis: Any) -> dict:
+    """Bind forced KIS balance to KisAPI's recorded *original HTTP* fetch.
+
+    get_balance_cached(force=True) returns a normalized dict without the
+    source timestamp.  Passing it as an injected balance to reconcile_kis()
+    previously caused CURRENT_ONLY_FRESH_BROKER_UNVERIFIED on every successful
+    forced-read path.  Only the wrapper's actual balance fetch timestamp
+    resolves that mismatch; missing/stale proofs remain fail-closed.
+    """
+    certified = dict(snapshot)
+    certified.pop("_kr_verified_fresh_at_kst", None)
+    observed_at = getattr(kis, "_balance_cache_at", None)
+    valid = (
+        isinstance(observed_at, datetime)
+        and _valid_original_kr_balance_snapshot(certified, at=observed_at)
+    )
+    if valid:
+        certified["_kr_verified_fresh_at_kst"] = observed_at.isoformat()
+    logger.info(
+        "[KR_BROKER_TRUTH][ORIGINAL_BALANCE_PROOF] "
+        "source=KIS_FORCE_REFRESH verified=%s reason=%s "
+        "has_output1=%s has_output2=%s",
+        int(valid),
+        "ORIGINAL_KIS_FETCH_TIMESTAMP" if valid
+        else "NO_FRESH_ORIGINAL_KIS_FETCH_TIMESTAMP",
+        int(isinstance(snapshot.get("output1"), list)),
+        int(bool(snapshot.get("output2"))),
+    )
+    return certified
+
+
 def _post_pb1_tick_reconcile(engine_obj: Any) -> None:
     if bool(getattr(engine_obj, "dry_run", True)):
         return
@@ -657,30 +743,45 @@ def _post_pb1_tick_reconcile(engine_obj: Any) -> None:
         )
         return
 
-    # If this tick never crossed the broker, the balance injected into PB1 is
-    # still authoritative for this tick. Reuse it instead of burning another
-    # KIS transaction call and shared tick budget.
-    if not broker_crossed and isinstance(tick_snapshot, dict):
+    # Reuse the injected snapshot only while its independent KIS fetch-time
+    # proof is valid. A stale runner cache must not turn into a perpetual
+    # account-wide RED or be treated as buy-safe by stamping this tick's clock.
+    # Legacy offline test doubles may have no KIS wrapper timestamp; those
+    # retain the original unverified snapshot without inventing proof.
+    fresh_tick_proof = _valid_original_kr_balance_snapshot(tick_snapshot)
+    reuse_snapshot = (
+        not broker_crossed and isinstance(tick_snapshot, dict)
+        and (fresh_tick_proof or not hasattr(kis, "_balance_cache_at"))
+    )
+    if reuse_snapshot:
         snapshot = tick_snapshot
         snapshot_source = "engine_tick_snapshot"
         logger.info(
-            "[KR_BROKER_TRUTH][BALANCE_SOURCE] source=%s broker_crossed=0 action=reuse",
-            snapshot_source,
+            "[KR_BROKER_TRUTH][BALANCE_SOURCE] source=%s broker_crossed=0 "
+            "original_kis_fresh=%s action=reuse",
+            snapshot_source, int(fresh_tick_proof),
         )
     else:
+        if not broker_crossed and isinstance(tick_snapshot, dict):
+            logger.warning(
+                "[KR_BROKER_TRUTH][TICK_BALANCE_STALE] "
+                "original_proof_valid=0 action=FORCE_ONE_NATIVE_REFRESH"
+            )
         if hasattr(kis, "invalidate_balance_cache"):
             try:
                 kis.invalidate_balance_cache(reason="post_pb1_tick_broker_truth")
             except Exception:
                 pass
-        snapshot = kis.get_balance_cached(force=True) if hasattr(kis, "get_balance_cached") else kis.get_balance()
-        if not isinstance(snapshot, dict):
+        fetched = kis.get_balance_cached(force=True) if hasattr(kis, "get_balance_cached") else kis.get_balance()
+        if not isinstance(fetched, dict):
             raise RuntimeError("KR_BROKER_TRUTH_BALANCE_INVALID")
+        snapshot = _attest_newly_forced_kr_balance(fetched, kis)
         snapshot_source = "fresh_kis"
         logger.info(
-            "[KR_BROKER_TRUTH][BALANCE_SOURCE] source=%s broker_crossed=%s action=force_refresh",
-            snapshot_source,
-            int(bool(broker_crossed)),
+            "[KR_BROKER_TRUTH][BALANCE_SOURCE] source=%s broker_crossed=%s "
+            "original_kis_fresh=%s action=force_refresh",
+            snapshot_source, int(bool(broker_crossed)),
+            int(_valid_original_kr_balance_snapshot(snapshot)),
         )
 
     import trader.reconcile_kis as rk
@@ -736,6 +837,7 @@ def _post_pb1_tick_reconcile(engine_obj: Any) -> None:
                 "broker_truth_linked_fills": int(result.get("linked_fills") or 0),
                 "broker_truth_policy_recovered": list(policy.get("recovered") or []),
                 "broker_truth_policy_review_required": list(policy.get("review_required") or []),
+                "broker_truth_foreign_owner_review_required": list(policy.get("foreign_owner_review_required") or []),
                 "broker_truth_qty_mismatch_count": int(health.get("qty_mismatch_count") or 0),
                 "broker_truth_stale_open_order_count": int(health.get("stale_open_order_count") or 0),
                 "broker_truth_reconcile_degraded": int(reconcile_unverified),

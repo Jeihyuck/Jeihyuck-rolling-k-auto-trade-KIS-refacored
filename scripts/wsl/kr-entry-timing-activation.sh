@@ -34,12 +34,16 @@ kr_pb1_entry_timing_defaults() {
     if [[ "$KR_PB1_ENTRY_TIMING_MODE" == "OFF" ]]; then
       export KR_PB1_OPENING_OBSERVER_ENABLED=0
     fi
-    export KR_PB1_OPENING_OBSERVER_INTERVAL_SEC="${KR_PB1_OPENING_OBSERVER_INTERVAL_SEC:-120}"
+    export KR_PB1_OPENING_OBSERVER_INTERVAL_SEC="${KR_PB1_OPENING_OBSERVER_INTERVAL_SEC:-45}"
+    # Shared *observer-only* KIS quota and critical-traffic notice are KR
+    # practice-scoped. Real order logic never waits on the read-only collector.
+    export KR_PB1_KIS_OBSERVER_BUDGET_ENABLED="${KR_PB1_KIS_OBSERVER_BUDGET_ENABLED:-1}"
   else
     export KR_PB1_ENTRY_TIMING_MODE="${KR_PB1_ENTRY_TIMING_MODE:-SHADOW}"
     export KR_PB1_ENTRY_TIMING_APPROVED="${KR_PB1_ENTRY_TIMING_APPROVED:-0}"
     export KR_PB1_ENTRY_TIMING_SHADOW_ENABLED="${KR_PB1_ENTRY_TIMING_SHADOW_ENABLED:-0}"
     export KR_PB1_OPENING_OBSERVER_ENABLED=0
+    export KR_PB1_KIS_OBSERVER_BUDGET_ENABLED=0
   fi
   echo "[KR][ENTRY_TIMING][EFFECTIVE_CONFIG] strategy_env=${STRATEGY_ENV:-unknown} kis_env=${KIS_ENV:-unknown} mode=$KR_PB1_ENTRY_TIMING_MODE approved=$KR_PB1_ENTRY_TIMING_APPROVED legacy_quote_shadow=DISABLED opening_observer=$KR_PB1_OPENING_OBSERVER_ENABLED interval_sec=${KR_PB1_OPENING_OBSERVER_INTERVAL_SEC:-n/a}"
   if [[ "${STRATEGY_ENV:-}" == "practice" && "${KIS_ENV:-}" == "practice" ]] &&
@@ -58,14 +62,16 @@ kr_pb1_opening_observer_start() {
     return 0
   }
   if ! [[ "${KR_PB1_OPENING_OBSERVER_INTERVAL_SEC:-}" =~ ^[0-9]+$ ]] ||
-     (( KR_PB1_OPENING_OBSERVER_INTERVAL_SEC < 120 || KR_PB1_OPENING_OBSERVER_INTERVAL_SEC > 600 )); then
+     (( KR_PB1_OPENING_OBSERVER_INTERVAL_SEC < 15 || KR_PB1_OPENING_OBSERVER_INTERVAL_SEC > 600 )); then
     echo "[KR][ENTRY_TIMING][OBSERVER_CONFIG_INVALID] interval_sec=${KR_PB1_OPENING_OBSERVER_INTERVAL_SEC:-unset} action=NO_OBSERVER" >&2
     return 0
   fi
   local final30="runtime/kr/watchlist/${trade_date}/final30_scored.json"
   if [[ ! -s "$final30" ]]; then
-    echo "[KR][ENTRY_TIMING][OBSERVER_INPUT_MISSING] file=$final30 action=NO_OBSERVER_BUY_FAIL_CLOSED"
-    return 0
+    # PREP may still be completing when AM starts at 08:55.  The independent
+    # collector must launch now and wait for a verified same-day contract,
+    # rather than disappear for the entire trading session.
+    echo "[KR][ENTRY_TIMING][OBSERVER_WAIT_PREP] file=$final30 action=LAUNCH_READ_ONLY_RETRY_UNTIL_VALID"
   fi
   mkdir -p "$log_dir" runtime/locks
   # Non-blocking, read-only sidecar. Do NOT let it inherit the AM/PM session
@@ -80,6 +86,7 @@ kr_pb1_opening_observer_start() {
     exec flock -n "runtime/locks/kr-pb1-opening-observer-${trade_date}.lock" \
       timeout --kill-after=15s 24000 \
       env NO_TRADE=1 DISABLE_REAL_TRADING=1 DISABLE_LIVE_TRADING=1 \
+          KR_PB1_OBSERVER_ONLY=1 \
           LIVE_TRADING_ENABLED=0 KR_LIVE_TRADING_ENABLED=0 KR_ORDER_ARMED=0 \
       python -m scripts.kr_opening_observer --loop --date "$trade_date" \
         --interval-sec "$KR_PB1_OPENING_OBSERVER_INTERVAL_SEC"
