@@ -175,6 +175,13 @@ def test_run_trade_tick_injects_warning_before_exit_and_blocks_existing_buy(monk
 
     monkeypatch.setattr("trader.us.portfolio_cluster_guard.filter_entry_intents_for_cluster_guard", lambda intents, guard: (intents, []))
     monkeypatch.setattr("trader.us.market_state_overlay.filter_entry_intents_for_market_state", lambda intents, overlay, positions=None: (intents, []))
+    # Isolate the local trend gate using an explicitly verified global risk
+    # contract. Unknown live market evidence correctly blocks all candidates.
+    monkeypatch.setattr("trader.us.market_state_overlay.evaluate_us_market_state", lambda **kwargs: {
+        "market_state": "NORMAL", "intraday_market_overlay": "NORMAL",
+        "intraday_overlay_available": True, "exposure_multiplier": 1.0,
+        "allow_new_buy": True, "allow_add_to_existing": True,
+    })
 
     captured = {}
     class _Engine:
