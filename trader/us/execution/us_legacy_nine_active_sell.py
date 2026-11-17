@@ -56,12 +56,9 @@ def _classify_immutable_source_order(
     )
     key = (source_account_hash, epoch, contract_sha, symbol, day_key,
            order_key, side, requested, filled)
-    if cacheable:
-        with _HISTORICAL_TERMINAL_LOCK:
-            hit = _HISTORICAL_TERMINAL_CACHE.get(key)
-            if hit is not None:
-                _HISTORICAL_TERMINAL_CACHE.move_to_end(key)
-                return dict(hit)
+    # Re-read native KIS evidence for every new SELL authorization. A historical
+    # order can be corrected by the broker after a prior classification;
+    # previously cached terminal proof must not authorize a later order.
     evidence = classifier(
         get_order_day(day), order_no=order_no, symbol=symbol,
         expected_qty=requested, trade_date=day, side=side,
@@ -70,12 +67,6 @@ def _classify_immutable_source_order(
     actual_filled = evidence.get("cumulative_filled_qty") if isinstance(evidence, dict) else None
     terminal = (status == "PROVEN_FILLED" if side == "BUY"
                 else status in {"PROVEN_FILLED", "PROVEN_CANCELLED"})
-    if cacheable and terminal and actual_filled == filled:
-        with _HISTORICAL_TERMINAL_LOCK:
-            _HISTORICAL_TERMINAL_CACHE[key] = dict(evidence)
-            _HISTORICAL_TERMINAL_CACHE.move_to_end(key)
-            while len(_HISTORICAL_TERMINAL_CACHE) > _HISTORICAL_TERMINAL_MAX:
-                _HISTORICAL_TERMINAL_CACHE.popitem(last=False)
     return evidence
 
 
