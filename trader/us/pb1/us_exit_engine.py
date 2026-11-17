@@ -1249,6 +1249,7 @@ def prepare_exit_position_snapshots(
             _state_elapsed_ms = 0.0
             _risk_elapsed_ms = 0.0
             _hwm_elapsed_ms = 0.0
+            price_data = None
             pos = dict(original_pos or {})
 
             def _observe_snapshot_outcome(outcome: str, reason: str = "") -> None:
@@ -1342,6 +1343,15 @@ def prepare_exit_position_snapshots(
                     or _quoted.get("asof")
                 )
                 pos["resolved_quote_received_at"] = datetime.now(timezone.utc).isoformat()
+            _quote_fields = price_data if isinstance(price_data, dict) else {}
+            pos["exit_quote_evidence"] = {
+                "price": current_price,
+                "source": str(_quote_fields.get("_quote_source") or _quote_fields.get("source") or "UNVERIFIED"),
+                "asof": str(_quote_fields.get("asof") or "") or None,
+                "asof_epoch": _quote_fields.get("_quote_asof_epoch") or _quote_fields.get("asof_epoch"),
+                "received_at_utc": datetime.now(timezone.utc).isoformat(),
+                "quality": str(_quote_fields.get("_quote_quality") or _quote_fields.get("quality") or "UNVERIFIED"),
+            }
             if current_price <= 0:
                 logger.debug("[US_EXIT][SKIP] symbol=%s reason=price_nonpositive price=%.4f", symbol, current_price)
                 _observe_snapshot_outcome("SKIP", "price_nonpositive")
@@ -1448,6 +1458,7 @@ def prepare_exit_position_snapshots(
                     "high_watermark_lifecycle_id": pos.get("high_watermark_lifecycle_id", original_pos.get("high_watermark_lifecycle_id")),
                     "position_lifecycle_id": pos.get("position_lifecycle_id", original_pos.get("position_lifecycle_id")),
                     "resolved_current_price": current_price,
+                    "exit_quote_evidence": pos.get("exit_quote_evidence"),
                     "current_price_usd": current_price,
                     "current_price": current_price,
                     "resolved_quote_source": pos.get("resolved_quote_source"),

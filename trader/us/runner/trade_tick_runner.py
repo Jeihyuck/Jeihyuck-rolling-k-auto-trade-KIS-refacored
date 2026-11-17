@@ -44,6 +44,24 @@ def calculate_latency_accounting(total_ms: float, stage_metrics: dict[str, float
     return round(accounted, 3), round(total - accounted, 3)
 
 
+def is_us_global_postfilter_contract_unverified(overlay: dict | None) -> bool:
+    """Only a genuinely unverified account-wide risk state fences all BUYs.
+
+    Individual per-symbol metadata, trend, cluster or rotation denials have
+    already been removed by their respective filters and cannot suppress
+    independently verified survivors.
+    """
+    if not isinstance(overlay, dict):
+        return True
+    return bool(
+        str(overlay.get("intraday_market_overlay") or "").upper()
+            == "INTRADAY_DATA_UNKNOWN"
+        or overlay.get("intraday_overlay_available") is False
+        or overlay.get("intraday_error_reason")
+        or overlay.get("global_risk_integrity_failed") is True
+    )
+
+
 def is_recoverable_order_route_budget_error(exc: BaseException) -> bool:
     """Classify local/shared tick-budget exhaustion as recoverable routing deferral."""
     text = str(exc or "").lower()
@@ -3258,7 +3276,7 @@ def run_trade_tick(
             defer_pending_until_claim=(real_order_mode and not offline),
             # Tick-start calendar time is not the end of TP evaluation.
             decision_clock=(lambda: datetime.now(timezone.utc))
-                if (real_order_mode and not offline) else None,
+                if (real_order_mode and not offline and not force_now) else None,
         )
         if profit_capture_intents:
             exit_intents.extend(profit_capture_intents)
@@ -4316,7 +4334,8 @@ def run_trade_tick(
             # The final filters already removed only vetoed symbols. Preserve
             # the verified peers unless there is an explicit *global* failure.
             _risk_global_failure = (
-                market_state_overlay.get("intraday_error_reason") == "LIVE_RISK_EVALUATION_FAILED"
+                is_us_global_postfilter_contract_unverified(market_state_overlay)
+                or market_state_overlay.get("intraday_error_reason") == "LIVE_RISK_EVALUATION_FAILED"
                 or market_state_overlay.get("risk_contract_invalid") is True
                 or any(item.get("reason") in {
                     "GLOBAL_RISK_CONTRACT_INVALID", "RISK_SNAPSHOT_ID_CONFLICT",
