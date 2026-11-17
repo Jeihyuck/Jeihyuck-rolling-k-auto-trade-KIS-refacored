@@ -522,6 +522,7 @@ class InfiniteRepository:
                         ON i.client_order_key=f.client_order_key
                        AND i.trading_epoch_id=f.trading_epoch_id
                        AND i.trade_date<=f.trade_date
+                       AND i.symbol=f.symbol AND i.side=f.side
                      WHERE f.symbol='TQQQ' AND f.side='BUY'
                        AND f.trading_epoch_id=:epoch
                        AND f.client_order_key LIKE :prefix
@@ -530,34 +531,40 @@ class InfiniteRepository:
                 """), {"epoch": str(epoch),
                        "prefix": "TQQQ_INF_V3:" + cycle + ":%"}).mappings().all()
             first = None
+            first_key = ""
             for row in rows:
                 key = str(row.get("client_order_key") or "")
+                if not key.startswith("TQQQ_INF_V3:" + cycle + ":"):
+                    continue
                 fill_meta = self._json_object(row.get("fill_meta"))
+                if (str(fill_meta.get("fill_evidence_type") or "")
+                        != "KIS_ORDER_CUMULATIVE_ACTUAL"
+                        or fill_meta.get("is_synthetic") is True
+                        or fill_meta.get("accounting_active") is False):
+                    continue
+                # The earliest actual BUY in this cycle MUST have a verified
+                # original decision. Never skip an unproven first BUY and
+                # call a later ADD a verified original entry.
                 meta = self._json_object(row.get("intent_meta"))
-                if (not key.startswith("TQQQ_INF_V3:" + cycle + ":")
-                        or str(row.get("intent_strategy") or "") != "TQQQ_INFINITE_V3"
+                account = str(row.get("intent_account_id") or "").strip()
+                if (str(row.get("intent_strategy") or "") != "TQQQ_INFINITE_V3"
                         or str(meta.get("strategy_owner") or "") != "TQQQ_INFINITE"
                         or str(meta.get("cycle_id") or "") != cycle
                         or str(meta.get("position_lifecycle_id") or "") != cycle
                         or str(meta.get("book") or "") != "TQQQ_INFINITE"
-                        or str(fill_meta.get("fill_evidence_type") or "")
-                            != "KIS_ORDER_CUMULATIVE_ACTUAL"
-                        or fill_meta.get("is_synthetic") is True
-                        or fill_meta.get("accounting_active") is False
+                        or not account
+                        or account != str(row.get("fill_account_id") or "").strip()
                         or not normalize_us_order_no(row.get("order_no"))):
-                    continue
-                account = str(row.get("intent_account_id") or "").strip()
-                if not account or account != str(row.get("fill_account_id") or "").strip():
-                    continue
+                    return None
                 try:
                     shares = int(row["qty"])
                     if shares <= 0 or float(row["qty"]) != shares:
-                        continue
+                        return None
                 except (ValueError, TypeError, OverflowError):
-                    continue
+                    return None
                 evidence = meta.get("entry_decision_evidence_5w1h")
                 if not verify_decision_evidence(evidence):
-                    continue
+                    return None if first is None else first
                 what = evidence.get("what") or {}
                 who = evidence.get("who") or {}
                 if (what.get("side") != "BUY" or what.get("symbol") != "TQQQ"
@@ -565,12 +572,11 @@ class InfiniteRepository:
                         or what.get("decision_id") != "TQQQ_INFINITE:BUY:" + key
                         or who.get("strategy_owner") != "TQQQ_INFINITE"
                         or meta.get("entry_decision_evidence_sha256") != evidence["sha256"]):
-                    continue
+                    return None if first is None else first
                 if first is None:
-                    first = evidence
-                elif first.get("what", {}).get("decision_id") == what.get("decision_id"):
-                    if first["sha256"] != evidence["sha256"]:
-                        return None  # two conflicting digests for one filled BUY
+                    first, first_key = evidence, key
+                elif first_key == key and first["sha256"] != evidence["sha256"]:
+                    return None  # conflicting proof for the original actual BUY
             return first
         except Exception as exc:
             logger.warning(
