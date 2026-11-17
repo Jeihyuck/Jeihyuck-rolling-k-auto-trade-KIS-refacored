@@ -241,10 +241,41 @@ def test_loop_waits_for_late_prep_then_starts_readonly_collection(monkeypatch):
         return {
             "completed": 1, "unknown": 0, "coverage_ok": 1,
             "vwap_unverified": 0, "symbol_scan_p95_sec": 0,
-            "symbol_scan_max_sec": 0,
+            "symbol_scan_max_sec": 0, "native_minute_request_attempts": 1,
+            "native_quote_request_attempts": 1, "native_request_failures": 0,
         }
     monkeypatch.setattr(observer, "run_once", collect)
     observer.main()
     assert no_http_or_order == {
         "client_creations": 1, "final30_loads": 1, "runs": 1,
     }
+
+
+
+def test_quote_failure_keeps_native_minute_proof_but_never_fabricates_vwap(
+    setup_readonly, monkeypatch
+):
+    now = at(9, 36)
+    monkeypatch.setattr(observer, "now_kst", lambda: now)
+    class NativeOnly:
+        def get_intraday_candles_today(self, code, start_hhmm, *, attempts=1):
+            if start_hhmm == "092900":
+                return native_mins(0, 30)
+            return native_mins(30, 36)
+        def get_price_snapshot(self, code, market="J"):
+            raise TimeoutError("offline quote timeout")
+        def buy_stock(self, *a, **kw):
+            raise AssertionError("never place BUY")
+    result = observer.run_once(
+        kis=NativeOnly(), codes=["251970"], observed_at=now, sleep_between=0,
+    )
+    persisted = proof.load_opening_proof(
+        env="practice", account_scope="replay-only", code="251970", now=now,
+    )
+    assert result["completed"] == 1
+    assert result["native_request_failures"] == 1
+    assert result["native_minute_request_attempts"] == 2
+    assert result["native_quote_request_attempts"] == 1
+    assert persisted and len(persisted["bars"]) >= 30
+    assert persisted["vwap"] is None
+    assert persisted["vwap_source"] == "UNKNOWN"

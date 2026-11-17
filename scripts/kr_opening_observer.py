@@ -212,6 +212,7 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
         return {"state": "OUTSIDE_SESSION", "completed": 0, "unknown": len(codes)}
     scope = get_account_key(env="practice")
     done, unknown, coverage_ok, missing_vwap = 0, 0, 0, 0
+    minute_requests, quote_requests, native_request_failures = 0, 0, 0
     symbol_scan_sec: list[float] = []
     for code in codes:
         symbol_started = time.monotonic()
@@ -283,6 +284,7 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
             data: list[dict] = []
             for anchor in dict.fromkeys(anchors):
                 try:
+                    minute_requests += 1
                     try:
                         rows = kis.get_intraday_candles_today(
                             code, start_hhmm=anchor, attempts=1,
@@ -298,6 +300,7 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
                     if isinstance(rows, list):
                         data.extend(row for row in rows if isinstance(row, dict))
                 except Exception as minute_exc:
+                    native_request_failures += 1
                     logger.warning(
                         "[KR][OPENING_OBSERVER][PARTIAL_MINUTE_FETCH] code=%s "
                         "anchor=%s error_type=%s",
@@ -305,9 +308,22 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
                     )
             if not data:
                 raise RuntimeError("NO_KIS_NATIVE_INTRADAY_MINUTE_ROWS")
-            quote = kis.get_price_snapshot(code, market="J")
-            if not isinstance(quote, dict):
+            # A failed quote must not throw away already-authenticated native
+            # minute rows. Persist bars with VWAP=UNKNOWN; styles requiring
+            # a verified VWAP remain fail-closed at their original gate.
+            try:
+                quote_requests += 1
+                quote = kis.get_price_snapshot(code, market="J")
+                if not isinstance(quote, dict):
+                    quote = {}
+            except Exception as quote_exc:
+                native_request_failures += 1
                 quote = {}
+                logger.warning(
+                    "[KR][OPENING_OBSERVER][QUOTE_FAIL_SOFT] code=%s type=%s "
+                    "action=PERSIST_NATIVE_MINUTES_WITH_UNVERIFIED_VWAP",
+                    code, type(quote_exc).__name__,
+                )
             raw = quote.get("raw") if isinstance(quote.get("raw"), dict) else {}
             quote_origin = str(quote.get("source") or raw.get("source") or "UNKNOWN")
             proof_now = now_kst()
@@ -352,6 +368,7 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
             if (coverage["reason"] == "OPENING_BARS_MISSING_OR_INCOMPLETE"
                     and repair_due):
                 try:
+                    minute_requests += 1
                     try:
                         repair_rows = kis.get_intraday_candles_today(
                             code, start_hhmm="091500", attempts=1,
@@ -387,6 +404,7 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
                         coverage["opening_count"], coverage["reason"],
                     )
                 except Exception as repair_exc:
+                    native_request_failures += 1
                     logger.warning(
                         "[KR][OPENING_OBSERVER][REPAIR_FAIL] code=%s type=%s "
                         "action=KEEP_OLD_VERIFIED_PROOF",
@@ -467,7 +485,10 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
         "coverage_ok": coverage_ok, "vwap_unverified": missing_vwap,
         "symbol_scan_p95_sec": p95,
         "symbol_scan_max_sec": ordered_latencies[-1] if ordered_latencies else None,
-        "native_quote_requests_added": 0,
+        "native_minute_request_attempts": minute_requests,
+        "native_quote_request_attempts": quote_requests,
+        "native_request_failures": native_request_failures,
+        "native_quote_requests_added": quote_requests,
     }
 
 
@@ -540,11 +561,15 @@ def main() -> None:
         logger.info(
             "[KR][OPENING_OBSERVER][PASS] completed=%s unknown=%s "
             "coverage_ok=%s vwap_unverified=%s symbol_p95_sec=%s "
-            "symbol_max_sec=%s elapsed_sec=%.1f target_period_sec=%.1f",
+            "symbol_max_sec=%s elapsed_sec=%.1f target_period_sec=%.1f "
+            "native_minute_requests=%s native_quote_requests=%s native_failures=%s",
             result["completed"], result["unknown"], result["coverage_ok"],
             result["vwap_unverified"], result["symbol_scan_p95_sec"],
             result["symbol_scan_max_sec"], elapsed,
             max(15.0, float(args.interval_sec)),
+            result["native_minute_request_attempts"],
+            result["native_quote_request_attempts"],
+            result["native_request_failures"],
         )
         time.sleep(max(1.0, max(15.0, float(args.interval_sec)) - elapsed))
 
