@@ -27,6 +27,73 @@ from .ttl_reconcile import (
 
 logger = logging.getLogger(__name__)
 
+
+def _tqqq_evidence_code_sha() -> str:
+    """Use the runtime-pinned revision, else one local bounded Git read.
+
+    Not a broker authority or executable policy gate. Do not fabricate SHA.
+    """
+    import re
+    from functools import lru_cache
+    from pathlib import Path
+    import subprocess
+
+    for key in ("US_PINNED_CODE_SHA", "GITHUB_SHA"):
+        value = str(os.getenv(key) or "").strip()
+        if re.fullmatch(r"[0-9a-fA-F]{40}", value):
+            return value
+
+    @lru_cache(maxsize=1)
+    def _read_git_head() -> str:
+        try:
+            root = Path(__file__).resolve().parents[3]
+            result = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "HEAD"],
+                capture_output=True, text=True, timeout=0.3, check=False,
+            )
+            rev = str(result.stdout or "").strip()
+            return rev if result.returncode == 0 and re.fullmatch(
+                r"[0-9a-fA-F]{40}", rev
+            ) else ""
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return ""
+
+    # Function-local cache exists only for this invocation; reuse a module
+    # cache below to avoid repeatedly spawning Git in one process.
+    return _tqqq_local_git_head()
+
+
+def _tqqq_local_git_head() -> str:
+    from functools import lru_cache
+    import subprocess
+    import re
+    from pathlib import Path
+
+    return _cached_tqqq_git_sha()
+
+
+from functools import lru_cache
+
+
+@lru_cache(maxsize=1)
+def _cached_tqqq_git_sha() -> str:
+    import re
+    import subprocess
+    from pathlib import Path
+    try:
+        root = Path(__file__).resolve().parents[3]
+        result = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=0.3, check=False,
+        )
+        sha = str(result.stdout or "").strip()
+        return sha if result.returncode == 0 and re.fullmatch(
+            r"[0-9a-fA-F]{40}", sha
+        ) else ""
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return ""
+
+
 _TQQQ_TTL_TERMINAL_STATUSES = {"CANCELLED", "REJECTED", "EXPIRED", "FILLED"}
 
 
@@ -1204,12 +1271,9 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
         # remain explicitly unverified rather than a fabricated digest.
         if decision.action == Action.BUY:
             try:
-                import re
                 from trader.us.decision_evidence_5w1h import build_decision_evidence
-                _code_sha = str(
-                    os.getenv("US_PINNED_CODE_SHA") or os.getenv("GITHUB_SHA") or ""
-                ).strip()
-                if not re.fullmatch(r"[a-fA-F0-9]{40}", _code_sha):
+                _code_sha = _tqqq_evidence_code_sha()
+                if not _code_sha:
                     intent["meta"]["entry_decision_evidence_status"] = "CODE_SHA_UNVERIFIED"
                     logger.warning("[TQQQ_INF][5W1H][CODE_SHA_UNVERIFIED] "
                                    "symbol=TQQQ action=AUDIT_MISSING_NOT_BROKER_BLOCK")
