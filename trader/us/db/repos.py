@@ -3957,6 +3957,7 @@ def verify_us_tp_claim_stage_at_http_boundary(
 def release_us_profit_capture_pre_http_abort(
     *, trade_date: str, symbol: str, stage: str,
     position_lifecycle_id: str, client_order_key: str,
+    close_intent: bool = False, failure_code: str = "PROVEN_PRE_HTTP_ABORT",
 ) -> bool:
     """Clear a TP intent-only PENDING *only* after proven no-HTTP abort.
 
@@ -4091,6 +4092,54 @@ def release_us_profit_capture_pre_http_abort(
                 or str((current.get("meta") or {}).get("last_status") or "") not in {"PENDING", "SUBMITTED"}
                 or (current.get(f"{stg}_broker_order_no") and not partial_stage)):
             return False
+        if close_intent:
+            # A previously separated intent close could commit after the
+            # stage was released, leaving PENDING and failing the next claim.
+            # Both exact transitions must now be one PostgreSQL transaction.
+            import re as _re
+            if (not order_key.startswith("US_PC_")
+                    or not _re.fullmatch(r"[A-Z0-9_]{1,100}", str(failure_code or ""))):
+                return False
+            scope = _us_execution_claim_scope()
+            attempt_scope = attempt[0]
+            if (str(scope.get("env") or "").lower() != "practice"
+                    or str(scope.get("trading_epoch_id") or "") != str(epoch_id)
+                    or not scope.get("account_id")
+                    or str(attempt_scope.get("account_id") or "") != str(scope["account_id"])
+                    or str(attempt_scope.get("lifecycle_id") or "") != lifecycle
+                    or str(attempt_scope.get("action") or "").lower() != stg):
+                return False
+            intent_row = conn.execute(text("""
+                SELECT status, meta
+                  FROM us_order_intents
+                 WHERE trade_date=:td AND client_order_key=:key
+                   AND symbol=:sym AND side='SELL'
+                   AND trading_epoch_id=:epoch
+                 FOR UPDATE
+            """), params).mappings().one_or_none()
+            if not intent_row or str(intent_row.get("status") or "") != "PENDING":
+                return False
+            intent_meta = _parse_json_meta(intent_row.get("meta"))
+            if (str(intent_meta.get("submit_attempt_id") or "") != attempt_id
+                    or str(intent_meta.get("profit_capture_stage") or "").lower() != stg
+                    or str(intent_meta.get("strategy_owner") or "US_STANDARD").upper() != "US_STANDARD"
+                    or (intent_meta.get("position_lifecycle_id")
+                        and str(intent_meta["position_lifecycle_id"]) != lifecycle)):
+                return False
+            updated = conn.execute(text("""
+                UPDATE us_order_intents
+                   SET status='BLOCKED',
+                       meta=COALESCE(meta, '{}'::jsonb) || CAST(:patch AS jsonb)
+                 WHERE trade_date=:td AND client_order_key=:key
+                   AND symbol=:sym AND side='SELL' AND trading_epoch_id=:epoch
+                   AND status='PENDING'
+            """), {**params, "patch": _json_param({
+                "pre_io_abort_attempt_id": attempt_id,
+                "pre_io_abort_stage": "BEFORE_KIS_HTTP",
+                "pre_io_abort_code": failure_code,
+            })})
+            if updated.rowcount != 1:
+                return False
         mark_us_profit_capture_stage(
             trade_date, sym, stg, order_key=order_key,
             position_lifecycle_id=lifecycle, status="FAILED",
