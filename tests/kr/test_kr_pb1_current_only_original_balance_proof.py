@@ -136,3 +136,56 @@ def test_unproven_forced_balance_never_becomes_fresh_for_reconcile(monkeypatch, 
     assert "_kr_verified_fresh_at_kst" not in passed[0]["balance_snapshot"]
     assert obj._run_summary_payload["broker_truth_reconcile_degraded"] == 1
     assert obj._run_summary_payload["broker_truth_health_status"] == "RED"
+
+
+def test_real_kr_runner_forces_stale_wrapper_cache_once(monkeypatch):
+    from trader import pb1_runner as runner
+
+    class RealKisEmulator:
+        def __init__(self):
+            self._balance_cache_at = now_kst() - timedelta(minutes=4)
+            self.calls = []
+
+        def get_balance_cached(self, *, force, return_source, return_raw):
+            assert return_source and return_raw
+            self.calls.append(force)
+            if force:
+                self._balance_cache_at = now_kst() - timedelta(seconds=1)
+                source = "api"
+            else:
+                source = "wrapper_cache"
+            row = _snapshot()
+            return row, source, dict(row)
+
+    monkeypatch.setattr(runner, "KisAPI", RealKisEmulator)
+    kis = RealKisEmulator()
+    state, snapshot, source = runner.get_balance_state(kis=kis, now=now_kst())
+    assert state == runner.BALANCE_STATE_OK
+    assert kis.calls == [False, True]
+    assert source == "api"
+    assert snapshot["_kr_verified_fresh_at_kst"] == kis._balance_cache_at.isoformat()
+
+
+def test_real_kr_runner_does_not_certify_invalid_refreshed_timestamp(monkeypatch):
+    from trader import pb1_runner as runner
+
+    class RealKisEmulator:
+        def __init__(self):
+            self._balance_cache_at = now_kst() - timedelta(minutes=4)
+            self.calls = []
+
+        def get_balance_cached(self, *, force, return_source, return_raw):
+            self.calls.append(force)
+            # Even when KIS returns a success-looking dict, failure to prove
+            # original HTTP fetch timestamp remains a hard UNKNOWN state.
+            self._balance_cache_at = None if force else self._balance_cache_at
+            row = _snapshot()
+            return row, "api" if force else "wrapper_cache", dict(row)
+
+    monkeypatch.setattr(runner, "KisAPI", RealKisEmulator)
+    kis = RealKisEmulator()
+    state, snapshot, source = runner.get_balance_state(kis=kis, now=now_kst())
+    assert kis.calls == [False, True]
+    assert state == runner.BALANCE_STATE_UNKNOWN
+    assert snapshot is None
+    assert source is None
