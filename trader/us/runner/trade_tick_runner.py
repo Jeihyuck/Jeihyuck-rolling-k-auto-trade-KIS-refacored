@@ -1462,6 +1462,8 @@ def release_proven_tp_pre_submit_block(
             stage=stage,
             position_lifecycle_id=ledger_lifecycle,
             client_order_key=key,
+            close_intent=True,
+            failure_code="PROVEN_PRE_HTTP_ABORT",
         )
     except Exception as exc:
         logger.error(
