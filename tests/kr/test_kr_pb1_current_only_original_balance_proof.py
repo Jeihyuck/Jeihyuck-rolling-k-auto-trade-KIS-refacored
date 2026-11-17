@@ -189,3 +189,58 @@ def test_real_kr_runner_does_not_certify_invalid_refreshed_timestamp(monkeypatch
     assert state == runner.BALANCE_STATE_UNKNOWN
     assert snapshot is None
     assert source is None
+
+
+def test_kr_infinite_reserved_122630_is_not_recovered_as_pb1_policy(monkeypatch):
+    """Wrongly PB1-tagged historical row may not adopt KR_INFINITE's broker 11 shares."""
+    import sqlalchemy as sa
+    from trader.kr.infinite import SYMBOL, STRATEGY_ID
+
+    positions = sa.table(
+        "positions",
+        sa.column("env"), sa.column("strategy"), sa.column("status"),
+        sa.column("qty"), sa.column("code"),
+    )
+    class FakeResult:
+        def mappings(self):
+            return self
+        def all(self):
+            return [{
+                "env": "practice", "strategy": "pb1_pullback_close",
+                "status": "OPEN", "qty": 11, "code": SYMBOL,
+                "exit_policy_family": "POLICY_MISSING",
+            }]
+    class FakeConnect:
+        def __init__(self):
+            self.execute_count = 0
+        def __enter__(self):
+            return self
+        def __exit__(self, *_):
+            return False
+        def execute(self, statement):
+            self.execute_count += 1
+            assert self.execute_count == 1, (
+                "FOREIGN OWNER: must not query PB1 fill chains"
+            )
+            return FakeResult()
+    class FakeEngine:
+        def __init__(self):
+            self.connection = FakeConnect()
+        def connect(self):
+            return self.connection
+
+    monkeypatch.setattr(
+        truth, "schema_for_engine",
+        lambda _: SimpleNamespace(positions=positions),
+    )
+    fake_engine = FakeEngine()
+    result = truth._recover_proven_policy_positions(
+        engine=fake_engine, env="practice",
+        strategy="pb1_pullback_close",
+        holdings_rows=[{"pdno": SYMBOL, "hldg_qty": "11"}],
+    )
+    assert STRATEGY_ID == "KR_INFINITE_V1"
+    assert result["recovered"] == []
+    assert result["review_required"] == [SYMBOL]
+    assert result["foreign_owner_review_required"] == [SYMBOL]
+    assert fake_engine.connection.execute_count == 1
