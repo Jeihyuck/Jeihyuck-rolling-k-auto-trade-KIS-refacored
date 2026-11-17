@@ -234,6 +234,14 @@ def _accumulate_kr_tick_skip_observations(
             session_metrics.get("skipped_order_unobserved_ticks", 0)
         ) + 1
     event = str(tick_metrics.get("terminal_event") or "").strip().upper()
+    if event:
+        session_metrics["terminal_event_observed_ticks"] = int(
+            session_metrics.get("terminal_event_observed_ticks", 0)
+        ) + 1
+    else:
+        session_metrics["terminal_event_unobserved_ticks"] = int(
+            session_metrics.get("terminal_event_unobserved_ticks", 0)
+        ) + 1
     if event == "FINAL_SKIP":
         session_metrics["terminal_final_skip_ticks"] = int(
             session_metrics.get("terminal_final_skip_ticks", 0)
@@ -8936,6 +8944,8 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             "skipped_order_observed_ticks": 0,
             "skipped_order_unobserved_ticks": 0,
             "terminal_final_skip_ticks": 0,
+            "terminal_event_observed_ticks": 0,
+            "terminal_event_unobserved_ticks": 0,
         }
         # A loop owns no PB1Engine instance: every tick creates and finalizes one
         # inside run_once. Preserve only its returned summary for session markers.
@@ -9497,6 +9507,12 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             "skipped_order_observed_ticks": int(session_metrics.get("skipped_order_observed_ticks", 0)),
             "skipped_order_unobserved_ticks": int(session_metrics.get("skipped_order_unobserved_ticks", 0)),
             "terminal_final_skip_ticks": int(session_metrics.get("terminal_final_skip_ticks", 0)),
+            "terminal_event_observed_ticks": int(session_metrics.get("terminal_event_observed_ticks", 0)),
+            "terminal_event_unobserved_ticks": int(session_metrics.get("terminal_event_unobserved_ticks", 0)),
+            "terminal_final_skip_count_complete": (
+                int(session_metrics.get("terminal_event_unobserved_ticks", 0)) == 0
+                and int(session_metrics.get("ticks_completed", 0)) > 0
+            ),
             "skipped_order_count_complete": (
                 int(session_metrics.get("skipped_order_unobserved_ticks", 0)) == 0
                 and int(session_metrics.get("ticks_completed", 0)) > 0
