@@ -344,7 +344,7 @@ def test_tqqq_buy_audit_missing_code_sha_is_not_fake_verified(monkeypatch):
     monkeypatch.setenv("US_TQQQ_INFINITE_REAL_ORDER", "1")
     monkeypatch.delenv("US_PINNED_CODE_SHA", raising=False)
     monkeypatch.delenv("GITHUB_SHA", raising=False)
-    monkeypatch.setattr(integration, "_tqqq_local_git_head", lambda: "")
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
     seen = []
     outcome = run_sleeve(
         positions=[], price=50.0, trading_date=date(2026, 8, 11),
