@@ -114,3 +114,29 @@ def verify_run_revision(trade_date: str, current_revision: str, *, expected_revi
     return {"ok": ok, "reason": "ok" if ok else "run_revision_mismatch",
             "entry_can_proceed": ok, "reconciliation_can_proceed": True, "manifest": manifest,
             "source": source}
+
+
+def verified_execution_revision(
+    *, actual_git_head: str, session_revision: str,
+    expected_revision: str | None, revision_guard_ok: bool,
+) -> str:
+    """Return executable code SHA only when runtime and pinned PREP agree.
+
+    Audit metadata must never claim that an arbitrary local Git HEAD, an
+    operator string, or a mismatched PREP revision is the code that executed
+    a broker order. This is read-only and does not alter trade permissions.
+    """
+    import re
+
+    actual = str(actual_git_head or "").strip()
+    session = str(session_revision or "").strip()
+    expected = str(expected_revision or "").strip()
+    if not bool(revision_guard_ok):
+        return ""
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", actual):
+        return ""
+    if actual.lower() != session.lower():
+        return ""
+    if expected and expected.lower() != session.lower():
+        return ""
+    return actual.lower()
