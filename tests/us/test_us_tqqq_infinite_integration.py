@@ -306,3 +306,53 @@ def test_cancelled_full_exit_uses_deterministic_retry_key(monkeypatch):
     assert result["decision"].action.value == "SELL"
     assert routed[0]["client_order_key"] == "TQQQ_INF_V3:exit-cycle:2026-08-11:TP1:RETRY:1"
     assert len(routed) == 1
+
+
+def test_tqqq_new_buy_5w1h_evidence_written_to_router_intent_without_policy_change(monkeypatch):
+    """No broker call. Exact owner BUY decision evidence is committed with intent."""
+    from trader.us.decision_evidence_5w1h import (
+        summarize_order_evidence, verify_decision_evidence,
+    )
+
+    monkeypatch.setenv("US_TQQQ_INFINITE_ENABLED", "1")
+    monkeypatch.setenv("US_TQQQ_INFINITE_REAL_ORDER", "1")
+    monkeypatch.setenv("US_PINNED_CODE_SHA", "a" * 40)
+    seen = []
+    outcome = run_sleeve(
+        positions=[], price=50.0, trading_date=date(2026, 8, 11),
+        overlay=market("NORMAL", tqqq_quote_source="KIS_LIVE"),
+        repository=FakeRepository(InfiniteState()),
+        route=lambda intent: (seen.append(intent) or {"status": "ACK"}),
+    )
+    assert outcome["status"] == "ACK"
+    assert len(seen) == 1
+    intent = seen[0]
+    assert intent["side"] == "BUY"
+    assert intent["strategy_owner"] == "TQQQ_INFINITE"
+    ev = intent["meta"]["entry_decision_evidence_5w1h"]
+    assert verify_decision_evidence(ev)
+    assert intent["meta"]["entry_decision_evidence_sha256"] == ev["sha256"]
+    assert ev["who"]["code_sha"] == "a" * 40
+    assert ev["what"]["position_lifecycle_id"] == intent["position_lifecycle_id"]
+    assert ev["why"]["facts"]["quote_asof"] is None  # never fabricate KIS time
+    assert summarize_order_evidence(intent["meta"], side="BUY")["status"] == "VERIFIED"
+
+
+def test_tqqq_buy_audit_missing_code_sha_is_not_fake_verified(monkeypatch):
+    from trader.us.infinite import integration
+    monkeypatch.setenv("US_TQQQ_INFINITE_ENABLED", "1")
+    monkeypatch.setenv("US_TQQQ_INFINITE_REAL_ORDER", "1")
+    monkeypatch.delenv("US_PINNED_CODE_SHA", raising=False)
+    monkeypatch.delenv("GITHUB_SHA", raising=False)
+    monkeypatch.setattr(integration, "_tqqq_local_git_head", lambda: "")
+    seen = []
+    outcome = run_sleeve(
+        positions=[], price=50.0, trading_date=date(2026, 8, 11),
+        overlay=market("NORMAL"),
+        repository=FakeRepository(InfiniteState()),
+        route=lambda intent: (seen.append(intent) or {"status": "ACK"}),
+    )
+    assert outcome["status"] == "ACK"
+    assert len(seen) == 1
+    assert seen[0]["meta"]["entry_decision_evidence_status"] == "CODE_SHA_UNVERIFIED"
+    assert "entry_decision_evidence_5w1h" not in seen[0]["meta"]
