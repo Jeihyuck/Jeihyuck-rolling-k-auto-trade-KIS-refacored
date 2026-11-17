@@ -150,3 +150,101 @@ def test_missing_native_minutes_do_not_turn_into_synthetic_proof(setup_readonly,
         code="093320", now=now, style="ENTRY_PULLBACK",
         setup_ok=True, trigger_ok=False, pivot=None, order_price=10000,
     )["state"] != "READY_SHADOW"
+
+
+
+def test_old_conflicted_completed_minute_gets_exact_native_anchor(
+    setup_readonly, monkeypatch
+):
+    # At 11:05, a native conflict from 10:05 is too old to be returned by
+    # the most recent 30-minute KIS window.  An exact 10:06 anchor is needed.
+    def bar_1005(close):
+        return {
+            "date": "20261117", "time": "100500",
+            "open": 10000, "high": max(close, 10010),
+            "low": 9990, "close": close, "volume": 200,
+        }
+    earlier = native_mins(0, 30)
+    proof.save_opening_proof(
+        env="practice", account_scope="replay-only", code="012750",
+        now=at(10, 8), raw_bars=earlier + [bar_1005(10000)],
+        vwap=None, vwap_source="UNKNOWN",
+    )
+    proof.save_opening_proof(
+        env="practice", account_scope="replay-only", code="012750",
+        now=at(10, 9), raw_bars=[bar_1005(10010)],
+        vwap=None, vwap_source="UNKNOWN",
+    )
+    assert proof.load_opening_proof(
+        env="practice", account_scope="replay-only",
+        code="012750", now=at(10, 9),
+    )["source_conflicts"]
+    now = at(11, 5)
+    monkeypatch.setattr(observer, "now_kst", lambda: now)
+    calls = []
+
+    def reply(code, anchor):
+        if anchor == "092900":
+            return earlier
+        if anchor == "100600":
+            return [bar_1005(10010)]
+        return native_mins(60 + 63, 60 + 65)
+
+    result = observer.run_once(
+        kis=fake_client(calls, reply), codes=["012750"],
+        observed_at=now, sleep_between=0,
+    )
+    assert result["completed"] == 1
+    assert "100600" in [a for _, a in calls], calls
+    persisted = proof.load_opening_proof(
+        env="practice", account_scope="replay-only",
+        code="012750", now=now,
+    )
+    assert persisted["source_conflicts"]  # first native revalidation only
+    assert persisted["conflict_observations"]["2026-11-17T10:05:00+09:00"][
+        "stable_native_reads"
+    ] >= 2
+
+
+def test_loop_waits_for_late_prep_then_starts_readonly_collection(monkeypatch):
+    import sys
+    import trader.kis_wrapper as kw
+    times = iter([at(9, 0), at(9, 1), at(15, 6)])
+    monkeypatch.setattr(observer, "now_kst", lambda: next(times))
+    monkeypatch.setattr(sys, "argv", [
+        "scripts.kr_opening_observer", "--loop", "--date", DATE,
+    ])
+    no_http_or_order = {"client_creations": 0, "runs": 0, "final30_loads": 0}
+    snapshots = iter([
+        {"state": "INVALID_PREP", "hot": [], "warm": [], "cold": []},
+        {"state": "PREP_FALLBACK", "hot": ["093320"],
+         "warm": [], "cold": []},
+    ])
+    monkeypatch.setattr(observer, "collection_priorities",
+                        lambda **kw: next(snapshots))
+    monkeypatch.setattr(observer, "get_account_key", lambda **kw: "replay-only")
+
+    def load_final30(**kw):
+        no_http_or_order["final30_loads"] += 1
+        return ["093320"] * 30
+
+    monkeypatch.setattr(observer, "final30_codes", load_final30)
+
+    def get_client(**kw):
+        no_http_or_order["client_creations"] += 1
+        return object()
+
+    monkeypatch.setattr(kw, "KisAPI", get_client)
+    monkeypatch.setattr(observer.time, "sleep", lambda _: None)
+    def collect(**kw):
+        no_http_or_order["runs"] += 1
+        return {
+            "completed": 1, "unknown": 0, "coverage_ok": 1,
+            "vwap_unverified": 0, "symbol_scan_p95_sec": 0,
+            "symbol_scan_max_sec": 0,
+        }
+    monkeypatch.setattr(observer, "run_once", collect)
+    observer.main()
+    assert no_http_or_order == {
+        "client_creations": 1, "final30_loads": 1, "runs": 1,
+    }

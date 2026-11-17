@@ -10,7 +10,7 @@ PB1 BUY/SELL hot path. Not enabled by scheduler changes in this PR.
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, time as dtime
+from datetime import datetime, timedelta, time as dtime
 import json
 import logging
 from pathlib import Path
@@ -240,15 +240,39 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
                 and valid_opening[0] <= "09:03"
                 and valid_opening[-1] >= "09:26"
             )
+            unresolved = list((stored or {}).get("source_conflicts") or [])
             repair_due = (
                 observed_at.time() >= dtime(9, 30)
-                and (not opening_ready or bool((stored or {}).get("source_conflicts")))
+                and (not opening_ready or bool(unresolved))
                 and _repair_opening_due(code)
             )
             anchors = (
                 ["092900", observed_at.strftime("%H%M%S")]
                 if repair_due else [observed_at.strftime("%H%M%S")]
             )
+            # An unresolved native-minute conflict can be >30 bars old.
+            # Current-window reads no longer contain it: target the exact
+            # conflict timestamp in an authenticated KIS historical window.
+            # The original value and conflict quarantine remain intact until
+            # the normal multi-read proof resolves it. Maximum two targeted
+            # reads per repair cycle to preserve the observer-only KIS budget.
+            if repair_due:
+                extra_conflict_anchors: list[str] = []
+                for conflict_minute in unresolved:
+                    try:
+                        conflict_at = datetime.fromisoformat(str(conflict_minute)).astimezone(KST)
+                    except (ValueError, TypeError, OverflowError):
+                        continue
+                    if (conflict_at.date() != observed_at.date()
+                            or not dtime(9, 0) <= conflict_at.time() < dtime(15, 30)
+                            or conflict_at >= observed_at.replace(second=0, microsecond=0)):
+                        continue
+                    # KIS time-itemchart returns a backward-looking window.
+                    next_completed = conflict_at + timedelta(minutes=1)
+                    extra_conflict_anchors.append(next_completed.strftime("%H%M%S"))
+                    if len(extra_conflict_anchors) >= 2:
+                        break
+                anchors.extend(extra_conflict_anchors)
             anchors = list(dict.fromkeys(anchors))
             if repair_due:
                 logger.info(
@@ -459,15 +483,18 @@ def main() -> None:
         parser.error("select exactly one of --once or --loop")
     logging.basicConfig(level=logging.INFO)
     from trader.kis_wrapper import KisAPI
-    kis = KisAPI(kis_env="practice")
     today = args.date or now_kst().date().isoformat()
-    codes = final30_codes(trade_date=today, filename=args.final30_file)
     if args.once:
+        # --once is the strict diagnostic: missing/invalid Final30 is an error.
+        codes = final30_codes(trade_date=today, filename=args.final30_file)
+        kis = KisAPI(kis_env="practice")
         print(json.dumps(run_once(kis=kis, codes=codes, observed_at=now_kst()), ensure_ascii=False))
         return
-    # The legacy --once path remains a full read-only 30-name diagnostic.
-    # Production --loop uses a bounded priority queue; the code never
-    # deletes a name from Final30 or uses collection status to authorize BUY.
+    # The live read-only loop must survive delayed PREP/Final30 creation.
+    # Do not pre-load Final30 or initialise the KIS client until the same-day
+    # PREP contract is actually verified.  No stale prior-day fallback.
+    codes: list[str] = []
+    kis = None
     schedule = CandidateSchedule(max_batch=6)
     scope = get_account_key(env="practice")
     while True:
@@ -481,9 +508,16 @@ def main() -> None:
         try:
             priority = collection_priorities(date=today, account_scope=scope, now=now)
             if priority["state"] == "INVALID_PREP":
-                logger.error("[KR][OPENING_OBSERVER][WAIT_PREP] verified_final30=0")
+                logger.warning("[KR][OPENING_OBSERVER][WAIT_PREP] verified_final30=0 action=RETRY_SAME_DAY_READ_ONLY")
                 time.sleep(10.0)
                 continue
+            # A PREP file can be written after the AM wrapper starts or be
+            # replaced atomically during recovery. Validate before each first
+            # use; all trading authorisation stays inside PB1 ENFORCE.
+            if not codes:
+                codes = final30_codes(trade_date=today, filename=args.final30_file)
+                kis = KisAPI(kis_env="practice")
+                logger.info("[KR][OPENING_OBSERVER][PREP_READY] final30=%s role=READ_ONLY", len(codes))
             selected = schedule.select(priority, now)
             if not selected:
                 time.sleep(min(10.0, max(2.0, float(args.interval_sec) / 3.0)))

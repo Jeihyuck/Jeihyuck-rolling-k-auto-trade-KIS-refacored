@@ -68,8 +68,10 @@ kr_pb1_opening_observer_start() {
   fi
   local final30="runtime/kr/watchlist/${trade_date}/final30_scored.json"
   if [[ ! -s "$final30" ]]; then
-    echo "[KR][ENTRY_TIMING][OBSERVER_INPUT_MISSING] file=$final30 action=NO_OBSERVER_BUY_FAIL_CLOSED"
-    return 0
+    # PREP may still be completing when AM starts at 08:55.  The independent
+    # collector must launch now and wait for a verified same-day contract,
+    # rather than disappear for the entire trading session.
+    echo "[KR][ENTRY_TIMING][OBSERVER_WAIT_PREP] file=$final30 action=LAUNCH_READ_ONLY_RETRY_UNTIL_VALID"
   fi
   mkdir -p "$log_dir" runtime/locks
   # Non-blocking, read-only sidecar. Do NOT let it inherit the AM/PM session
