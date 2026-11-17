@@ -277,19 +277,15 @@ def _recover_proven_policy_positions_fixed(
     holdings_rows: list[dict] | None,
 ) -> dict[str, Any]:
     """Recover POLICY_MISSING only into one exact, unambiguous OPEN row."""
-    # This function is installed on the PB1 base runtime: its schema authority
-    # must be identical to that of the calling base guard (and injected tests).
-    schema = base.schema_for_engine(engine)
+    schema = schema_for_engine(engine)
     kis = base._holdings_index(holdings_rows)
     recovered: list[str] = []
     review: list[str] = []
     foreign_owner_review: list[str] = []
     with engine.connect() as conn:
-        # The runtime guard installs this function on the base module. Always
-        # resolve the same epoch authority used by the live PB1 tick.
-        active_epoch = base.active_trading_epoch_id(
-            conn, env=env, account_id=base.get_account_key(env=env),
-            required=base.trading_epoch_enforced(),
+        active_epoch = active_trading_epoch_id(
+            conn, env=env, account_id=get_account_key(env=env),
+            required=trading_epoch_enforced(),
         )
         position_predicate = sa.and_(
             schema.positions.c.env == env,
@@ -591,11 +587,12 @@ def _recover_proven_policy_positions_fixed(
             source_cycle,
         )
 
-    return {
-        "recovered": recovered,
-        "review_required": sorted(set(review)),
-        "foreign_owner_review_required": sorted(set(foreign_owner_review)),
-    }
+    # Preserve the established result contract for non-reserved PB1 symbols.
+    # The extra explicit RED owner marker is present only for 122630.
+    result = {"recovered": recovered, "review_required": sorted(set(review))}
+    if foreign_owner_review:
+        result["foreign_owner_review_required"] = sorted(set(foreign_owner_review))
+    return result
 
 
 def _health_after_reconcile_fixed(*, engine, env: str, strategy: str, holdings_rows: list[dict] | None) -> dict[str, Any]:
@@ -607,9 +604,9 @@ def _health_after_reconcile_fixed(*, engine, env: str, strategy: str, holdings_r
     with engine.connect() as conn:
         # CURRENT_ONLY health must not report historic epochs as if they
         # belonged to the active trading cycle. Keep legacy no-epoch behavior.
-        active_epoch = base.active_trading_epoch_id(
-            conn, env=env, account_id=base.get_account_key(env=env),
-            required=base.trading_epoch_enforced(),
+        active_epoch = active_trading_epoch_id(
+            conn, env=env, account_id=get_account_key(env=env),
+            required=trading_epoch_enforced(),
         )
         position_predicate = sa.and_(
             schema.positions.c.env == env,
