@@ -4160,6 +4160,15 @@ def update_us_soft_stop_risk_state(
 ) -> dict:
     """Increment/reset and persist per-symbol soft-stop state."""
     key_symbol = _risk_state_key(symbol, trade_date)[1]
+    # An armed US order path cannot use memory-only soft-stop confirmations.
+    # Their loss after restart would make otherwise protected SELL unsafe.
+    require_durable = (
+        os.getenv("WSL_RUN_MARKET", "").upper() == "US"
+        and os.getenv("KIS_ENV", "").strip().lower() in {"practice", "real", "live"}
+        and os.getenv("US_ORDER_ARMED", "0").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+    )
     previous = load_us_position_risk_state(key_symbol, trade_date)
     now_iso = (now if now.tzinfo else now.replace(tzinfo=timezone.utc)).isoformat()
     previous_state = dict(previous.get("state") or {})
@@ -4192,7 +4201,14 @@ def update_us_soft_stop_risk_state(
             "last_pnl_pct": float(pnl_pct),
             "updated_at": now_iso,
         }
-        save_us_position_risk_state(key_symbol, trade_date, state)
+        if not save_us_position_risk_state(
+            key_symbol, trade_date, state, require_durable=require_durable,
+        ) and require_durable:
+            logger.error(
+                "[US_RISK_STATE][DURABLE_STATE_NOT_SAVED] symbol=%s trade_date=%s "
+                "action=NO_SOFT_STOP_CONFIRMATION", key_symbol, trade_date,
+            )
+            raise RuntimeError("US_SOFT_STOP_DURABLE_STATE_WRITE_FAILED")
         logger.info(
             "[US_RISK_STATE][SOFT_STOP] symbol=%s trade_date=%s count=%d pnl_pct=%.4f price=%.4f action=increment",
             key_symbol, trade_date, state["soft_stop_breach_count"], pnl_pct, current_price,
@@ -4210,7 +4226,14 @@ def update_us_soft_stop_risk_state(
         "last_pnl_pct": float(pnl_pct),
         "updated_at": now_iso,
     }
-    save_us_position_risk_state(key_symbol, trade_date, state)
+    if not save_us_position_risk_state(
+        key_symbol, trade_date, state, require_durable=require_durable,
+    ) and require_durable:
+        logger.error(
+            "[US_RISK_STATE][DURABLE_STATE_NOT_SAVED] symbol=%s trade_date=%s "
+            "action=NO_SOFT_STOP_CONFIRMATION", key_symbol, trade_date,
+        )
+        raise RuntimeError("US_SOFT_STOP_DURABLE_STATE_WRITE_FAILED")
     logger.info(
         "[US_RISK_STATE][SOFT_STOP_RESET] symbol=%s trade_date=%s pnl_pct=%.4f price=%.4f action=reset",
         key_symbol, trade_date, pnl_pct, current_price,
