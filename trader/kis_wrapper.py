@@ -3794,8 +3794,10 @@ class KisAPI:
                     continue
 
                 if "초당 거래건수" in str(data.get("msg1") or ""):
+                    # Final rejection never sleeps. Next cycle or
+                    # account-wide throttle may retry without blocking an
+                    # unrelated broker-protective SELL.
                     if attempt < native_max_attempts:
-                        if attempt < native_max_attempts:
                         time.sleep(0.35 + random.uniform(0, 0.15))
                     continue
 
