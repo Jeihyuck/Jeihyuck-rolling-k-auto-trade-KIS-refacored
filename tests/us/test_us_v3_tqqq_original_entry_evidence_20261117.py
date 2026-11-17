@@ -13,6 +13,16 @@ from trader.us.infinite.repository import InfiniteRepository
 CYCLE = "tqqq-proof-cycle"
 KEY = f"TQQQ_INF_V3:{CYCLE}:2026-11-10:BUY"
 EPOCH = "tqqq-practice-epoch"
+ACCOUNT = "a" * 64
+
+
+@pytest.fixture(autouse=True)
+def exact_test_claim_scope(monkeypatch):
+    from trader.us.db import repos
+    monkeypatch.setattr(repos, "_us_execution_claim_scope", lambda: {
+        "env": "practice", "market": "US", "trading_epoch_id": EPOCH,
+        "account_id": ACCOUNT,
+    })
 
 
 class Result:
@@ -61,8 +71,15 @@ def _row():
     return {
         "trade_date": "2026-11-10", "qty": 4, "side": "BUY",
         "order_no": "0000099887", "client_order_key": KEY,
-        "fill_account_id": "practice-account",
-        "intent_account_id": "practice-account",
+        # Real existing US fill/intent rows have NULL account_id;
+        # the durable execution Claim is the account authority.
+        "fill_account_id": None,
+        "intent_account_id": None,
+        "claim_account_id": ACCOUNT,
+        "claim_owner": "TQQQ_INFINITE",
+        "claim_lifecycle": CYCLE,
+        "claim_action_key": "test-exact-action",
+        "claim_attempt_id": "test-exact-attempt",
         "intent_strategy": "TQQQ_INFINITE_V3",
         "fill_meta": {"fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
                       "accounting_active": True, "is_synthetic": False},
@@ -89,15 +106,22 @@ def test_tqqq_exact_actual_filled_original_returns_verifiable_entry():
     result = repo.load_verified_cycle_entry_evidence(cycle_id=CYCLE)
     assert result["sha256"] == row["intent_meta"]["entry_decision_evidence_sha256"]
     assert repo.engine.conn.queries[0][1] == {
-        "epoch": EPOCH, "prefix": f"TQQQ_INF_V3:{CYCLE}:%"
+        "epoch": EPOCH, "cycle": CYCLE, "account": ACCOUNT,
+        "prefix": f"TQQQ_INF_V3:{CYCLE}:%"
     }
+    assert "JOIN us_execution_claims c" in repo.engine.conn.queries[0][0]
+    assert "c.account_id=:account" in repo.engine.conn.queries[0][0]
     assert "f.trading_epoch_id=:epoch" in repo.engine.conn.queries[0][0]
     assert "i.trade_date<=f.trade_date" in repo.engine.conn.queries[0][0]
 
 
 @pytest.mark.parametrize("tamper", [
     lambda r: r.update(fill_account_id="foreign-account"),
-    lambda r: r.update(intent_account_id=""),
+    lambda r: r.update(intent_account_id="foreign-account"),
+    lambda r: r.update(claim_account_id="foreign-account"),
+    lambda r: r.update(claim_owner="US_STANDARD"),
+    lambda r: r.update(claim_lifecycle="foreign-cycle"),
+    lambda r: r.update(claim_attempt_id=""),
     lambda r: r.update(order_no=""),
     lambda r: r["fill_meta"].update(fill_evidence_type="BALANCE_DELTA_SYNTHETIC"),
     lambda r: r["fill_meta"].update(is_synthetic=True),
