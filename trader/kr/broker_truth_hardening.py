@@ -313,18 +313,30 @@ def _recover_proven_policy_positions(
     recovered: list[str] = []
     review: list[str] = []
     foreign_owner_review: list[str] = []
+    # A CURRENT_ONLY post-tick pass must not adopt positions from historic
+    # epochs into the active PB1 strategy. Economic/historical corrections
+    # belong to the AM/CLOSE recovery lane. Match _health_after_reconcile's
+    # existing active-epoch scoping, preserving legacy DB behavior when no
+    # enforced active epoch is available.
+    active_epoch = active_trading_epoch_id(
+        engine,
+        env=env,
+        account_id=get_account_key(env=env),
+        required=trading_epoch_enforced(),
+    )
+    position_scope = [
+        schema.positions.c.env == env,
+        schema.positions.c.strategy == strategy,
+        schema.positions.c.status == "OPEN",
+        schema.positions.c.qty > 0,
+    ]
+    if active_epoch:
+        position_scope.append(schema.positions.c.trading_epoch_id == active_epoch)
     with engine.connect() as conn:
         positions = [
             dict(row)
             for row in conn.execute(
-                sa.select(schema.positions).where(
-                    sa.and_(
-                        schema.positions.c.env == env,
-                        schema.positions.c.strategy == strategy,
-                        schema.positions.c.status == "OPEN",
-                        schema.positions.c.qty > 0,
-                    )
-                )
+                sa.select(schema.positions).where(sa.and_(*position_scope))
             ).mappings().all()
         ]
 
