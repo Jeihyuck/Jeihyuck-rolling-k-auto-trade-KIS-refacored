@@ -3716,26 +3716,31 @@ class KisAPI:
                 except requests.exceptions.SSLError as e:
                     last_err = e
                     logger.warning("[NET:SSL_ERROR] INTRADAY %s attempt=%s %s", iscd, attempt, e)
-                    time.sleep(0.4 * attempt)
+                    if attempt < native_max_attempts:
+                        time.sleep(0.4 * attempt)
                     continue
                 except requests.exceptions.RequestException as e:
                     last_err = e
                     logger.warning("[NET:REQ_ERROR] INTRADAY %s attempt=%s %s", iscd, attempt, e)
-                    time.sleep(0.4 * attempt)
+                    if attempt < native_max_attempts:
+                        time.sleep(0.4 * attempt)
                     continue
                 except ValueError as e:
                     last_err = e
                     logger.warning("[NET:JSON_DECODE] INTRADAY %s attempt=%s %s", iscd, attempt, e)
-                    time.sleep(0.35 + random.uniform(0, 0.15))
+                    if attempt < native_max_attempts:
+                        time.sleep(0.35 + random.uniform(0, 0.15))
                     continue
                 except Exception as e:
                     last_err = e
                     logger.warning("[NET:UNEXPECTED] INTRADAY %s attempt=%s %s", iscd, attempt, e)
-                    time.sleep(0.4 * attempt)
+                    if attempt < native_max_attempts:
+                        time.sleep(0.4 * attempt)
                     continue
 
                 if "초당 거래건수" in str(data.get("msg1") or ""):
                     if attempt < native_max_attempts:
+                        if attempt < native_max_attempts:
                         time.sleep(0.35 + random.uniform(0, 0.15))
                     continue
 
