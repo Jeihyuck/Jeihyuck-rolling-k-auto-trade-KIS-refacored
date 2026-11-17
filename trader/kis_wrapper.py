@@ -3704,7 +3704,8 @@ class KisAPI:
             # The read-only priority observer may opt into one bounded
             # attempt; all existing KIS callers keep the original default
             # three-attempt contract.
-            for attempt in range(1, max(1, min(3, int(attempts))) + 1):
+            native_max_attempts = max(1, min(3, int(attempts)))
+            for attempt in range(1, native_max_attempts + 1):
                 try:
                     resp = self._safe_request(
                         "GET", url, headers=headers, params=params, timeout=(3.0, 7.0)
@@ -3734,7 +3735,8 @@ class KisAPI:
                     continue
 
                 if "초당 거래건수" in str(data.get("msg1") or ""):
-                    time.sleep(0.35 + random.uniform(0, 0.15))
+                    if attempt < native_max_attempts:
+                        time.sleep(0.35 + random.uniform(0, 0.15))
                     continue
 
                 arr = data.get("output2") or []
@@ -3788,7 +3790,8 @@ class KisAPI:
                     f"BAD_RESP rt_cd={data.get('rt_cd')} msg={data.get('msg1')}"
                 )
                 logger.warning("[INTRADAY_BAD_RESP] %s %s", iscd, data)
-                time.sleep(0.4 + random.uniform(0, 0.2))
+                if attempt < native_max_attempts:
+                    time.sleep(0.4 + random.uniform(0, 0.2))
 
         if last_err:
             raise last_err
