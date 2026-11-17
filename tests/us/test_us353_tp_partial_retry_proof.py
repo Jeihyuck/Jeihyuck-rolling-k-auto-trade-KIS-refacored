@@ -136,7 +136,4 @@ def test_v3_all_tp_stages_allow_exact_verified_cancelled_partial_only(stage):
     assert proven_partial_tp_remainder(**evidence)
     for bad_qty in (1, 2, 4, 6, 10):
         evidence["qty"] = bad_qty
-        if bad_qty == 3:
-            assert proven_partial_tp_remainder(**evidence)
-        else:
-            assert not proven_partial_tp_remainder(**evidence)
+        assert not proven_partial_tp_remainder(**evidence)
