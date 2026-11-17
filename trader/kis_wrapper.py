@@ -1670,6 +1670,16 @@ class KisAPI:
             attempts = max(self._safe_attempts, 1)
         if no_retry_inquire_investor:
             attempts = 1
+        # The independent KR minute observer must never hold KIS's quota
+        # with nested retries. All non-observer callers preserve their
+        # original retries and broker submission semantics.
+        is_kr_observer = (
+            str(os.getenv("KR_PB1_OBSERVER_ONLY") or "") == "1"
+            and str(self.env or "").lower() == "practice"
+            and str(os.getenv("KR_PB1_KIS_OBSERVER_BUDGET_ENABLED") or "") == "1"
+        )
+        if is_kr_observer and method.upper() == "GET":
+            attempts = 1
         start_ts = time.monotonic()
         auth_refreshed = False
         reset_done = False
@@ -1687,6 +1697,36 @@ class KisAPI:
             endpoint_category = "price"
         gate = get_kis_gate()
         account_key = f"{str(self.CANO or '').strip()}:{str(self.ACNT_PRDT_CD or '').strip()}"
+        # Coordinate with the *low-priority collector* across WSL processes.
+        # Critical order/balance requests NEVER wait for or acquire an
+        # observer slot. Its notice is best-effort and nonblocking.
+        if (
+            str(self.env or "").lower() == "practice"
+            and os.getenv("KR_PB1_KIS_OBSERVER_BUDGET_ENABLED", "0") == "1"
+        ):
+            from trader.kr.kis_observer_budget import (
+                acquire_observer_slot, note_critical_kr_call,
+            )
+            if is_kr_observer and method.upper() == "GET" and (
+                "inquire-time-itemchartprice" in path_lower
+                or "inquire-price" in path_lower
+            ):
+                granted, quota_reason = acquire_observer_slot(
+                    environment="practice", account_key=account_key,
+                )
+                if not granted:
+                    logger.info(
+                        "[KR][KIS_BUDGET][OBSERVER_DEFER] endpoint=%s reason=%s "
+                        "priority_order_not_waiting=1",
+                        endpoint_name, quota_reason,
+                    )
+                    raise KisTemporaryError(
+                        "KR_PB1_OBSERVER_SHARED_BUDGET_" + quota_reason,
+                    )
+            elif not is_kr_observer and endpoint_category in {"order", "balance"}:
+                note_critical_kr_call(
+                    environment="practice", account_key=account_key,
+                )
         wait_limiter = gate.acquire(
             environment=str(self.env or "practice"),
             account_key=account_key,
