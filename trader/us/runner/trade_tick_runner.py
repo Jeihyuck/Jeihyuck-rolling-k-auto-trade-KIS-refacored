@@ -2784,6 +2784,7 @@ def run_trade_tick(
     # entry_price가 없으면 fail-closed SELL intent 생성 (US_EXIT_FAIL_CLOSED_ON_PNL_MISSING 기본값=1)
     _exit_trade_date = trade_date if isinstance(trade_date, str) else str(trade_date)
     _exit_engine_started = time.monotonic()
+    _exit_resolver_started = time.monotonic()
     try:
         from trader.us.pb1.us_exit_position_resolver import enrich_us_positions_for_exit
         from trader.us.strategy_ownership import exclude_non_standard
@@ -2811,6 +2812,12 @@ def run_trade_tick(
         )
     except Exception as _resolve_exc:
         logger.warning("[US_EXIT][POSITION_RESOLVE][WARN] resolver failed: %s", _resolve_exc)
+    finally:
+        # A nested phase of exit_engine_ms, never sum it twice into Tick total.
+        _exit_resolver_ms = (time.monotonic() - _exit_resolver_started) * 1000.0
+        tick_context.metrics["exit_resolver_ms"] = _exit_resolver_ms
+        logger.info("[US_EXIT][RESOLVER_LATENCY] positions=%d elapsed_ms=%.2f",
+                    len(current_positions or []), _exit_resolver_ms)
 
     # Process-local earliest readiness; observation only, never persisted.
     _sell_signal_ready_by_symbol: dict[str, float] = {}
