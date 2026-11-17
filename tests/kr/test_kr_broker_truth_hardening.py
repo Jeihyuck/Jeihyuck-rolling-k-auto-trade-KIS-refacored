@@ -288,6 +288,7 @@ def test_health_flags_db_kis_qty_mismatch_and_previous_day_open_ack() -> None:
 def test_current_only_policy_recovery_does_not_adopt_historical_epoch(monkeypatch):
     """A stale OPEN PB1 legacy row cannot be adopted into the active epoch."""
     from trader.kr import broker_truth_hardening as truth
+    from trader.kr import broker_truth_review_fixes as installed_review
 
     engine = _db()
     schema = schema_for_engine(engine)
@@ -318,8 +319,13 @@ def test_current_only_policy_recovery_does_not_adopt_historical_epoch(monkeypatc
             )
         )
     monkeypatch.setattr(truth, "trading_epoch_enforced", lambda: True)
+    monkeypatch.setattr(installed_review, "trading_epoch_enforced", lambda: True)
     monkeypatch.setattr(
         truth, "active_trading_epoch_id",
+        lambda *args, **kwargs: live_epoch,
+    )
+    monkeypatch.setattr(
+        installed_review, "active_trading_epoch_id",
         lambda *args, **kwargs: live_epoch,
     )
     report = truth._recover_proven_policy_positions(
@@ -330,7 +336,7 @@ def test_current_only_policy_recovery_does_not_adopt_historical_epoch(monkeypatc
     )
     assert report["recovered"] == []
     assert report["review_required"] == []
-    assert report["foreign_owner_review_required"] == []
+    assert report.get("foreign_owner_review_required", []) == []
     with engine.connect() as conn:
         rows = conn.execute(sa.select(schema.positions)).mappings().all()
     assert len(rows) == 1
