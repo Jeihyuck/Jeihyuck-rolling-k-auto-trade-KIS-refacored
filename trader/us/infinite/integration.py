@@ -1288,6 +1288,15 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                         cycle_id=lifecycle_id,
                     )
                     if isinstance(_entry, dict):
+                        _entry_identity = _entry.get("what") or {}
+                        _entry_owner = _entry.get("who") or {}
+                        if (not isinstance(_entry_identity, dict)
+                                or not isinstance(_entry_owner, dict)
+                                or _entry_identity.get("position_lifecycle_id") != lifecycle_id
+                                or _entry_identity.get("symbol") != "TQQQ"
+                                or _entry_identity.get("side") != "BUY"
+                                or _entry_owner.get("strategy_owner") != "TQQQ_INFINITE"):
+                            raise ValueError("TQQQ_ENTRY_NOT_THIS_EXACT_CYCLE")
                         _sell_ev = build_exit_evidence_from_entry(
                             entry_evidence=_entry,
                             decision_id="TQQQ_INFINITE:SELL:" + client_order_key,
