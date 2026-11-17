@@ -214,6 +214,7 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
     done, unknown, coverage_ok, missing_vwap = 0, 0, 0, 0
     minute_requests, quote_requests, native_request_failures = 0, 0, 0
     symbol_scan_sec: list[float] = []
+    symbol_outcomes: dict[str, dict] = {}
     for code in codes:
         symbol_started = time.monotonic()
         if str(code).zfill(6) == "122630":
@@ -438,6 +439,15 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
                 )
             if not verified_vwap:
                 missing_vwap += 1
+            symbol_outcomes[code] = {
+                "state": coverage["state"],
+                "reason": coverage["reason"],
+                "opening_count": coverage["opening_count"],
+                "post_open_count": coverage["post_open_count"],
+                "latest_bar_age_sec": coverage["latest_bar_age_sec"],
+                "vwap_verified": verified_vwap,
+                "conflicts": len(persisted.get("source_conflicts") or []),
+            }
             logger.info(
                 "[KR][OPENING_OBSERVER][COVERAGE] code=%s state=%s reason=%s "
                 "opening_count=%s post_open_count=%s bar_age_sec=%s "
@@ -462,6 +472,12 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
                 unknown += 1
         except Exception as exc:
             unknown += 1
+            symbol_outcomes[code] = {
+                "state": "UNKNOWN", "reason": type(exc).__name__,
+                "opening_count": None, "post_open_count": None,
+                "latest_bar_age_sec": None, "vwap_verified": False,
+                "conflicts": None,
+            }
             logger.warning(
                 "[KR][OPENING_OBSERVER][UNKNOWN] code=%s error_type=%s "
                 "action=NO_TIMING_PROOF",
@@ -470,6 +486,8 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
         finally:
             elapsed_for_symbol = time.monotonic() - symbol_started
             symbol_scan_sec.append(elapsed_for_symbol)
+            if code in symbol_outcomes:
+                symbol_outcomes[code]["poll_elapsed_sec"] = elapsed_for_symbol
             logger.info(
                 "[KR][OPENING_OBSERVER][SYMBOL_LATENCY] code=%s elapsed_sec=%.3f",
                 code, elapsed_for_symbol,
@@ -489,6 +507,7 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
         "native_quote_request_attempts": quote_requests,
         "native_request_failures": native_request_failures,
         "native_quote_requests_added": quote_requests,
+        "symbol_outcomes": symbol_outcomes,
     }
 
 
@@ -517,6 +536,7 @@ def main() -> None:
     codes: list[str] = []
     kis = None
     schedule = CandidateSchedule(max_batch=6)
+    last_capacity_warning_key = None
     scope = get_account_key(env="practice")
     while True:
         now = now_kst()
@@ -539,6 +559,25 @@ def main() -> None:
                 codes = final30_codes(trade_date=today, filename=args.final30_file)
                 kis = KisAPI(kis_env="practice")
                 logger.info("[KR][OPENING_OBSERVER][PREP_READY] final30=%s role=READ_ONLY", len(codes))
+            health = schedule.diagnostics(
+                priority, now, interval_sec=float(args.interval_sec),
+            )
+            warning_key = (
+                priority["state"], tuple(health["tiers"][tier]["count"]
+                                         for tier in ("hot", "warm", "cold")),
+                round(float(args.interval_sec), 3),
+            )
+            if health["overcommitted"] and warning_key != last_capacity_warning_key:
+                logger.warning(
+                    "[KR][OPENING_OBSERVER][THEORETICAL_CAPACITY_SHORTFALL] "
+                    "hot=%s warm=%s cold=%s required_poll_rps=%.4f "
+                    "slot_capacity_rps=%.4f all_180s_possible=%s "
+                    "assumption=ZERO_HTTP_LATENCY action=KEEP_BUY_ENFORCE_FAIL_CLOSED",
+                    *warning_key[1], health["configured_demand_per_sec"],
+                    health["theoretical_polls_per_sec"],
+                    int(health["all_180s_possible_at_slot_capacity"]),
+                )
+            last_capacity_warning_key = warning_key
             selected = schedule.select(priority, now)
             if not selected:
                 time.sleep(min(10.0, max(2.0, float(args.interval_sec) / 3.0)))
@@ -550,6 +589,22 @@ def main() -> None:
                 len(priority["cold"]), selected, len(codes),
             )
             result = run_once(kis=kis, codes=selected, observed_at=now)
+            for code, outcome in result.get("symbol_outcomes", {}).items():
+                tier = next(
+                    (name for name in ("hot", "warm", "cold")
+                     if code in priority[name]), "unknown",
+                )
+                logger.info(
+                    "[KR][OPENING_OBSERVER][POLL_PROOF_HEALTH] code=%s "
+                    "tier=%s state=%s reason=%s opening=%s post_open=%s "
+                    "last_completed_age_sec=%s vwap_verified=%s conflicts=%s "
+                    "poll_elapsed_sec=%.3f poll_not_order_authorization=1",
+                    code, tier, outcome["state"], outcome["reason"],
+                    outcome["opening_count"], outcome["post_open_count"],
+                    outcome["latest_bar_age_sec"],
+                    int(outcome["vwap_verified"]), outcome["conflicts"],
+                    outcome.get("poll_elapsed_sec", 0.0),
+                )
         except Exception:
             logger.exception(
                 "[KR][OPENING_OBSERVER][CYCLE_FAIL] action=RETRY_READ_ONLY "
