@@ -44,6 +44,24 @@ def calculate_latency_accounting(total_ms: float, stage_metrics: dict[str, float
     return round(accounted, 3), round(total - accounted, 3)
 
 
+def is_us_global_postfilter_contract_unverified(overlay: dict | None) -> bool:
+    """Only a genuinely unverified account-wide risk state fences all BUYs.
+
+    Individual per-symbol metadata, trend, cluster or rotation denials have
+    already been removed by their respective filters and cannot suppress
+    independently verified survivors.
+    """
+    if not isinstance(overlay, dict):
+        return True
+    return bool(
+        str(overlay.get("intraday_market_overlay") or "").upper()
+            == "INTRADAY_DATA_UNKNOWN"
+        or overlay.get("intraday_overlay_available") is False
+        or overlay.get("intraday_error_reason")
+        or overlay.get("global_risk_integrity_failed") is True
+    )
+
+
 def is_recoverable_order_route_budget_error(exc: BaseException) -> bool:
     """Classify local/shared tick-budget exhaustion as recoverable routing deferral."""
     text = str(exc or "").lower()
@@ -4308,14 +4326,7 @@ def run_trade_tick(
             # still pass the regular preflight/risk/broker gates below.
             # Missing or contradictory account-wide market proof remains
             # fail-closed for every US_STANDARD BUY.
-            _global_filter_unverified = (
-                not isinstance(market_state_overlay, dict)
-                or str(market_state_overlay.get("intraday_market_overlay") or "").upper()
-                    == "INTRADAY_DATA_UNKNOWN"
-                or market_state_overlay.get("intraday_overlay_available") is False
-                or bool(market_state_overlay.get("intraday_error_reason"))
-                or market_state_overlay.get("global_risk_integrity_failed") is True
-            )
+            _global_filter_unverified = is_us_global_postfilter_contract_unverified(market_state_overlay)
             if _global_filter_unverified:
                 logger.error(
                     "[US_ENTRY][CANDIDATE_FILTER_INVARIANT_FAIL] "
