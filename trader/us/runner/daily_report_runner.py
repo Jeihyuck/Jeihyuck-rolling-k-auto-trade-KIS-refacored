@@ -1938,6 +1938,7 @@ def run_daily_report(
     sessions_payload = schedule_health_payload.get("sessions") if isinstance(schedule_health_payload.get("sessions"), dict) else {}
     runtime_liveness_failures = []
     runtime_liveness_failure_reasons = []
+    runtime_liveness_causal_breakdown = []
     for _name in ("am", "afternoon"):
         _row = sessions_payload.get(_name) if isinstance(sessions_payload, dict) else None
         if not isinstance(_row, dict):
@@ -1972,8 +1973,33 @@ def run_daily_report(
                 "entry_liveness_status": _entry_status or "UNKNOWN",
                 "reconcile_liveness_status": _reconcile_status or "UNKNOWN",
             })
+            # Report *every* failing dimension, not just the highest-priority
+            # legacy error. This is observation only; never downgrade fatal
+            # current-day reconcile/account-integrity outcomes.
+            _all_reasons = []
+            if _sell_bad:
+                _all_reasons.append("protective_sell_liveness_failure")
+            if _reconcile_bad:
+                _all_reasons.append("reconcile_liveness_failure")
+            if _entry_bad:
+                _all_reasons.append("entry_liveness_degraded")
+            if _runtime_status in {"LIVENESS_DEGRADED", "RECONCILE_REQUIRED", "INTEGRITY_DEGRADED"}:
+                _all_reasons.append("runtime_integrity_degraded")
+            runtime_liveness_causal_breakdown.append({
+                "session": _name,
+                "all_failed_dimensions": _all_reasons,
+                "runtime_integrity_status": _runtime_status or "UNKNOWN",
+                "sell_liveness_status": _sell_status or "UNKNOWN",
+                "entry_liveness_status": _entry_status or "UNKNOWN",
+                "reconcile_liveness_status": _reconcile_status or "UNKNOWN",
+                "exit_route_liveness_failure": bool(_row.get("exit_route_liveness_failure")),
+                "entry_degraded": bool(_row.get("entry_degraded")),
+                "reconciliation_scope": "UNVERIFIED",
+                "scope_reason": "schedule_health_does_not_prove_current_vs_historical_lineage",
+            })
     report["runtime_liveness_failures"] = runtime_liveness_failures
     report["runtime_liveness_failure_reasons"] = runtime_liveness_failure_reasons
+    report["runtime_liveness_causal_breakdown"] = runtime_liveness_causal_breakdown
     if session == "close" and runtime_liveness_failures:
         for _reason in sorted({row["reason"] for row in runtime_liveness_failure_reasons}):
             report["errors"].append(f"CLOSE_INTEGRITY_FAILED: {_reason}")
@@ -2107,6 +2133,18 @@ def run_daily_report(
         report["errors"].append("REPORT_VALIDATION_FAILED: kis_positions_nonzero_report_zero")
         logger.error("[US_DAILY_REPORT][CONSISTENCY_FAIL] reason=kis_positions_nonzero_report_zero")
     historical_unresolved = (report.get("broker_recovery_health") or {}).get("historical_recovery_unresolved")
+    # Historical unresolved and current-session integrity have different
+    # meanings. Neither a stale 2-order count nor a writer pending=0 snapshot
+    # proves that the other scope is healthy. Keep all existing fatal gates.
+    _broker_health = report.get("broker_recovery_health") or {}
+    report["reconciliation_scope_diagnostics"] = {
+        "historical_recovery_unresolved": historical_unresolved,
+        "current_execution_actions_unresolved": _broker_health.get("unresolved_execution_actions"),
+        "current_recovery_health_available": _broker_health.get("available"),
+        "current_recovery_error_count": _broker_health.get("recovery_health_error_count"),
+        "historical_vs_current_attribution": "SEPARATE_SOURCE_FIELDS_NOT_CAUSALLY_PROVEN",
+        "runtime_session_causal_breakdown": runtime_liveness_causal_breakdown,
+    }
     if session == "close" and historical_unresolved:
         report["warnings"].append(f"HISTORICAL_RECOVERY_UNRESOLVED:{historical_unresolved}")
     broker_health_errors = (
