@@ -200,10 +200,12 @@ def test_old_conflicted_completed_minute_gets_exact_native_anchor(
         env="practice", account_scope="replay-only",
         code="012750", now=now,
     )
-    assert persisted["source_conflicts"]  # first native revalidation only
+    assert persisted["source_conflicts"]  # no three independent KIS responses
+    # Offline KIS stub provides native-formatted rows but no response-bound
+    # receipt; it may not count towards live conflict clearance.
     assert persisted["conflict_observations"]["2026-11-17T10:05:00+09:00"][
         "stable_native_reads"
-    ] >= 2
+    ] == 0
 
 
 def test_loop_waits_for_late_prep_then_starts_readonly_collection(monkeypatch):
