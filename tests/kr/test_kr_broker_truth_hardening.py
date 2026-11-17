@@ -336,3 +336,13 @@ def test_current_only_policy_recovery_does_not_adopt_historical_epoch(monkeypatc
     assert len(rows) == 1
     assert rows[0]["exit_policy_family"] == "POLICY_MISSING"
     assert str(rows[0]["trading_epoch_id"]) == historical_epoch
+    # The installed post-tick health guard uses exactly the same active epoch.
+    # Historical PB1 rows cannot create false active-epoch RED discrepancies.
+    health = truth._health_after_reconcile(
+        engine=engine,
+        env="practice",
+        strategy=STRATEGY,
+        holdings_rows=[{"pdno": "000660", "hldg_qty": "1"}],
+    )
+    assert health["qty_mismatch_count"] == 0
+    assert health["stale_open_order_count"] == 0
