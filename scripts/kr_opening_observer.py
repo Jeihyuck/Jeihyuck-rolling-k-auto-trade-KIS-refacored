@@ -547,7 +547,8 @@ def main() -> None:
             continue
         cycle_started = time.monotonic()
         try:
-            priority = collection_priorities(date=today, account_scope=scope, now=now)
+            priority = collection_priorities(date=today, account_scope=scope, now=now,
+                                             final30_file=args.final30_file)
             if priority["state"] == "INVALID_PREP":
                 logger.warning("[KR][OPENING_OBSERVER][WAIT_PREP] verified_final30=0 action=RETRY_SAME_DAY_READ_ONLY")
                 time.sleep(10.0)
@@ -555,9 +556,10 @@ def main() -> None:
             # A PREP file can be written after the AM wrapper starts or be
             # replaced atomically during recovery. Validate before each first
             # use; all trading authorisation stays inside PB1 ENFORCE.
-            if not codes:
-                codes = final30_codes(trade_date=today, filename=args.final30_file)
-                kis = KisAPI(kis_env="practice")
+            if not codes or kis is None:
+                candidate_codes = final30_codes(trade_date=today, filename=args.final30_file)
+                candidate_kis = KisAPI(kis_env="practice")
+                codes, kis = candidate_codes, candidate_kis
                 logger.info("[KR][OPENING_OBSERVER][PREP_READY] final30=%s role=READ_ONLY", len(codes))
             health = schedule.diagnostics(
                 priority, now, interval_sec=float(args.interval_sec),
