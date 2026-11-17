@@ -50,5 +50,6 @@ jobs:
             tests/kr/test_kr_pb1_minute_native_conflicts.py \
             tests/kr/test_kr_pb1_kis_observer_budget.py \
             tests/kr/test_kr_pb1_minute_incident_replay.py \
+            tests/kr/test_kr_pb1_minute_egw_final_retry.py \
             tests/kr/test_kr_20261029_price_aware_opening.py \
             tests/kr/test_kr_20261110_timing_activation_cjenm.py
