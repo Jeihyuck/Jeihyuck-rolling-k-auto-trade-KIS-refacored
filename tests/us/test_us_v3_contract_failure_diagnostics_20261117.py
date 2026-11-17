@@ -71,3 +71,17 @@ def test_infinite_owner_never_gets_standard_proof():
         {"symbol": "TQQQ", "strategy_owner": "TQQQ_INFINITE",
          "entry_exit_contract": c},
     ) == "OWNER_SCOPE_TQQQ_INFINITE_CONFLICT"
+
+
+def test_top_level_digest_only_wrapper_with_valid_nested_original_is_valid():
+    c = signed()
+    wrapped = {
+        "symbol": "AMGN",
+        "entry_exit_contract_sha256": c["sha256"],
+        "meta": {
+            "entry_exit_contract": c,
+            "entry_exit_contract_sha256": c["sha256"],
+        },
+    }
+    assert us_entry_exit_contract_integrity_state(wrapped) == "VALID"
+    assert explain_us_entry_exit_contract_integrity(wrapped) == "VALID"
