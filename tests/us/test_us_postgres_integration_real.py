@@ -4518,9 +4518,10 @@ def test_v3_atomic_pre_http_tp_stage_and_intent_under_same_pg_commit(
     })
 
     def seed(suffix, *, broker_possible=False, foreign_owner=False,
-             active=False, bad_intent=False):
+             active=False, bad_intent=False, broker_open=False):
         key = f"US_PC_v3_ATOMIC_{suffix}"
         aid = f"v3-atomic-{suffix}-attempt"
+        cycle = f"{lifecycle}-{suffix}"
         with pg_engine.begin() as conn:
             conn.execute(text("""
                 INSERT INTO us_execution_claims
@@ -4531,7 +4532,7 @@ def test_v3_atomic_pre_http_tp_stage_and_intent_under_same_pg_commit(
                         :cycle,'tp3',2,:claim_state,:active,:day)
             """), {"key": key, "account": account, "epoch": epoch,
                    "owner": "TQQQ_INFINITE" if foreign_owner else "US_STANDARD",
-                   "cycle": lifecycle, "claim_state": "IN_FLIGHT" if active else "OPEN",
+                   "cycle": cycle, "claim_state": "IN_FLIGHT" if active else "OPEN",
                    "active": aid if active else None, "day": day})
             conn.execute(text("""
                 INSERT INTO us_execution_attempts
@@ -4549,7 +4550,7 @@ def test_v3_atomic_pre_http_tp_stage_and_intent_under_same_pg_commit(
                    "meta": json.dumps({
                        "submit_attempt_id": "wrong-id" if bad_intent else aid,
                        "strategy_owner": "US_STANDARD",
-                       "position_lifecycle_id": lifecycle,
+                       "position_lifecycle_id": cycle,
                        "profit_capture_stage": "tp3",
                    })})
             for kind in (("BROKER_SUBMIT_ABORTED_PRE_IO", "BROKER_ACK_RECEIVED")
@@ -4565,23 +4566,30 @@ def test_v3_atomic_pre_http_tp_stage_and_intent_under_same_pg_commit(
                 """), {"day": day, "kind": kind, "key": key, "aid": aid,
                        "sym": sym, "epoch": epoch,
                        "idem": f"{key}:{kind}"})
+            if broker_open:
+                conn.execute(text("""
+                    INSERT INTO us_orders
+                      (trade_date,client_order_key,symbol,exchange,side,
+                       qty_requested,status,dry_run,trading_epoch_id)
+                    VALUES (:day,:key,:sym,'NASDAQ','SELL',2,'OPEN',false,:epoch)
+                """), {"day": day, "key": key, "sym": sym, "epoch": epoch})
         repos.mark_us_profit_capture_stage(
             day, sym, "tp3", order_key=key, qty=2,
-            position_lifecycle_id=lifecycle, status="PENDING",
+            position_lifecycle_id=cycle, status="PENDING",
         )
-        return key
+        return key, cycle
 
-    def attempt(key):
+    def attempt(key, cycle):
         return repos.release_us_profit_capture_pre_http_abort(
             trade_date=day, symbol=sym, stage="tp3",
-            position_lifecycle_id=lifecycle, client_order_key=key,
+            position_lifecycle_id=cycle, client_order_key=key,
             close_intent=True, failure_code="US_TP_DECISION_EXPIRED_BEFORE_HTTP",
         )
 
     # Test each scope independently because stage rows are unique per day,
     # symbol, lifecycle and TP stage.
-    safe_key = seed("safe")
-    assert attempt(safe_key) is True
+    safe_key, safe_cycle = seed("safe")
+    assert attempt(safe_key, safe_cycle) is True
     with pg_engine.connect() as conn:
         intent = conn.execute(text(
             "SELECT status,meta FROM us_order_intents WHERE client_order_key=:key"
@@ -4595,7 +4603,6 @@ def test_v3_atomic_pre_http_tp_stage_and_intent_under_same_pg_commit(
     assert stage == "NOT_TRIGGERED"
 
     # Same target on a different trade_date has its own independent stage.
-    bad_day = "2026-11-10"
     # Existing stage-scope test covers duplicate concurrent attempts; here
     # force a failing stage write after the conditional intent UPDATE.
     with pg_engine.begin() as conn:
@@ -4605,14 +4612,14 @@ def test_v3_atomic_pre_http_tp_stage_and_intent_under_same_pg_commit(
                      {"key":safe_key})
     repos.mark_us_profit_capture_stage(
         day, sym, "tp3", order_key=safe_key, qty=2,
-        position_lifecycle_id=lifecycle, status="PENDING",
+        position_lifecycle_id=safe_cycle, status="PENDING",
     )
     original = repos.mark_us_profit_capture_stage
     monkeypatch.setattr(repos, "mark_us_profit_capture_stage",
                         lambda *args, **kwargs: (_ for _ in ()).throw(
                             RuntimeError("simulated stage commit failure")))
     with pytest.raises(RuntimeError, match="simulated stage commit failure"):
-        attempt(safe_key)
+        attempt(safe_key, safe_cycle)
     monkeypatch.setattr(repos, "mark_us_profit_capture_stage", original)
     with pg_engine.connect() as conn:
         intent_status = conn.execute(text(
@@ -4623,3 +4630,25 @@ def test_v3_atomic_pre_http_tp_stage_and_intent_under_same_pg_commit(
         ), {"key":safe_key}).scalar_one()
     assert intent_status == "PENDING"
     assert stage_status == "PENDING"
+
+    # A distinct economic lifecycle per case means one rejected symbol does
+    # not corrupt another stage. All unsafe attempts remain PENDING in both
+    # ledgers and are never silently rearmed.
+    for suffix, options in (
+        ("broker_ack", {"broker_possible": True}),
+        ("foreign_owner", {"foreign_owner": True}),
+        ("active_claim", {"active": True}),
+        ("tampered_intent", {"bad_intent": True}),
+        ("open_broker_order", {"broker_open": True}),
+    ):
+        key, cycle = seed(suffix, **options)
+        assert attempt(key, cycle) is False, suffix
+        with pg_engine.connect() as conn:
+            intent_status = conn.execute(text(
+                "SELECT status FROM us_order_intents WHERE client_order_key=:key"
+            ), {"key": key}).scalar_one()
+            stage_status = conn.execute(text(
+                "SELECT stage_status FROM us_profit_capture_lifecycle "
+                "WHERE client_order_key=:key"
+            ), {"key": key}).scalar_one()
+        assert (intent_status, stage_status) == ("PENDING", "PENDING"), suffix
