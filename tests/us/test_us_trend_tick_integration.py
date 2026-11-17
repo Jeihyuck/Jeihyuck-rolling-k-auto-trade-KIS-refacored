@@ -191,7 +191,8 @@ def test_run_trade_tick_injects_warning_before_exit_and_blocks_existing_buy(monk
     assert captured["exit_positions"][0]["trend_state"] == "WARNING"
     assert result["exit_intents"] == 0
     assert result["trend_add_blocked_count"] == 1
-    # A postfilter rejection after the same row passed prefilter is a system
-    # invariant failure: fail all BUYs closed rather than route a partial set.
+    # The rejected existing-position ADD is a local trend gate, not a
+    # global integrity failure. It must not poison unrelated candidates.
+    # KIS routing is disabled in this fixture so no broker POST may occur.
     assert routed == []
-    assert result["entry_degraded_reason"] == "candidate_filter_invariant_fail"
+    assert result.get("entry_degraded_reason") != "candidate_filter_invariant_fail"
