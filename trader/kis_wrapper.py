@@ -2412,6 +2412,16 @@ class KisAPI:
             cash, meta = self._parse_cash_from_psbl_order(resp)
             cash_meta.update(meta)
             cash_meta["source"] = "psbl_order"
+            # Provenance is only diagnostic metadata: legacy cash fallback
+            # remains unchanged. Dedicated KR_INFINITE add-buy entry requires
+            # this to be True AND an orderable field, never balance/cached cash.
+            cash_meta["native_source_verified"] = bool(
+                isinstance(resp, dict)
+                and str(resp.get("rt_cd") or "") == "0"
+                and not any(bool(resp.get(key)) for key in (
+                    "_diag_stub", "_kis_disabled", "_stub",
+                ))
+            )
             raw_fields = cash_meta.get("raw_fields") or {}
             logger.info(
                 "[CASH][PSBL] ord_psbl_cash=%s ord_psbl_amt=%s",
