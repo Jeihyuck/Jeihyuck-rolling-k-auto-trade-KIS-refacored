@@ -29,6 +29,9 @@ def test_single_request_observer_egw002_fails_closed_without_final_backoff(monke
     api.CANO = "123"
     api.ACNT_PRDT_CD = "01"
     api._safe_attempts = 3
+    api._safe_max_seconds = 18.0
+    api._safe_backoff_base = 1.2
+    api._safe_backoff_cap = 8.0
     api.session = SimpleNamespace(request=MagicMock(return_value=response))
     api._rate_limit_safe_enabled = lambda: False
     api._wait_for_http_gap = lambda *a, **kw: None
