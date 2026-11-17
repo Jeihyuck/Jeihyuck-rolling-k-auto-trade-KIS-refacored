@@ -109,7 +109,8 @@ def test_tqqq_exact_actual_filled_original_returns_verifiable_entry():
         "epoch": EPOCH, "cycle": CYCLE, "account": ACCOUNT,
         "prefix": f"TQQQ_INF_V3:{CYCLE}:%"
     }
-    assert "JOIN us_execution_claims c" in repo.engine.conn.queries[0][0]
+    assert "LEFT JOIN us_execution_claims c" in repo.engine.conn.queries[0][0]
+    assert "LEFT JOIN us_order_intents i" in repo.engine.conn.queries[0][0]
     assert "c.account_id=:account" in repo.engine.conn.queries[0][0]
     assert "f.trading_epoch_id=:epoch" in repo.engine.conn.queries[0][0]
     assert "i.trade_date<=f.trade_date" in repo.engine.conn.queries[0][0]
@@ -187,3 +188,27 @@ def test_missing_first_actual_buy_proof_cannot_be_replaced_by_later_add():
     assert _repository([first, later]).load_verified_cycle_entry_evidence(
         cycle_id=CYCLE,
     )["sha256"] == _evidence()["sha256"]
+
+
+def test_original_first_kis_fill_without_durable_claim_must_not_promote_add():
+    first = _row()
+    first.update(claim_action_key=None, claim_attempt_id=None,
+                 claim_account_id=None, claim_owner=None,
+                 claim_lifecycle=None)
+    second = deepcopy(_row())
+    second_key = f"TQQQ_INF_V3:{CYCLE}:2026-11-12:BUY"
+    second["trade_date"] = "2026-11-12"
+    second["client_order_key"] = second_key
+    ev = build_decision_evidence(
+        decision_id="TQQQ_INFINITE:BUY:" + second_key,
+        side="BUY", strategy_owner="TQQQ_INFINITE", symbol="TQQQ",
+        decision_at="2026-11-12T13:32:00+00:00",
+        policy_version="TQQQ_INFINITE_V3", code_sha="a" * 40,
+        position_lifecycle_id=CYCLE, decision_reason="FAST_DIP_ADD_BUY",
+        facts={}, thresholds={}, market_context={}, sizing={"qty": 2},
+    )
+    second["intent_meta"]["entry_decision_evidence_5w1h"] = ev
+    second["intent_meta"]["entry_decision_evidence_sha256"] = ev["sha256"]
+    assert _repository([first, second]).load_verified_cycle_entry_evidence(
+        cycle_id=CYCLE
+    ) is None
