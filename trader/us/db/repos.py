@@ -1562,11 +1562,21 @@ def close_proven_unsent_us_sell_intent(
                     or a["authoritative"] is not True):
                 return False
             claim = conn.execute(text("""
-                SELECT action_state, active_attempt_id FROM us_execution_claims
+                SELECT action_state, active_attempt_id, env, market, strategy_owner,
+                       trading_epoch_id, trade_date, action
+                FROM us_execution_claims
                 WHERE action_key=:action FOR UPDATE
             """), {"action": a["action_key"]}).mappings().first()
-            if (not claim or claim["active_attempt_id"] is not None
-                    or claim["action_state"] in {"IN_FLIGHT", "UNCERTAIN"}):
+            if (not claim
+                    or claim["active_attempt_id"] is not None
+                    or claim["action_state"] != "OPEN"
+                    or str(claim["env"] or "").lower() != "practice"
+                    or str(claim["market"] or "").upper() != "US"
+                    or str(claim["strategy_owner"] or "").upper() != "US_STANDARD"
+                    or str(claim["trading_epoch_id"] or "") != str(epoch)
+                    or str(claim["trade_date"] or "")[:10] != day
+                    or str(claim["action"] or "").lower() !=
+                       str(meta["profit_capture_stage"]).lower()):
                 return False
             events = {
                 str(r[0]) for r in conn.execute(text("""
