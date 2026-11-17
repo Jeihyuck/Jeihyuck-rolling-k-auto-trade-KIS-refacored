@@ -59,3 +59,56 @@ def test_timed_out_ticks_count_as_attempts_and_warning_totals_survive_session_js
     assert payload["ticks_timeout"] == 1
     assert payload["warning_counts"]["timeout_count"] == 1
     assert payload["terminal_state"] == "SESSION_END_OK_WITH_WARNINGS"
+
+
+def test_terminal_final_skip_distinct_from_unknown_order_skips(tmp_path, monkeypatch):
+    from trader.pb1_runner import _accumulate_kr_tick_skip_observations
+
+    out = tmp_path / "kr-session-skips.json"
+    monkeypatch.setenv("PB1_SESSION_RESULT_PATH", str(out))
+    summary = {"skipped": 0, "ticks_completed": 0}
+    # Engine reported FINAL_SKIP but *not* the number of broker-order skips.
+    _accumulate_kr_tick_skip_observations(
+        summary, {"terminal_event": "FINAL_SKIP", "order_candidates": 0},
+    )
+    summary["ticks_completed"] += 1
+    # A second tick explicitly witnessed zero order skips.
+    _accumulate_kr_tick_skip_observations(
+        summary, {"terminal_event": "NO_ORDERABLE_CANDIDATES", "skipped": 0},
+    )
+    summary["ticks_completed"] += 1
+    assert summary["terminal_final_skip_ticks"] == 1
+    assert summary["skipped"] == 0
+    assert summary["skipped_order_unobserved_ticks"] == 1
+    assert summary["skipped_order_observed_ticks"] == 1
+    _write_session_result_file({
+        "status": "OK_NO_TRADE",
+        "ticks_total": 2,
+        "ticks_completed": 2,
+        "terminal_final_skip_ticks": summary["terminal_final_skip_ticks"],
+        "skipped": summary["skipped"],
+        "skipped_order_unobserved_ticks": summary["skipped_order_unobserved_ticks"],
+        "skipped_order_observed_ticks": summary["skipped_order_observed_ticks"],
+        "skipped_order_count_complete": False,
+    })
+    saved = json.loads(out.read_text(encoding="utf-8"))
+    assert saved["terminal_final_skip_ticks"] == 1
+    assert saved["skipped"] == 0
+    assert saved["skipped_order_count_complete"] is False
+    # The count is not fabricated as 1; the missing observation is visible.
+
+
+def test_explicit_order_skip_counter_accumulates_without_conflating_terminal_event():
+    from trader.pb1_runner import _accumulate_kr_tick_skip_observations
+
+    summary = {}
+    _accumulate_kr_tick_skip_observations(
+        summary, {"skipped_count": 3, "terminal_event": "FINAL_SKIP"},
+    )
+    _accumulate_kr_tick_skip_observations(
+        summary, {"skipped": 2, "terminal_event": "OK_WITH_ORDERS"},
+    )
+    assert summary["skipped"] == 5
+    assert summary["terminal_final_skip_ticks"] == 1
+    assert summary["skipped_order_observed_ticks"] == 2
+    assert summary.get("skipped_order_unobserved_ticks", 0) == 0
