@@ -133,3 +133,33 @@ def test_dupe_same_buy_fill_must_share_one_immutable_evidence_hash():
         b["intent_meta"]["entry_decision_evidence_5w1h"]["sha256"]
     )
     assert _repository([a,b]).load_verified_cycle_entry_evidence(cycle_id=CYCLE) is None
+
+
+def test_missing_first_actual_buy_proof_cannot_be_replaced_by_later_add():
+    first = _row()
+    first["intent_meta"].pop("entry_decision_evidence_5w1h")
+    later = deepcopy(_row())
+    later_key = f"TQQQ_INF_V3:{CYCLE}:2026-11-12:BUY"
+    later["client_order_key"] = later_key
+    later["trade_date"] = "2026-11-12"
+    later["intent_meta"]["entry_decision_evidence_5w1h"] = build_decision_evidence(
+        decision_id="TQQQ_INFINITE:BUY:" + later_key,
+        side="BUY", strategy_owner="TQQQ_INFINITE", symbol="TQQQ",
+        decision_at="2026-11-12T13:31:01+00:00",
+        policy_version="TQQQ_INFINITE_V3", code_sha="a" * 40,
+        position_lifecycle_id=CYCLE, decision_reason="FAST_DIP_ADD_BUY",
+        facts={"decision_price_usd": 52.0}, thresholds={},
+        market_context={}, sizing={"qty": 2},
+    )
+    later["intent_meta"]["entry_decision_evidence_sha256"] = (
+        later["intent_meta"]["entry_decision_evidence_5w1h"]["sha256"]
+    )
+    assert _repository([first, later]).load_verified_cycle_entry_evidence(
+        cycle_id=CYCLE,
+    ) is None
+    # Once the actual first BUY is proven, subsequent unrelated BUY audit
+    # status cannot change the immutable first-cycle entry evidence.
+    first["intent_meta"]["entry_decision_evidence_5w1h"] = _evidence()
+    assert _repository([first, later]).load_verified_cycle_entry_evidence(
+        cycle_id=CYCLE,
+    )["sha256"] == _evidence()["sha256"]
