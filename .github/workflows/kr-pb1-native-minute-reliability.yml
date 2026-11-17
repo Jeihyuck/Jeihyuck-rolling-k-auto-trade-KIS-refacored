@@ -11,6 +11,7 @@ on:
       - "trader/pb1_runner.py"
       - "trader/kr/broker_truth_hardening.py"
       - "trader/kr/infinite/runner.py"
+      - "trader/kr/infinite/executor.py"
       - "tests/kr/infinite/test_runner_integration.py"
       - "trader/reconcile_kis.py"
       - "tests/kr/test_kr_pb1_current_only_original_balance_proof.py"
@@ -50,7 +51,7 @@ jobs:
         run: |
           python -m py_compile trader/kr/entry_priority_queue.py trader/kr/kis_observer_budget.py \
             trader/kr/opening_bar_contract.py trader/kis_wrapper.py trader/pb1_engine.py scripts/kr_opening_observer.py \
-            trader/kr/broker_truth_hardening.py trader/reconcile_kis.py trader/pb1_runner.py trader/kr/infinite/runner.py
+            trader/kr/broker_truth_hardening.py trader/reconcile_kis.py trader/pb1_runner.py trader/kr/infinite/runner.py trader/kr/infinite/executor.py
           bash -n scripts/wsl/kr-entry-timing-activation.sh scripts/wsl/run-kr-am.sh scripts/wsl/run-kr-afternoon.sh
       - name: Native minute offline incident & integration regressions
         run: |
