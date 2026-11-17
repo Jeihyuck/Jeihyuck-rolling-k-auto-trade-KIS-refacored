@@ -100,3 +100,43 @@ def test_incomplete_or_conflicting_evidence_fences_retry(change):
     evidence = deepcopy(proof())
     change(evidence)
     assert not proven_partial_tp_remainder(**evidence)
+
+
+@pytest.mark.parametrize("stage", ["tp1", "tp2", "tp3"])
+@pytest.mark.parametrize("broker_state,open_qty", [
+    ("OPEN", 6),
+    ("PARTIALLY_FILLED", 6),
+    ("CANCEL_REQUESTED", 6),
+    ("CANCELLED", 6),
+    ("UNKNOWN", 6),
+])
+def test_v3_all_tp_stages_fence_broker_live_or_uncertain_remaining(
+    stage, broker_state, open_qty,
+):
+    evidence = deepcopy(proof())
+    evidence["symbol"] = "ANY_NEW_US_STANDARD_TICKER"
+    evidence["stage_name"] = stage
+    evidence["claim"]["action"] = stage.upper()
+    evidence["prior_orders"][0]["symbol"] = evidence["symbol"]
+    evidence["prior_orders"][0]["status"] = broker_state
+    evidence["prior_orders"][0]["meta"]["profit_capture_stage"] = stage
+    evidence["prior_orders"][0]["meta"]["broker_open_qty"] = open_qty
+    evidence["prior_orders"][0]["meta"]["broker_raw_row"]["remaining_qty"] = open_qty
+    assert not proven_partial_tp_remainder(**evidence)
+
+
+@pytest.mark.parametrize("stage", ["tp1", "tp2", "tp3"])
+def test_v3_all_tp_stages_allow_exact_verified_cancelled_partial_only(stage):
+    evidence = deepcopy(proof())
+    evidence["symbol"] = "ANY_NEW_US_STANDARD_TICKER"
+    evidence["stage_name"] = stage
+    evidence["claim"]["action"] = stage.upper()
+    evidence["prior_orders"][0]["symbol"] = evidence["symbol"]
+    evidence["prior_orders"][0]["meta"]["profit_capture_stage"] = stage
+    assert proven_partial_tp_remainder(**evidence)
+    for bad_qty in (1, 2, 4, 6, 10):
+        evidence["qty"] = bad_qty
+        if bad_qty == 3:
+            assert proven_partial_tp_remainder(**evidence)
+        else:
+            assert not proven_partial_tp_remainder(**evidence)
