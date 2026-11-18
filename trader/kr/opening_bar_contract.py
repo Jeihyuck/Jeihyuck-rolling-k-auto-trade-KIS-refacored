@@ -183,8 +183,20 @@ def inspect_completed_bar_coverage(*, rows: list[dict], now: datetime) -> dict:
     unobserved = [
         f"09:{i:02d}" for i in range(30) if f"09:{i:02d}" not in observed
     ]
+    native_recent = after_open[-8:]
+    recent_native_stamps = [
+        datetime.fromisoformat(bar["timestamp"]) for bar in native_recent
+    ]
+    recent_native_window_ready = bool(
+        len(native_recent) == 8
+        and all((b - a).total_seconds() == 60
+                for a, b in zip(recent_native_stamps,
+                                recent_native_stamps[1:]))
+        and 0 <= (now - recent_native_stamps[-1]).total_seconds() <= 180
+    )
     return {
         "state": state, "reason": reason,
+        "native_post_open_window_ready": recent_native_window_ready,
         "bars": len(bars), "opening_count": len(opening),
         # Unobserved does NOT prove a broker data gap: some minutes may have
         # no genuine trades. Never synthesize their OHLC or volume.
