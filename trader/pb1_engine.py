@@ -8134,6 +8134,7 @@ class PB1Engine:
             logger.exception("[SELL_SESSION_BLOCK][DURABLE_LOOKUP_FAIL] code=%s action=fail_closed", code)
             return True, {"status": "LOOKUP_FAILED"}
         session = str(os.getenv("PB1_SESSION_KIND") or self.window_internal or "day").lower()
+        session = {"am": "morning", "pm": "day", "afternoon": "day"}.get(session, session)
         for row in rows or []:
             if str(row.get("strategy") or "") != self.STRATEGY_NAME:
                 continue
@@ -8155,6 +8156,7 @@ class PB1Engine:
             else:
                 request = {}
             row_session = str(request.get("trade_session") or "").lower()
+            row_session = {"am": "morning", "pm": "day", "afternoon": "day"}.get(row_session, row_session)
             if row_session and row_session != session:
                 continue
             prior_stage = str(row.get("stage") or request.get("exit_stage") or "")
@@ -8188,8 +8190,17 @@ class PB1Engine:
                     "FILLED", "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED"
                 }
                 prior_balance_proven = (
-                    fresh and prior_pre_qty > 0 and prior_submitted > 0
-                    and 0 < remaining <= prior_pre_qty - prior_submitted
+                    fresh and remaining > 0 and (
+                        (prior_pre_qty > 0 and prior_submitted > 0
+                         and remaining <= prior_pre_qty - prior_submitted)
+                        # Existing TP-stage ledger rows may lack the newer
+                        # pre-order quantity fields. Their FILLED stage and a
+                        # fresh broker remainder preserve legacy progression.
+                        or (prior_pre_qty <= 0 and prior_stage in {
+                            "TP1", "TP2", "TP3", "PROFIT_PROTECT_PARTIAL_1",
+                            "KR_PAPER_SOFT_STOP_PARTIAL_1", "DEFENSE_TRIM_1"
+                        })
+                    )
                 )
                 if (prior_completed and prior_balance_proven and prior_was_partial
                         and str(exit_stage or "").upper() == "FULL_EXIT"):
