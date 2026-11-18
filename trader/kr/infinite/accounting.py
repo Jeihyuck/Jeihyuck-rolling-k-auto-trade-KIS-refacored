@@ -68,7 +68,7 @@ def apply_confirmed_fill(state: State, intent: OrderIntent, broker: BrokerOrderS
     if sequence > 40:
         raise ValueError("KR_INF_UNIT_INVARIANT")
     reserve = sequence > 30
-    price = delta_notional / delta_qty
+    price = float(delta_notional_decimal / Decimal(delta_qty))
     metadata = {**state.metadata, "fill_balance_pending": True,
                 "fill_balance_pending_attempts": int(state.metadata.get("fill_balance_pending_attempts") or 0)}
     return replace(
@@ -76,8 +76,8 @@ def apply_confirmed_fill(state: State, intent: OrderIntent, broker: BrokerOrderS
         units_used=state.units_used + (1 if new_unit else 0),
         core_units_used=state.core_units_used + (1 if new_unit and not reserve else 0),
         reserve_units_used=state.reserve_units_used + (1 if new_unit and reserve else 0),
-        core_filled_notional=state.core_filled_notional + (0 if reserve else delta_notional),
-        reserve_filled_notional=state.reserve_filled_notional + (delta_notional if reserve else 0),
+        core_filled_notional=_money(state.core_filled_notional) + (Decimal("0") if reserve else delta_notional_decimal),
+        reserve_filled_notional=_money(state.reserve_filled_notional) + (delta_notional_decimal if reserve else Decimal("0")),
         last_buy_date=trade_date,
         last_buy_price=price,
         recovery_probe_done=state.recovery_probe_done or intent.side == "RECOVERY",
