@@ -157,11 +157,22 @@ def test_16_native_bars_reach_actual_pb1_pre_submit_gate(monkeypatch):
     monkeypatch.setattr(pb1, "evaluate_proof_for_candidate", native_16)
     engine = pb1.PB1Engine.__new__(pb1.PB1Engine)
     engine.env = "practice"
+    engine.STRATEGY_NAME = "pb1_pullback_close"
     engine._now_kst = NOW
+    # The real timing evaluator must run before these *independently mocked*
+    # ledger / risk / submit gates. A timing-only unit test cannot claim a
+    # broker order or fill, and must not access an uninitialized DB repo.
+    monkeypatch.setattr(pb1, "get_account_key", lambda **kwargs: "offline:test-account")
+    engine.orders_repo = SimpleNamespace()
+    engine._build_unified_gate_context = lambda **kwargs: {"qty": kwargs["qty"]}
+    engine._evaluate_unified_buyable_gate = lambda **kwargs: SimpleNamespace(
+        ok=True, reason_codes=[],
+    )
+    engine._order_precheck_gate_reasons = lambda **kwargs: []
     candidate = SimpleNamespace(
-        code="093320", setup_ok=True,
+        code="093320", setup_ok=True, planned_qty=1, client_order_key=None,
         features={"entry_style_selected": "ENTRY_PULLBACK",
-                  "setup_ok": True, "trigger_ok": False},
+                  "setup_ok": True, "trigger_ok": False, "buyable_ok": True},
     )
     decision = engine._resolve_entry_pre_submit(
         cf=candidate, stage="PB1-AM",
