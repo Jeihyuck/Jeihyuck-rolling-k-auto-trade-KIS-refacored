@@ -137,17 +137,24 @@ class KISExecutor:
         if delta == 0:
             return None
         status = "FILLED" if delta >= int(intent.requested_qty or 0) else "PARTIALLY_FILLED"
-        fill_avg = None
-        fill_notional = 0.0
         if intent.side in {"BUY", "RECOVERY"}:
-            pre_avg = float(metadata.get("pre_order_avg_price") or 0.0)
-            post_cost = post_avg * post_qty
-            pre_cost = pre_avg * pre_qty
-            fill_notional = max(0.0, post_cost - pre_cost)
-            fill_avg = (fill_notional / delta) if delta > 0 and fill_notional > 0 else (post_avg or None)
-            if fill_notional <= 0 and fill_avg:
-                fill_notional = float(fill_avg) * delta
-        return BrokerOrderState(status, delta, fill_notional, fill_avg)
+            # Holding delta can support a *quantity discrepancy* diagnostic,
+            # but post-trade average cost is not an exact execution-price/
+            # notional receipt for this original KIS order (other purchases,
+            # fees, or corrections can affect the holdings average). Never
+            # manufacture a confirmed 13-share cash amount from that delta.
+            # Keep the original unresolved order fenced until KIS original
+            # fill price evidence or an explicitly approved repair exists.
+            logger.warning(
+                "[KR_INF][BALANCE_ONLY_BUY_FILL][UNVERIFIED_PRICE] "
+                "order_id=%s cycle=%s observed_delta_qty=%s "
+                "action=RECONCILE_PENDING_NO_SYNTHETIC_CASH",
+                intent.broker_order_id, intent.cycle_id, delta,
+            )
+            return BrokerOrderState("RECONCILE_PENDING")
+        # SELL quantity may still be proven for risk cleanup after daily-ccld
+        # failure, but no realized proceeds or fill price are fabricated.
+        return BrokerOrderState(status, delta, 0.0, None)
 
     def _historical_unchanged_balance_expiry(
         self, intent: OrderIntent, *, lookup_date: date, trade_date: date
