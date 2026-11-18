@@ -285,3 +285,113 @@ def test_fractional_etf_owner_limit_never_truncates_before_tick(monkeypatch):
     )
     executor_module.KISExecutor(FakeKIS(), "practice").submit(decision, "122630")
     assert seen == [("122630", 2, 55220)]
+
+
+def test_kis_original_order_day_native_total_cash_proves_thirteen_shares():
+    """Use exact native KIS order-day total, not rounded AVG or order LIMIT."""
+    from trader.kr.infinite.executor import KISExecutor
+    from dataclasses import replace
+    state_engine, _, state, intent, _, _ = _fixture_native_intent()
+    dates = []
+
+    class NativeKIS:
+        def inquire_daily_ccld(self, *, start_date, end_date):
+            dates.append((start_date, end_date))
+            return {"rt_cd": "0", "output1": [{
+                "odno": "0000010702", "pdno": "122630",
+                "sll_buy_dvsn_cd": "02", "tot_ccld_qty": "13",
+                "tot_ccld_amt": "718900", "avg_prvs": "",
+            }]}
+
+    broker = KISExecutor(NativeKIS(), "practice").order_state(
+        intent, date(2026, 11, 19),
+    )
+    assert dates == [("20261118", "20261118")]
+    assert broker.status == "FILLED"
+    assert broker.filled_qty == 13
+    assert broker.filled_notional_krw == Decimal("718900")
+    assert broker.filled_avg_price == 55300.0
+
+
+def _fixture_native_intent():
+    """A broker receipt never comes from or modifies our simulated state."""
+    engine = _Engine()
+    state = State(cycle_id="KRINF-TEST-CYCLE", status=Status.ACTIVE)
+    intent = OrderIntent(
+        id=13, cycle_id="KRINF-TEST-CYCLE", trade_date=DAY,
+        side="BUY", idempotency_key="key-10702", requested_qty=13,
+        unit_sequence=2, broker_order_id="0000010702",
+        status="SUBMITTED", filled_qty=0,
+        filled_notional_krw=Decimal("0"),
+    )
+    return engine, None, state, intent, None, None
+
+
+@pytest.mark.parametrize(
+    ("row_override", "expected_status"),
+    [
+        ({"pdno": "028050"}, "RECONCILE_PENDING"),
+        ({"sll_buy_dvsn_cd": "01"}, "RECONCILE_PENDING"),
+        ({"tot_ccld_amt": "0"}, "RECONCILE_PENDING"),
+        ({"tot_ccld_amt": "-718900"}, "RECONCILE_PENDING"),
+        ({"tot_ccld_amt": "NaN"}, "RECONCILE_PENDING"),
+        ({"tot_ccld_amt": "", "avg_prvs": ""}, "RECONCILE_PENDING"),
+        ({"tot_ccld_qty": "14"}, "RECONCILE_PENDING"),
+    ],
+)
+def test_kis_order_row_never_authorizes_unproven_or_wrong_owner_fill(
+    row_override, expected_status,
+):
+    """Wrong symbol/side, qty, and missing native cash all preserve BUY fence."""
+    from trader.kr.infinite.executor import KISExecutor
+
+    row = {
+        "odno": "0000010702", "pdno": "122630", "sll_buy_dvsn_cd": "02",
+        "tot_ccld_qty": "13", "tot_ccld_amt": "718900",
+        "avg_prvs": "55300",
+    }
+    row.update(row_override)
+
+    class NativeKIS:
+        def inquire_daily_ccld(self, **kwargs):
+            return {"rt_cd": "0", "output1": [row]}
+
+        def get_balance(self):
+            raise AssertionError("Incorrect fill may not use holdings as a substitute")
+
+    intent = _fixture_native_intent()[3]
+    broker = KISExecutor(NativeKIS(), "practice").order_state(intent, DAY)
+    assert broker.status == expected_status
+    assert broker.filled_qty is None
+
+
+def test_kis_native_average_only_and_partial_cash_receipts_are_reconciled():
+    """Existing native avg-only responses remain compatible, not synthetic."""
+    from trader.kr.infinite.executor import KISExecutor
+    intent = _fixture_native_intent()[3]
+    rows = [
+        {
+            "odno": "0000010702", "pdno": "122630", "sll_buy_dvsn_cd": "02",
+            "tot_ccld_qty": "5", "tot_ccld_amt": "276500",
+            "avg_prvs": "55300",
+        },
+        {
+            "odno": "0000010702", "pdno": "122630", "sll_buy_dvsn_cd": "02",
+            "tot_ccld_qty": "13", "tot_ccld_amt": "",
+            "avg_prvs": "55300",
+        },
+    ]
+    class NativeKIS:
+        def __init__(self, row):
+            self.row = row
+        def inquire_daily_ccld(self, **kwargs):
+            return {"rt_cd": "0", "output1": [self.row]}
+
+    first = KISExecutor(NativeKIS(rows[0]), "practice").order_state(intent, DAY)
+    assert first.status == "PARTIALLY_FILLED"
+    assert first.filled_qty == 5
+    assert first.filled_notional_krw == Decimal("276500")
+    final = KISExecutor(NativeKIS(rows[1]), "practice").order_state(intent, DAY)
+    assert final.status == "FILLED"
+    assert final.filled_qty == 13
+    assert final.filled_notional_krw == Decimal("718900")
