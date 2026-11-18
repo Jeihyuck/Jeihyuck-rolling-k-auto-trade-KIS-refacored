@@ -4,7 +4,7 @@ from datetime import date
 from typing import Any
 import logging
 
-from trader.kr_price_utils import normalize_kr_order_price
+from trader.kr_price_utils import normalize_kr_etf_order_price
 
 from trader.kis_wrapper import extract_order_no, is_order_accepted
 
@@ -81,14 +81,14 @@ class KISExecutor:
         if decision.action in {Action.BUY, Action.RECOVERY}:
             if int(decision.qty or 0) <= 0:
                 raise ValueError("KR_INF_BUY_QTY_INVALID")
-            # KIS's buy_stock_limit() already rounds UP to the KRX tick.
+            # KIS's buy_stock_limit() uses the same dedicated ETF tick.
             # Pre-normalize here with the same shared tick function so the
             # exact submitted LIMIT is observable and is reproducible from
             # the immutable decision price stored in the intent journal.
             # This does not relax entry/capital policy or change the order.
             intended_price = float(decision.notional) / int(decision.qty)
             before_native_round = int(intended_price)
-            submit_price, tick_size = normalize_kr_order_price(
+            submit_price, tick_size = normalize_kr_etf_order_price(
                 before_native_round, side="BUY",
             )
             if submit_price <= 0:
@@ -96,7 +96,7 @@ class KISExecutor:
             logger.info(
                 "[KR_INF][BUY_LIMIT_PRICE] symbol=%s qty=%s decision_price=%.8f "
                 "kro_priced_input=%s kis_submit_price=%s tick_size=%s "
-                "price_source=DECISION_NOTIONAL_TICK_NORMALIZED",
+                "price_source=DECISION_NOTIONAL_ETF_TICK_NORMALIZED",
                 symbol, decision.qty, intended_price,
                 before_native_round, submit_price, tick_size,
             )
