@@ -835,3 +835,133 @@ def test_active_scope_sql_does_not_select_unrelated_epoch_rows():
     assert "dry_run IS FALSE" in legacy.HISTORICAL_PENDING_SQL
     assert "trade_date>=:buy_day" in legacy.HISTORICAL_PENDING_SQL
 
+
+
+def _db_verified_legacy_stop_position(scenario, monkeypatch):
+    from contextlib import contextmanager
+    from trader.us.db import repos
+    from trader.us.execution.us_legacy_nine_active_sell import (
+        enrich_legacy_nine_v2_decision_position,
+    )
+    db, _client, _intent = scenario
+
+    class Engine:
+        @contextmanager
+        def connect(self):
+            yield db
+
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: Engine())
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda *a, **kw: EPOCH)
+    original = {
+        "symbol": SYMBOL, "qty": 4, "exchange": "NYSE",
+        "strategy_owner": "US_STANDARD", "entry_price": 100.0,
+        "max_price": 100.0, "meta": {},
+    }
+    enriched = enrich_legacy_nine_v2_decision_position(
+        original, trade_date="2026-11-11",
+    )
+    assert enriched.get("legacy_nine_decision_only_provisional") is True
+    assert original.get("account_id") is None
+    assert original["meta"] == {}
+    return enriched
+
+
+def test_legacy_stop_durable_scope_matches_independently_proven_router(scenario, monkeypatch):
+    from trader.us.execution.us_legacy_nine_active_sell import (
+        build_verified_legacy_stop_obligation_position,
+    )
+    db, client, intent = scenario
+    enriched = _db_verified_legacy_stop_position(scenario, monkeypatch)
+    scoped = build_verified_legacy_stop_obligation_position(
+        enriched, trade_date="2026-11-11",
+    )
+    assert scoped["_legacy_stop_proof_scoped"] is True
+    assert scoped["account_id"] == RAW_ACCOUNT
+    assert scoped["trading_epoch_id"] == EPOCH
+    assert scoped["portfolio_epoch_id"] == PORTFOLIO
+    assert scoped["position_cycle_id"] == scoped["position_lifecycle_id"]
+    assert scoped["position_cycle_id"] != OLD_CYCLE
+    assert enriched["position_lifecycle_id"] == OLD_CYCLE
+    assert enriched.get("portfolio_epoch_id") is None
+    assert db.position["portfolio_epoch_id"] is None
+    ok, reason, proof = _authorize(scenario)
+    assert ok, reason
+    assert scoped["position_cycle_id"] == proof["prospective_cycle"]
+    assert scoped["portfolio_epoch_id"] == proof["portfolio"]
+
+
+def test_verified_legacy_hard_stop_is_not_dropped_before_sell_intent(scenario, monkeypatch):
+    from datetime import datetime, timezone
+    from trader.us.pb1 import us_exit_engine
+    position = _db_verified_legacy_stop_position(scenario, monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        "trader.us.protective_stop_obligation.record_confirmed_stop",
+        lambda scoped_position, **kw: calls.append((scoped_position, kw)) or True,
+    )
+    monkeypatch.setattr(
+        us_exit_engine, "_make_exit_intent",
+        lambda **kw: {"side": "SELL", "symbol": kw["symbol"],
+                      "exit_type": kw["exit_type"], "qty": kw["qty"]},
+    )
+    result = us_exit_engine.evaluate_exit(
+        position, 90.0,
+        now=datetime(2026, 11, 11, 15, 0, tzinfo=timezone.utc),
+        include_trend_time=False,
+    )
+    assert result and result["side"] == "SELL"
+    assert len(calls) == 1
+    scoped, evidence = calls[0]
+    assert evidence["exit_type"] in {"hard_stop_loss", "hard_stop"}
+    assert scoped["account_id"] == RAW_ACCOUNT
+    assert scoped["trading_epoch_id"] == EPOCH
+    assert scoped["portfolio_epoch_id"] == PORTFOLIO
+    assert scoped["position_cycle_id"] == scoped["position_lifecycle_id"]
+    assert position["position_lifecycle_id"] == OLD_CYCLE
+
+
+def test_legacy_stop_scope_rejects_changed_current_epoch_or_contract(scenario, monkeypatch):
+    from trader.us.execution.us_legacy_nine_active_sell import (
+        build_verified_legacy_stop_obligation_position,
+    )
+    from trader.us.db import repos
+    db, client, intent = scenario
+    enriched = _db_verified_legacy_stop_position(scenario, monkeypatch)
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda *a, **kw: "new-epoch")
+    with pytest.raises(ValueError, match="ACTIVE_ACCOUNT_OR_EPOCH_CHANGED"):
+        build_verified_legacy_stop_obligation_position(
+            enriched, trade_date="2026-11-11",
+        )
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda *a, **kw: EPOCH)
+    db.position["meta"]["entry_exit_contract_sha256"] = "f" * 64
+    with pytest.raises(ValueError, match="DB_ORIGINAL_UNVERIFIED"):
+        build_verified_legacy_stop_obligation_position(
+            enriched, trade_date="2026-11-11",
+        )
+
+
+def test_verified_legacy_buy_date_proves_min_hold_conservatively(scenario, monkeypatch):
+    from datetime import datetime, timezone
+    from trader.us.pb1.us_exit_router import _min_hold_elapsed
+    pos = _db_verified_legacy_stop_position(scenario, monkeypatch)
+    elapsed, held, required = _min_hold_elapsed(
+        pos, datetime(2026, 11, 11, 15, 0, tzinfo=timezone.utc),
+    )
+    assert elapsed is True and held >= required == 390
+    # No known intraday time: even a trusted BUY-date cannot bypass same-day.
+    pos["_legacy_nine_db_original_provenance"]["source_buy_day"] = "2026-11-11"
+    elapsed, held, required = _min_hold_elapsed(
+        pos, datetime(2026, 11, 11, 15, 0, tzinfo=timezone.utc),
+    )
+    assert elapsed is False
+
+
+def test_missing_legacy_buy_provenance_cannot_bypass_soft_min_hold():
+    from datetime import datetime, timezone
+    from trader.us.pb1.us_exit_router import _min_hold_elapsed
+    position = {"symbol": "PFE", "strategy_owner": "US_STANDARD",
+                "legacy_nine_decision_only_provisional": True}
+    elapsed, held, required = _min_hold_elapsed(
+        position, datetime(2026, 11, 17, 15, 0, tzinfo=timezone.utc),
+    )
+    assert elapsed is False and held == 0
