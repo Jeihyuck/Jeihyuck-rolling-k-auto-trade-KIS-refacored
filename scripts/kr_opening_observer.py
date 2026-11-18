@@ -245,7 +245,8 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
             unresolved = list((stored or {}).get("source_conflicts") or [])
             repair_due = (
                 observed_at.time() >= dtime(9, 30)
-                and (not opening_ready or bool(unresolved))
+                and (not (opening_ready or opening_coverage.get(
+                    "native_post_open_window_ready", False)) or bool(unresolved))
                 and _repair_opening_due(code)
             )
             anchors = (
