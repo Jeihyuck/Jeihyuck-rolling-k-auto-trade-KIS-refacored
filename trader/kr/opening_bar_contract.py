@@ -324,6 +324,9 @@ def evaluate_price_aware_entry(
     structure_state, structure_reason, opening, after_open = _completed_bar_structure(bars, now)
     if structure_state != "COVERED":
         if structure_reason == "OPENING_BARS_MISSING_OR_INCOMPLETE":
+            if not after_open:
+                # No post-opening market observation exists to evaluate.
+                return _result("UNKNOWN", structure_reason, opening_count=len(opening))
             # An opening completeness diagnostic is not a *universal* BUY
             # veto. Only use a separately confirmed post-opening calculation
             # whose data dependency is fully satisfied.
