@@ -160,6 +160,7 @@ def test_100_replays_with_reloaded_intent_do_not_increase_notional(monkeypatch):
     BrokerOrderState("FILLED", 13, Decimal("0")),
     BrokerOrderState("FILLED", 14, Decimal("718900")),
     BrokerOrderState("FILLED", -1, Decimal("718900")),
+    BrokerOrderState("FILLED", None, Decimal("0")),
 ])
 def test_invalid_broker_cumulative_values_roll_back_atomically(monkeypatch, bad):
     engine, repo, state, intent, _, journal = _fixture(monkeypatch)
