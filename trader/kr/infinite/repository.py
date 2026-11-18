@@ -394,6 +394,7 @@ class InfiniteRepository:
                         FOR UPDATE
                     """), {"epoch_id": epoch_id, "id": intent.id}).mappings().first()
                     if (not persisted
+                            or str(persisted["trading_epoch_id"]) != str(epoch_id)
                             or persisted["strategy_id"] != "KR_INFINITE_V1"
                             or persisted["symbol"] != "122630"
                             or persisted["cycle_id"] != intent.cycle_id
