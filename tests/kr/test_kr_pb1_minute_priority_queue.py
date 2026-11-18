@@ -45,7 +45,7 @@ def test_no_minute_proof_is_needed_to_seed_preopen_collection(seed_prep):
     state = pq.collection_priorities(date=date, account_scope="practice:test",
                                       now=moment())
     assert state["state"] == "PREP_FALLBACK"
-    assert state["hot"] == [f"{i:06d}" for i in range(1, 6)]
+    assert state["hot"] == []\n    assert state["warm"] == []\n    # A stale/missing ranking must not promote arbitrary Final30 into HOT.\n    # Keep the universe eligible for low-frequency discovery only.
     assert set(state["hot"] + state["warm"] + state["cold"]) == {
         f"{i:06d}" for i in range(1, 31)
     }
@@ -63,6 +63,7 @@ def test_pb1_publisher_prioritizes_actual_candidates_without_restricting_univers
                                         now=moment(9, 6))
     assert snapshot["state"] == "PB1_ACTIVE"
     assert snapshot["hot"] == ["000021", "000023"]
+    assert snapshot["warm"] == []  # No unrelated Final30 symbols in WARM.
     assert "000022" in snapshot["cold"]
     assert len(set(snapshot["hot"] + snapshot["warm"] + snapshot["cold"])) == 30
 
@@ -183,3 +184,29 @@ def test_hot_overcrowding_reports_capacity_while_retaining_fail_closed_ttl():
     # The scheduler prioritizes collection only: a late KIS bar still fails
     # the unchanged 180s entry gate, regardless of poll scheduling.
     assert schedule.select(state, moment(9, 0))
+
+
+def test_only_one_actual_candidate_is_hot_and_no_other_symbol_is_warm(seed_prep):
+    date, _ = seed_prep
+    pq.publish_pb1_priority(date=date, account_scope="practice:test",
+                            eligible_codes=["000021"], now=moment(9, 5))
+    result = pq.collection_priorities(date=date, account_scope="practice:test",
+                                      now=moment(9, 6))
+    assert result["state"] == "PB1_ACTIVE"
+    assert result["hot"] == ["000021"]
+    assert result["warm"] == []
+    assert len(result["cold"]) == 29
+    assert "000021" not in result["cold"]
+
+
+def test_preminute_candidate_promotion_recovers_from_missing_manifest(seed_prep):
+    date, _ = seed_prep
+    fallback = pq.collection_priorities(date=date, account_scope="practice:test",
+                                        now=moment(9, 3))
+    assert fallback["hot"] == []
+    pq.publish_pb1_priority(date=date, account_scope="practice:test",
+                            eligible_codes=["000021"], now=moment(9, 4))
+    active = pq.collection_priorities(date=date, account_scope="practice:test",
+                                      now=moment(9, 5))
+    assert active["state"] == "PB1_ACTIVE"
+    assert active["hot"] == ["000021"]
