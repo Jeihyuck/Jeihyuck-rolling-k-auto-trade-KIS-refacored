@@ -968,3 +968,53 @@ def test_missing_legacy_buy_provenance_cannot_bypass_soft_min_hold():
         position, datetime(2026, 11, 17, 15, 0, tzinfo=timezone.utc),
     )
     assert elapsed is False and held == 0
+
+
+def test_legacy_scoped_hard_stop_debt_replays_with_exact_active_epoch(scenario, monkeypatch):
+    from datetime import datetime, timezone
+    from trader.us.pb1 import us_exit_engine
+    from trader.us.execution.us_legacy_nine_active_sell import (
+        build_verified_legacy_stop_obligation_position,
+    )
+    from trader.us.protective_stop_obligation import (
+        replay_confirmed_protective_intents,
+    )
+    original = _db_verified_legacy_stop_position(scenario, monkeypatch)
+    scoped = build_verified_legacy_stop_obligation_position(
+        original, trade_date="2026-11-11",
+    )
+    source_snapshot = {
+        **original, "holding_qty": 4, "orderable_qty": 4,
+        "resolved_current_price": 90.0, "current_price": 90.0,
+    }
+    debt = {
+        "symbol": SYMBOL,
+        "account_id": RAW_ACCOUNT,
+        "trading_epoch_id": EPOCH,
+        "portfolio_epoch_id": PORTFOLIO,
+        "position_cycle_id": scoped["position_cycle_id"],
+        "lifecycle_id": scoped["position_lifecycle_id"],
+        "severity": 3, "obligation_state": "PENDING",
+        "hard_stop_pct": 0.06, "soft_stop_pct": 0.03,
+    }
+    built = []
+    monkeypatch.setattr(us_exit_engine, "_make_exit_intent",
+                        lambda **kw: built.append(kw) or {
+                            "side": "SELL", "symbol": kw["symbol"], "qty": kw["qty"]
+                        })
+    now = datetime(2026, 11, 11, 15, 0, tzinfo=timezone.utc)
+    output = replay_confirmed_protective_intents(
+        snapshots=[source_snapshot], existing_intents=[],
+        pending=[debt], now=now,
+    )
+    assert len(output) == 1
+    assert built[0]["position_lifecycle_id"] == scoped["position_cycle_id"]
+    assert built[0]["meta_extra"]["stop_obligation_replay"] is True
+    assert source_snapshot.get("portfolio_epoch_id") is None
+    # A previous trading epoch's debt never replays on today's position.
+    built.clear()
+    assert replay_confirmed_protective_intents(
+        snapshots=[source_snapshot], existing_intents=[],
+        pending=[{**debt, "trading_epoch_id": "retired-epoch"}], now=now,
+    ) == []
+    assert built == []
