@@ -169,7 +169,8 @@ def publish_pb1_priority(*, date: str, account_scope: str,
     # Invalid or unverified held state does NOT remove a Final30 code globally.
     remaining = [c for c in prep["codes"] if c not in ranked and c not in held]
     hot = ranked[:HOT_TARGET]
-    warm = _unique(ranked[HOT_TARGET:] + remaining)[:WARM_TARGET]
+    # WARM is a genuine next-in-line BUY candidate, not a filler from Final30.
+    warm = ranked[HOT_TARGET:HOT_TARGET + WARM_TARGET]
     body = _snapshot(date=date, account_scope=account_scope, prep=prep,
                      hot=hot, warm=warm, source="PB1_PRE_MINUTE",
                      stage=stage, now=now, code_sha=_current_sha())
@@ -238,9 +239,7 @@ def collection_priorities(*, date: str, account_scope: str,
                 "code_sha": observed_sha}
     except (FileNotFoundError, ValueError, TypeError, KeyError, OSError, AttributeError):
         return {"state": "PREP_FALLBACK",
-                "hot": prep["codes"][:HOT_TARGET],
-                "warm": prep["codes"][HOT_TARGET:HOT_TARGET + WARM_TARGET],
-                "cold": prep["codes"][HOT_TARGET + WARM_TARGET:]}
+                "hot": [], "warm": [], "cold": prep["codes"]}
 
 
 class CandidateSchedule:
@@ -253,7 +252,7 @@ class CandidateSchedule:
     """
 
     def __init__(self, *, max_batch: int = 10,
-                 hot_sec: int = 45, warm_sec: int = 180, cold_sec: int = 600):
+                 hot_sec: int = 45, warm_sec: int = 180, cold_sec: int = 1800):
         self.last_attempt: dict[str, datetime] = {}
         self.last_tier: dict[str, str] = {}
         self.max_batch = max(3, int(max_batch))
