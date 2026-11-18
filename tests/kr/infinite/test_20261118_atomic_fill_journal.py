@@ -337,6 +337,9 @@ def _fixture_native_intent():
         ({"tot_ccld_amt": "NaN"}, "RECONCILE_PENDING"),
         ({"tot_ccld_amt": "", "avg_prvs": ""}, "RECONCILE_PENDING"),
         ({"tot_ccld_qty": "14"}, "RECONCILE_PENDING"),
+        ({"tot_ccld_qty": "13.5"}, "RECONCILE_PENDING"),
+        ({"tot_ccld_qty": "NaN"}, "RECONCILE_PENDING"),
+        ({"tot_ccld_qty": "Infinity"}, "RECONCILE_PENDING"),
     ],
 )
 def test_kis_order_row_never_authorizes_unproven_or_wrong_owner_fill(
