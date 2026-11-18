@@ -58,6 +58,7 @@ def test_observer_can_report_partial_opening_while_pb1_verified_intraday_signal_
     health = inspect_completed_bar_coverage(rows=rows, now=NOW)
     assert health["state"] == "UNKNOWN"
     assert health["opening_count"] == 16
+    assert health["native_post_open_window_ready"] is True
     verdict = signal(rows)
     assert verdict["state"] == "READY_SHADOW"
     assert verdict["opening_range_complete"] is False
