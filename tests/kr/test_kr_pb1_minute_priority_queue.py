@@ -45,7 +45,10 @@ def test_no_minute_proof_is_needed_to_seed_preopen_collection(seed_prep):
     state = pq.collection_priorities(date=date, account_scope="practice:test",
                                       now=moment())
     assert state["state"] == "PREP_FALLBACK"
-    assert state["hot"] == []\n    assert state["warm"] == []\n    # A stale/missing ranking must not promote arbitrary Final30 into HOT.\n    # Keep the universe eligible for low-frequency discovery only.
+    assert state["hot"] == []
+    assert state["warm"] == []
+    # A stale/missing ranking must not promote arbitrary Final30 into HOT.
+    # Keep the universe eligible for low-frequency discovery only.
     assert set(state["hot"] + state["warm"] + state["cold"]) == {
         f"{i:06d}" for i in range(1, 31)
     }
