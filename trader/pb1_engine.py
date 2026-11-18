@@ -19844,11 +19844,46 @@ class PB1Engine:
                 and not allow_add_to_existing
             ):
                 try:
-                    from trader.kr.entry_priority_queue import publish_pb1_priority
+                    from trader.kr.entry_priority_queue import (
+                        eligible_preminute_codes,
+                        publish_pb1_priority,
+                    )
+                    # All of these lists have already been loaded through
+                    # fail-closed order/fill reads above. A known duplicate,
+                    # a held position or a zero-quantity setup is NOT a HOT
+                    # collection target, even if the daily setup scored high.
+                    # This only prioritizes read-only KIS minute collection;
+                    # the existing PB1 order/claim/balance gates still decide.
+                    _priority_blocked_today = [
+                        row.get("code")
+                        for row in today_orders
+                        if str(row.get("side") or "").upper() == "BUY"
+                        and self._is_blocking_open_buy_row(row)
+                    ]
+                    _priority_blocked_keys = [
+                        key for key, row in prior_intent_by_key.items()
+                        if self._is_blocking_open_buy_row(row)
+                    ]
+                    _priority_codes = eligible_preminute_codes(
+                        candidates=ok_after_risk,
+                        held_codes=held_codes,
+                        blocking_buy_codes=[*open_buy_codes, *_priority_blocked_today],
+                        filled_buy_codes=[
+                            code for code, rows in today_buy_fill_by_code.items() if rows
+                        ],
+                        blocking_client_order_keys=_priority_blocked_keys,
+                    )
+                    logger.info(
+                        "[KR][ENTRY_TIMING][PRIORITY_PREFILTER] setup_risk=%s "
+                        "positive_qty_order_free=%s held=%s open_buys=%s filled=%s",
+                        len(ok_after_risk), len(_priority_codes),
+                        len(held_codes), len(open_buy_codes),
+                        sum(bool(rows) for rows in today_buy_fill_by_code.values()),
+                    )
                     _priority_status = publish_pb1_priority(
                         date=str(self._today),
                         account_scope=get_account_key(env=self.env),
-                        eligible_codes=[cf.code for cf in ok_after_risk],
+                        eligible_codes=_priority_codes,
                         held_codes=[c for c in held_codes if c],
                         allow_add_to_existing=False,
                         stage=self._entry_stage_name(),
