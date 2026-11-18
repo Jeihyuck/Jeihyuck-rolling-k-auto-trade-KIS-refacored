@@ -18,6 +18,10 @@ def test_sell_price_181905_rounds_down_to_181500():
 
 
 def test_buy_stock_limit_payload_never_sends_181905(monkeypatch):
+    # CI globally sets NO_TRADE=1. This test's _safe_request is a pure
+    # in-process stub, not a network/broker call; explicitly exercise the
+    # final mocked payload serialization rather than the NO_TRADE sentinel.
+    monkeypatch.setenv("NO_TRADE", "0")
     sent = {}
 
     class Gate:
