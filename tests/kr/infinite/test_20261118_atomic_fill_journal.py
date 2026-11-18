@@ -422,3 +422,86 @@ def test_diagnostic_or_failed_kis_envelope_cannot_confirm_fill(invalid_envelope)
     observed = KISExecutor(FailedKIS(), "practice").order_state(intent, DAY)
     assert observed.status == "RECONCILE_PENDING"
     assert observed.filled_qty is None
+
+
+def test_original_kis_order_on_second_page_is_proven_without_wrong_date():
+    """Avoid false unresolved KODEX fill when order 0000010702 is on page 2."""
+    from trader.kr.infinite.executor import KISExecutor
+
+    class PagedKIS:
+        def __init__(self):
+            self.seen = []
+        def inquire_daily_ccld(self, **kwargs):
+            self.seen.append(kwargs)
+            if not kwargs.get("ctx_area_fk100"):
+                return {
+                    "rt_cd": "0", "output1": [
+                        {"odno": "OTHER", "pdno": "028050"},
+                    ],
+                    "ctx_area_fk100": "K-FK", "ctx_area_nk100": "K-NK",
+                    "_response_meta": {"tr_cont": "F"},
+                }
+            assert kwargs["ctx_area_fk100"] == "K-FK"
+            assert kwargs["ctx_area_nk100"] == "K-NK"
+            return {
+                "rt_cd": "0",
+                "output1": [{
+                    "odno": "0000010702", "pdno": "122630",
+                    "sll_buy_dvsn_cd": "02", "tot_ccld_qty": "13",
+                    "tot_ccld_amt": "718900", "avg_prvs": "55300",
+                }],
+                "_response_meta": {"tr_cont": "D"},
+            }
+
+    native = PagedKIS()
+    result = KISExecutor(native, "practice").order_state(
+        _fixture_native_intent()[3], date(2026, 11, 19),
+    )
+    assert result.status == "FILLED"
+    assert result.filled_qty == 13
+    assert result.filled_notional_krw == Decimal("718900")
+    assert len(native.seen) == 2
+    assert all(
+        call["start_date"] == call["end_date"] == "20261118"
+        for call in native.seen
+    )
+
+
+@pytest.mark.parametrize("failure", ["REPEATED_CURSOR", "FAILED_PAGE", "TOO_MANY_PAGES"])
+def test_incomplete_native_kis_pagination_preserves_original_order_fence(failure):
+    from trader.kr.infinite.executor import KISExecutor
+
+    class PagedKIS:
+        def __init__(self):
+            self.calls = 0
+        def inquire_daily_ccld(self, **kwargs):
+            self.calls += 1
+            if self.calls == 2 and failure == "FAILED_PAGE":
+                return {
+                    "rt_cd": "-1", "_ccld_status": "HTTP 500",
+                    "output1": [{
+                        "odno": "0000010702", "pdno": "122630",
+                        "sll_buy_dvsn_cd": "02", "tot_ccld_qty": "13",
+                        "tot_ccld_amt": "718900",
+                    }],
+                }
+            cursor = "REPEATED" if failure == "REPEATED_CURSOR" else (
+                "PAGE-" + str(self.calls)
+            )
+            return {
+                "rt_cd": "0",
+                "output1": [],
+                "ctx_area_fk100": cursor,
+                "ctx_area_nk100": cursor,
+                "_response_meta": {"tr_cont": "M"},
+            }
+        def get_balance(self):
+            raise AssertionError("Incomplete KIS pages cannot authorize balance inference")
+
+    api = PagedKIS()
+    result = KISExecutor(api, "practice").order_state(
+        _fixture_native_intent()[3], date(2026, 11, 19),
+    )
+    assert result.status == "RECONCILE_PENDING"
+    assert result.filled_qty is None
+    assert 2 <= api.calls <= 3
