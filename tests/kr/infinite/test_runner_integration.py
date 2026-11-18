@@ -54,15 +54,7 @@ class FakeKIS:
     def inquire_daily_ccld(self, **kwargs):
         return {"output1": [{"odno": "O1", "pdno": "122630", "side": self.last_side or "BUY",
                               "ord_qty": str(self.orders[-1][1] if self.orders else 0),
-                              # A mock broker cannot execute more shares than
-                              # the accepted order quantity.  An unbounded
-                              # fill_qty=110 previously reported 110 executions
-                              # of a 75-share SELL, contradicting the holdings
-                              # update and the native KIS fill guard.
-                              "tot_ccld_qty": str(min(
-                                  self.fill_qty,
-                                  self.orders[-1][1] if self.orders else 0,
-                              )), "avg_prvs": str(self.price)}]}
+                              "tot_ccld_qty": str(self.fill_qty), "avg_prvs": str(self.price)}]}
 
 
 class FakeRepository:
@@ -232,7 +224,9 @@ def test_confirmed_buy_updates_only_confirmed_fill(armed_practice_env):
 
 
 def test_sell_acceptance_partial_and_final_completion(armed_practice_env):
-    kis = FakeKIS(qty=150, average=100, price=110, fill_qty=110)
+    # The first TP1 order is for 75 shares. A native receipt claiming
+    # 110 executed shares of a 75-share order is invalid broker evidence.
+    kis = FakeKIS(qty=150, average=100, price=110, fill_qty=75)
     repo = FakeRepository(active())
     partial = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
     assert partial.decision.action == Action.SELL_PARTIAL and partial.state.status == Status.ACTIVE and kis.qty == 75
