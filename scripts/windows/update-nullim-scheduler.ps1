@@ -10,7 +10,7 @@ function New-NullimTaskActionArguments([string]$Distro, [string]$Repo, [string]$
   $repoQ=ConvertTo-BashSingleQuoted $Repo; $scriptQ=ConvertTo-BashSingleQuoted $Script
   $scriptArgsQ=@($ScriptArgs | ForEach-Object { ConvertTo-BashSingleQuoted $_ })
   $taskQ=ConvertTo-BashSingleQuoted $TaskName; $shaQ=ConvertTo-BashSingleQuoted $InstallSha
-  $purpose = switch ($TaskName) { "PB1 US Prep Prewarm EDT WSL" { "prep-prewarm-edt" }; "PB1 US Prep Prewarm EST WSL" { "prep-prewarm-est" }; "PB1 US Prep WSL" { "prep" }; "PB1 US Prep Recovery WSL" { "prep-recovery" }; "PB1 US AM Preflight WSL" { "am-preflight" }; default { ([IO.Path]::GetFileNameWithoutExtension($Script) -replace '^run-','') } }
+  $purpose = switch ($TaskName) { "PB1 US Prep WSL" { "prep" }; "PB1 US Prep Recovery WSL" { "prep-recovery" }; "PB1 US AM Preflight WSL" { "am-preflight" }; default { ([IO.Path]::GetFileNameWithoutExtension($Script) -replace '^run-','') } }
   $purposeQ=ConvertTo-BashSingleQuoted $purpose
   $entryQ=ConvertTo-BashSingleQuoted "$Repo/scripts/wsl/run-windows-scheduled-task.sh"
   $linuxCommand="unset NULLIM_APP_DIR; export NULLIM_SCHEDULER_OWNER=WINDOWS_TASK_SCHEDULER NULLIM_SCHEDULER_TASK_NAME=$taskQ NULLIM_SCHEDULER_INSTALL_SHA=$shaQ NULLIM_RUN_PURPOSE=$purposeQ; cd $repoQ && exec bash $entryQ $scriptQ"
@@ -36,7 +36,7 @@ function Get-UsKstTime([string]$EdtClock) {
 Write-Host "[SCHEDULER][US_TIME_PROFILE] season=$(if($usOffsetHours -eq 1){'EST'}else{'EDT'}) offset_hours=$usOffsetHours"
 $defs = @(
  @{Name="PB1 KR Prep WSL";Days=$krDays;Time="06:30";Script="$base/run-kr-prep.sh";Args=@();Limit="PT2H"}, @{Name="PB1 KR AM WSL";Days=$krDays;Time="08:55";Script="$base/run-kr-am.sh";Args=@();Limit="PT5H"}, @{Name="PB1 KR Afternoon WSL";Days=$krDays;Time="13:00";Script="$base/run-kr-afternoon.sh";Args=@();Limit="PT3H"}, @{Name="PB1 KR Close WSL";Days=$krDays;Time="15:15";Script="$base/run-kr-close.sh";Args=@();Limit="PT1H"}, @{Name="PB1 KR Mail WSL";Days=$krDays;Time="16:00";Script="$base/send-kr-log-mail.sh";Args=@();Limit="PT1H"}, @{Name="PB1 KR Health WSL";Days=$krDays;Time="16:10";Script="$base/check-nullim-day-health.sh";Args=@("kr");Limit="PT30M"},
- @{Name="PB1 US Prep Prewarm EDT WSL";Days=$usEveningDays;Time="19:30";Script="$base/run-us-prep.sh";Args=@();Limit="PT2H"}, @{Name="PB1 US Prep Prewarm EST WSL";Days=$usEveningDays;Time="20:30";Script="$base/run-us-prep.sh";Args=@();Limit="PT2H"}, @{Name="PB1 US Prep WSL";Days=$usEveningDays;Time=(Get-UsKstTime "21:30");Script="$base/run-us-prep.sh";Args=@();Limit="PT2H"}, @{Name="PB1 US Prep Recovery WSL";Days=$usEveningDays;Time=(Get-UsKstTime "22:10");Script="$base/run-us-prep-recovery.sh";Args=@();Limit="PT1H"}, @{Name="PB1 US AM Preflight WSL";Days=$usEveningDays;Time=(Get-UsKstTime "22:20");Script="$base/check-us-prep-before-am.sh";Args=@();Limit="PT30M"}, @{Name="PB1 US AM WSL";Days=$usEveningDays;Time=(Get-UsKstTime "22:30");Script="$base/run-us-am.sh";Args=@();Limit="PT5H"}, @{Name="PB1 US Afternoon WSL";Days=$usMorningDays;Time=(Get-UsKstTime "02:00");Script="$base/run-us-afternoon.sh";Args=@();Limit="PT5H"}, @{Name="PB1 US Close WSL";Days=$usMorningDays;Time=(Get-UsKstTime "05:05");Script="$base/run-us-close.sh";Args=@();Limit="PT1H"}, @{Name="PB1 US Mail WSL";Days=$usMorningDays;Time=(Get-UsKstTime "06:00");Script="$base/send-us-log-mail.sh";Args=@();Limit="PT1H"}, @{Name="PB1 US Health WSL";Days=$usMorningDays;Time=(Get-UsKstTime "06:10");Script="$base/check-nullim-day-health.sh";Args=@("us");Limit="PT30M"}
+ @{Name="PB1 US Prep WSL";Days=$usEveningDays;Time=(Get-UsKstTime "21:30");Script="$base/run-us-prep.sh";Args=@();Limit="PT2H"}, @{Name="PB1 US Prep Recovery WSL";Days=$usEveningDays;Time=(Get-UsKstTime "22:10");Script="$base/run-us-prep-recovery.sh";Args=@();Limit="PT1H"}, @{Name="PB1 US AM Preflight WSL";Days=$usEveningDays;Time=(Get-UsKstTime "22:20");Script="$base/check-us-prep-before-am.sh";Args=@();Limit="PT30M"}, @{Name="PB1 US AM WSL";Days=$usEveningDays;Time=(Get-UsKstTime "22:30");Script="$base/run-us-am.sh";Args=@();Limit="PT5H"}, @{Name="PB1 US Afternoon WSL";Days=$usMorningDays;Time=(Get-UsKstTime "02:00");Script="$base/run-us-afternoon.sh";Args=@();Limit="PT5H"}, @{Name="PB1 US Close WSL";Days=$usMorningDays;Time=(Get-UsKstTime "05:05");Script="$base/run-us-close.sh";Args=@();Limit="PT1H"}, @{Name="PB1 US Mail WSL";Days=$usMorningDays;Time=(Get-UsKstTime "06:00");Script="$base/send-us-log-mail.sh";Args=@();Limit="PT1H"}, @{Name="PB1 US Health WSL";Days=$usMorningDays;Time=(Get-UsKstTime "06:10");Script="$base/check-nullim-day-health.sh";Args=@("us");Limit="PT30M"}
 )
 & $wsl -d $Distro -- bash -lc "cd '$Repo' && bash scripts/wsl/install-nullim-cron.sh"; if ($LASTEXITCODE -ne 0) { throw "WSL NULLIM scheduler cleanup failed" }
 $canonical=@($defs|ForEach-Object Name);$repoMarker='Jeihyuck-rolling-k-auto-trade-KIS-refacored';$runnerMarker='run-kr-|run-us-|run_pb1_kr\.sh|send-(market|kr|us)-log-mail\.sh|check-nullim-day-health\.sh|pb1_runner|trade_session_runner'
@@ -58,7 +58,7 @@ $markerJson=[ordered]@{
   status='OK'
   scheduler_owner='WINDOWS_TASK_SCHEDULER'
   installed_commit_sha=$installSha
-  canonical_windows_tasks=16
+  canonical_windows_tasks=14
   noncanonical_windows_tasks=0
   forbidden_wsl_sources=0
   installed_at=[datetime]::UtcNow.ToString('o')
