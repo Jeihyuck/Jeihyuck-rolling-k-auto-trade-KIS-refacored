@@ -3399,6 +3399,49 @@ def reconcile_kis(
             except (TypeError, ValueError, OverflowError):
                 proof_reason = "INJECTED_FRESH_TIMESTAMP_MISSING_OR_INVALID"
                 fresh_balance_proven = False
+            if not fresh_balance_proven:
+                # 2026-11-18: an authentic injected balance became 22.684s
+                # old while DB reads were running. Never extend its 20s
+                # freshness allowance, and never infer freshness from the
+                # aged cached payload. Instead obtain a NEW KIS balance now.
+                # On API failure/invalid response the BUY gate remains closed.
+                stale_reason = proof_reason
+                try:
+                    refreshed = kis.get_balance_cached(force=True)
+                    if isinstance(refreshed, dict):
+                        ref_status = refreshed.get("rt_cd")
+                        ref_ok = ref_status is None or str(ref_status) == "0"
+                        ref_rows_ok = isinstance(refreshed.get("output1"), list)
+                        ref_summary_ok = bool(refreshed.get("output2"))
+                    else:
+                        ref_ok = ref_rows_ok = ref_summary_ok = False
+                    if ref_ok and ref_rows_ok and ref_summary_ok:
+                        snapshot = refreshed
+                        fresh_balance_proven = True
+                        broker_response_ok, has_holdings, has_summary = True, True, True
+                        proof_source = "FORCED_KIS_BALANCE_AFTER_STALE_INJECTION"
+                        proof_reason = "NEW_AUTHENTICATED_BROKER_RESPONSE"
+                        logger.info(
+                            "[KR_RECONCILE][INJECTED_STALE_REFRESH][RECOVERED] "
+                            "previous_reason=%s action=USE_NEW_KIS_BALANCE",
+                            stale_reason,
+                        )
+                    else:
+                        proof_reason = "FORCED_KIS_BALANCE_RESPONSE_INVALID"
+                        logger.warning(
+                            "[KR_RECONCILE][INJECTED_STALE_REFRESH][REJECTED] "
+                            "previous_reason=%s native_ok=%s holdings_valid=%s "
+                            "summary_valid=%s action=BLOCK_NEW_BUY",
+                            stale_reason, int(ref_ok), int(ref_rows_ok),
+                            int(ref_summary_ok),
+                        )
+                except Exception as refresh_exc:
+                    proof_reason = "FORCED_KIS_BALANCE_FETCH_FAILED"
+                    logger.warning(
+                        "[KR_RECONCILE][INJECTED_STALE_REFRESH][FAILED] "
+                        "previous_reason=%s error_type=%s action=BLOCK_NEW_BUY",
+                        stale_reason, type(refresh_exc).__name__,
+                    )
         logger.info(
             "[KR_RECONCILE][CURRENT_ONLY_BALANCE_PROVENANCE] source=%s fresh=%s "
             "reason=%s native_status_ok=%s holdings_type_valid=%s "
