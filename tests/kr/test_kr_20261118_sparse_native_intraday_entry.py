@@ -200,3 +200,44 @@ def test_sparse_native_signal_still_fails_pre_submit_if_limit_chases(monkeypatch
     )
     assert decision.ok is False
     assert decision.reason_codes == ["KR_ENTRY_TIMING_NOT_READY_OR_PRICE_TOO_HIGH"]
+
+
+def test_missing_opening_high_cannot_be_replaced_by_five_minute_high_for_breakout():
+    rows = sparse_opening_and_native_rebound()
+    decision = signal(
+        rows, style="ENTRY_BREAKOUT", trigger_ok=True, pivot=102.0,
+    )
+    assert decision["state"] == "UNKNOWN"
+    assert decision["reason"] == "OPENING_RANGE_HIGH_UNVERIFIED_FOR_BREAKOUT"
+    assert decision["opening_range_complete"] is False
+    assert decision["verified_pivot"] == 102.0
+
+
+def test_partial_momentum_breakout_requires_true_opening_high():
+    rows = sparse_opening_and_native_rebound()
+    # A real VWAP and native 8-bar window do not make the 09:00-09:29
+    # opening high known; use a same-day post-open series that surges above
+    # its preceding five bars, with a valid rising three-minute signal.
+    now = NOW
+    day = DAY
+    raw = []
+    for minute, (lo, close, hi, vol) in enumerate([
+        (96.0, 97.0, 97.5, 1000), (96.2, 97.0, 97.5, 1000),
+        (96.0, 97.0, 97.5, 1000), (96.3, 97.0, 97.5, 1000),
+        (96.0, 97.0, 97.5, 1000), (96.5, 97.3, 97.6, 1600),
+        (96.8, 98.0, 98.1, 1600), (97.2, 98.8, 99.0, 1600),
+    ]):
+        instant = BASE + timedelta(minutes=30 + minute)
+        raw.append({
+            "date": day, "time": instant.strftime("%H%M%S"),
+            "open": close, "high": hi, "low": lo,
+            "close": close, "volume": vol,
+        })
+    decision = signal(
+        rows[:16] + raw, style="ENTRY_MOMENTUM",
+        vwap=96.0, vwap_verified=True, trigger_ok=True,
+        order_price=98.8,
+    )
+    assert decision["state"] == "UNKNOWN"
+    assert decision["reason"] == "OPENING_RANGE_HIGH_UNVERIFIED_FOR_MOMENTUM_BREAKOUT"
+    assert decision["opening_range_complete"] is False
