@@ -197,8 +197,8 @@ def test_prior_filled_notional_must_not_regress(monkeypatch):
     assert engine.data == before
 
 
-def test_kodex_55215_decision_price_reaches_kis_as_55300_limit(monkeypatch):
-    """Submitted limit is exchange-tick-normalized, not a fabricated fill."""
+def test_kodex_55215_decision_price_remains_native_etf_55215_at_kis_submit(monkeypatch):
+    """ETF's legitimate 5-KRW tick must not be rounded to the stock 100-KRW tick."""
     import trader.kr.infinite.executor as executor_module
     from trader.kr.infinite.models import Decision, Action
     monkeypatch.setattr(executor_module, "is_order_accepted",
@@ -220,9 +220,11 @@ def test_kodex_55215_decision_price_reaches_kis_as_55300_limit(monkeypatch):
     decision = Decision(Action.BUY, reason="OWNER_BUY",
                         qty=13, notional=13 * intent_price)
     odno, response = executor.submit(decision, "122630")
-    assert received == [("122630", 13, 55300)]
+    assert received == [("122630", 13, 55215)]
     assert odno == "0000010702"
     assert response["rt_cd"] == "0"
+    # 55,300 in 11/18 historical evidence is preserved as the ACTUAL
+    # historical request. New code does not rewrite or guess prior fills.
     # KIS ACK confirms only acceptance, never a 13-share fill.
 
 
