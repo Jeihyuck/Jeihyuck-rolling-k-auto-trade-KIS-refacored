@@ -224,3 +224,24 @@ def test_kodex_55215_decision_price_reaches_kis_as_55300_limit(monkeypatch):
     assert odno == "0000010702"
     assert response["rt_cd"] == "0"
     # KIS ACK confirms only acceptance, never a 13-share fill.
+
+
+def test_too_large_economic_state_cannot_silently_consume_other_fill(monkeypatch):
+    """Quantity-CAS alone is insufficient if a different order raced us."""
+    from dataclasses import replace
+    engine, repo, state, intent, broker, _ = _fixture(monkeypatch)
+    before = deepcopy(engine.data)
+    bogus = replace(state, core_filled_notional=Decimal("1408953"))
+    with pytest.raises(RuntimeError, match="ECONOMIC_DELTA_MISMATCH"):
+        repo.persist_reconciliation(bogus, [(intent, broker)])
+    assert engine.data == before
+
+
+def test_unit_sequence_consistent_with_exactly_one_confirmed_buy(monkeypatch):
+    from dataclasses import replace
+    engine, repo, state, intent, broker, _ = _fixture(monkeypatch)
+    before = deepcopy(engine.data)
+    bogus = replace(state, units_used=3)
+    with pytest.raises(RuntimeError, match="ECONOMIC_DELTA_MISMATCH"):
+        repo.persist_reconciliation(bogus, [(intent, broker)])
+    assert engine.data == before
