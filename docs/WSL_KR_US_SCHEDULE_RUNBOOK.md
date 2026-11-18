@@ -32,7 +32,7 @@ powershell -ExecutionPolicy Bypass -File scripts/windows/update-nullim-scheduler
 powershell -ExecutionPolicy Bypass -File scripts/windows/verify-scheduler.ps1 -Repo "/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored"
 ```
 
-Success is `canonical_windows_tasks=16`, `noncanonical_windows_tasks=0`, and `forbidden_wsl_sources=0`.
+Success is `canonical_windows_tasks=14`, `noncanonical_windows_tasks=0`, and `forbidden_wsl_sources=0`.
 
 ## PR #76 follow-up hardening
 
@@ -101,9 +101,9 @@ failure. The archive SHA-256 and source-evidence SHA-256 are recorded separately
 ### Administrator deployment gate and rollback
 
 Do not merge/deploy until the `windows-latest` PowerShell parser succeeds. On the actual Windows
-host, export the existing 16 task XML definitions, run `update-nullim-scheduler.ps1`, then run
+host, export the existing 14 task XML definitions, run `update-nullim-scheduler.ps1`, then run
 `verify-scheduler.ps1`. Review every emitted `CONFIG_OK`/`LAST_RUN_*` state, the installed/current
-SHA values, `canonical_windows_tasks=16`, `noncanonical_windows_tasks=0`, and
+SHA values, `canonical_windows_tasks=14`, `noncanonical_windows_tasks=0`, and
 `forbidden_wsl_sources=0`. Perform KR and US dry-run fixture packaging, then one real test mail per
 market. A repository pull alone never updates registered tasks.
 
