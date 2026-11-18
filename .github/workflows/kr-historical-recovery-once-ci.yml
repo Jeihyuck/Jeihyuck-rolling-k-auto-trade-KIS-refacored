@@ -9,6 +9,7 @@ on:
       - "trader/kr/historical_recovery_journal.py"
       - "trader/kr/close_historical_reconcile.py"
       - "tests/kr/test_kr_historical_recovery*.py"
+      - "tests/kr/test_kr_20261109_historical_debt_isolation.py"
       - "tests/kr/test_kr_balance_freshness_provenance_20261106.py"
       - "scripts/kr_20261027_293490_readonly_proof.py"
       - "trader/kr/reconcile_guard_classification.py"
@@ -87,7 +88,8 @@ jobs:
             tests/kr/test_kr_balance_freshness_provenance_20261106.py \
             tests/kr/test_kr257_sell_first_runner_integration.py \
             tests/kr/test_kr_20261027_broker_readonly_proof.py \
-            tests/kr/test_kr_reconcile_guard_classification_20261106.py
+            tests/kr/test_kr_reconcile_guard_classification_20261106.py \
+            tests/kr/test_kr_20261109_historical_debt_isolation.py
       - name: After PR327 merge verify exact Final30 parity still holds
         run: |
           python -m pytest -q tests/kr/test_kr_final30_db_file_parity_p0_20261106.py
