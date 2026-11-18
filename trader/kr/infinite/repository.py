@@ -352,15 +352,30 @@ class InfiniteRepository:
             if is_postgres:
                 # Lock the economic state first, consistently across workers.
                 locked_state = conn.execute(text("""
-                    SELECT version,cycle_id FROM kr_infinite_state
+                    SELECT version,cycle_id,
+                           units_used,core_filled_notional,reserve_filled_notional,
+                           status
+                    FROM kr_infinite_state
                     WHERE trading_epoch_id=:epoch_id
                       AND strategy_id='KR_INFINITE_V1' AND symbol='122630'
                     FOR UPDATE
                 """), {"epoch_id": epoch_id}).mappings().first()
                 if (not locked_state
-                        or str(locked_state["cycle_id"] or "") != str(state.cycle_id or "")
-                        or int(locked_state["version"]) != int(state.version)):
+                        or str(locked_state["cycle_id"] or "") != str(state.cycle_id or "")):
                     raise RuntimeError("KR_INF_RECONCILE_STATE_RACE_RELOAD")
+                # Earlier market/submit lifecycle save_state() operations in
+                # THIS tick legitimately advanced the DB version without
+                # modifying the immutable caller's State.version. Therefore a
+                # strict version == state.version check would block every
+                # post-submit fill. Guard non-regressing economics here; the
+                # locked intent's original cumulative snapshot below provides
+                # the exact compare-and-swap of economic fill application.
+                if (int(state.units_used) < int(locked_state["units_used"])
+                        or money(state.core_filled_notional) < money(locked_state["core_filled_notional"])
+                        or money(state.reserve_filled_notional) < money(locked_state["reserve_filled_notional"])
+                        or (str(locked_state["status"]).upper() == "FROZEN"
+                            and state.status != Status.FROZEN)):
+                    raise RuntimeError("KR_INF_RECONCILE_ECONOMIC_STATE_REGRESSION")
 
             seen_ids = set()
             for intent, broker in updates:
@@ -428,7 +443,8 @@ class InfiniteRepository:
                     else previous_qty if previous_qty > 0 else None
                 )
                 persisted_notional = (
-                    cumulative_notional if is_postgres else broker.filled_notional_krw
+                    cumulative_notional if is_postgres or broker.filled_qty is None
+                    else broker.filled_notional_krw
                 )
                 conn.execute(text("""UPDATE kr_infinite_order_intents
                     SET status=:status,filled_qty=:qty,
