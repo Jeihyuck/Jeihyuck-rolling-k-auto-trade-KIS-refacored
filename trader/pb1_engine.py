@@ -8209,11 +8209,23 @@ class PB1Engine:
                     # pending/unattributed original SELL.
                     self._session_sell_blocked_codes.pop(str(code).zfill(6), None)
                     self._session_sell_accepted_codes.pop(str(code).zfill(6), None)
+                    # The third same-session fence must follow the very same
+                    # proven partial -> next-stage decision.
+                    submitted = getattr(self, "session_exit_submitted_codes", None)
+                    if isinstance(submitted, set):
+                        submitted.discard(str(code).zfill(6))
+                        submitted.discard(self._display_code(code))
                     continue
                 if (prior_completed and prior_balance_proven and prior_stage and exit_stage
                         and legal_next_exit_stage(prior_stage, exit_stage)):
                     self._session_sell_blocked_codes.pop(str(code).zfill(6), None)
                     self._session_sell_accepted_codes.pop(str(code).zfill(6), None)
+                    # The third same-session fence must follow the very same
+                    # proven partial -> next-stage decision.
+                    submitted = getattr(self, "session_exit_submitted_codes", None)
+                    if isinstance(submitted, set):
+                        submitted.discard(str(code).zfill(6))
+                        submitted.discard(self._display_code(code))
                     continue
             # Pending/full-exit orders block regardless of a changing reason.
             logger.info("[SELL_SESSION_BLOCK][DURABLE_SKIP] code=%s cycle=%s prior_order_id=%s",
