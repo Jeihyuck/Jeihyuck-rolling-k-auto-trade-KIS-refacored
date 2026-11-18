@@ -131,3 +131,72 @@ def test_policy_will_not_use_fake_previous_date_native_minutes():
         row["date"] = "20261117"
     decision = signal(rows)
     assert decision["state"] != "READY_SHADOW"
+
+
+def test_16_native_bars_reach_actual_pb1_pre_submit_gate(monkeypatch):
+    """An independently proven entry reaches PB1's real final timing fence.
+
+    No fake broker acceptance is claimed: this test is strictly the native
+    timing -> existing order-pre-submit boundary, with no KIS IO.
+    """
+    from types import SimpleNamespace
+    import trader.pb1_engine as pb1
+
+    rows = sparse_opening_and_native_rebound()
+    monkeypatch.setenv("KR_PB1_ENTRY_TIMING_MODE", "ENFORCE")
+    monkeypatch.setenv("KR_PB1_ENTRY_TIMING_APPROVED", "1")
+    monkeypatch.setattr(pb1, "now_kst", lambda: NOW)
+    def native_16(**kwargs):
+        assert kwargs["style"] == "ENTRY_PULLBACK"
+        return evaluate_price_aware_entry(
+            style=kwargs["style"], rows=rows, now=NOW,
+            vwap=None, vwap_verified=False, pivot=None,
+            trigger_ok=False, setup_ok=kwargs["setup_ok"],
+            order_price=kwargs["order_price"],
+        )
+    monkeypatch.setattr(pb1, "evaluate_proof_for_candidate", native_16)
+    engine = pb1.PB1Engine.__new__(pb1.PB1Engine)
+    engine.env = "practice"
+    engine._now_kst = NOW
+    candidate = SimpleNamespace(
+        code="093320", setup_ok=True,
+        features={"entry_style_selected": "ENTRY_PULLBACK",
+                  "setup_ok": True, "trigger_ok": False},
+    )
+    decision = engine._resolve_entry_pre_submit(
+        cf=candidate, stage="PB1-AM",
+        order_price=103.5, order_type="LIMIT",
+    )
+    assert decision.ok is True, decision
+    assert candidate.features["entry_timing_evidence"]["opening_count"] == 16
+    assert candidate.features["entry_timing_evidence"]["state"] == "READY_SHADOW"
+    assert candidate.features["entry_timing_evidence"]["is_order_authorization"] is False
+
+
+def test_sparse_native_signal_still_fails_pre_submit_if_limit_chases(monkeypatch):
+    from types import SimpleNamespace
+    import trader.pb1_engine as pb1
+    monkeypatch.setenv("KR_PB1_ENTRY_TIMING_MODE", "ENFORCE")
+    monkeypatch.setenv("KR_PB1_ENTRY_TIMING_APPROVED", "1")
+    monkeypatch.setattr(pb1, "now_kst", lambda: NOW)
+    monkeypatch.setattr(
+        pb1, "evaluate_proof_for_candidate",
+        lambda **kwargs: signal(
+            sparse_opening_and_native_rebound(),
+            order_price=kwargs["order_price"],
+        ),
+    )
+    engine = pb1.PB1Engine.__new__(pb1.PB1Engine)
+    engine.env = "practice"
+    engine._now_kst = NOW
+    candidate = SimpleNamespace(
+        code="093320", setup_ok=True,
+        features={"entry_style_selected": "ENTRY_PULLBACK",
+                  "setup_ok": True, "trigger_ok": False},
+    )
+    decision = engine._resolve_entry_pre_submit(
+        cf=candidate, stage="PB1-AM",
+        order_price=105.0, order_type="LIMIT",
+    )
+    assert decision.ok is False
+    assert decision.reason_codes == ["KR_ENTRY_TIMING_NOT_READY_OR_PRICE_TOO_HIGH"]
