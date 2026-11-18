@@ -159,6 +159,9 @@ def test_16_native_bars_reach_actual_pb1_pre_submit_gate(monkeypatch):
     engine.env = "practice"
     engine.STRATEGY_NAME = "pb1_pullback_close"
     engine._now_kst = NOW
+    # __new__ intentionally skips heavyweight market-data name-map bootstrap;
+    # the display name is unrelated to the real timing verdict under test.
+    engine._display_code = lambda code: str(code).zfill(6)
     # The real timing evaluator must run before these *independently mocked*
     # ledger / risk / submit gates. A timing-only unit test cannot claim a
     # broker order or fill, and must not access an uninitialized DB repo.
