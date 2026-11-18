@@ -222,13 +222,13 @@ def _evaluate_verified_intraday_window(
         "opening_range_complete": False,
         "reference_source": "KIS_NATIVE_POST_OPENING_5_PLUS_3",
     }
-    if len(after_open) < 8:
-        return _result("WAIT", "POST_OPENING_NATIVE_WINDOW_PENDING", **proof)
     window = after_open[-8:]
     stamps = [datetime.fromisoformat(bar["timestamp"]) for bar in window]
     if any((right - left).total_seconds() != 60
            for left, right in zip(stamps, stamps[1:])):
         return _result("UNKNOWN", "POST_OPENING_NATIVE_WINDOW_GAP", **proof)
+    if len(window) < 8:
+        return _result("WAIT", "POST_OPENING_NATIVE_WINDOW_PENDING", **proof)
     current = window[-1]
     if (now - stamps[-1]).total_seconds() > 180:
         return _result("UNKNOWN", "COMPLETED_BAR_STALE", **proof)
