@@ -263,3 +263,25 @@ def test_price_unresolved_sell_quantity_can_settle_without_fabricating_proceeds(
     assert engine.data["intent"]["filled_qty"] == 3
     assert engine.data["intent"]["filled_notional_krw"] == Decimal("0")
     assert engine.data["state"]["core_filled_notional"] == Decimal("690052")
+
+
+def test_fractional_etf_owner_limit_never_truncates_before_tick(monkeypatch):
+    """An owner 55215.1 limit must be rounded UP to 55220, not DOWN to 55215."""
+    import trader.kr.infinite.executor as executor_module
+    from trader.kr.infinite.models import Decision, Action
+    monkeypatch.setattr(executor_module, "is_order_accepted",
+                        lambda response, **kwargs: response.get("rt_cd") == "0")
+    monkeypatch.setattr(executor_module, "extract_order_no",
+                        lambda response: response["output"]["ODNO"])
+    seen = []
+
+    class FakeKIS:
+        def buy_stock_limit(self, symbol, qty, price):
+            seen.append((symbol, qty, price))
+            return {"rt_cd": "0", "output": {"ODNO": "SYNTHETIC"}}
+
+    decision = Decision(
+        Action.BUY, reason="SYNTHETIC", qty=2, notional=2 * 55215.1,
+    )
+    executor_module.KISExecutor(FakeKIS(), "practice").submit(decision, "122630")
+    assert seen == [("122630", 2, 55220)]
