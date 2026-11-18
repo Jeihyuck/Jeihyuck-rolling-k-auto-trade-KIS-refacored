@@ -194,3 +194,32 @@ def test_prior_filled_notional_must_not_regress(monkeypatch):
     with pytest.raises(RuntimeError, match="ECONOMIC_STATE_REGRESSION"):
         repo.persist_reconciliation(state, [(intent, broker)])
     assert engine.data == before
+
+
+def test_kodex_55215_decision_price_reaches_kis_as_55300_limit(monkeypatch):
+    """Submitted limit is exchange-tick-normalized, not a fabricated fill."""
+    import trader.kr.infinite.executor as executor_module
+    from trader.kr.infinite.models import Decision, Action
+    monkeypatch.setattr(executor_module, "is_order_accepted",
+                        lambda response, **kwargs: response["rt_cd"] == "0")
+    monkeypatch.setattr(executor_module, "extract_order_no",
+                        lambda response: response["output"]["ODNO"])
+    received = []
+
+    class FakeKIS:
+        def buy_stock_limit(self, symbol, qty, price):
+            received.append((symbol, qty, price))
+            return {"rt_cd": "0", "output": {"ODNO": "0000010702"}}
+
+        def sell_stock(self, *_args, **_kwargs):
+            raise AssertionError("must never place a SELL")
+
+    executor = executor_module.KISExecutor(FakeKIS(), "practice")
+    intent_price = 55215
+    decision = Decision(Action.BUY, reason="OWNER_BUY",
+                        qty=13, notional=13 * intent_price)
+    odno, response = executor.submit(decision, "122630")
+    assert received == [("122630", 13, 55300)]
+    assert odno == "0000010702"
+    assert response["rt_cd"] == "0"
+    # KIS ACK confirms only acceptance, never a 13-share fill.
