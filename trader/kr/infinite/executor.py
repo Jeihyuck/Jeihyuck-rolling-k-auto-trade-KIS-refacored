@@ -267,9 +267,18 @@ class KISExecutor:
             None,
         )
         try:
-            qty = int(float(qty_raw)) if qty_raw is not None else None
-        except (TypeError, ValueError):
+            native_qty = Decimal(str(qty_raw)) if qty_raw is not None else None
+            qty = (
+                int(native_qty)
+                if native_qty is not None
+                and native_qty.is_finite()
+                and native_qty == native_qty.to_integral_value()
+                else None
+            )
+        except (InvalidOperation, TypeError, ValueError, OverflowError):
             qty = None
+        # Native executed share count must be an exact nonnegative integer;
+        # int(float(...)) would accept 13.5 -> 13 as confirmed execution.
         if qty is None or qty < 0 or qty > int(intent.requested_qty or 0):
             return BrokerOrderState("RECONCILE_PENDING")
         # Native KIS total executed amount is a more exact economic
