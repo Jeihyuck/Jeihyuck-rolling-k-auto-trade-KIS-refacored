@@ -12,6 +12,12 @@ on:
       - "trader/kr/broker_truth_hardening.py"
       - "trader/kr/infinite/runner.py"
       - "trader/kr/infinite/executor.py"
+      - "trader/kr/infinite/repository.py"
+      - "trader/kr_price_utils.py"
+      - "tests/kr/infinite/test_20261118_etf_tick_contract.py"
+      - "tests/kr/infinite/test_20261118_atomic_fill_journal.py"
+      - "tests/kr/test_kr_20261118_sparse_native_intraday_entry.py"
+      - "tests/test_kr_order_price_guardrails.py"
       - "tests/kr/infinite/test_runner_integration.py"
       - "trader/reconcile_kis.py"
       - "tests/kr/test_kr_pb1_current_only_original_balance_proof.py"
@@ -51,7 +57,7 @@ jobs:
         run: |
           python -m py_compile trader/kr/entry_priority_queue.py trader/kr/kis_observer_budget.py \
             trader/kr/opening_bar_contract.py trader/kis_wrapper.py trader/pb1_engine.py scripts/kr_opening_observer.py \
-            trader/kr/broker_truth_hardening.py trader/reconcile_kis.py trader/pb1_runner.py trader/kr/infinite/runner.py trader/kr/infinite/executor.py
+            trader/kr/broker_truth_hardening.py trader/reconcile_kis.py trader/pb1_runner.py trader/kr/infinite/runner.py trader/kr/infinite/executor.py trader/kr/infinite/repository.py
           bash -n scripts/wsl/kr-entry-timing-activation.sh scripts/wsl/run-kr-am.sh scripts/wsl/run-kr-afternoon.sh
       - name: Native minute offline incident & integration regressions
         run: |
@@ -65,6 +71,10 @@ jobs:
             tests/kr/test_kr_broker_truth_hardening.py \
             tests/kr/infinite/test_v3_contract.py \
             tests/kr/infinite/test_runner_integration.py \
+            tests/kr/infinite/test_20261118_atomic_fill_journal.py \
+            tests/kr/infinite/test_20261118_etf_tick_contract.py \
+            tests/kr/test_kr_20261118_sparse_native_intraday_entry.py \
+            tests/test_kr_order_price_guardrails.py \
             tests/kr/test_kr_pb1_kis_http_audit.py \
             tests/kr/test_kr_session_metrics_accumulator.py \
             tests/kr/test_kr_balance_freshness_provenance_20261106.py \

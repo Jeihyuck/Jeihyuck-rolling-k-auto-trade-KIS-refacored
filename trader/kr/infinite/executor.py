@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 from datetime import date
+from decimal import Decimal, InvalidOperation
 from typing import Any
+import logging
+
+from trader.kr_price_utils import normalize_kr_etf_order_price
 
 from trader.kis_wrapper import extract_order_no, is_order_accepted
 
 from .models import Action, BrokerOrderState, BrokerPosition, Decision, OrderIntent
+
+logger = logging.getLogger(__name__)
 
 
 class KISExecutor:
@@ -74,7 +80,30 @@ class KISExecutor:
 
     def submit(self, decision: Decision, symbol: str) -> tuple[str | None, dict]:
         if decision.action in {Action.BUY, Action.RECOVERY}:
-            response = self.kis.buy_stock_limit(symbol, decision.qty, int(decision.notional / decision.qty))
+            if int(decision.qty or 0) <= 0:
+                raise ValueError("KR_INF_BUY_QTY_INVALID")
+            # KIS's buy_stock_limit() uses the same dedicated ETF tick.
+            # Pre-normalize here with the same shared tick function so the
+            # exact submitted LIMIT is observable and is reproducible from
+            # the immutable decision price stored in the intent journal.
+            # This does not relax entry/capital policy or change the order.
+            intended_price = float(decision.notional) / int(decision.qty)
+            # The tick normalizer itself rounds UP. Truncating a fractional
+            # owner LIMIT first could undercut the actual owner reference:
+            # 55,215.1 would incorrectly become 55,215 instead of 55,220.
+            submit_price, tick_size = normalize_kr_etf_order_price(
+                intended_price, side="BUY",
+            )
+            if submit_price <= 0:
+                raise ValueError("KR_INF_SUBMIT_PRICE_INVALID")
+            logger.info(
+                "[KR_INF][BUY_LIMIT_PRICE] symbol=%s qty=%s decision_price=%.8f "
+                "kis_submit_price=%s tick_size=%s "
+                "price_source=DECISION_NOTIONAL_ETF_TICK_NORMALIZED",
+                symbol, decision.qty, intended_price,
+                submit_price, tick_size,
+            )
+            response = self.kis.buy_stock_limit(symbol, decision.qty, submit_price)
         elif decision.action in {Action.SELL_PARTIAL, Action.SELL_ALL}:
             response = self.kis.sell_stock(symbol, decision.qty)
         else:
@@ -111,17 +140,24 @@ class KISExecutor:
         if delta == 0:
             return None
         status = "FILLED" if delta >= int(intent.requested_qty or 0) else "PARTIALLY_FILLED"
-        fill_avg = None
-        fill_notional = 0.0
         if intent.side in {"BUY", "RECOVERY"}:
-            pre_avg = float(metadata.get("pre_order_avg_price") or 0.0)
-            post_cost = post_avg * post_qty
-            pre_cost = pre_avg * pre_qty
-            fill_notional = max(0.0, post_cost - pre_cost)
-            fill_avg = (fill_notional / delta) if delta > 0 and fill_notional > 0 else (post_avg or None)
-            if fill_notional <= 0 and fill_avg:
-                fill_notional = float(fill_avg) * delta
-        return BrokerOrderState(status, delta, fill_notional, fill_avg)
+            # Holding delta can support a *quantity discrepancy* diagnostic,
+            # but post-trade average cost is not an exact execution-price/
+            # notional receipt for this original KIS order (other purchases,
+            # fees, or corrections can affect the holdings average). Never
+            # manufacture a confirmed 13-share cash amount from that delta.
+            # Keep the original unresolved order fenced until KIS original
+            # fill price evidence or an explicitly approved repair exists.
+            logger.warning(
+                "[KR_INF][BALANCE_ONLY_BUY_FILL][UNVERIFIED_PRICE] "
+                "order_id=%s cycle=%s observed_delta_qty=%s "
+                "action=RECONCILE_PENDING_NO_SYNTHETIC_CASH",
+                intent.broker_order_id, intent.cycle_id, delta,
+            )
+            return BrokerOrderState("RECONCILE_PENDING")
+        # SELL quantity may still be proven for risk cleanup after daily-ccld
+        # failure, but no realized proceeds or fill price are fabricated.
+        return BrokerOrderState(status, delta, 0.0, None)
 
     def _historical_unchanged_balance_expiry(
         self, intent: OrderIntent, *, lookup_date: date, trade_date: date
@@ -157,19 +193,114 @@ class KISExecutor:
             return None
         return BrokerOrderState("EXPIRED", 0)
 
+    def _original_daily_ccld_pages(self, order_date: date) -> dict | None:
+        """Return bounded *complete* KIS pages for the original order day.
+
+        Continuation calls happen only when KIS explicitly supplies a
+        continuation cursor. A failed page, repeated cursor or unbounded
+        history cannot become false no-order/fill proof. Protect all other
+        KIS data/order traffic with a strict maximum of three pages.
+        """
+        query_day = order_date.strftime("%Y%m%d")
+        fk = nk = ""
+        cursors: set[tuple[str, str]] = set()
+        rows: list[dict] = []
+        for page in range(1, 4):
+            try:
+                raw = self.kis.inquire_daily_ccld(
+                    start_date=query_day,
+                    end_date=query_day,
+                    **({"ctx_area_fk100": fk, "ctx_area_nk100": nk}
+                       if page > 1 else {}),
+                )
+            except Exception:
+                # First-page HTTP failure means original order history is
+                # UNAVAILABLE, not an incomplete pagination cursor. Preserve
+                # the established old-day unchanged-balance SELL expiry proof
+                # only for this distinct condition.
+                return {"_kr_inf_first_page_unavailable": True} if page == 1 else None
+            if (not isinstance(raw, dict)
+                    or raw.get("_diag_stub") or raw.get("_stub")
+                    or raw.get("_ccld_status")
+                    or str(raw.get("_fill_source") or "").lower()
+                    == "daily_ccld_fail_open"
+                    or raw.get("rt_cd") not in (None, "0", 0)):
+                return {"_kr_inf_first_page_unavailable": True} if page == 1 else None
+            chunk = raw.get("output1") or raw.get("output") or []
+            if isinstance(chunk, dict):
+                chunk = [chunk]
+            if not isinstance(chunk, list) or any(
+                not isinstance(item, dict) for item in chunk
+            ):
+                return None
+            rows.extend(chunk)
+            meta = raw.get("_response_meta") or {}
+            # A missing tr_cont header means no continuation is signalled.
+            # str(None) becomes "NONE" and otherwise rejects every valid
+            # single-page broker response lacking _response_meta.
+            cont = str(
+                (meta.get("tr_cont") or "") if isinstance(meta, dict) else ""
+            ).strip().upper()
+            if cont not in {"", "F", "M", "D", "E"}:
+                return None
+            next_fk = str(raw.get("ctx_area_fk100")
+                          or raw.get("CTX_AREA_FK100") or "").strip()
+            next_nk = str(raw.get("ctx_area_nk100")
+                          or raw.get("CTX_AREA_NK100") or "").strip()
+            if cont in {"D", "E"} or (
+                not cont and not next_fk and not next_nk
+            ):
+                return {"rt_cd": "0", "output1": rows,
+                        "_kr_inf_ccld_verified_pages": page}
+            if not next_fk and not next_nk:
+                return None
+            cursor = (next_fk, next_nk)
+            if cursor in cursors:
+                return None
+            cursors.add(cursor)
+            fk, nk = cursor
+        logger.warning(
+            "[KR_INF][KIS_CCLD_PAGINATION_LIMIT] day=%s pages=3 "
+            "action=RECONCILE_PENDING",
+            query_day,
+        )
+        return None
+
     def order_state(self, intent: OrderIntent, trade_date: date) -> BrokerOrderState:
         # Reconcile against the order's original trading day, not the current
         # session day. Domestic day orders do not migrate to a later trade date;
         # using today's date can make an old SELL stay RECONCILE_PENDING forever.
         lookup_date = intent.trade_date or trade_date
-        try:
-            raw = self.kis.inquire_daily_ccld(
-                start_date=lookup_date.strftime("%Y%m%d"),
-                end_date=lookup_date.strftime("%Y%m%d"),
-            )
-        except Exception:
-            raw = None
-        rows = (raw.get("output1") or raw.get("output") or []) if isinstance(raw, dict) else []
+        raw = self._original_daily_ccld_pages(lookup_date)
+        first_page_unavailable = bool(
+            isinstance(raw, dict)
+            and raw.get("_kr_inf_first_page_unavailable") is True
+        )
+        if raw is None or first_page_unavailable:
+            # A failed first page is NOT evidence of no broker execution.
+            # A partial/incomplete subsequent page is never order-expiry
+            # evidence. Keep unknown BUY cash and duplicate submissions fenced.
+            if intent.side in {"SELL_PARTIAL", "SELL_ALL"} and str(
+                intent.broker_order_id or ""
+            ).strip():
+                try:
+                    balance_proof = self._balance_delta_state(intent)
+                except Exception:
+                    balance_proof = None
+                if balance_proof is not None:
+                    return balance_proof
+                # Existing legacy contract: an old domestic day SELL that
+                # still shows exactly the immutable pre-order holding count
+                # can expire *only* when the first KIS page was unavailable;
+                # NEVER when any pagination page was incomplete.
+                if first_page_unavailable:
+                    historical_expiry = self._historical_unchanged_balance_expiry(
+                        intent, lookup_date=lookup_date, trade_date=trade_date,
+                    )
+                    if historical_expiry is not None:
+                        return historical_expiry
+            return BrokerOrderState("RECONCILE_PENDING")
+        rows = raw["output1"]
         if intent.broker_order_id:
             matches = [item for item in rows if str(item.get("odno") or item.get("ODNO") or item.get("ord_no") or "") == intent.broker_order_id]
         else:
@@ -184,6 +315,38 @@ class KISExecutor:
             if len(matches) > 1:
                 raise RuntimeError("KR_INF_PENDING_ORDER_AMBIGUOUS")
         row = matches[0] if len(matches) == 1 else None
+        if row is not None:
+            # A broker order number alone is not owner/symbol proof. KIS
+            # order numbers can be reused across dates/accounts; we query
+            # the original trade date and additionally reject any explicit
+            # conflicting native symbol or BUY/SELL side evidence.
+            native_symbol = str(
+                row.get("pdno") or row.get("code") or row.get("symbol") or ""
+            ).strip().removeprefix("A")
+            if native_symbol and native_symbol != "122630":
+                logger.error(
+                    "[KR_INF][BROKER_ORDER_IDENTITY_MISMATCH] "
+                    "order=%s expected_symbol=122630 observed_symbol=%s "
+                    "action=RECONCILE_PENDING",
+                    intent.broker_order_id, native_symbol,
+                )
+                return BrokerOrderState("RECONCILE_PENDING")
+            native_side_raw = str(
+                row.get("sll_buy_dvsn_cd") or row.get("side")
+                or row.get("sll_buy_dvsn_name") or ""
+            ).strip().upper()
+            sides = {"01": "SELL", "02": "BUY",
+                     "SELL": "SELL", "BUY": "BUY",
+                     "매도": "SELL", "매수": "BUY"}
+            expected_side = "BUY" if intent.side in {"BUY", "RECOVERY"} else "SELL"
+            if native_side_raw and sides.get(native_side_raw) != expected_side:
+                logger.error(
+                    "[KR_INF][BROKER_ORDER_SIDE_MISMATCH] "
+                    "order=%s expected=%s observed=%s "
+                    "action=RECONCILE_PENDING",
+                    intent.broker_order_id, expected_side, native_side_raw,
+                )
+                return BrokerOrderState("RECONCILE_PENDING")
         if row is None:
             balance_proof = self._balance_delta_state(intent)
             if balance_proof is not None:
@@ -199,21 +362,59 @@ class KISExecutor:
             None,
         )
         try:
-            qty = int(float(qty_raw)) if qty_raw is not None else None
-        except (TypeError, ValueError):
+            native_qty = Decimal(str(qty_raw)) if qty_raw is not None else None
+            qty = (
+                int(native_qty)
+                if native_qty is not None
+                and native_qty.is_finite()
+                and native_qty == native_qty.to_integral_value()
+                else None
+            )
+        except (InvalidOperation, TypeError, ValueError, OverflowError):
             qty = None
-        avg = float(row.get("avg_prvs") or row.get("avg_price") or row.get("ccld_unpr") or 0)
-        if qty is None:
+        # Native executed share count must be an exact nonnegative integer;
+        # int(float(...)) would accept 13.5 -> 13 as confirmed execution.
+        if qty is None or qty < 0 or qty > int(intent.requested_qty or 0):
             return BrokerOrderState("RECONCILE_PENDING")
+        # Native KIS total executed amount is a more exact economic
+        # receipt than qty * a rounded average. Neither an order LIMIT
+        # nor a changed holdings average may replace missing fill cash.
+        total_field = row.get("tot_ccld_amt")
+        avg_field = next(
+            (row[key] for key in ("avg_prvs", "avg_price", "ccld_unpr")
+             if row.get(key) not in (None, "")),
+            None,
+        )
+        total = Decimal("0")
+        avg = None
+        if qty > 0:
+            try:
+                if total_field not in (None, ""):
+                    total = Decimal(str(total_field))
+                    if not total.is_finite() or total <= 0:
+                        raise ValueError("NONPOSITIVE_NATIVE_CCLD_AMOUNT")
+                    avg = total / Decimal(qty)
+                elif avg_field not in (None, ""):
+                    avg = Decimal(str(avg_field))
+                    if not avg.is_finite() or avg <= 0:
+                        raise ValueError("NONPOSITIVE_NATIVE_CCLD_AVERAGE")
+                    total = avg * Decimal(qty)
+                else:
+                    raise ValueError("KIS_CCLD_NO_NATIVE_CASH_PROOF")
+            except (InvalidOperation, TypeError, ValueError, OverflowError):
+                logger.warning(
+                    "[KR_INF][KIS_FILL_CASH_UNVERIFIED] "
+                    "order=%s date=%s qty=%s action=RECONCILE_PENDING",
+                    intent.broker_order_id, lookup_date, qty,
+                )
+                return BrokerOrderState("RECONCILE_PENDING")
         if qty >= intent.requested_qty:
             status = "FILLED"
         elif qty > 0:
-            # A historical partial fill needs explicit lifecycle review; do not
-            # silently advance TP stage or create a replacement SELL.
+            # The original partial fill remains a durable pending fence.
             status = "PARTIALLY_FILLED"
         elif lookup_date < trade_date:
-            # A zero-fill domestic day order cannot remain live overnight.
             status = "EXPIRED"
         else:
             status = "PENDING"
-        return BrokerOrderState(status, qty, qty * avg, avg or None)
+        return BrokerOrderState(status, qty, total, float(avg) if avg else None)

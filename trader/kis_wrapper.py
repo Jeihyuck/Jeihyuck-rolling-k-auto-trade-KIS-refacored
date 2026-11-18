@@ -50,7 +50,7 @@ from trader.rate_limit import get_kis_gate
 from trader.cache_ttl import price_cache, PRICE_SNAPSHOT_TTL_SEC
 from trader.marketdata.kis_ws_price import get_kis_ws_price_service
 from trader.eventlog import emit_event
-from trader.kr_price_utils import krx_tick, normalize_kr_order_price
+from trader.kr_price_utils import krx_tick, normalize_kr_order_price, normalize_kr_etf_order_price
 
 logger = logging.getLogger(__name__)
 
@@ -3669,8 +3669,20 @@ class KisAPI:
                 if not _kr_sleep_with_budget(random.uniform(0.0, _PRICE_JITTER_MAX_SEC)):
                     return {}
 
-            # 5) 기존 get_price_quote 호출
-            data = self.get_price_quote(code, diag_mode=False, attempts=2)
+            # 5) Canonical KR six-digit quotes must never fan out to the
+            # generic legacy U-market / A-prefixed alternatives. The latter
+            # generated OPSQ2001 invalid market-code replies during native
+            # minute observation, wasting the shared KIS API budget.
+            domestic_code = str(code or "").strip().removeprefix("A")
+            canonical_kr = (
+                str(market or "").upper() == "J"
+                and len(domestic_code) == 6 and domestic_code.isdigit()
+            )
+            data = self.get_price_quote(
+                domestic_code if canonical_kr else code,
+                diag_mode=False, attempts=2,
+                retry_cap=2 if canonical_kr else None,
+            )
 
             # 6) EGW002 guard (초당 제한)
             msg_cd = str(data.get("msg_cd", ""))
@@ -5276,7 +5288,15 @@ class KisAPI:
     def buy_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
         from trader.config import get_live_gate_status_fresh
         raw_price = float(price or 0)
-        normalized_price, tick_size = _normalize_kr_order_price(raw_price, side="BUY")
+        # KODEX Leverage 122630 is an ETF: unlike ordinary KRX equities,
+        # ETF limits >=2,000 KRW use a flat 5 KRW quotation unit. Do not
+        # force its 55,215-KRW native limit to the stock 55,300-KRW tick.
+        # Explicit symbol scope prevents changing any PB1 stock price policy.
+        is_kr_inf_etf = safe_strip(pdno).removeprefix("A").zfill(6) == "122630"
+        if is_kr_inf_etf:
+            normalized_price, tick_size = normalize_kr_etf_order_price(raw_price, side="BUY")
+        else:
+            normalized_price, tick_size = _normalize_kr_order_price(raw_price, side="BUY")
         if int(round(raw_price)) != int(normalized_price):
             logger.info(
                 "[ORDER][PRICE_NORMALIZE] code=%s side=BUY raw=%s normalized=%s tick=%s source=pre_kis_final",

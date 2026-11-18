@@ -224,7 +224,9 @@ def test_confirmed_buy_updates_only_confirmed_fill(armed_practice_env):
 
 
 def test_sell_acceptance_partial_and_final_completion(armed_practice_env):
-    kis = FakeKIS(qty=150, average=100, price=110, fill_qty=110)
+    # The first TP1 order is for 75 shares. A native receipt claiming
+    # 110 executed shares of a 75-share order is invalid broker evidence.
+    kis = FakeKIS(qty=150, average=100, price=110, fill_qty=75)
     repo = FakeRepository(active())
     partial = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
     assert partial.decision.action == Action.SELL_PARTIAL and partial.state.status == Status.ACTIVE and kis.qty == 75

@@ -176,6 +176,13 @@ PY_KR_AM_DEBT
   echo "[KR_AM][EFFECTIVE_ENV] timeout_sec=${KR_AM_SESSION_TIMEOUT_SEC}"
   # Exit 137 can be SIGKILL/OOM/external termination as well as a timeout
   # kill escalation. Do not claim a timer expired without authoritative proof.
+  # Read-only cgroup OOM counter. A SIGKILL exit code alone is not OOM
+  # evidence; comparing the same cgroup before/after narrows the diagnosis.
+  _kr_am_oom_file="/sys/fs/cgroup/memory.events"
+  _kr_am_oom_before=""
+  if [[ -r "$_kr_am_oom_file" ]]; then
+    _kr_am_oom_before=$(awk '$1=="oom_kill"{print $2; exit}' "$_kr_am_oom_file" 2>/dev/null || true)
+  fi
   start_epoch=$(date +%s)
   set +e
   timeout --kill-after=30s "${KR_AM_SESSION_TIMEOUT_SEC}" python -m trader.kr.runner.trade_session_runner --session am --env "$STRATEGY_ENV"
@@ -207,6 +214,13 @@ PY_KR_AM_DEBT
       # timeout --kill-after. Preserve the uncertainty for kernel/task logs.
       export NULLIM_SESSION_FINAL_STATUS=FAILED NULLIM_SESSION_FINAL_REASON=SESSION_KILLED_UNVERIFIED
       reason=SESSION_KILLED_UNVERIFIED
+      if [[ -n "$_kr_am_oom_before" && -r "$_kr_am_oom_file" ]]; then
+        _kr_am_oom_after=$(awk '$1=="oom_kill"{print $2; exit}' "$_kr_am_oom_file" 2>/dev/null || true)
+        if [[ "$_kr_am_oom_before" =~ ^[0-9]+$ && "$_kr_am_oom_after" =~ ^[0-9]+$ ]]; then
+          _kr_am_oom_delta=$((_kr_am_oom_after - _kr_am_oom_before))
+          echo "[KR_AM][KILL_EVIDENCE] source=CGROUP_MEMORY_EVENTS oom_kill_before=$_kr_am_oom_before oom_kill_after=$_kr_am_oom_after oom_kill_delta=$_kr_am_oom_delta child_attribution=NOT_PROVEN"
+        fi
+      fi
     fi
     echo "[KR_AM][ABNORMAL_EXIT] reason=${reason} rc=${rc} elapsed_sec=${elapsed_sec} timeout_sec=${KR_AM_SESSION_TIMEOUT_SEC} last_stage=${LAST_STAGE}"
     echo "[RUN_SUMMARY][RESULT] market=KR session=am status=FAIL reason=${reason} orders_intent=unknown orders_ack=unknown blocked=0"

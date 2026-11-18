@@ -245,7 +245,8 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
             unresolved = list((stored or {}).get("source_conflicts") or [])
             repair_due = (
                 observed_at.time() >= dtime(9, 30)
-                and (not opening_ready or bool(unresolved))
+                and (not (opening_ready or opening_coverage.get(
+                    "native_post_open_window_ready", False)) or bool(unresolved))
                 and _repair_opening_due(code)
             )
             anchors = (
@@ -561,8 +562,13 @@ def main() -> None:
                 candidate_kis = KisAPI(kis_env="practice")
                 codes, kis = candidate_codes, candidate_kis
                 logger.info("[KR][OPENING_OBSERVER][PREP_READY] final30=%s role=READ_ONLY", len(codes))
+            # COLD remains in the signed Final30 universe and continues to
+            # receive low-cost PB1 pre-minute evaluation; it does NOT consume
+            # native 1-minute REST calls. Only actual HOT/WARM BUY candidates
+            # are eligible for high-frequency native collection.
+            native_priority = {**priority, "cold": []}
             health = schedule.diagnostics(
-                priority, now, interval_sec=float(args.interval_sec),
+                native_priority, now, interval_sec=float(args.interval_sec),
             )
             warning_key = (
                 priority["state"], tuple(health["tiers"][tier]["count"]
@@ -580,13 +586,13 @@ def main() -> None:
                     int(health["all_180s_possible_at_slot_capacity"]),
                 )
             last_capacity_warning_key = warning_key
-            selected = schedule.select(priority, now)
+            selected = schedule.select(native_priority, now)
             if not selected:
                 time.sleep(min(10.0, max(2.0, float(args.interval_sec) / 3.0)))
                 continue
             logger.info(
                 "[KR][OPENING_OBSERVER][QUEUE] source=%s hot=%s warm=%s cold=%s "
-                "selected=%s full_universe=%s order_authorization=0",
+                "selected=%s full_universe=%s order_authorization=0 native_collection_scope=HOT_WARM_ONLY",
                 priority["state"], len(priority["hot"]), len(priority["warm"]),
                 len(priority["cold"]), selected, len(codes),
             )

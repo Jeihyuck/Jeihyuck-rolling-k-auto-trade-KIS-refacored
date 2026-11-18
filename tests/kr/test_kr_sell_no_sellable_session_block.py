@@ -194,7 +194,7 @@ def test_unconfirmed_tp1_never_unlocks_tp2(status):
 
 
 @pytest.mark.parametrize("status", ["PARTIAL_FILLED", "FILLED"])
-def test_confirmed_tp1_with_fresh_remaining_balance_unlocks_tp2(status):
+def test_tp1_must_be_filled_before_next_stage_even_with_fresh_remaining_balance(status):
     db = sa.create_engine("sqlite:///:memory:")
     create_schema_with_active_test_epoch(db)
     OrdersRepo(db).create_intent_idempotent(
@@ -207,7 +207,9 @@ def test_confirmed_tp1_with_fresh_remaining_balance_unlocks_tp2(status):
     balance = {"output1": [{"pdno": "010060", "hldg_qty": "7", "ord_psbl_qty": "7"}], "output2": [{}]}
     engine, _ = _make_engine(db, FakeKis(), balance)
     blocked, _ = engine._durable_sell_block(code="010060", position_cycle_id="cycle-x", exit_stage="TP2")
-    assert not blocked
+    # PARTIAL_FILLED may still have a pending broker remainder. Do not send
+    # the next TP order until the original stage is terminal and fully proven.
+    assert blocked is (status == "PARTIAL_FILLED")
 
 
 def test_failed_tp1_does_not_block_protective_full_exit():

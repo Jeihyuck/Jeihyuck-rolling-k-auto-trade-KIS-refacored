@@ -148,6 +148,46 @@ def _snapshot(*, date: str, account_scope: str, prep: dict,
     return body
 
 
+
+def eligible_preminute_codes(
+    *, candidates: Iterable[object], held_codes: Iterable[str] = (),
+    blocking_buy_codes: Iterable[str] = (),
+    filled_buy_codes: Iterable[str] = (),
+    blocking_client_order_keys: Iterable[str] = (),
+) -> list[str]:
+    """Read-only HOT/WARM shortlist from *already* computed owner risk results.
+
+    A setup without a positive sized quantity, a known held position, a live
+    BUY intent, or an already-filled BUY does not warrant high-frequency
+    minute polling. A prior local-only rejected intent need not be excluded:
+    its separate final PB1 duplicate guard remains authoritative.
+
+    This is never an order-authorization, cash, risk, or timing decision.
+    """
+    excluded = set(_unique(held_codes))
+    excluded.update(_unique(blocking_buy_codes))
+    excluded.update(_unique(filled_buy_codes))
+    keys = {str(key).strip() for key in blocking_client_order_keys if str(key).strip()}
+    result = []
+    for cf in candidates:
+        code = _code(getattr(cf, "code", None))
+        if not code or code in excluded:
+            continue
+        if not bool(getattr(cf, "setup_ok", False)):
+            continue
+        try:
+            qty = int(getattr(cf, "planned_qty", 0) or 0)
+        except (ValueError, TypeError, OverflowError):
+            qty = 0
+        if qty <= 0:
+            continue
+        key = str(getattr(cf, "client_order_key", "") or "").strip()
+        if key and key in keys:
+            continue
+        result.append(code)
+    return _unique(result)
+
+
 def publish_pb1_priority(*, date: str, account_scope: str,
                          eligible_codes: Iterable[str],
                          held_codes: Iterable[str] = (),
@@ -169,7 +209,8 @@ def publish_pb1_priority(*, date: str, account_scope: str,
     # Invalid or unverified held state does NOT remove a Final30 code globally.
     remaining = [c for c in prep["codes"] if c not in ranked and c not in held]
     hot = ranked[:HOT_TARGET]
-    warm = _unique(ranked[HOT_TARGET:] + remaining)[:WARM_TARGET]
+    # WARM is a genuine next-in-line BUY candidate, not a filler from Final30.
+    warm = ranked[HOT_TARGET:HOT_TARGET + WARM_TARGET]
     body = _snapshot(date=date, account_scope=account_scope, prep=prep,
                      hot=hot, warm=warm, source="PB1_PRE_MINUTE",
                      stage=stage, now=now, code_sha=_current_sha())
@@ -238,9 +279,7 @@ def collection_priorities(*, date: str, account_scope: str,
                 "code_sha": observed_sha}
     except (FileNotFoundError, ValueError, TypeError, KeyError, OSError, AttributeError):
         return {"state": "PREP_FALLBACK",
-                "hot": prep["codes"][:HOT_TARGET],
-                "warm": prep["codes"][HOT_TARGET:HOT_TARGET + WARM_TARGET],
-                "cold": prep["codes"][HOT_TARGET + WARM_TARGET:]}
+                "hot": [], "warm": [], "cold": prep["codes"]}
 
 
 class CandidateSchedule:
@@ -253,7 +292,7 @@ class CandidateSchedule:
     """
 
     def __init__(self, *, max_batch: int = 10,
-                 hot_sec: int = 45, warm_sec: int = 180, cold_sec: int = 600):
+                 hot_sec: int = 45, warm_sec: int = 180, cold_sec: int = 1800):
         self.last_attempt: dict[str, datetime] = {}
         self.last_tier: dict[str, str] = {}
         self.max_batch = max(3, int(max_batch))

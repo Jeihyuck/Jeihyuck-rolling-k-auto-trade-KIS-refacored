@@ -18,6 +18,10 @@ def test_sell_price_181905_rounds_down_to_181500():
 
 
 def test_buy_stock_limit_payload_never_sends_181905(monkeypatch):
+    # CI globally sets NO_TRADE=1. This test's _safe_request is a pure
+    # in-process stub, not a network/broker call; explicitly exercise the
+    # final mocked payload serialization rather than the NO_TRADE sentinel.
+    monkeypatch.setenv("NO_TRADE", "0")
     sent = {}
 
     class Gate:
@@ -120,3 +124,52 @@ def test_shared_kr_price_utils_181905_buy_sell():
 
     assert round_to_tick(181905, mode="up") == 182000
     assert round_to_tick(181905, mode="down") == 181500
+
+
+def test_kodex_infinite_etf_native_limit_reaches_final_kis_http_payload(monkeypatch):
+    """Only 122630 uses ETF tick: KIS ORD_UNPR is 55215, never stock 55300."""
+    import json
+    from types import SimpleNamespace
+
+    class Response:
+        status_code = 200
+        def json(self):
+            return {"rt_cd": "0", "msg_cd": "0", "msg1": "OK",
+                    "output": {"ODNO": "0000010702"}}
+
+    client = object.__new__(kis_wrapper.KisAPI)
+    client.CANO = "SYNTHETIC"
+    client.ACNT_PRDT_CD = "01"
+    client.env = "practice"
+    monkeypatch.setenv("NO_TRADE", "0")
+    monkeypatch.setattr(
+        trader_config, "get_live_gate_status_fresh",
+        lambda **kwargs: SimpleNamespace(
+            allow_live_gate=True, force_block_live=False, reason="OK",
+        ),
+    )
+    monkeypatch.setattr(kis_wrapper, "_assert_orders_allowed", lambda *_: None)
+    monkeypatch.setattr(kis_wrapper, "_order_block_reason", lambda *_: None)
+    monkeypatch.setattr(kis_wrapper, "_pick_tr", lambda *_: ["TTTC0802U"])
+    monkeypatch.setattr(client, "_create_hashkey", lambda *_: "SYNTHETIC")
+    monkeypatch.setattr(client, "_headers", lambda *_: {})
+    monkeypatch.setattr(client, "_wait_before_order_submit", lambda: None)
+    monkeypatch.setattr(kis_wrapper, "append_fill", lambda **kwargs: None)
+    sent = []
+
+    def mock_http(method, url, **kwargs):
+        assert method == "POST"
+        body = json.loads(kwargs["data"].decode("utf-8"))
+        sent.append((body["PDNO"], body["ORD_QTY"], body["ORD_UNPR"]))
+        return Response()
+
+    monkeypatch.setattr(client, "_safe_request", mock_http)
+
+    assert client.buy_stock_limit("122630", 13, 55_215)["rt_cd"] == "0"
+    assert client.buy_stock_limit("033780", 13, 55_215)["rt_cd"] == "0"
+    assert client.buy_stock_limit("122630", 13, 55_216)["rt_cd"] == "0"
+    assert sent == [
+        ("122630", "13", "55215"),  # Native KRX ETF price stays intact
+        ("033780", "13", "55300"),  # Equity tick unchanged
+        ("122630", "13", "55220"),  # Next ETF tick, never skip to 55300
+    ]
