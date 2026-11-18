@@ -168,6 +168,48 @@ def _min_hold_elapsed(position: dict, now: datetime | None) -> tuple[bool, int, 
         or position.get("opened_trade_date")
     )
     if not entry_time_raw:
+        # A legacy V2 original BUY may have a verified DATE without a
+        # trustworthy intraday timestamp. Do not invent an entry time:
+        # use the very END of its authenticated exchange-local BUY day as
+        # the most conservative possible opening bound. This proves the
+        # existing 390-minute policy elapsed only on sufficiently later days.
+        provenance = (
+            position.get("_legacy_nine_db_original_provenance")
+            if isinstance(position.get("_legacy_nine_db_original_provenance"), dict)
+            else {}
+        )
+        if (position.get("legacy_nine_decision_only_provisional") is True
+                and str(position.get("strategy_owner") or "US_STANDARD").upper()
+                    == "US_STANDARD"
+                and provenance.get("symbol") == str(position.get("symbol") or "").upper()
+                and provenance.get("source_buy_day")
+                and provenance.get("epoch")
+                and provenance.get("account_hash")):
+            try:
+                from datetime import date as _date, time as _time
+                from zoneinfo import ZoneInfo
+                end_of_buy_day = datetime.combine(
+                    _date.fromisoformat(str(provenance["source_buy_day"])),
+                    _time(23, 59, 59),
+                    tzinfo=ZoneInfo("America/New_York"),
+                )
+                observed = now or datetime.now(timezone.utc)
+                if observed.tzinfo is None:
+                    observed = observed.replace(tzinfo=timezone.utc)
+                lower_bound_minutes = int(
+                    (observed.astimezone(timezone.utc)
+                     - end_of_buy_day.astimezone(timezone.utc)).total_seconds() / 60
+                )
+                if lower_bound_minutes >= required:
+                    logger.info(
+                        "[US_EXIT][SWING_GUARD][PROVEN_CROSSDAY_MIN_HOLD] "
+                        "symbol=%s held_min_lower_bound=%d required=%d "
+                        "source=ACTIVE_EPOCH_DB_BUY_DATE",
+                        position.get("symbol"), lower_bound_minutes, required,
+                    )
+                    return True, lower_bound_minutes, required
+            except (ValueError, TypeError, OverflowError):
+                pass
         logger.warning(
             "[US_EXIT][SWING_GUARD][BLOCK_UNKNOWN_ENTRY_TIME] "
             "symbol=%s reason=UNKNOWN_ENTRY_TIME_BLOCKS_SWING_SOFT_EXIT required_minutes=%d",

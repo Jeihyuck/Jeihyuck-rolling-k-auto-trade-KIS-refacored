@@ -203,7 +203,53 @@ def replay_confirmed_protective_intents(
 
     require_epoch = trading_epoch_enforced()
     by_scope = {}
+    # Only for a pending durable high-severity stop on one of the nine legacy
+    # holdings: re-prove the ORIGINAL V2 BUY from the ACTIVE account/epoch DB
+    # and map the snapshot to the SAME prospective cycle used on durable
+    # stop creation. Never infer a cycle from a ticker or old NULL scope.
+    # This is DB-only preparation, NOT authorization of broker execution.
+    legacy_pending_symbols = {
+        str(debt.get("symbol") or "").upper() for debt in pending
+        if int(debt.get("severity") or 0) >= 2
+        and str(debt.get("obligation_state") or "").upper() in {
+            "PENDING", "BLOCKED", "RECONCILE_REQUIRED",
+            "SUBMITTED", "PARTIAL", "ESCALATED",
+        }
+    }
     for snapshot in snapshots:
+        original_symbol = str(snapshot.get("symbol") or "").upper()
+        if (original_symbol in legacy_pending_symbols
+                and os.getenv("WSL_RUN_MARKET", "").upper() == "US"
+                and os.getenv("KIS_ENV") == "practice"):
+            try:
+                from zoneinfo import ZoneInfo
+                from trader.us.execution.us_legacy_nine_active_sell import (
+                    SYMBOLS as LEGACY_SYMBOLS,
+                    enrich_legacy_nine_v2_decision_position,
+                    build_verified_legacy_stop_obligation_position,
+                )
+                if original_symbol in LEGACY_SYMBOLS:
+                    observed = now or datetime.now(timezone.utc)
+                    if observed.tzinfo is None:
+                        observed = observed.replace(tzinfo=timezone.utc)
+                    us_trade_day = observed.astimezone(
+                        ZoneInfo("America/New_York")
+                    ).date().isoformat()
+                    legacy = enrich_legacy_nine_v2_decision_position(
+                        snapshot, trade_date=us_trade_day,
+                    )
+                    if legacy.get("legacy_nine_decision_only_provisional") is True:
+                        snapshot = build_verified_legacy_stop_obligation_position(
+                            legacy, trade_date=us_trade_day,
+                        )
+            except Exception as exc:
+                # Failed DB proof may never fall back to a foreign account,
+                # stale trading epoch or an invented KIS terminal status.
+                logger.warning(
+                    "[US_PROTECTIVE_STOP][LEGACY_REPLAY_PROOF_FENCED] "
+                    "symbol=%s error_type=%s",
+                    original_symbol, type(exc).__name__,
+                )
         symbol, life, account = scope_for_position(snapshot)
         meta = snapshot.get("meta") if isinstance(snapshot.get("meta"), dict) else {}
         position_epoch = str(snapshot.get("trading_epoch_id") or meta.get("trading_epoch_id") or "")
