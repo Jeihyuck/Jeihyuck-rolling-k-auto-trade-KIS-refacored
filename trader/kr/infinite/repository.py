@@ -398,6 +398,13 @@ class InfiniteRepository:
                             and state.status != Status.FROZEN)):
                     raise RuntimeError("KR_INF_RECONCILE_ECONOMIC_STATE_REGRESSION")
 
+            # Verify that economic increments exactly equal the distinct
+            # native cumulative BUY advances covered by this locked journal.
+            # A larger-but-stale state from another overlapping order must
+            # not silently overwrite the correct sleeve totals.
+            delta_core = Decimal("0")
+            delta_reserve = Decimal("0")
+            delta_units = 0
             seen_ids = set()
             for intent, broker in updates:
                 if intent.id in seen_ids:
@@ -463,6 +470,21 @@ class InfiniteRepository:
                     # consume the intent; else later genuine fill is lost.
                     raise RuntimeError("KR_INF_RECONCILE_PRICE_UNVERIFIED")
 
+                if is_postgres and intent.side in {"BUY", "RECOVERY"}:
+                    gained = cumulative_notional - previous_notional
+                    if cumulative_qty > previous_qty:
+                        sequence = intent.unit_sequence or (
+                            int(locked_state["units_used"]) + 1
+                        )
+                        if sequence > 40 or sequence <= 0:
+                            raise RuntimeError("KR_INF_RECONCILE_UNIT_SEQUENCE_INVALID")
+                        if sequence > 30:
+                            delta_reserve += gained
+                        else:
+                            delta_core += gained
+                        if previous_qty == 0:
+                            delta_units += 1
+
                 # PostgreSQL numeric and all Python arithmetic stay Decimal.
                 # A missing broker fill count NEVER clears the stored 0.
                 persisted_qty = cumulative_qty if is_postgres else (
@@ -481,6 +503,19 @@ class InfiniteRepository:
                     {"status": broker.status, "qty": persisted_qty,
                      "notional": persisted_notional,
                      "average": broker.filled_avg_price, "id": intent.id})
+            if is_postgres and updates:
+                if (
+                    money(state.core_filled_notional) != (
+                        money(locked_state["core_filled_notional"]) + delta_core
+                    )
+                    or money(state.reserve_filled_notional) != (
+                        money(locked_state["reserve_filled_notional"]) + delta_reserve
+                    )
+                    or int(state.units_used) != (
+                        int(locked_state["units_used"]) + delta_units
+                    )
+                ):
+                    raise RuntimeError("KR_INF_RECONCILE_ECONOMIC_DELTA_MISMATCH")
             self._save_state(conn, state, epoch_id=epoch_id)
 
         # The intent+state commit above is the recoverable economic journal.
