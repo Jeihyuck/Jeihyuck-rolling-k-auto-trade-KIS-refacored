@@ -505,3 +505,44 @@ def test_incomplete_native_kis_pagination_preserves_original_order_fence(failure
     assert result.status == "RECONCILE_PENDING"
     assert result.filled_qty is None
     assert 2 <= api.calls <= 3
+
+
+def test_incomplete_second_kis_page_does_not_expire_prior_sell_from_unchanged_balance():
+    """An unavailable first page differs from missing continuation data."""
+    from dataclasses import replace
+    from trader.kr.infinite.executor import KISExecutor
+
+    class IncompleteKIS:
+        def __init__(self):
+            self.calls = 0
+
+        def inquire_daily_ccld(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "rt_cd": "0",
+                    "output1": [{"odno": "UNRELATED", "pdno": "028050"}],
+                    "ctx_area_fk100": "NEXT-FK",
+                    "ctx_area_nk100": "NEXT-NK",
+                    "_response_meta": {"tr_cont": "F"},
+                }
+            raise RuntimeError("KIS second-page HTTP 500")
+
+        def get_balance(self):
+            return {
+                "output1": [{"pdno": "122630", "hldg_qty": "3"}],
+                "output2": {"tot_evlu_amt": "4000000"},
+            }
+
+    intent = replace(
+        _fixture_native_intent()[3],
+        side="SELL_ALL",
+        requested_qty=3,
+        broker_order_id="OLD-TP2",
+        metadata={"pre_order_holding_qty": 3},
+    )
+    broker = KISExecutor(IncompleteKIS(), "practice").order_state(
+        intent, date(2026, 11, 19),
+    )
+    assert broker.status == "RECONCILE_PENDING"
+    assert broker.filled_qty is None
