@@ -247,3 +247,19 @@ def test_unit_sequence_consistent_with_exactly_one_confirmed_buy(monkeypatch):
     with pytest.raises(RuntimeError, match="ECONOMIC_DELTA_MISMATCH"):
         repo.persist_reconciliation(bogus, [(intent, broker)])
     assert engine.data == before
+
+
+def test_price_unresolved_sell_quantity_can_settle_without_fabricating_proceeds(monkeypatch):
+    """SELL balance delta safety is not the same as BUY cost-basis proof."""
+    from dataclasses import replace
+    engine, repo, state, intent, _, _ = _fixture(monkeypatch)
+    engine.data["intent"]["side"] = "SELL_PARTIAL"
+    engine.data["intent"]["requested_qty"] = 3
+    intent = replace(intent, side="SELL_PARTIAL", requested_qty=3)
+    state = replace(state, units_used=1, core_units_used=1,
+                    core_filled_notional=Decimal("690052"))
+    broker = BrokerOrderState("FILLED", 3, Decimal("0"), None)
+    repo.persist_reconciliation(state, [(intent, broker)])
+    assert engine.data["intent"]["filled_qty"] == 3
+    assert engine.data["intent"]["filled_notional_krw"] == Decimal("0")
+    assert engine.data["state"]["core_filled_notional"] == Decimal("690052")
