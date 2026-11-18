@@ -37,8 +37,7 @@ def fixture_us_repo(tmp_path: Path, trade_date: str, *, missing_purposes=()) -> 
     _copy_calendar_runtime(root)
 
     purposes = (
-        "prep-prewarm-edt", "prep-prewarm-est", "prep", "prep-recovery",
-        "am-preflight", "am", "afternoon", "close",
+        "prep", "prep-recovery", "am-preflight", "am", "afternoon", "close",
     )
     log_root = root / "runtime/logs/us" / trade_date
     for purpose in purposes:
@@ -127,17 +126,17 @@ def run_us_mail(root: Path, trade_date: str | None, *, kst_run_date: str):
     return result, archive
 
 
-def test_us_missing_edt_prewarm_sends_degraded_mail(tmp_path):
+def test_us_missing_am_preflight_sends_degraded_mail(tmp_path):
     trade_date = "2026-09-10"
     run_date = "2026-09-11"
-    root = fixture_us_repo(tmp_path, trade_date, missing_purposes={"prep-prewarm-edt"})
+    root = fixture_us_repo(tmp_path, trade_date, missing_purposes={"am-preflight"})
 
     result, archive = run_us_mail(root, trade_date, kst_run_date=run_date)
 
     assert result.returncode == 0, result.stderr + result.stdout
     assert (root / "smtp-count").read_text().strip() == "1"
     assert "status=DEGRADED" in result.stdout
-    assert "REQUIRED_LOG_MISSING_prep-prewarm-edt" in result.stderr
+    assert "REQUIRED_LOG_MISSING_am-preflight" in result.stderr
     marker = json.loads((root / f"runtime/health/us-mail-{run_date}.json").read_text())
     assert marker["status"] == "DEGRADED"
     assert marker["mail_sent"] is True
@@ -147,8 +146,8 @@ def test_us_missing_edt_prewarm_sends_degraded_mail(tmp_path):
     assert marker["mail_complete"] is False
     assert marker["required_missing_count"] == 1
     assert marker["missing_evidence"] == [{
-        "code": "REQUIRED_LOG_MISSING_prep-prewarm-edt",
-        "path": f"runtime/logs/us/{trade_date}/prep-prewarm-edt",
+        "code": "REQUIRED_LOG_MISSING_am-preflight",
+        "path": f"runtime/logs/us/{trade_date}/am-preflight",
     }]
     assert "[NULLIM][US][DEGRADED]" in (root / "smtp-args").read_text()
 
@@ -159,11 +158,11 @@ def test_us_missing_edt_prewarm_sends_degraded_mail(tmp_path):
     assert manifest["evidence_status"] == "DEGRADED"
     assert manifest["required_missing_count"] == 1
     assert evidence["status"] == "DEGRADED"
-    assert evidence["expected"] == 8
-    assert evidence["present"] == 7
-    assert evidence["missing"] == ["prep-prewarm-edt"]
-    assert not any("prep-prewarm-edt/" in name for name in names)
-    assert any("prep-prewarm-est/" in name for name in names)
+    assert evidence["expected"] == 6
+    assert evidence["present"] == 5
+    assert evidence["missing"] == ["am-preflight"]
+    assert not any("am-preflight/" in name for name in names)
+    assert any("prep/" in name for name in names)
 
 
 def test_us_missing_core_am_log_still_delivers_degraded_mail(tmp_path):
@@ -183,7 +182,7 @@ def test_us_missing_core_am_log_still_delivers_degraded_mail(tmp_path):
 def test_degraded_evidence_digest_is_idempotent(tmp_path):
     trade_date = "2026-09-10"
     run_date = "2026-09-11"
-    root = fixture_us_repo(tmp_path, trade_date, missing_purposes={"prep-prewarm-edt"})
+    root = fixture_us_repo(tmp_path, trade_date, missing_purposes={"am-preflight"})
 
     first, _ = run_us_mail(root, trade_date, kst_run_date=run_date)
     second, _ = run_us_mail(root, trade_date, kst_run_date=run_date)
@@ -197,7 +196,7 @@ def test_degraded_evidence_digest_is_idempotent(tmp_path):
 def test_evidence_digest_ignores_repo_commit_changes(tmp_path):
     trade_date = "2026-09-10"
     run_date = "2026-09-11"
-    root = fixture_us_repo(tmp_path, trade_date, missing_purposes={"prep-prewarm-edt"})
+    root = fixture_us_repo(tmp_path, trade_date, missing_purposes={"am-preflight"})
     _init_fixture_git(root)
 
     first, _ = run_us_mail(root, trade_date, kst_run_date=run_date)
@@ -217,7 +216,7 @@ def test_same_trade_evidence_is_idempotent_across_kst_run_dates(tmp_path):
     trade_date = "2026-09-10"
     first_run_date = "2026-09-11"
     second_run_date = "2026-09-12"
-    root = fixture_us_repo(tmp_path, trade_date, missing_purposes={"prep-prewarm-edt"})
+    root = fixture_us_repo(tmp_path, trade_date, missing_purposes={"am-preflight"})
 
     first, _ = run_us_mail(root, trade_date, kst_run_date=first_run_date)
     second, _ = run_us_mail(root, trade_date, kst_run_date=second_run_date)
@@ -232,13 +231,13 @@ def test_same_trade_evidence_is_idempotent_across_kst_run_dates(tmp_path):
 def test_newly_arrived_missing_log_changes_digest_and_allows_complete_resend(tmp_path):
     trade_date = "2026-09-10"
     run_date = "2026-09-11"
-    root = fixture_us_repo(tmp_path, trade_date, missing_purposes={"prep-prewarm-edt"})
+    root = fixture_us_repo(tmp_path, trade_date, missing_purposes={"am-preflight"})
 
     first, _ = run_us_mail(root, trade_date, kst_run_date=run_date)
     first_marker = json.loads((root / f"runtime/health/us-mail-{run_date}.json").read_text())
-    restored = root / f"runtime/logs/us/{trade_date}/prep-prewarm-edt"
+    restored = root / f"runtime/logs/us/{trade_date}/am-preflight"
     restored.mkdir(parents=True)
-    (restored / "attempt.log").write_text("purpose=prep-prewarm-edt\n", encoding="utf-8")
+    (restored / "attempt.log").write_text("purpose=am-preflight\n", encoding="utf-8")
     second, _ = run_us_mail(root, trade_date, kst_run_date=run_date)
 
     assert first.returncode == 0, first.stderr + first.stdout
