@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
+from decimal import Decimal, InvalidOperation
 from typing import Any
 import logging
 
@@ -219,6 +220,38 @@ class KISExecutor:
             if len(matches) > 1:
                 raise RuntimeError("KR_INF_PENDING_ORDER_AMBIGUOUS")
         row = matches[0] if len(matches) == 1 else None
+        if row is not None:
+            # A broker order number alone is not owner/symbol proof. KIS
+            # order numbers can be reused across dates/accounts; we query
+            # the original trade date and additionally reject any explicit
+            # conflicting native symbol or BUY/SELL side evidence.
+            native_symbol = str(
+                row.get("pdno") or row.get("code") or row.get("symbol") or ""
+            ).strip().removeprefix("A")
+            if native_symbol and native_symbol != "122630":
+                logger.error(
+                    "[KR_INF][BROKER_ORDER_IDENTITY_MISMATCH] "
+                    "order=%s expected_symbol=122630 observed_symbol=%s "
+                    "action=RECONCILE_PENDING",
+                    intent.broker_order_id, native_symbol,
+                )
+                return BrokerOrderState("RECONCILE_PENDING")
+            native_side_raw = str(
+                row.get("sll_buy_dvsn_cd") or row.get("side")
+                or row.get("sll_buy_dvsn_name") or ""
+            ).strip().upper()
+            sides = {"01": "SELL", "02": "BUY",
+                     "SELL": "SELL", "BUY": "BUY",
+                     "매도": "SELL", "매수": "BUY"}
+            expected_side = "BUY" if intent.side in {"BUY", "RECOVERY"} else "SELL"
+            if native_side_raw and sides.get(native_side_raw) != expected_side:
+                logger.error(
+                    "[KR_INF][BROKER_ORDER_SIDE_MISMATCH] "
+                    "order=%s expected=%s observed=%s "
+                    "action=RECONCILE_PENDING",
+                    intent.broker_order_id, expected_side, native_side_raw,
+                )
+                return BrokerOrderState("RECONCILE_PENDING")
         if row is None:
             balance_proof = self._balance_delta_state(intent)
             if balance_proof is not None:
@@ -237,18 +270,47 @@ class KISExecutor:
             qty = int(float(qty_raw)) if qty_raw is not None else None
         except (TypeError, ValueError):
             qty = None
-        avg = float(row.get("avg_prvs") or row.get("avg_price") or row.get("ccld_unpr") or 0)
-        if qty is None:
+        if qty is None or qty < 0 or qty > int(intent.requested_qty or 0):
             return BrokerOrderState("RECONCILE_PENDING")
+        # Native KIS total executed amount is a more exact economic
+        # receipt than qty * a rounded average. Neither an order LIMIT
+        # nor a changed holdings average may replace missing fill cash.
+        total_field = row.get("tot_ccld_amt")
+        avg_field = next(
+            (row[key] for key in ("avg_prvs", "avg_price", "ccld_unpr")
+             if row.get(key) not in (None, "")),
+            None,
+        )
+        total = Decimal("0")
+        avg = None
+        if qty > 0:
+            try:
+                if total_field not in (None, ""):
+                    total = Decimal(str(total_field))
+                    if not total.is_finite() or total <= 0:
+                        raise ValueError("NONPOSITIVE_NATIVE_CCLD_AMOUNT")
+                    avg = total / Decimal(qty)
+                elif avg_field not in (None, ""):
+                    avg = Decimal(str(avg_field))
+                    if not avg.is_finite() or avg <= 0:
+                        raise ValueError("NONPOSITIVE_NATIVE_CCLD_AVERAGE")
+                    total = avg * Decimal(qty)
+                else:
+                    raise ValueError("KIS_CCLD_NO_NATIVE_CASH_PROOF")
+            except (InvalidOperation, TypeError, ValueError, OverflowError):
+                logger.warning(
+                    "[KR_INF][KIS_FILL_CASH_UNVERIFIED] "
+                    "order=%s date=%s qty=%s action=RECONCILE_PENDING",
+                    intent.broker_order_id, lookup_date, qty,
+                )
+                return BrokerOrderState("RECONCILE_PENDING")
         if qty >= intent.requested_qty:
             status = "FILLED"
         elif qty > 0:
-            # A historical partial fill needs explicit lifecycle review; do not
-            # silently advance TP stage or create a replacement SELL.
+            # The original partial fill remains a durable pending fence.
             status = "PARTIALLY_FILLED"
         elif lookup_date < trade_date:
-            # A zero-fill domestic day order cannot remain live overnight.
             status = "EXPIRED"
         else:
             status = "PENDING"
-        return BrokerOrderState(status, qty, qty * avg, avg or None)
+        return BrokerOrderState(status, qty, total, float(avg) if avg else None)
