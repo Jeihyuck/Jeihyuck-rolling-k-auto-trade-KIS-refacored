@@ -3669,8 +3669,20 @@ class KisAPI:
                 if not _kr_sleep_with_budget(random.uniform(0.0, _PRICE_JITTER_MAX_SEC)):
                     return {}
 
-            # 5) 기존 get_price_quote 호출
-            data = self.get_price_quote(code, diag_mode=False, attempts=2)
+            # 5) Canonical KR six-digit quotes must never fan out to the
+            # generic legacy U-market / A-prefixed alternatives. The latter
+            # generated OPSQ2001 invalid market-code replies during native
+            # minute observation, wasting the shared KIS API budget.
+            domestic_code = str(code or "").strip().removeprefix("A")
+            canonical_kr = (
+                str(market or "").upper() == "J"
+                and len(domestic_code) == 6 and domestic_code.isdigit()
+            )
+            data = self.get_price_quote(
+                domestic_code if canonical_kr else code,
+                diag_mode=False, attempts=2,
+                retry_cap=2 if canonical_kr else None,
+            )
 
             # 6) EGW002 guard (초당 제한)
             msg_cd = str(data.get("msg_cd", ""))
