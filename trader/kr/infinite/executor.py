@@ -231,8 +231,11 @@ class KISExecutor:
                 return None
             rows.extend(chunk)
             meta = raw.get("_response_meta") or {}
+            # A missing tr_cont header means no continuation is signalled.
+            # str(None) becomes "NONE" and otherwise rejects every valid
+            # single-page broker response lacking _response_meta.
             cont = str(
-                meta.get("tr_cont") if isinstance(meta, dict) else ""
+                (meta.get("tr_cont") or "") if isinstance(meta, dict) else ""
             ).strip().upper()
             if cont not in {"", "F", "M", "D", "E"}:
                 return None
