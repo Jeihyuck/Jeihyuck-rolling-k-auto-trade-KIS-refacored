@@ -99,20 +99,42 @@ class FakeConnection:
         if "FROM portfolio_epochs" in q:
             return FakeResult([(PORTFOLIO,)])
         if "FROM us_positions" in q:
-            return FakeResult([self.position])
+            return FakeResult(
+                [self.position]
+                if self.position["trading_epoch_id"] == params["epoch"] else []
+            )
         if "FROM us_position_risk_state" in q:
-            return FakeResult([self.history])
+            return FakeResult(
+                [self.history]
+                if self.history["lifecycle"]["trading_epoch_id"] == params["epoch"]
+                else []
+            )
         if "FROM us_fills" in q:
-            return FakeResult(self.fills)
+            return FakeResult([
+                row for row in self.fills
+                if row.get("trading_epoch_id", EPOCH) == params["epoch"]
+            ])
         if "FROM us_profit_capture_lifecycle" in q:
             return FakeResult(self.stages)
         if "FROM us_orders" in q:
             if "side='BUY'" in q:
-                return FakeResult([self.buy])
+                return FakeResult(
+                    [self.buy]
+                    if self.buy.get("trading_epoch_id", EPOCH) == params["epoch"]
+                    else []
+                )
             if "status NOT IN" in q:
-                return FakeResult(self.pending)
+                return FakeResult([
+                    row for row in self.pending
+                    if row.get("trading_epoch_id", EPOCH) == params["epoch"]
+                    and row["trade_date"] >= params["buy_day"]
+                ])
             if "side='SELL'" in q:
-                return FakeResult(self.sell_orders)
+                return FakeResult([
+                    row for row in self.sell_orders
+                    if row.get("trading_epoch_id", EPOCH) == params["epoch"]
+                    and row["trade_date"] >= params["buy_day"]
+                ])
         raise AssertionError("Unexpected SQL: "+q)
 
 
@@ -123,6 +145,7 @@ class FakeKis:
         self.holding=4
         self.orderable=4
         self.extra_today=[]
+        self.order_days_requested=[]
         self.old_rows={
             "2026-10-27":[_native_order(
                 no=ORIGINAL_BUY_NO,symbol="ABBV",day="2026-10-27",
@@ -144,6 +167,7 @@ class FakeKis:
                     "ord_psbl_qty":str(self.orderable),
                 }]}
     def get_us_today_orders(self, trade_date=None):
+        self.order_days_requested.append(trade_date)
         return self.old_rows.get(trade_date)
 
 
@@ -185,7 +209,7 @@ def _authorize(scenario):
     )
 
 
-def test_active_v2_sell_true_only_after_original_kis_and_current_balance(scenario):
+def test_active_v2_sell_true_only_after_current_epoch_db_and_fresh_kis(scenario):
     db,client,intent=scenario
     ok,reason,proof=_authorize(scenario)
     assert ok is True,reason
@@ -200,9 +224,11 @@ def test_active_v2_sell_true_only_after_original_kis_and_current_balance(scenari
     assert db.position["position_cycle_id"] is None  # historic DB untouched
     assert db.buy["meta"]["position_lifecycle_id"]=="ENTRY:US_STANDARD:ABBV"
     assert proof["portfolio"]==PORTFOLIO
+    assert client.order_days_requested==["2026-11-11"]
     assert recheck_legacy_nine_sell_before_http(
         intent,kis_client=client,proof=proof,qty=1,
     )[0] is True
+    assert client.order_days_requested==["2026-11-11", "2026-11-11"]
 
 
 @pytest.mark.parametrize("mutation,reason_prefix",[
@@ -223,8 +249,12 @@ def test_active_v2_sell_true_only_after_original_kis_and_current_balance(scenari
         profit_capture_stage="tp1"),"TP_STAGE_ALREADY"),
     (lambda db,cl,it: it.update(
         qty=1.5),"LEGACY_STRATEGY_SELL"),
-    (lambda db,cl,it: cl.old_rows["2026-10-27"].clear(),"ORIGINAL_KIS_BUY"),
-    (lambda db,cl,it: cl.old_rows["2026-10-30"].clear(),"ORIGINAL_KIS_SELL"),
+    (lambda db,cl,it: db.buy.update(account_id="foreign-account"),
+        "ORIGINAL_BUY_ACTIVE_ACCOUNT"),
+    (lambda db,cl,it: db.fills[0].update(account_id="foreign-account"),
+        "ORIGINAL_FILL_ACTIVE_ACCOUNT"),
+    (lambda db,cl,it: db.position["meta"].update(
+        broker_account_hash="foreign-hash"),"LEGACY_POSITION_ACCOUNT"),
 ])
 def test_no_automatic_authorization_without_exact_originals(
     scenario,mutation,reason_prefix,
@@ -250,17 +280,17 @@ def test_open_historical_tmo_like_sell_stops_auto_authority(scenario):
     ))
     ok,reason,_=_authorize(scenario)
     assert not ok
-    assert reason=="HISTORICAL_KIS_SELL_STILL_UNRESOLVED"
+    assert reason=="ACTIVE_EPOCH_HISTORICAL_SELL_UNRESOLVED"
 
 
-def test_original_cancel_proven_terminal_can_pass_without_claim_release(scenario):
+def test_historical_kis_cancel_does_not_override_unresolved_current_epoch_db(scenario):
     db,client,intent=scenario
     db.pending=[{
         "trade_date":"2026-10-30","order_no":"0000048888",
         "qty_requested":1,"qty_filled":0,"status":"OPEN",
     }]
-    # Broker cancellation status requires the KIS original order row to
-    # explicitly encode a cancellation; an unrelated cancel ACK is not proof.
+    # Even if a previous KIS snapshot claims cancellation, the current-epoch
+    # unresolved DB row must first be reconciled at AM/CLOSE.
     row=_native_order(
         no="0000048888",symbol="ABBV",day="2026-10-30",
         side="SELL",qty=1,filled=0,remaining=0,
@@ -268,9 +298,9 @@ def test_original_cancel_proven_terminal_can_pass_without_claim_release(scenario
     row["status"]="CANCELLED"
     client.old_rows["2026-10-30"].append(row)
     ok,reason,_=_authorize(scenario)
-    # The KIS normalizer must report cancellation as terminal, otherwise fail.
-    assert ok or reason=="HISTORICAL_KIS_SELL_STILL_UNRESOLVED"
-    assert db.pending[0]["status"]=="OPEN"  # original DB not changed
+    assert not ok
+    assert reason=="ACTIVE_EPOCH_HISTORICAL_SELL_UNRESOLVED"
+    assert db.pending[0]["status"]=="OPEN"
 
 
 def test_current_competing_order_blocks_even_if_originals_pass(scenario):
@@ -579,7 +609,7 @@ def test_legacy_zero_fill_open_original_sell_is_not_an_invented_fill(scenario):
     assert len(evidence["prior_sell_proofs"])==1
     ok,reason,_=_authorize(scenario)
     assert not ok
-    assert reason=="ORIGINAL_KIS_ZERO_FILL_SELL_NOT_CANCELLED"
+    assert reason=="ACTIVE_EPOCH_ZERO_FILL_SELL_UNRESOLVED"
 
 
 def test_legacy_zero_fill_unknown_or_recorded_partial_fill_is_fenced(scenario):
@@ -607,8 +637,8 @@ def test_all_nine_v2_exit_signals_are_broker_fenced_offline(
 ):
     """Each original V2 owner path reaches a guarded SELL with native fixtures.
 
-    This is an offline regression only. It neither authenticates real KIS
-    historical orders nor proves an actual practice fill or WSL deployment.
+    This is an offline regression only. It validates current-epoch DB lineage
+    and a fake current KIS account, not actual practice fills or WSL deployment.
     """
     db, client, intent = scenario
     contract = build_us_entry_exit_contract({
@@ -713,3 +743,95 @@ def test_forward_tp_ack_rejects_tampered_original_lineage(scenario, monkeypatch)
     assert repos.load_us_profit_capture_state(
         "2026-11-11", ["ABBV"], {"ABBV": OLD_CYCLE},
     )["ABBV"]["tp2_done"] is False
+
+
+def test_past_kis_order_day_unavailable_does_not_block_verified_active_epoch_db(scenario):
+    db, client, intent = scenario
+    client.old_rows["2026-10-27"] = []
+    client.old_rows["2026-10-30"] = []
+    ok, reason, proof = _authorize(scenario)
+    assert ok, reason
+    assert proof["source_cycle"] == OLD_CYCLE
+    assert client.order_days_requested == ["2026-11-11"]
+
+
+def test_foreign_epoch_unresolved_order_cannot_fence_current_epoch(scenario):
+    db, client, intent = scenario
+    db.pending.append({
+        "trade_date": "2026-10-30", "order_no": "0000088888",
+        "qty_requested": 1, "qty_filled": 0, "status": "OPEN",
+        "trading_epoch_id": "retired-practice-epoch",
+    })
+    ok, reason, proof = _authorize(scenario)
+    assert ok, reason
+    assert proof is not None
+    assert client.order_days_requested == ["2026-11-11"]
+
+
+def test_foreign_epoch_original_buy_cannot_be_rebound_to_active_epoch(scenario):
+    db, _, _ = scenario
+    db.buy["trading_epoch_id"] = "retired-practice-epoch"
+    ok, reason, proof = _authorize(scenario)
+    assert not ok and reason == "ORIGINAL_BUY_NOT_UNIQUE"
+    assert proof is None
+
+
+def test_foreign_epoch_position_does_not_supply_active_position(scenario):
+    db, _, _ = scenario
+    db.position["trading_epoch_id"] = "retired-practice-epoch"
+    ok, reason, proof = _authorize(scenario)
+    assert not ok and reason == "ONE_LEGACY_POSITION_NOT_PROVEN"
+    assert proof is None
+
+
+def test_active_epoch_db_row_account_hash_is_verified(scenario):
+    import hashlib
+    db, client, intent = scenario
+    h = hashlib.sha256(RAW_ACCOUNT.encode("utf-8")).hexdigest()
+    db.buy["account_id"] = h
+    db.fills[0]["account_id"] = h
+    ok, reason, _ = _authorize(scenario)
+    assert ok, reason
+    db.fills[0]["account_id"] = "other-account-hash"
+    ok, reason, _ = _authorize(scenario)
+    assert not ok and reason == "ORIGINAL_FILL_ACTIVE_ACCOUNT_OR_EPOCH_MISMATCH"
+
+
+def test_same_epoch_pending_order_remains_blocked_without_old_kis_lookup(scenario):
+    db, client, intent = scenario
+    db.pending.append({
+        "trade_date": "2026-10-30", "order_no": "0000088888",
+        "qty_requested": 1, "qty_filled": 0, "status": "OPEN",
+        "trading_epoch_id": EPOCH,
+    })
+    ok, reason, _ = _authorize(scenario)
+    assert not ok and reason == "ACTIVE_EPOCH_HISTORICAL_SELL_UNRESOLVED"
+    assert client.order_days_requested == []
+
+
+def test_native_terminal_zero_fill_requires_durable_broker_evidence(scenario):
+    db, client, intent = scenario
+    db.sell_orders.append({
+        "trade_date": "2026-10-30", "order_no": "0000050555",
+        "qty_requested": 1, "qty_filled": 0, "status": "CANCELLED",
+        "meta": {"position_lifecycle_id": OLD_CYCLE,
+                 "fill_evidence_type": "KIS_ORDER_STATUS_ACTUAL"},
+    })
+    ok, reason, _ = _authorize(scenario)
+    assert ok, reason
+    db.sell_orders[-1]["meta"].pop("fill_evidence_type")
+    ok, reason, _ = _authorize(scenario)
+    assert not ok and reason == "ACTIVE_EPOCH_ZERO_FILL_SELL_UNRESOLVED"
+
+
+def test_active_scope_sql_does_not_select_unrelated_epoch_rows():
+    from trader.us.execution import us_legacy_nine_active_sell as legacy
+    for query in (
+        legacy.POSITION_SQL, legacy.ORIGINAL_BUY_SQL, legacy.FILLS_SQL,
+        legacy.SELL_ORDERS_SQL, legacy.HISTORICAL_PENDING_SQL,
+        legacy.HISTORICAL_SQL, legacy.STAGES_SQL,
+    ):
+        assert "trading_epoch_id=:epoch" in query
+    assert "dry_run IS FALSE" in legacy.HISTORICAL_PENDING_SQL
+    assert "trade_date>=:buy_day" in legacy.HISTORICAL_PENDING_SQL
+
