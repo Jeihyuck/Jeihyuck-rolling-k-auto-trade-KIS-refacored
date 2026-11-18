@@ -462,7 +462,7 @@ class InfiniteRepository:
                 )
                 if cumulative_notional < previous_notional:
                     raise RuntimeError("KR_INF_RECONCILE_FILL_NOTIONAL_REGRESSION")
-                if is_postgres and (
+                if is_postgres and intent.side in {"BUY", "RECOVERY"} and (
                     (cumulative_qty > previous_qty and cumulative_notional <= previous_notional)
                     or (cumulative_qty == previous_qty and cumulative_notional != previous_notional)
                 ):
