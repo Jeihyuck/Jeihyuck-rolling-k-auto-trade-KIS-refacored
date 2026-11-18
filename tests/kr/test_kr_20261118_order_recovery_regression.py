@@ -113,6 +113,8 @@ def _pb1_durable_context(*, status="FILLED", request=None, fresh=True):
         _authoritative_balance=balance,
         _session_sell_blocked_codes={"028050": {"reason": "SELL_ACCEPTED"}},
         _session_sell_accepted_codes={"028050": {"reason": "SELL_ACCEPTED"}},
+        session_exit_submitted_codes={"028050"},
+        _display_code=lambda code: str(code).zfill(6),
     )
 
 
@@ -126,6 +128,7 @@ def test_pb1_samsung_ea_partial_to_full_exit_proven_by_fresh_balance(monkeypatch
     assert not blocked
     assert "028050" not in engine._session_sell_blocked_codes
     assert "028050" not in engine._session_sell_accepted_codes
+    assert "028050" not in engine.session_exit_submitted_codes
 
 
 def test_pb1_samsung_ea_unresolved_or_stale_prior_sell_stays_blocked(monkeypatch):
@@ -139,6 +142,7 @@ def test_pb1_samsung_ea_unresolved_or_stale_prior_sell_stays_blocked(monkeypatch
         )
         assert blocked
         assert "028050" in engine._session_sell_blocked_codes
+        assert "028050" in engine.session_exit_submitted_codes
 
 
 def test_pb1_samsung_ea_corrupt_request_json_fails_closed(monkeypatch):
