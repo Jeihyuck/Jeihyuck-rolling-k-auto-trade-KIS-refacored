@@ -403,6 +403,99 @@ def _evidence_from_db(conn, *, symbol: str, trade_date: str,
     },"DB_LEGACY_EVIDENCE_VERIFIED"
 
 
+
+def _verified_prospective_legacy_scope(
+    conn, *, evidence: dict, symbol: str, raw_account: str, epoch: str,
+) -> tuple[str, str, str]:
+    """One deterministic current-account/epoch management cycle.
+
+    Shared by the DB-only stop ledger and the independent KIS-proven router.
+    This forward scope is NOT backdated onto an original BUY or authorized
+    merely by being computed.
+    """
+    from trader.us.execution.recovery_identity import current_us_portfolio_epoch
+    if (symbol not in SYMBOLS or not raw_account or not epoch
+            or not evidence or not evidence.get("original_cycle")
+            or not evidence.get("v2_sha")):
+        raise ValueError("LEGACY_FORWARD_SCOPE_UNVERIFIED")
+    portfolio = current_us_portfolio_epoch(
+        conn, env="practice", account_key=raw_account,
+        trading_epoch_id=epoch, strategy_owner="US_STANDARD",
+    )
+    account_hash = hashlib.sha256(raw_account.encode()).hexdigest()
+    material = "|".join((
+        account_hash, epoch, portfolio, evidence["original_cycle"],
+        symbol, evidence["v2_sha"], "FORWARD_ONLY_V2_LEGACY_SELL_V1",
+    ))
+    return portfolio, hashlib.sha256(material.encode()).hexdigest()[:32], account_hash
+
+
+def build_verified_legacy_stop_obligation_position(
+    position: dict, *, trade_date: str,
+) -> dict:
+    """Current-epoch DB-proven stop-debt scope, never a SELL authorization.
+
+    The exit evaluator must not drop an otherwise valid stop signal simply
+    because the original V2 BUY preceded a canonical portfolio epoch. Re-prove
+    the DB original and current account/epoch, then persist the stop under the
+    SAME prospective management cycle the canonical SELL router will derive.
+    Current KIS holdings/orders are still separately checked by that router.
+    """
+    if (position.get("legacy_nine_decision_only_provisional") is not True
+            or str(position.get("symbol") or "").upper() not in SYMBOLS
+            or os.getenv("KIS_ENV") != "practice"
+            or os.getenv("WSL_RUN_MARKET", "").upper() != "US"
+            or os.getenv("US_LEGACY_NINE_AUTO_SELL_ACTIVE", "1") != "1"):
+        raise ValueError("LEGACY_STOP_PROVENANCE_NOT_ELIGIBLE")
+    provenance = _json(position.get("_legacy_nine_db_original_provenance"))
+    from trader.us.entry_exit_contract import US_ENTRY_EXIT_CONTRACT_VERSION
+    from trader.us.db.repos import _active_us_epoch, _get_engine_or_none
+    from trader.account_state import get_account_key
+    symbol = str(position["symbol"]).upper()
+    account = get_account_key(env="practice")
+    engine = _get_engine_or_none()
+    if engine is None or not account:
+        raise ValueError("LEGACY_STOP_DB_OR_ACCOUNT_UNAVAILABLE")
+    with engine.connect() as conn:
+        epoch = str(_active_us_epoch(conn, required=True))
+        expected_hash = hashlib.sha256(account.encode()).hexdigest()
+        if (not epoch or provenance.get("epoch") != epoch
+                or provenance.get("account_hash") != expected_hash
+                or provenance.get("symbol") != symbol):
+            raise ValueError("LEGACY_STOP_ACTIVE_ACCOUNT_OR_EPOCH_CHANGED")
+        digest = str(provenance.get("v2_sha") or "")
+        intent = {
+            "symbol": symbol, "side": "SELL", "strategy_owner": "US_STANDARD",
+            "meta": {
+                "source_entry_contract_sha256": digest,
+                "source_entry_contract_version": US_ENTRY_EXIT_CONTRACT_VERSION,
+            },
+        }
+        evidence, reason = _evidence_from_db(
+            conn, symbol=symbol, trade_date=trade_date, active_epoch=epoch,
+            raw_account=account, intent=intent,
+        )
+        if (not evidence or evidence["original_cycle"] != provenance.get("original_cycle")
+                or evidence["source_buy_day"] != provenance.get("source_buy_day")
+                or evidence["v2_sha"] != digest
+                or evidence["holding"] != _positive(position.get("qty"))):
+            raise ValueError("LEGACY_STOP_DB_ORIGINAL_UNVERIFIED:" + str(reason))
+        portfolio, prospective, _ = _verified_prospective_legacy_scope(
+            conn, evidence=evidence, symbol=symbol, raw_account=account,
+            epoch=epoch,
+        )
+    scoped = dict(position)
+    fields = {
+        "strategy_owner": "US_STANDARD", "account_id": account,
+        "trading_epoch_id": epoch, "portfolio_epoch_id": portfolio,
+        "position_cycle_id": prospective, "position_lifecycle_id": prospective,
+    }
+    scoped.update(fields)
+    scoped["meta"] = {**_json(position.get("meta")), **fields}
+    scoped["_legacy_stop_proof_scoped"] = True
+    return scoped
+
+
 def prove_and_bind_legacy_nine_sell(
     intent: dict, *, conn: Any, kis_client: Any,
     trade_date: str, env: str, raw_account: str, active_epoch: str,
@@ -412,7 +505,6 @@ def prove_and_bind_legacy_nine_sell(
     Caller must be the canonical US_STANDARD router. Updates only the current
     SELL intent; historical BUY / fill / position rows stay immutable.
     """
-    from trader.us.execution.recovery_identity import current_us_portfolio_epoch
     from trader.account_state import get_account_key
     import hashlib
 
@@ -472,16 +564,14 @@ def prove_and_bind_legacy_nine_sell(
         )
         if not ok:
             return False,reason,None
-        portfolio=current_us_portfolio_epoch(
-            conn,env=env,account_key=raw_account,
-            trading_epoch_id=active_epoch,strategy_owner="US_STANDARD",
+        # The SAME prospective cycle is used by the DB-verified durable
+        # stop obligation; neither scope retroactively changes the source BUY.
+        portfolio,prospective,_derived_account_hash=_verified_prospective_legacy_scope(
+            conn,evidence=evidence,symbol=symbol,raw_account=raw_account,
+            epoch=active_epoch,
         )
-        # A prospective SELL cycle, distinct from the original BUY lifecycle.
-        # Never update old us_orders/us_fills/us_positions with this value.
-        material="|".join((hashed,active_epoch,portfolio,
-                           evidence["original_cycle"],symbol,
-                           evidence["v2_sha"],"FORWARD_ONLY_V2_LEGACY_SELL_V1"))
-        prospective=hashlib.sha256(material.encode()).hexdigest()[:32]
+        if _derived_account_hash!=hashed:
+            return False,"LEGACY_ACCOUNT_HASH_CONFLICT",None
         existing=str(intent.get("position_lifecycle_id") or
                      meta.get("position_lifecycle_id") or "")
         if existing not in ("",evidence["original_cycle"],prospective):
@@ -632,6 +722,12 @@ def enrich_legacy_nine_v2_decision_position(
                 meta_out[f"{stage}_done"]=True
         out["meta"]=meta_out
         out["legacy_nine_decision_only_provisional"]=True
+        out["_legacy_nine_db_original_provenance"]={
+            "symbol":symbol,"epoch":epoch,
+            "account_hash":hashlib.sha256(raw_account.encode()).hexdigest(),
+            "original_cycle":old_life,"v2_sha":evidence["v2_sha"],
+            "source_buy_day":evidence["source_buy_day"],
+        }
         return out
     except Exception:
         # Strategy may still evaluate a protective decision, but will never
