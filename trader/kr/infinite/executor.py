@@ -87,18 +87,20 @@ class KISExecutor:
             # the immutable decision price stored in the intent journal.
             # This does not relax entry/capital policy or change the order.
             intended_price = float(decision.notional) / int(decision.qty)
-            before_native_round = int(intended_price)
+            # The tick normalizer itself rounds UP. Truncating a fractional
+            # owner LIMIT first could undercut the actual owner reference:
+            # 55,215.1 would incorrectly become 55,215 instead of 55,220.
             submit_price, tick_size = normalize_kr_etf_order_price(
-                before_native_round, side="BUY",
+                intended_price, side="BUY",
             )
             if submit_price <= 0:
                 raise ValueError("KR_INF_SUBMIT_PRICE_INVALID")
             logger.info(
                 "[KR_INF][BUY_LIMIT_PRICE] symbol=%s qty=%s decision_price=%.8f "
-                "kro_priced_input=%s kis_submit_price=%s tick_size=%s "
+                "kis_submit_price=%s tick_size=%s "
                 "price_source=DECISION_NOTIONAL_ETF_TICK_NORMALIZED",
                 symbol, decision.qty, intended_price,
-                before_native_round, submit_price, tick_size,
+                submit_price, tick_size,
             )
             response = self.kis.buy_stock_limit(symbol, decision.qty, submit_price)
         elif decision.action in {Action.SELL_PARTIAL, Action.SELL_ALL}:
