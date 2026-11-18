@@ -193,28 +193,83 @@ class KISExecutor:
             return None
         return BrokerOrderState("EXPIRED", 0)
 
+    def _original_daily_ccld_pages(self, order_date: date) -> dict | None:
+        """Return bounded *complete* KIS pages for the original order day.
+
+        Continuation calls happen only when KIS explicitly supplies a
+        continuation cursor. A failed page, repeated cursor or unbounded
+        history cannot become false no-order/fill proof. Protect all other
+        KIS data/order traffic with a strict maximum of three pages.
+        """
+        query_day = order_date.strftime("%Y%m%d")
+        fk = nk = ""
+        cursors: set[tuple[str, str]] = set()
+        rows: list[dict] = []
+        for page in range(1, 4):
+            try:
+                raw = self.kis.inquire_daily_ccld(
+                    start_date=query_day,
+                    end_date=query_day,
+                    **({"ctx_area_fk100": fk, "ctx_area_nk100": nk}
+                       if page > 1 else {}),
+                )
+            except Exception:
+                return None
+            if (not isinstance(raw, dict)
+                    or raw.get("_diag_stub") or raw.get("_stub")
+                    or raw.get("_ccld_status")
+                    or str(raw.get("_fill_source") or "").lower()
+                    == "daily_ccld_fail_open"
+                    or raw.get("rt_cd") not in (None, "0", 0)):
+                return None
+            chunk = raw.get("output1") or raw.get("output") or []
+            if isinstance(chunk, dict):
+                chunk = [chunk]
+            if not isinstance(chunk, list) or any(
+                not isinstance(item, dict) for item in chunk
+            ):
+                return None
+            rows.extend(chunk)
+            meta = raw.get("_response_meta") or {}
+            cont = str(
+                meta.get("tr_cont") if isinstance(meta, dict) else ""
+            ).strip().upper()
+            if cont not in {"", "F", "M", "D", "E"}:
+                return None
+            next_fk = str(raw.get("ctx_area_fk100")
+                          or raw.get("CTX_AREA_FK100") or "").strip()
+            next_nk = str(raw.get("ctx_area_nk100")
+                          or raw.get("CTX_AREA_NK100") or "").strip()
+            if cont in {"D", "E"} or (
+                not cont and not next_fk and not next_nk
+            ):
+                return {"rt_cd": "0", "output1": rows,
+                        "_kr_inf_ccld_verified_pages": page}
+            if not next_fk and not next_nk:
+                return None
+            cursor = (next_fk, next_nk)
+            if cursor in cursors:
+                return None
+            cursors.add(cursor)
+            fk, nk = cursor
+        logger.warning(
+            "[KR_INF][KIS_CCLD_PAGINATION_LIMIT] day=%s pages=3 "
+            "action=RECONCILE_PENDING",
+            query_day,
+        )
+        return None
+
     def order_state(self, intent: OrderIntent, trade_date: date) -> BrokerOrderState:
         # Reconcile against the order's original trading day, not the current
         # session day. Domestic day orders do not migrate to a later trade date;
         # using today's date can make an old SELL stay RECONCILE_PENDING forever.
         lookup_date = intent.trade_date or trade_date
-        try:
-            raw = self.kis.inquire_daily_ccld(
-                start_date=lookup_date.strftime("%Y%m%d"),
-                end_date=lookup_date.strftime("%Y%m%d"),
-            )
-        except Exception:
-            raw = None
-        # A DIAG/stubbed/fail-open daily-ccld result is NOT an authoritative
-        # KIS fill receipt, even when its output1 contains a plausible row.
-        # Keep the original intent/claim unresolved and never re-submit it.
-        if (not isinstance(raw, dict)
-                or raw.get("_diag_stub") or raw.get("_stub")
-                or raw.get("_ccld_status")
-                or str(raw.get("_fill_source") or "").lower() == "daily_ccld_fail_open"
-                or raw.get("rt_cd") not in (None, "0", 0)):
+        raw = self._original_daily_ccld_pages(lookup_date)
+        if raw is None:
+            # Never infer a missing original order from an incomplete KIS
+            # result. In particular, no balance-delta fill from a failed page.
             return BrokerOrderState("RECONCILE_PENDING")
-        rows = raw.get("output1") or raw.get("output") or []
+        rows = raw["output1"]
         if intent.broker_order_id:
             matches = [item for item in rows if str(item.get("odno") or item.get("ODNO") or item.get("ord_no") or "") == intent.broker_order_id]
         else:
