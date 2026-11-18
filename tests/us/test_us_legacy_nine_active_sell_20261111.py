@@ -893,6 +893,9 @@ def test_legacy_stop_durable_scope_matches_independently_proven_router(scenario,
 def test_verified_legacy_hard_stop_is_not_dropped_before_sell_intent(scenario, monkeypatch):
     from datetime import datetime, timezone
     from trader.us.pb1 import us_exit_engine
+    monkeypatch.setenv("US_PROTECTIVE_STOP_LEDGER_MODE", "ENFORCE")
+    monkeypatch.setenv("KIS_HTTP_BLOCK", "0")
+    monkeypatch.setenv("OFFLINE_MODE", "0")
     position = _db_verified_legacy_stop_position(scenario, monkeypatch)
     calls = []
     monkeypatch.setattr(
