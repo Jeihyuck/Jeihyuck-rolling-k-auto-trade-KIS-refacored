@@ -1518,9 +1518,10 @@ def _evaluate_exit_intents_from_snapshots(
                 pos.get("exit_resolution_failure_reason") or "UNKNOWN",
             )
             continue
-        # The original BUY-time V2 policy was already verified by DB and
-        # is restored ONLY for the in-memory exit decision. Router still
-        # needs independent authenticated KIS proof to issue the SELL.
+        # Original V2 BUY-time policy is verified from ACTIVE-epoch DB
+        # and restored only for the in-memory exit decision. The router
+        # independently checks fresh CURRENT KIS account/holdings/orders
+        # before authorizing a SELL; historical KIS days are not reread.
         try:
             from trader.us.execution.us_legacy_nine_active_sell import (
                 enrich_legacy_nine_v2_decision_position,

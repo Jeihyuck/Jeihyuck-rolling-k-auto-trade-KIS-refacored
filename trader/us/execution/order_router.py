@@ -1705,7 +1705,7 @@ def route_order(
                         _legacy_nine_auto_sell_proof = _legacy_proof
                         logger.info(
                             "[US_LEGACY_NINE][AUTO_SELL][AUTHORIZED] symbol=%s "
-                            "source=KIS_ORIGINAL_AND_FRESH_CURRENT scope=FORWARD_ONLY_V2 "
+                            "source=ACTIVE_EPOCH_DB_ORIGINAL_AND_FRESH_KIS_CURRENT scope=FORWARD_ONLY_V2 "
                             "automated_sell_authorized=true", symbol_upper,
                         )
                     elif _legacy_reason != "NOT_AN_UNSCOPED_LEGACY_POSITION":

@@ -1,11 +1,14 @@
 """ACTIVE practice-only nine legacy US_STANDARD SELL scope bridge.
 
-A broker-confirmed, same-account V2 holding may receive a *prospective*
-management scope for a new SELL, without rewriting its original October BUY.
-This is never a grant to sell without a normal V2 strategy exit signal.
-Every attempted SELL must prove immutable V2 BUY, old runtime lifecycle,
-complete native KIS holdings, every actual fill, TP-stage state, and all
-outstanding historical and current orders. No SHADOW, no blanket TRUE.
+An ACTIVE-practice-account/ACTIVE-trading-epoch V2 legacy holding may receive
+a prospective management scope for a new SELL, without backdating its original
+BUY. The immutable original BUY, prior actual SELL fills, TP stages, original
+lifecycle and all order claims are verified from strictly current-epoch DB
+rows. Historical KIS order-day queries are NOT a SELL prerequisite; the
+current authenticated KIS account, live holdings, orderable shares and
+same-day competing orders still require fresh broker GET before authorization
+and immediately before HTTP. Ambiguous same-epoch historic SELL remains
+fenced. No SHADOW, no blanket TRUE, no strategy bypass.
 
 This module performs GET/SELECT only. All real order intents, claim/outbox,
 risk gates, KIS submit and reconciliation stay in canonical order_router.
@@ -71,20 +74,20 @@ def _classify_immutable_source_order(
 
 
 ORIGINAL_BUY_SQL = """
-SELECT trade_date,order_no,qty_requested,qty_filled,status,meta
+SELECT trade_date,order_no,qty_requested,qty_filled,status,meta,account_id
 FROM us_orders WHERE symbol=:symbol AND side='BUY' AND
 trading_epoch_id=:epoch AND env='practice' AND dry_run IS FALSE
 ORDER BY trade_date,id
 """
 FILLS_SQL = """
-SELECT trade_date,order_no,side,qty,meta
+SELECT trade_date,order_no,side,qty,meta,account_id
 FROM us_fills WHERE symbol=:symbol AND trading_epoch_id=:epoch
   AND side IN ('BUY','SELL') ORDER BY trade_date,id
 """
 POSITION_SQL = """
 SELECT DISTINCT ON (symbol) symbol,qty,exchange,as_of,meta,account_id,
   trading_epoch_id,portfolio_epoch_id,position_cycle_id
-FROM us_positions WHERE symbol=:symbol AND as_of<=:today
+FROM us_positions WHERE symbol=:symbol AND trading_epoch_id=:epoch AND as_of<=:today
 ORDER BY symbol,as_of DESC,created_at DESC
 """
 HISTORICAL_SQL = """
@@ -101,15 +104,16 @@ WHERE trading_epoch_id=:epoch AND symbol=:symbol AND trade_date>=:buy_day
 ORDER BY trade_date,stage
 """
 HISTORICAL_PENDING_SQL = """
-SELECT trade_date,order_no,qty_requested,qty_filled,status
+SELECT trade_date,order_no,qty_requested,qty_filled,status,meta,account_id
 FROM us_orders WHERE symbol=:symbol AND side='SELL' AND env='practice'
+AND trading_epoch_id=:epoch AND dry_run IS FALSE AND trade_date>=:buy_day
 AND status NOT IN ('FILLED','RECONCILED','CANCELLED','REJECTED','BLOCKED','EXPIRED')
 ORDER BY trade_date,order_no
 """
 SELL_ORDERS_SQL = """
-SELECT trade_date,order_no,qty_requested,qty_filled,status,meta
+SELECT trade_date,order_no,qty_requested,qty_filled,status,meta,account_id
 FROM us_orders WHERE symbol=:symbol AND trading_epoch_id=:epoch
-AND side='SELL' AND env='practice' AND trade_date>=:buy_day
+AND side='SELL' AND env='practice' AND dry_run IS FALSE AND trade_date>=:buy_day
 ORDER BY trade_date,order_no
 """
 
@@ -137,6 +141,29 @@ def _json(d: Any) -> dict:
 
 def _rows(conn, sql: str, params: dict) -> list[dict]:
     return [dict(row) for row in conn.execute(text(sql), params).mappings().all()]
+
+
+def _row_in_active_practice_scope(
+    row: dict, *, account: str, epoch: str,
+) -> bool:
+    """Only explicit ACTIVE account/epoch evidence, never a foreign fallback.
+
+    Legacy DB columns may be NULL, but the signed original V2 contract and
+    original runtime lifecycle must separately prove the active account and
+    trading epoch. Any populated row/meta identity MUST match the active one.
+    """
+    if not account or not epoch:
+        return False
+    account_hash = hashlib.sha256(account.encode("utf-8")).hexdigest()
+    for source in (row, _json(row.get("meta"))):
+        for key in ("account_id", "account_key", "broker_account_hash"):
+            value = source.get(key)
+            if value not in (None, "") and str(value) not in (account, account_hash):
+                return False
+        value = source.get("trading_epoch_id")
+        if value not in (None, "") and str(value) != epoch:
+            return False
+    return True
 
 
 def _get_broker_safety(client, *, symbol: str, exchange: str,
@@ -195,6 +222,10 @@ def _evidence_from_db(conn, *, symbol: str, trade_date: str,
     holding=_positive(pos.get("qty"))
     if holding is None or str(pos.get("trading_epoch_id") or "")!=active_epoch:
         return None,"LEGACY_HOLDING_OR_EPOCH_UNVERIFIED"
+    if not _row_in_active_practice_scope(
+        pos, account=raw_account, epoch=active_epoch,
+    ):
+        return None,"LEGACY_POSITION_ACCOUNT_OR_EPOCH_MISMATCH"
     scoped_fields=(pos.get("account_id"),pos.get("portfolio_epoch_id"),
                    pos.get("position_cycle_id"))
     if all(value not in (None,"") for value in scoped_fields):
@@ -238,6 +269,10 @@ def _evidence_from_db(conn, *, symbol: str, trade_date: str,
     if len(buys)!=1:
         return None,"ORIGINAL_BUY_NOT_UNIQUE"
     buy=buys[0]
+    if not _row_in_active_practice_scope(
+        buy, account=raw_account, epoch=active_epoch,
+    ):
+        return None,"ORIGINAL_BUY_ACTIVE_ACCOUNT_OR_EPOCH_MISMATCH"
     bmeta=_json(buy.get("meta"))
     buy_qty=_positive(buy.get("qty_filled"))
     if (str(buy.get("trade_date"))!=opened or
@@ -256,6 +291,10 @@ def _evidence_from_db(conn, *, symbol: str, trade_date: str,
     net=0
     fill_sells={}
     for f in fills:
+        if not _row_in_active_practice_scope(
+            f, account=raw_account, epoch=active_epoch,
+        ):
+            return None,"ORIGINAL_FILL_ACTIVE_ACCOUNT_OR_EPOCH_MISMATCH"
         fm=_json(f.get("meta"))
         qty=_positive(f.get("qty"))
         if (qty is None or not f.get("order_no")
@@ -287,6 +326,10 @@ def _evidence_from_db(conn, *, symbol: str, trade_date: str,
     matched_sells=set()
     seen_orders=set()
     for order in sells:
+        if not _row_in_active_practice_scope(
+            order, account=raw_account, epoch=active_epoch,
+        ):
+            return None,"ORIGINAL_SELL_ACTIVE_ACCOUNT_OR_EPOCH_MISMATCH"
         key=(str(order["trade_date"]),str(order.get("order_no") or "").lstrip("0"))
         if not key[1] or key in seen_orders:
             return None,"ORIGINAL_SELL_ORDER_IDENTITY_DUPLICATE"
@@ -301,15 +344,18 @@ def _evidence_from_db(conn, *, symbol: str, trade_date: str,
                 or meta.get("position_lifecycle_id")!=original_cycle):
             return None,"ORIGINAL_SELL_DB_ORDER_FILL_CONFLICT"
         if qty is None:
-            # An old zero-fill ACK/OPEN is still a real historical order.
-            # It need not have a fill row. Do not invent one to make the
-            # count match. Authorize later only if its original KIS day
-            # proves a terminal cancellation with cumulative 0.
+            # DB-only historical checks may accept a zero-fill terminal
+            # broker observation, NEVER an OPEN/ACK/UNKNOWN or locally
+            # inferred cancellation. Current live KIS safety is checked
+            # independently before every SELL and again immediately pre-HTTP.
             if recorded != 0 or status not in {
                 "OPEN","ACK","SUBMITTED","CANCELLED","CANCELED",
                 "REJECTED","EXPIRED","BLOCKED",
             }:
                 return None,"ORIGINAL_SELL_NO_FILL_UNVERIFIED"
+            if (status in {"CANCELLED","CANCELED","REJECTED"}
+                    and meta.get("fill_evidence_type") == "KIS_ORDER_STATUS_ACTUAL"):
+                continue
             zero_fill_sell_proofs.append((key[0],str(order["order_no"]),requested,0))
             continue
         if (requested<qty or recorded!=qty
@@ -336,6 +382,10 @@ def _evidence_from_db(conn, *, symbol: str, trade_date: str,
         return None,"HISTORICAL_SELL_PENDING_OVERFLOW"
     unresolved=[]
     for row in pending:
+        if not _row_in_active_practice_scope(
+            row, account=raw_account, epoch=active_epoch,
+        ):
+            return None,"ACTIVE_EPOCH_PENDING_SELL_ACCOUNT_MISMATCH"
         qty=_positive(row.get("qty_requested"))
         filled=_nonnegative(row.get("qty_filled"))
         if not row.get("order_no") or qty is None or filled is None:
@@ -357,12 +407,11 @@ def prove_and_bind_legacy_nine_sell(
     intent: dict, *, conn: Any, kis_client: Any,
     trade_date: str, env: str, raw_account: str, active_epoch: str,
 ) -> tuple[bool,str,dict | None]:
-    """Conditional TRUE only after original and current KIS + DB evidence.
+    """Conditional TRUE only after scoped DB originals and fresh CURRENT KIS.
 
     Caller must be the canonical US_STANDARD router. Updates only the current
     SELL intent; historical BUY / fill / position rows stay immutable.
     """
-    from scripts.us_original_order_readonly_probe import classify_original_order
     from trader.us.execution.recovery_identity import current_us_portfolio_epoch
     from trader.account_state import get_account_key
     import hashlib
@@ -407,55 +456,15 @@ def prove_and_bind_legacy_nine_sell(
         source_exchange=aliases.get(evidence["exchange"],evidence["exchange"])
         if intent_exchange!=source_exchange:
             return False,"LEGACY_BROKER_EXCHANGE_MISMATCH",None
-        from trader.us.data_provider import normalize_us_order_status_row
-        cache={}
-        def get_order_day(d: str):
-            if d not in cache:
-                cache[d]=kis_client.get_us_today_orders(trade_date=d)
-            if not isinstance(cache[d],list):
-                raise ValueError("KIS_ORIGINAL_DAY_INCOMPLETE")
-            return cache[d]
-        def check_historical_source(*, day, order_no, qty, filled, side):
-            return _classify_immutable_source_order(
-                classifier=classify_original_order, get_order_day=get_order_day,
-                day=day, current_trade_date=trade_date,
-                source_account_hash=hashed, epoch=active_epoch,
-                contract_sha=evidence["v2_sha"], symbol=symbol,
-                order_no=order_no, side=side,
-                requested_qty=qty, cumulative_filled_qty=filled,
-            )
-        buy_proof=check_historical_source(
-            day=evidence["source_buy_day"],
-            order_no=evidence["source_buy_order"],
-            qty=evidence["source_buy_qty"],
-            filled=evidence["source_buy_qty"], side="BUY",
-        )
-        if (buy_proof["classification"]!="PROVEN_FILLED"
-                or buy_proof.get("cumulative_filled_qty")!=evidence["source_buy_qty"]):
-            return False,"ORIGINAL_KIS_BUY_NOT_PROVEN",None
-        for day,no,req,filled in evidence["prior_sell_proofs"]:
-            status=check_historical_source(
-                day=day, order_no=no, qty=req, filled=filled, side="SELL",
-            )
-            if (status["classification"] not in {"PROVEN_FILLED","PROVEN_CANCELLED"}
-                    or status.get("cumulative_filled_qty")!=filled):
-                return False,"ORIGINAL_KIS_SELL_FILL_UNVERIFIED",None
-        for day,no,req,filled in evidence["zero_fill_sell_proofs"]:
-            # Source-day broker cancelled + zero cumulative fill is the
-            # only proof accepted for a local zero-fill SELL.
-            zero_status=check_historical_source(
-                day=day, order_no=no, qty=req, filled=0, side="SELL",
-            )
-            if (zero_status["classification"]!="PROVEN_CANCELLED"
-                    or zero_status.get("cumulative_filled_qty")!=0):
-                return False,"ORIGINAL_KIS_ZERO_FILL_SELL_NOT_CANCELLED",None
-        for day,no,req,filled in evidence["old_unresolved"]:
-            status=check_historical_source(
-                day=day, order_no=no, qty=req, filled=filled, side="SELL",
-            )
-            if (status["classification"] not in {"PROVEN_FILLED","PROVEN_CANCELLED"}
-                    or status.get("cumulative_filled_qty")!=filled):
-                return False,"HISTORICAL_KIS_SELL_STILL_UNRESOLVED",None
+        # Original BUY/fills/SELLs and immutable V2 policy were verified in
+        # the ACTIVE practice account + ACTIVE trading epoch DB scope above.
+        # Never requery old KIS dates, old accounts or old trading epochs.
+        # A same-epoch unresolved SELL cannot be assumed cancelled merely
+        # because it is old; AM/CLOSE reconciliation must resolve it first.
+        if evidence["zero_fill_sell_proofs"]:
+            return False,"ACTIVE_EPOCH_ZERO_FILL_SELL_UNRESOLVED",None
+        if evidence["old_unresolved"]:
+            return False,"ACTIVE_EPOCH_HISTORICAL_SELL_UNRESOLVED",None
         ok,reason=_get_broker_safety(
             kis_client,symbol=symbol,exchange=source_exchange,
             expected_holding=evidence["holding"],
