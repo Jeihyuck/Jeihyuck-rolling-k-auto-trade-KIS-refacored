@@ -269,8 +269,21 @@ class KISExecutor:
         lookup_date = intent.trade_date or trade_date
         raw = self._original_daily_ccld_pages(lookup_date)
         if raw is None:
-            # Never infer a missing original order from an incomplete KIS
-            # result. In particular, no balance-delta fill from a failed page.
+            # Failed/incomplete KIS fill pages cannot establish a missing BUY
+            # or prove any executed BUY cash amount. Preserve the existing
+            # *SELL-only* emergency balance-delta contract: an immutable
+            # pre-order holding baseline plus fresh authoritative KIS balance
+            # can prove sold quantity even when daily-ccld returns HTTP 500.
+            # No proceeds/average price are manufactured from that quantity.
+            if intent.side in {"SELL_PARTIAL", "SELL_ALL"} and str(
+                intent.broker_order_id or ""
+            ).strip():
+                try:
+                    balance_proof = self._balance_delta_state(intent)
+                except Exception:
+                    balance_proof = None
+                if balance_proof is not None:
+                    return balance_proof
             return BrokerOrderState("RECONCILE_PENDING")
         rows = raw["output1"]
         if intent.broker_order_id:
