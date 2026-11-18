@@ -323,18 +323,126 @@ class InfiniteRepository:
                 })
 
     def persist_reconciliation(self, state: State, updates: list[tuple[OrderIntent, BrokerOrderState]]) -> None:
+        """Commit the complete broker-fill journal and sleeve state atomically.
+
+        PostgreSQL writers lock the one active-epoch sleeve row *before* the
+        intent rows, and compare both state version and each original intent
+        cumulative snapshot. A concurrent tick, older KIS response or
+        mismatched owner/cycle rolls the entire transaction back. No retry
+        submits a new order: the next tick must reload KIS and the database.
+
+        Legacy SQLite claim-only tests have a reduced table schema; their
+        state writer is supplied by the test fixture and cannot provide the
+        PostgreSQL locking guarantee.
+        """
+        from decimal import Decimal, InvalidOperation
+
+        def money(value):
+            try:
+                amount = Decimal(str(0 if value is None else value))
+                if not amount.is_finite() or amount < 0:
+                    raise ValueError("KR_INF_FILL_NOTIONAL_INVALID")
+                return amount
+            except (InvalidOperation, TypeError):
+                raise ValueError("KR_INF_FILL_NOTIONAL_INVALID")
+
         with self.engine.begin() as conn:
             epoch_id = self._epoch_id(conn, required=True)
+            is_postgres = conn.dialect.name == "postgresql"
+            if is_postgres:
+                # Lock the economic state first, consistently across workers.
+                locked_state = conn.execute(text("""
+                    SELECT version,cycle_id FROM kr_infinite_state
+                    WHERE trading_epoch_id=:epoch_id
+                      AND strategy_id='KR_INFINITE_V1' AND symbol='122630'
+                    FOR UPDATE
+                """), {"epoch_id": epoch_id}).mappings().first()
+                if (not locked_state
+                        or str(locked_state["cycle_id"] or "") != str(state.cycle_id or "")
+                        or int(locked_state["version"]) != int(state.version)):
+                    raise RuntimeError("KR_INF_RECONCILE_STATE_RACE_RELOAD")
+
+            seen_ids = set()
             for intent, broker in updates:
+                if intent.id in seen_ids:
+                    raise ValueError("KR_INF_RECONCILE_DUPLICATE_INTENT")
+                seen_ids.add(intent.id)
                 previous_qty = int(intent.filled_qty or 0)
-                qty = broker.filled_qty if broker.filled_qty is not None else (
-                    previous_qty if previous_qty > 0 else None
+                previous_notional = money(intent.filled_notional_krw)
+                if is_postgres:
+                    persisted = conn.execute(text("""
+                        SELECT trading_epoch_id,strategy_id,symbol,cycle_id,side,
+                               idempotency_key,broker_order_id,trade_date,
+                               requested_qty,filled_qty,filled_notional_krw,status
+                        FROM kr_infinite_order_intents
+                        WHERE trading_epoch_id=:epoch_id AND id=:id
+                        FOR UPDATE
+                    """), {"epoch_id": epoch_id, "id": intent.id}).mappings().first()
+                    if (not persisted
+                            or persisted["strategy_id"] != "KR_INFINITE_V1"
+                            or persisted["symbol"] != "122630"
+                            or persisted["cycle_id"] != intent.cycle_id
+                            or persisted["cycle_id"] != state.cycle_id
+                            or persisted["side"] != intent.side
+                            or persisted["idempotency_key"] != intent.idempotency_key
+                            or persisted["trade_date"] != intent.trade_date
+                            or str(persisted["broker_order_id"] or "") != str(intent.broker_order_id or "")
+                            or int(persisted["filled_qty"] or 0) != previous_qty
+                            or money(persisted["filled_notional_krw"]) != previous_notional):
+                        raise RuntimeError("KR_INF_RECONCILE_INTENT_RACE_RELOAD")
+                    if str(persisted["status"]).upper() == "FILLED" and str(broker.status).upper() != "FILLED":
+                        raise RuntimeError("KR_INF_RECONCILE_TERMINAL_REGRESSION")
+                    requested_qty = int(persisted["requested_qty"] or 0)
+                    if requested_qty <= 0:
+                        raise RuntimeError("KR_INF_RECONCILE_REQUEST_QTY_UNVERIFIED")
+                else:
+                    requested_qty = int(intent.requested_qty or 0)
+
+                cumulative_qty = (
+                    int(broker.filled_qty) if broker.filled_qty is not None
+                    else previous_qty
                 )
-                conn.execute(text("""UPDATE kr_infinite_order_intents SET status=:status,filled_qty=:qty,
-                    filled_notional_krw=:notional,filled_avg_price=:average,updated_at=NOW() WHERE id=:id"""),
-                    {"status": broker.status, "qty": qty, "notional": broker.filled_notional_krw,
+                if cumulative_qty < previous_qty or (
+                    requested_qty > 0 and cumulative_qty > requested_qty
+                ):
+                    raise RuntimeError("KR_INF_RECONCILE_FILL_QTY_REGRESSION")
+                cumulative_notional = (
+                    money(broker.filled_notional_krw)
+                    if broker.filled_qty is not None and cumulative_qty > 0
+                    else previous_notional
+                )
+                if cumulative_notional < previous_notional:
+                    raise RuntimeError("KR_INF_RECONCILE_FILL_NOTIONAL_REGRESSION")
+                if is_postgres and (
+                    (cumulative_qty > previous_qty and cumulative_notional <= previous_notional)
+                    or (cumulative_qty == previous_qty and cumulative_notional != previous_notional)
+                ):
+                    # Quantity without original broker cash evidence may not
+                    # consume the intent; else later genuine fill is lost.
+                    raise RuntimeError("KR_INF_RECONCILE_PRICE_UNVERIFIED")
+
+                # PostgreSQL numeric and all Python arithmetic stay Decimal.
+                # A missing broker fill count NEVER clears the stored 0.
+                persisted_qty = cumulative_qty if is_postgres else (
+                    broker.filled_qty if broker.filled_qty is not None
+                    else previous_qty if previous_qty > 0 else None
+                )
+                persisted_notional = (
+                    cumulative_notional if is_postgres else broker.filled_notional_krw
+                )
+                conn.execute(text("""UPDATE kr_infinite_order_intents
+                    SET status=:status,filled_qty=:qty,
+                        filled_notional_krw=:notional,filled_avg_price=:average,
+                        updated_at=NOW()
+                    WHERE id=:id"""),
+                    {"status": broker.status, "qty": persisted_qty,
+                     "notional": persisted_notional,
                      "average": broker.filled_avg_price, "id": intent.id})
             self._save_state(conn, state, epoch_id=epoch_id)
+
+        # The intent+state commit above is the recoverable economic journal.
+        # A claim observation is derived from that journal; if this separate
+        # materialized view fails, the next AM/Close replay must repair it.
         terminal_fill_states = {"FILLED", "PARTIALLY_FILLED", "REJECTED", "CANCELLED", "EXPIRED"}
         for intent, broker in updates:
             metadata = dict(intent.metadata or {})
