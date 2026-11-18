@@ -76,7 +76,7 @@ def test_20260824_ccld_http500_sell_uses_balance_delta_6_to_3() -> None:
     assert broker.filled_qty == 3
 
 
-def test_20260819_ccld_failure_buy_uses_balance_delta_0_to_6() -> None:
+def test_20260819_ccld_failure_buy_only_proves_possible_qty_never_fabricates_cash() -> None:
     intent = OrderIntent(
         id=1,
         cycle_id="KRINF-20260819-test",
@@ -90,10 +90,11 @@ def test_20260819_ccld_failure_buy_uses_balance_delta_0_to_6() -> None:
     )
     executor = KISExecutor(_Ccld500(), "practice", balance_snapshot=_balance(6, 110500.0))
     broker = executor.order_state(intent, date(2026, 8, 19))
-    assert broker.status == "FILLED"
-    assert broker.filled_qty == 6
-    assert broker.filled_avg_price == 110500.0
-    assert broker.filled_notional_krw == 663000.0
+    assert broker.status == "RECONCILE_PENDING"
+    assert broker.filled_qty is None
+    assert broker.filled_avg_price is None
+    assert broker.filled_notional_krw == 0.0
+    # A position's average cost is not original KIS execution-price evidence.
 
 
 def test_historical_zero_fill_day_order_expires_after_successful_lookup() -> None:
