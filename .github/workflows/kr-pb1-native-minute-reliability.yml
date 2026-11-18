@@ -13,6 +13,8 @@ on:
       - "trader/kr/infinite/runner.py"
       - "trader/kr/infinite/executor.py"
       - "trader/kr/infinite/repository.py"
+      - "trader/kr_price_utils.py"
+      - "tests/kr/infinite/test_20261118_etf_tick_contract.py"
       - "tests/kr/infinite/test_20261118_atomic_fill_journal.py"
       - "tests/kr/test_kr_20261118_sparse_native_intraday_entry.py"
       - "tests/kr/infinite/test_runner_integration.py"
@@ -69,6 +71,7 @@ jobs:
             tests/kr/infinite/test_v3_contract.py \
             tests/kr/infinite/test_runner_integration.py \
             tests/kr/infinite/test_20261118_atomic_fill_journal.py \
+            tests/kr/infinite/test_20261118_etf_tick_contract.py \
             tests/kr/test_kr_20261118_sparse_native_intraday_entry.py \
             tests/kr/test_kr_pb1_kis_http_audit.py \
             tests/kr/test_kr_session_metrics_accumulator.py \
