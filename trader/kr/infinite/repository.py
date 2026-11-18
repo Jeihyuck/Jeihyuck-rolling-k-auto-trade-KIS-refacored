@@ -346,9 +346,10 @@ class InfiniteRepository:
         """Commit the complete broker-fill journal and sleeve state atomically.
 
         PostgreSQL writers lock the one active-epoch sleeve row *before* the
-        intent rows, and compare both state version and each original intent
-        cumulative snapshot. A concurrent tick, older KIS response or
-        mismatched owner/cycle rolls the entire transaction back. No retry
+        intent rows; the economic state must never regress and each original
+        intent's cumulative snapshot must match the locked DB journal. A
+        concurrent tick, older KIS response or mismatched owner/cycle aborts
+        the entire transaction. No retry
         submits a new order: the next tick must reload KIS and the database.
 
         Legacy SQLite claim-only tests have a reduced table schema; their
@@ -434,6 +435,11 @@ class InfiniteRepository:
                 else:
                     requested_qty = int(intent.requested_qty or 0)
 
+                if is_postgres and (
+                    str(broker.status or "").upper() in {"FILLED", "PARTIALLY_FILLED"}
+                    and broker.filled_qty is None
+                ):
+                    raise RuntimeError("KR_INF_RECONCILE_TERMINAL_QTY_UNPROVEN")
                 cumulative_qty = (
                     int(broker.filled_qty) if broker.filled_qty is not None
                     else previous_qty
