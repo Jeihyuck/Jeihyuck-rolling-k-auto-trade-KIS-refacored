@@ -68,3 +68,67 @@ def test_journal_corruption_is_not_permission_to_submit():
         },
         durable_record_ok=True,
     )
+
+
+def test_historical_open_orders_exclude_only_proven_foreign_epoch_or_account():
+    """Same-account KR Infinite remains a distinct blocking order, not PB1."""
+    from trader.kr.recovery_scope_20261104 import (
+        KRRecoveryScope, relevant_open_orders_for_scope,
+    )
+    scope = KRRecoveryScope(
+        env="practice", account_key="practice:account-a:paper",
+        trading_epoch_id="epoch-active",
+    )
+    def portfolio(portfolio_id, *, account, epoch, strategy):
+        return {
+            "portfolio_epoch_id": portfolio_id,
+            "env": "practice", "account_id": account,
+            "trading_epoch_id": epoch, "strategy": strategy,
+        }
+    portfolios = {
+        "pb1-own": portfolio(
+            "pb1-own", account=scope.account_key,
+            epoch="epoch-active", strategy="pb1_pullback_close",
+        ),
+        "infinite-own": portfolio(
+            "infinite-own", account=scope.account_key,
+            epoch="epoch-active", strategy="KR_INFINITE_V1",
+        ),
+        "other-account": portfolio(
+            "other-account", account="practice:account-b:paper",
+            epoch="epoch-active", strategy="pb1_pullback_close",
+        ),
+        "other-epoch": portfolio(
+            "other-epoch", account=scope.account_key,
+            epoch="epoch-prior", strategy="pb1_pullback_close",
+        ),
+    }
+    def order(portfolio_id, *, code, epoch, owner):
+        return {
+            "order_id": "unique-" + portfolio_id,
+            "env": "practice", "strategy": owner,
+            "portfolio_epoch_id": portfolio_id,
+            "position_cycle_id": "cycle-" + portfolio_id,
+            "trading_epoch_id": epoch, "code": code,
+            "status": "SUBMITTED",
+        }
+    rows = [
+        order("pb1-own", code="093320", epoch="epoch-active",
+              owner="pb1_pullback_close"),
+        order("infinite-own", code="122630", epoch="epoch-active",
+              owner="KR_INFINITE_V1"),
+        order("other-account", code="093320", epoch="epoch-active",
+              owner="pb1_pullback_close"),
+        order("other-epoch", code="293490", epoch="epoch-prior",
+              owner="pb1_pullback_close"),
+        order("no-portfolio-proof", code="028050", epoch="epoch-prior",
+              owner="pb1_pullback_close"),
+    ]
+    retained = relevant_open_orders_for_scope(
+        orders=rows, portfolios=portfolios, scope=scope,
+    )
+    assert [item["portfolio_epoch_id"] for item in retained] == [
+        "pb1-own", "infinite-own", "no-portfolio-proof",
+    ]
+    # Do not relabel 122630 as PB1 to unblock the historical BUY gate.
+    assert retained[1]["strategy"] == "KR_INFINITE_V1"
