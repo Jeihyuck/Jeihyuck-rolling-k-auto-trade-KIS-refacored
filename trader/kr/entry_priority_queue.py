@@ -148,6 +148,46 @@ def _snapshot(*, date: str, account_scope: str, prep: dict,
     return body
 
 
+
+def eligible_preminute_codes(
+    *, candidates: Iterable[object], held_codes: Iterable[str] = (),
+    blocking_buy_codes: Iterable[str] = (),
+    filled_buy_codes: Iterable[str] = (),
+    blocking_client_order_keys: Iterable[str] = (),
+) -> list[str]:
+    """Read-only HOT/WARM shortlist from *already* computed owner risk results.
+
+    A setup without a positive sized quantity, a known held position, a live
+    BUY intent, or an already-filled BUY does not warrant high-frequency
+    minute polling. A prior local-only rejected intent need not be excluded:
+    its separate final PB1 duplicate guard remains authoritative.
+
+    This is never an order-authorization, cash, risk, or timing decision.
+    """
+    excluded = set(_unique(held_codes))
+    excluded.update(_unique(blocking_buy_codes))
+    excluded.update(_unique(filled_buy_codes))
+    keys = {str(key).strip() for key in blocking_client_order_keys if str(key).strip()}
+    result = []
+    for cf in candidates:
+        code = _code(getattr(cf, "code", None))
+        if not code or code in excluded:
+            continue
+        if not bool(getattr(cf, "setup_ok", False)):
+            continue
+        try:
+            qty = int(getattr(cf, "planned_qty", 0) or 0)
+        except (ValueError, TypeError, OverflowError):
+            qty = 0
+        if qty <= 0:
+            continue
+        key = str(getattr(cf, "client_order_key", "") or "").strip()
+        if key and key in keys:
+            continue
+        result.append(code)
+    return _unique(result)
+
+
 def publish_pb1_priority(*, date: str, account_scope: str,
                          eligible_codes: Iterable[str],
                          held_codes: Iterable[str] = (),
