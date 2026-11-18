@@ -8140,7 +8140,20 @@ class PB1Engine:
             row_cycle = str(row.get("position_cycle_id") or "")
             if position_cycle_id and row_cycle and row_cycle != str(position_cycle_id):
                 continue
-            request = row.get("request_json") if isinstance(row.get("request_json"), dict) else {}
+            raw_request = row.get("request_json")
+            if isinstance(raw_request, dict):
+                request = raw_request
+            elif isinstance(raw_request, str):
+                try:
+                    request = json.loads(raw_request)
+                except (ValueError, TypeError):
+                    logger.warning("[SELL_SESSION_BLOCK][BAD_REQUEST_JSON] code=%s action=fail_closed", code)
+                    return True, dict(row)
+                if not isinstance(request, dict):
+                    logger.warning("[SELL_SESSION_BLOCK][BAD_REQUEST_TYPE] code=%s action=fail_closed", code)
+                    return True, dict(row)
+            else:
+                request = {}
             row_session = str(request.get("trade_session") or "").lower()
             if row_session and row_session != session:
                 continue
@@ -8164,14 +8177,32 @@ class PB1Engine:
                 prior_submitted = int(request.get("submitted_qty") or row.get("qty") or 0)
                 prior_pre_qty = int(request.get("pre_order_holding_qty") or 0)
                 prior_was_partial = (
-                    prior_stage in {"TP1", "TP2", "PROFIT_PROTECT_PARTIAL_1", "DEFENSE_TRIM_1"}
+                    prior_stage in {"TP1", "TP2", "PROFIT_PROTECT_PARTIAL_1",
+                                    "KR_US_PROFIT_DEFENSE_PARTIAL", "DEFENSE_TRIM_1"}
                     or (prior_pre_qty > 0 and 0 < prior_submitted < prior_pre_qty)
                 )
-                if (fresh and remaining > 0 and prior_was_partial
+                # A PARTIAL_FILLED ACK still has a live remainder. Only a
+                # fully confirmed prior execution plus a *fresh* broker holding
+                # reduction may release the next economic SELL stage.
+                prior_completed = prior_status in {
+                    "FILLED", "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED"
+                }
+                prior_balance_proven = (
+                    fresh and prior_pre_qty > 0 and prior_submitted > 0
+                    and 0 < remaining <= prior_pre_qty - prior_submitted
+                )
+                if (prior_completed and prior_balance_proven and prior_was_partial
                         and str(exit_stage or "").upper() == "FULL_EXIT"):
+                    # The fast session cache cannot override the reconciled
+                    # partial -> FULL_EXIT transition. Do not clear it for a
+                    # pending/unattributed original SELL.
+                    self._session_sell_blocked_codes.pop(str(code).zfill(6), None)
+                    self._session_sell_accepted_codes.pop(str(code).zfill(6), None)
                     continue
-                if (fresh and remaining > 0 and prior_stage and exit_stage
+                if (prior_completed and prior_balance_proven and prior_stage and exit_stage
                         and legal_next_exit_stage(prior_stage, exit_stage)):
+                    self._session_sell_blocked_codes.pop(str(code).zfill(6), None)
+                    self._session_sell_accepted_codes.pop(str(code).zfill(6), None)
                     continue
             # Pending/full-exit orders block regardless of a changing reason.
             logger.info("[SELL_SESSION_BLOCK][DURABLE_SKIP] code=%s cycle=%s prior_order_id=%s",
@@ -19779,7 +19810,13 @@ class PB1Engine:
             if (
                 str(getattr(self, "STRATEGY_NAME", "")) == "pb1_pullback_close"
                 and str(self.env or "").lower() == "practice"
-                and self._is_kr_equity_context()
+                and (
+                    self._is_kr_equity_context()
+                    or (
+                        str(getattr(self, "final30_source", "")).lower() == "kr_canonical_artifact"
+                        and str(getattr(self, "session_kind", "")).lower() in {"am", "pm", "afternoon"}
+                    )
+                )
                 and self.phase in {"entry", "pm_entry"}
                 and not allow_add_to_existing
             ):
