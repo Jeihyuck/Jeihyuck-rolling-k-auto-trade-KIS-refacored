@@ -205,7 +205,16 @@ class KISExecutor:
             )
         except Exception:
             raw = None
-        rows = (raw.get("output1") or raw.get("output") or []) if isinstance(raw, dict) else []
+        # A DIAG/stubbed/fail-open daily-ccld result is NOT an authoritative
+        # KIS fill receipt, even when its output1 contains a plausible row.
+        # Keep the original intent/claim unresolved and never re-submit it.
+        if (not isinstance(raw, dict)
+                or raw.get("_diag_stub") or raw.get("_stub")
+                or raw.get("_ccld_status")
+                or str(raw.get("_fill_source") or "").lower() == "daily_ccld_fail_open"
+                or raw.get("rt_cd") not in (None, "0", 0)):
+            return BrokerOrderState("RECONCILE_PENDING")
+        rows = raw.get("output1") or raw.get("output") or []
         if intent.broker_order_id:
             matches = [item for item in rows if str(item.get("odno") or item.get("ODNO") or item.get("ord_no") or "") == intent.broker_order_id]
         else:
