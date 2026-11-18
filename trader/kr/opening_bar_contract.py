@@ -290,29 +290,26 @@ def _evaluate_verified_intraday_window(
                 and vol_ratio >= 1.2):
             return _result("WAIT", "NO_CONFIRMED_MOMENTUM_RECLAIM", **proof)
         if close >= high and trigger_ok:
-            cap = high * 1.005
-            if price > cap:
-                return _result("WAIT", "BREAKOUT_CHASE_TOO_EXPENSIVE", **proof)
-            return _result("READY_SHADOW", "MOMENTUM_INTRADAY_NATIVE_BREAKOUT",
-                           max_entry_price=cap, **proof)
+            # The five recent post-open bars are NOT a substitute for a
+            # verified 09:00-09:29 opening-range high. Retain owner-approved
+            # breakout uncertainty instead of authorizing an easier entry.
+            return _result("UNKNOWN",
+                           "OPENING_RANGE_HIGH_UNVERIFIED_FOR_MOMENTUM_BREAKOUT",
+                           **proof)
         if (high - price) / risk < 1.5:
             return _result("WAIT", "INSUFFICIENT_ROOM_VS_STOP", **proof)
         return _result("READY_SHADOW", "MOMENTUM_INTRADAY_NATIVE_RECLAIM",
                        max_entry_price=min(close * 1.0025, high), **proof)
 
     # Original BREAKOUT owner approval and a verified pivot are mandatory.
-    # An observed intraday high is not an invented opening-range high.
+    # A verified daily pivot cannot by itself replace the *opening high* in
+    # the existing max(opening_high,pivot) contract. Incomplete native 09:00
+    # coverage means that operand is unknown; continue read-only observation.
     pivot_val = _positive(pivot)
     if pivot_val is None or not trigger_ok:
         return _result("WAIT", "ORIGINAL_PIVOT_TRIGGER_UNCONFIRMED", **proof)
-    breakout_level = max(high, pivot_val)
-    if close <= breakout_level or not rising or vol_ratio < 1.5:
-        return _result("WAIT", "BREAKOUT_PRICE_OR_VOLUME_NOT_CONFIRMED", **proof)
-    cap = breakout_level * 1.005
-    if price > cap:
-        return _result("WAIT", "BREAKOUT_CHASE_TOO_EXPENSIVE", **proof)
-    return _result("READY_SHADOW", "BREAKOUT_INTRADAY_NATIVE_PIVOT_CONFIRMED",
-                   max_entry_price=cap, **proof)
+    return _result("UNKNOWN", "OPENING_RANGE_HIGH_UNVERIFIED_FOR_BREAKOUT",
+                   verified_pivot=pivot_val, **proof)
 
 
 def evaluate_price_aware_entry(
