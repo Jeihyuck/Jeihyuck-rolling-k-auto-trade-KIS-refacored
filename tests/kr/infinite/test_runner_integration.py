@@ -54,7 +54,15 @@ class FakeKIS:
     def inquire_daily_ccld(self, **kwargs):
         return {"output1": [{"odno": "O1", "pdno": "122630", "side": self.last_side or "BUY",
                               "ord_qty": str(self.orders[-1][1] if self.orders else 0),
-                              "tot_ccld_qty": str(self.fill_qty), "avg_prvs": str(self.price)}]}
+                              # A mock broker cannot execute more shares than
+                              # the accepted order quantity.  An unbounded
+                              # fill_qty=110 previously reported 110 executions
+                              # of a 75-share SELL, contradicting the holdings
+                              # update and the native KIS fill guard.
+                              "tot_ccld_qty": str(min(
+                                  self.fill_qty,
+                                  self.orders[-1][1] if self.orders else 0,
+                              )), "avg_prvs": str(self.price)}]}
 
 
 class FakeRepository:
