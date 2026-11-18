@@ -2,10 +2,15 @@ from __future__ import annotations
 
 from datetime import date
 from typing import Any
+import logging
+
+from trader.kr_price_utils import normalize_kr_order_price
 
 from trader.kis_wrapper import extract_order_no, is_order_accepted
 
 from .models import Action, BrokerOrderState, BrokerPosition, Decision, OrderIntent
+
+logger = logging.getLogger(__name__)
 
 
 class KISExecutor:
@@ -74,7 +79,28 @@ class KISExecutor:
 
     def submit(self, decision: Decision, symbol: str) -> tuple[str | None, dict]:
         if decision.action in {Action.BUY, Action.RECOVERY}:
-            response = self.kis.buy_stock_limit(symbol, decision.qty, int(decision.notional / decision.qty))
+            if int(decision.qty or 0) <= 0:
+                raise ValueError("KR_INF_BUY_QTY_INVALID")
+            # KIS's buy_stock_limit() already rounds UP to the KRX tick.
+            # Pre-normalize here with the same shared tick function so the
+            # exact submitted LIMIT is observable and is reproducible from
+            # the immutable decision price stored in the intent journal.
+            # This does not relax entry/capital policy or change the order.
+            intended_price = float(decision.notional) / int(decision.qty)
+            before_native_round = int(intended_price)
+            submit_price, tick_size = normalize_kr_order_price(
+                before_native_round, side="BUY",
+            )
+            if submit_price <= 0:
+                raise ValueError("KR_INF_SUBMIT_PRICE_INVALID")
+            logger.info(
+                "[KR_INF][BUY_LIMIT_PRICE] symbol=%s qty=%s decision_price=%.8f "
+                "kro_priced_input=%s kis_submit_price=%s tick_size=%s "
+                "price_source=DECISION_NOTIONAL_TICK_NORMALIZED",
+                symbol, decision.qty, intended_price,
+                before_native_round, submit_price, tick_size,
+            )
+            response = self.kis.buy_stock_limit(symbol, decision.qty, submit_price)
         elif decision.action in {Action.SELL_PARTIAL, Action.SELL_ALL}:
             response = self.kis.sell_stock(symbol, decision.qty)
         else:
