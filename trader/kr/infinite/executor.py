@@ -214,14 +214,18 @@ class KISExecutor:
                        if page > 1 else {}),
                 )
             except Exception:
-                return None
+                # First-page HTTP failure means original order history is
+                # UNAVAILABLE, not an incomplete pagination cursor. Preserve
+                # the established old-day unchanged-balance SELL expiry proof
+                # only for this distinct condition.
+                return {"_kr_inf_first_page_unavailable": True} if page == 1 else None
             if (not isinstance(raw, dict)
                     or raw.get("_diag_stub") or raw.get("_stub")
                     or raw.get("_ccld_status")
                     or str(raw.get("_fill_source") or "").lower()
                     == "daily_ccld_fail_open"
                     or raw.get("rt_cd") not in (None, "0", 0)):
-                return None
+                return {"_kr_inf_first_page_unavailable": True} if page == 1 else None
             chunk = raw.get("output1") or raw.get("output") or []
             if isinstance(chunk, dict):
                 chunk = [chunk]
@@ -268,13 +272,14 @@ class KISExecutor:
         # using today's date can make an old SELL stay RECONCILE_PENDING forever.
         lookup_date = intent.trade_date or trade_date
         raw = self._original_daily_ccld_pages(lookup_date)
-        if raw is None:
-            # Failed/incomplete KIS fill pages cannot establish a missing BUY
-            # or prove any executed BUY cash amount. Preserve the existing
-            # *SELL-only* emergency balance-delta contract: an immutable
-            # pre-order holding baseline plus fresh authoritative KIS balance
-            # can prove sold quantity even when daily-ccld returns HTTP 500.
-            # No proceeds/average price are manufactured from that quantity.
+        first_page_unavailable = bool(
+            isinstance(raw, dict)
+            and raw.get("_kr_inf_first_page_unavailable") is True
+        )
+        if raw is None or first_page_unavailable:
+            # A failed first page is NOT evidence of no broker execution.
+            # A partial/incomplete subsequent page is never order-expiry
+            # evidence. Keep unknown BUY cash and duplicate submissions fenced.
             if intent.side in {"SELL_PARTIAL", "SELL_ALL"} and str(
                 intent.broker_order_id or ""
             ).strip():
@@ -284,6 +289,16 @@ class KISExecutor:
                     balance_proof = None
                 if balance_proof is not None:
                     return balance_proof
+                # Existing legacy contract: an old domestic day SELL that
+                # still shows exactly the immutable pre-order holding count
+                # can expire *only* when the first KIS page was unavailable;
+                # NEVER when any pagination page was incomplete.
+                if first_page_unavailable:
+                    historical_expiry = self._historical_unchanged_balance_expiry(
+                        intent, lookup_date=lookup_date, trade_date=trade_date,
+                    )
+                    if historical_expiry is not None:
+                        return historical_expiry
             return BrokerOrderState("RECONCILE_PENDING")
         rows = raw["output1"]
         if intent.broker_order_id:
