@@ -272,8 +272,11 @@ class InfiniteRepository:
             if int(decision.qty or 0) <= 0:
                 raise ValueError("KR_INF_BUY_QTY_INVALID")
             decision_limit = float(decision.notional) / int(decision.qty)
+            # Preserve the owner's entire reference price when rounding UP
+            # to the ETF tick. Truncating before the native tick can submit a
+            # lower LIMIT than the owner intended.
             native_price, price_tick = normalize_kr_etf_order_price(
-                int(decision_limit), side="BUY",
+                decision_limit, side="BUY",
             )
             if native_price <= 0:
                 raise ValueError("KR_INF_SUBMIT_PRICE_INVALID")
