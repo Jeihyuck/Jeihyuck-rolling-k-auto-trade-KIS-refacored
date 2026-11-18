@@ -6,7 +6,7 @@ must not weaken same-session SHA pins or the conditional recovery gate.
 """
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def _src(path: str) -> str:
