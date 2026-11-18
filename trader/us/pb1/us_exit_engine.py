@@ -482,6 +482,9 @@ def evaluate_exit(
         from trader.us.protective_stop_obligation import record_confirmed_stop
         stop_ledger_position = position
         if (position.get("legacy_nine_decision_only_provisional") is True
+                and os.getenv("US_PROTECTIVE_STOP_LEDGER_MODE", "SHADOW").upper() != "OFF"
+                and os.getenv("KIS_HTTP_BLOCK", "0") != "1"
+                and os.getenv("OFFLINE_MODE", "0") != "1"
                 and str(kwargs.get("exit_type") or "").lower() in {
                     "soft_stop_loss", "soft_stop",
                     "persistent_soft_stop_full_exit",
