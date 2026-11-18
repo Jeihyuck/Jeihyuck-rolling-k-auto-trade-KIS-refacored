@@ -204,6 +204,105 @@ def _result(state: str, reason: str, **extra) -> dict:
             "not_order_authorization": True, **extra}
 
 
+def _evaluate_verified_intraday_window(
+    *, family: str, opening: list[dict], after_open: list[dict],
+    now: datetime, vwap: float | None, vwap_verified: bool,
+    pivot: float | None, trigger_ok: bool, order_price: float | None,
+) -> dict:
+    """Use independent native post-open candles when the opening range is incomplete.
+
+    The previous five and latest three *consecutive completed minutes* are
+    precisely the lookbacks needed by the existing rebound / risk checks.
+    Their high and mean volume are local verified references, NEVER represented
+    as the full 09:00-09:29 opening high or 30-minute volume.
+    An incomplete native opening interval remains visible in every verdict.
+    """
+    proof = {
+        "family": family, "opening_count": len(opening),
+        "opening_range_complete": False,
+        "reference_source": "KIS_NATIVE_POST_OPENING_5_PLUS_3",
+    }
+    if len(after_open) < 8:
+        return _result("WAIT", "POST_OPENING_NATIVE_WINDOW_PENDING", **proof)
+    window = after_open[-8:]
+    stamps = [datetime.fromisoformat(bar["timestamp"]) for bar in window]
+    if any((right - left).total_seconds() != 60
+           for left, right in zip(stamps, stamps[1:])):
+        return _result("UNKNOWN", "POST_OPENING_NATIVE_WINDOW_GAP", **proof)
+    current = window[-1]
+    if (now - stamps[-1]).total_seconds() > 180:
+        return _result("UNKNOWN", "COMPLETED_BAR_STALE", **proof)
+
+    earlier, recent = window[:5], window[-3:]
+    high = max(bar["high"] for bar in earlier)
+    low = min(bar["low"] for bar in earlier)
+    close = current["close"]
+    price = _positive(order_price) or close
+    if price <= 0:
+        return _result("UNKNOWN", "INVALID_ORDER_PRICE", **proof)
+    base_volume = sum(bar["volume"] for bar in earlier) / len(earlier)
+    vol_ratio = (sum(bar["volume"] for bar in recent[-2:])
+                 / (2 * base_volume)) if base_volume > 0 else 0.0
+    rising = recent[0]["close"] < recent[1]["close"] < recent[2]["close"]
+    higher_lows = recent[0]["low"] < recent[1]["low"] < recent[2]["low"]
+    native_vwap = _positive(vwap) if vwap_verified else None
+    proof.update(
+        reference_price=close, intraday_reference_high=high,
+        intraday_reference_low=low, latest_bar_ts=current["timestamp"],
+        observed_volume_ratio=round(vol_ratio, 5),
+        vwap=native_vwap, vwap_proven=bool(native_vwap is not None),
+        increasing_close=rising, higher_lows=higher_lows,
+    )
+    if abs(price / close - 1.0) > MAX_ORDER_PRICE_DEVIATION:
+        return _result("WAIT", "ORDER_PRICE_MOVED_FROM_CONFIRMED_BAR", **proof)
+
+    stop = min(bar["low"] for bar in recent)
+    risk = price - stop
+    if risk <= 0:
+        return _result("WAIT", "NO_VALID_STRUCTURAL_RISK", **proof)
+
+    if family == "PULLBACK":
+        had_dip = any(bar["low"] <= high * 0.99 for bar in earlier)
+        if not (had_dip and rising and higher_lows
+                and close > recent[-2]["high"] and vol_ratio >= 1.0):
+            return _result("WAIT", "PULLBACK_SUPPORT_REBOUND_NOT_CONFIRMED", **proof)
+        if (high - price) / risk < 1.5:
+            return _result("WAIT", "PULLBACK_NO_ROOM_VS_STOP", **proof)
+        return _result("READY_SHADOW", "PULLBACK_INTRADAY_NATIVE_REBOUND_CONFIRMED",
+                       max_entry_price=min(close * 1.0025, high), **proof)
+
+    if family == "MOMENTUM":
+        if native_vwap is None:
+            return _result("UNKNOWN", "NO_VERIFIED_INTRADAY_VWAP", **proof)
+        if not (rising and higher_lows and close > native_vwap
+                and vol_ratio >= 1.2):
+            return _result("WAIT", "NO_CONFIRMED_MOMENTUM_RECLAIM", **proof)
+        if close >= high and trigger_ok:
+            cap = high * 1.005
+            if price > cap:
+                return _result("WAIT", "BREAKOUT_CHASE_TOO_EXPENSIVE", **proof)
+            return _result("READY_SHADOW", "MOMENTUM_INTRADAY_NATIVE_BREAKOUT",
+                           max_entry_price=cap, **proof)
+        if (high - price) / risk < 1.5:
+            return _result("WAIT", "INSUFFICIENT_ROOM_VS_STOP", **proof)
+        return _result("READY_SHADOW", "MOMENTUM_INTRADAY_NATIVE_RECLAIM",
+                       max_entry_price=min(close * 1.0025, high), **proof)
+
+    # Original BREAKOUT owner approval and a verified pivot are mandatory.
+    # An observed intraday high is not an invented opening-range high.
+    pivot_val = _positive(pivot)
+    if pivot_val is None or not trigger_ok:
+        return _result("WAIT", "ORIGINAL_PIVOT_TRIGGER_UNCONFIRMED", **proof)
+    breakout_level = max(high, pivot_val)
+    if close <= breakout_level or not rising or vol_ratio < 1.5:
+        return _result("WAIT", "BREAKOUT_PRICE_OR_VOLUME_NOT_CONFIRMED", **proof)
+    cap = breakout_level * 1.005
+    if price > cap:
+        return _result("WAIT", "BREAKOUT_CHASE_TOO_EXPENSIVE", **proof)
+    return _result("READY_SHADOW", "BREAKOUT_INTRADAY_NATIVE_PIVOT_CONFIRMED",
+                   max_entry_price=cap, **proof)
+
+
 def evaluate_price_aware_entry(
     *, style: str, rows: list[dict], now: datetime,
     vwap: float | None, vwap_verified: bool, pivot: float | None = None,
@@ -224,10 +323,19 @@ def evaluate_price_aware_entry(
     bars = clean_completed_bars(rows, now)
     structure_state, structure_reason, opening, after_open = _completed_bar_structure(bars, now)
     if structure_state != "COVERED":
+        if structure_reason == "OPENING_BARS_MISSING_OR_INCOMPLETE":
+            # An opening completeness diagnostic is not a *universal* BUY
+            # veto. Only use a separately confirmed post-opening calculation
+            # whose data dependency is fully satisfied.
+            return _evaluate_verified_intraday_window(
+                family=family, opening=opening, after_open=after_open,
+                now=now, vwap=vwap, vwap_verified=vwap_verified,
+                pivot=pivot, trigger_ok=trigger_ok, order_price=order_price,
+            )
         meta = {"opening_count": len(opening)}
         if opening:
-            meta.update(opening_high=max(b["high"] for b in opening),
-                        opening_low=min(b["low"] for b in opening))
+            meta.update(observed_opening_high=max(b["high"] for b in opening),
+                        observed_opening_low=min(b["low"] for b in opening))
         return _result(structure_state, structure_reason, **meta)
     high = max(b["high"] for b in opening)
     low = min(b["low"] for b in opening)
