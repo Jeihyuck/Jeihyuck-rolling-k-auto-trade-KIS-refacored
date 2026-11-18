@@ -298,7 +298,7 @@ if [[ "$MARKET" == kr ]]; then
     record_missing REQUIRED_EVIDENCE_MISSING "$expected_final30"
   fi
 else
-  purposes=(prep-prewarm-edt prep-prewarm-est prep prep-recovery am-preflight am afternoon close)
+  purposes=(prep prep-recovery am-preflight am afternoon close)
   evidence_groups=("reports/us_daily/$TRADE_DATE" "reports/us_prep/$TRADE_DATE" "runtime/us/session_state/$TRADE_DATE" "runtime/us/watchlist/$TRADE_DATE" "reports/us_schedule_health/$TRADE_DATE.json")
 fi
 

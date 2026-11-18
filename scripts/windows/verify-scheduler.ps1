@@ -57,7 +57,7 @@ Write-Host "[SCHEDULER][US_TIME_PROFILE] season=$(if($usOffsetHours -eq 1){'EST'
 $expected=[ordered]@{
   # Dedicated mail wrappers take no market argument; health requires an exact quoted argv token.
   "PB1 KR Prep WSL"=@("06:30","run-kr-prep.sh",$false,62);"PB1 KR AM WSL"=@("08:55","run-kr-am.sh",$true,62);"PB1 KR Afternoon WSL"=@("13:00","run-kr-afternoon.sh",$true,62);"PB1 KR Close WSL"=@("15:15","run-kr-close.sh",$true,62);"PB1 KR Mail WSL"=@("16:00","send-kr-log-mail.sh",$false,62);"PB1 KR Health WSL"=@("16:10","check-nullim-day-health.sh",$false,62);
-  "PB1 US Prep Prewarm EDT WSL"=@("19:30","run-us-prep.sh",$false,62);"PB1 US Prep Prewarm EST WSL"=@("20:30","run-us-prep.sh",$false,62);"PB1 US Prep WSL"=@((Get-UsKstTime "21:30"),"run-us-prep.sh",$false,62);"PB1 US Prep Recovery WSL"=@((Get-UsKstTime "22:10"),"run-us-prep-recovery.sh",$false,62);"PB1 US AM Preflight WSL"=@((Get-UsKstTime "22:20"),"check-us-prep-before-am.sh",$false,62);"PB1 US AM WSL"=@((Get-UsKstTime "22:30"),"run-us-am.sh",$true,62);"PB1 US Afternoon WSL"=@((Get-UsKstTime "02:00"),"run-us-afternoon.sh",$true,124);"PB1 US Close WSL"=@((Get-UsKstTime "05:05"),"run-us-close.sh",$true,124);"PB1 US Mail WSL"=@((Get-UsKstTime "06:00"),"send-us-log-mail.sh",$false,124);"PB1 US Health WSL"=@((Get-UsKstTime "06:10"),"check-nullim-day-health.sh",$false,124)
+  "PB1 US Prep WSL"=@((Get-UsKstTime "21:30"),"run-us-prep.sh",$false,62);"PB1 US Prep Recovery WSL"=@((Get-UsKstTime "22:10"),"run-us-prep-recovery.sh",$false,62);"PB1 US AM Preflight WSL"=@((Get-UsKstTime "22:20"),"check-us-prep-before-am.sh",$false,62);"PB1 US AM WSL"=@((Get-UsKstTime "22:30"),"run-us-am.sh",$true,62);"PB1 US Afternoon WSL"=@((Get-UsKstTime "02:00"),"run-us-afternoon.sh",$true,124);"PB1 US Close WSL"=@((Get-UsKstTime "05:05"),"run-us-close.sh",$true,124);"PB1 US Mail WSL"=@((Get-UsKstTime "06:00"),"send-us-log-mail.sh",$false,124);"PB1 US Health WSL"=@((Get-UsKstTime "06:10"),"check-nullim-day-health.sh",$false,124)
 }
 
 foreach($name in $expected.Keys) {
@@ -168,7 +168,7 @@ if($LASTEXITCODE -ne 0){
 if($failed){exit 1}
 Write-Host '[SCHEDULER_POLICY][OK]'
 Write-Host 'owner=WINDOWS_TASK_SCHEDULER'
-Write-Host 'canonical_windows_tasks=16'
+Write-Host 'canonical_windows_tasks=14'
 Write-Host "noncanonical_windows_tasks=$non"
 Write-Host 'forbidden_wsl_sources=0'
 Write-Host "historical_run_failures=$historicalRunFailureCount"

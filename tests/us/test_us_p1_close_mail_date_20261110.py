@@ -97,8 +97,7 @@ class CloseMailDateContract(unittest.TestCase):
 
     def test_windows_scheduler_uses_one_consistent_us_dst_profile(self):
         # Baselines are KST EDT wall-clock triggers. Every phase, including
-        # Close, mail and health, gets +1h during EST; prewarm tasks already
-        # carry explicit season labels and stay on their separate clocks.
+        # Close, mail and health, gets +1h during EST.
         baseline = {
             "PB1 US Prep WSL": "21:30",
             "PB1 US Prep Recovery WSL": "22:10",

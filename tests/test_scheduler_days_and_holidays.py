@@ -18,7 +18,7 @@ def test_windows_weekly_day_groups_are_exact():
     assert '$usEveningDays=@("Monday","Tuesday","Wednesday","Thursday","Friday")' in text
     assert '$usMorningDays=@("Tuesday","Wednesday","Thursday","Friday","Saturday")' in text
     assert text.count('Days=$krDays') == 6
-    assert text.count('Days=$usEveningDays') == 6
+    assert text.count('Days=$usEveningDays') == 4
     assert text.count('Days=$usMorningDays') == 4
     assert 'Sunday' not in '\n'.join(line for line in text.splitlines() if 'Days=@' in line)
 
@@ -27,7 +27,7 @@ def test_us_morning_uses_masks_and_requires_saturday():
     text=VERIFIER.read_text()
     assert 'function ConvertTo-NullimDayMask' in text
     assert text.count(',124)') == 4
-    assert text.count(',62)') == 12
+    assert text.count(',62)') == 10
     assert 'DaysOfWeek=(New-NullimCheck -Ok ($actualDaysMask -eq [int]$e[3])' in text
     contract=(ROOT/'scripts/windows/test-scheduler-trigger-contract.ps1').read_text()
     assert 'New-ScheduledTaskTrigger -Weekly' in contract

@@ -25,7 +25,7 @@ def fixture_repo(tmp_path: Path, market: str, *, smtp_mode: str = "dry", trade_d
     (root / "config").mkdir()
     shutil.copy2(ROOT / "config/krx_holidays.json", root / "config/krx_holidays.json")
     purposes = ("prep", "am", "afternoon", "close") if market == "kr" else (
-        "prep-prewarm-edt", "prep-prewarm-est", "prep", "prep-recovery", "am-preflight", "am", "afternoon", "close"
+        "prep", "prep-recovery", "am-preflight", "am", "afternoon", "close"
     )
     log_root = root / "runtime/logs" / market / trade_date
     for purpose in purposes:
@@ -315,7 +315,7 @@ def test_us_cross_midnight_partition_collects_every_purpose(tmp_path):
     assert result.returncode == 0, result.stderr+result.stdout
     with tarfile.open(archive,"r:gz") as tf:
         names=tf.getnames()
-    for purpose in ("prep-prewarm-edt","prep-prewarm-est","prep","prep-recovery","am-preflight","am","afternoon","close"):
+    for purpose in ("prep","prep-recovery","am-preflight","am","afternoon","close"):
         assert any(f"runtime/logs/us/{DATE}/{purpose}/" in n for n in names)
     assert any(f"runtime/us/session_state/{DATE}" in n for n in names)
     assert not any(f"runtime/us/session/{DATE}" in n for n in names)
