@@ -14,6 +14,7 @@ from trader.account_state import get_account_key, resolve_env_name
 from trader.db.trading_epoch import active_trading_epoch_id, trading_epoch_enforced
 from trader.execution_claims import DurableExecutionClaimRepo
 from trader.execution_state import SemanticActionIdentity
+from trader.kr_price_utils import normalize_kr_order_price
 
 from .models import BrokerOrderState, Decision, OrderIntent, State, Status
 
@@ -267,6 +268,25 @@ class InfiniteRepository:
     def create_intent(self, state: State, decision: Decision, trade_date: date, market_state: str) -> bool:
         """Persist first. A uniqueness loss means the caller must not submit."""
         intent_metadata = self._intent_metadata(state, decision)
+        if decision.action.value in {"BUY", "RECOVERY"}:
+            if int(decision.qty or 0) <= 0:
+                raise ValueError("KR_INF_BUY_QTY_INVALID")
+            decision_limit = float(decision.notional) / int(decision.qty)
+            native_price, price_tick = normalize_kr_order_price(
+                int(decision_limit), side="BUY",
+            )
+            if native_price <= 0:
+                raise ValueError("KR_INF_SUBMIT_PRICE_INVALID")
+            # The executor sends precisely this normalized BUY LIMIT to the
+            # KIS wrapper, which normalizes idempotently. These are price
+            # provenance fields, NOT broker execution/fill evidence.
+            intent_metadata.update({
+                "owner_decision_price_krw": decision_limit,
+                "kis_submit_limit_price_krw": native_price,
+                "kis_submit_tick_size_krw": price_tick,
+                "kis_submit_price_basis": "OWNER_NOTIONAL_KRX_TICK_PREPARED",
+                "kis_fill_price_verified": False,
+            })
         with self.engine.begin() as conn:
             epoch_id = self._epoch_id(conn)
             if not epoch_id:
