@@ -480,8 +480,22 @@ def evaluate_exit(
         # Persist the confirmed stop BEFORE _make_exit_intent's pending-SELL
         # suppression. A stale TP fence must not erase a verified stop signal.
         from trader.us.protective_stop_obligation import record_confirmed_stop
+        stop_ledger_position = position
+        if position.get("legacy_nine_decision_only_provisional") is True:
+            # Original BUY belongs to the current active trading epoch but
+            # has NULL old portfolio/cycle columns. Re-prove its DB lineage
+            # and derive the prospective SELL lifecycle *only for the stop
+            # obligation*, before the pending-SELL gate. A normal SELL still
+            # needs independent fresh CURRENT KIS proof in order_router.
+            from trader.us.execution.us_legacy_nine_active_sell import (
+                build_verified_legacy_stop_obligation_position,
+            )
+            stop_ledger_position = build_verified_legacy_stop_obligation_position(
+                position,
+                trade_date=_trade_date_from_key(resolve_us_trade_date_key(now)),
+            )
         record_confirmed_stop(
-            position,
+            stop_ledger_position,
             exit_type=str(kwargs.get("exit_type") or ""),
             target_qty=int(kwargs.get("qty") or 0),
             pnl_pct=float(kwargs.get("pnl_pct") or 0.0),
