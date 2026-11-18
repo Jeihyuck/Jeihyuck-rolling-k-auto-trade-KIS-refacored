@@ -491,9 +491,18 @@ class InfiniteRepository:
                     broker.filled_qty if broker.filled_qty is not None
                     else previous_qty if previous_qty > 0 else None
                 )
+                # PostgreSQL NUMERIC preserves Decimal exactly. SQLite is
+                # used by the offline execution-claim fixtures with a raw
+                # SQL/text() bind and cannot bind a Decimal object. The test
+                # adapter has FLOAT columns; do not let a missing KIS fill
+                # quantity turn an unresolved ACK into a database failure.
                 persisted_notional = (
-                    cumulative_notional if is_postgres or broker.filled_qty is None
-                    else broker.filled_notional_krw
+                    cumulative_notional if is_postgres
+                    else float(
+                        cumulative_notional
+                        if broker.filled_qty is None
+                        else money(broker.filled_notional_krw)
+                    )
                 )
                 conn.execute(text("""UPDATE kr_infinite_order_intents
                     SET status=:status,filled_qty=:qty,
