@@ -398,3 +398,27 @@ def test_kis_native_average_only_and_partial_cash_receipts_are_reconciled():
     assert final.status == "FILLED"
     assert final.filled_qty == 13
     assert final.filled_notional_krw == Decimal("718900")
+
+
+@pytest.mark.parametrize("invalid_envelope", [
+    {"rt_cd": "1"},
+    {"rt_cd": "-1", "_ccld_status": "KIS_TIMEOUT"},
+    {"rt_cd": "0", "_diag_stub": True},
+    {"rt_cd": "0", "_stub": True},
+    {"rt_cd": "0", "_fill_source": "daily_ccld_fail_open"},
+])
+def test_diagnostic_or_failed_kis_envelope_cannot_confirm_fill(invalid_envelope):
+    """A plausible-looking row from failed HTTP is not an economic receipt."""
+    from trader.kr.infinite.executor import KISExecutor
+    intent = _fixture_native_intent()[3]
+    valid_row = {
+        "odno": "0000010702", "pdno": "122630",
+        "sll_buy_dvsn_cd": "02", "tot_ccld_qty": "13",
+        "tot_ccld_amt": "718900", "avg_prvs": "55300",
+    }
+    class FailedKIS:
+        def inquire_daily_ccld(self, **kwargs):
+            return {"output1": [valid_row], **invalid_envelope}
+    observed = KISExecutor(FailedKIS(), "practice").order_state(intent, DAY)
+    assert observed.status == "RECONCILE_PENDING"
+    assert observed.filled_qty is None
