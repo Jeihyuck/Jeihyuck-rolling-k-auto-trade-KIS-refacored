@@ -481,7 +481,12 @@ def evaluate_exit(
         # suppression. A stale TP fence must not erase a verified stop signal.
         from trader.us.protective_stop_obligation import record_confirmed_stop
         stop_ledger_position = position
-        if position.get("legacy_nine_decision_only_provisional") is True:
+        if (position.get("legacy_nine_decision_only_provisional") is True
+                and str(kwargs.get("exit_type") or "").lower() in {
+                    "soft_stop_loss", "soft_stop",
+                    "persistent_soft_stop_full_exit",
+                    "hard_stop", "hard_stop_loss", "hard_stop_full_exit",
+                }):
             # Original BUY belongs to the current active trading epoch but
             # has NULL old portfolio/cycle columns. Re-prove its DB lineage
             # and derive the prospective SELL lifecycle *only for the stop
