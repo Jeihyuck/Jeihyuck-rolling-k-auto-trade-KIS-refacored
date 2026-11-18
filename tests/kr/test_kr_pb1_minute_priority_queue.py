@@ -213,3 +213,63 @@ def test_preminute_candidate_promotion_recovers_from_missing_manifest(seed_prep)
                                       now=moment(9, 5))
     assert active["state"] == "PB1_ACTIVE"
     assert active["hot"] == ["000021"]
+
+
+def test_preminute_filter_drops_held_open_filled_zero_qty_and_blocking_intent():
+    """Collection HOT is only genuinely available, positively-sized PB1 setup."""
+    from types import SimpleNamespace
+    def cf(code, *, qty=11, setup=True, key=None):
+        return SimpleNamespace(
+            code=code, planned_qty=qty, setup_ok=setup,
+            client_order_key=key,
+        )
+
+    candidates = [
+        cf("000021"),                    # Sole genuinely buyable setup
+        cf("000022"),                    # Already held, no ADD
+        cf("000023"),                    # Pending broker BUY
+        cf("000024"),                    # Same-day BUY fill
+        cf("000025", qty=0),             # No executable quantity
+        cf("000026", key="known-ACK"),   # Durable broker intent
+        cf("000027", setup=False),      # Only score, no setup
+        cf("000028", key="local-REJECTED"),
+        cf("000021"),                    # Dedup without changing ranking
+    ]
+    eligible = pq.eligible_preminute_codes(
+        candidates=candidates,
+        held_codes={"000022"},
+        blocking_buy_codes={"A000023"},
+        filled_buy_codes={"000024"},
+        blocking_client_order_keys={"known-ACK"},
+    )
+    assert eligible == ["000021", "000028"]
+    # An explicitly rejected local intent does NOT imply a KIS order.
+    # A future retry remains subject to the owner duplicate/order gate.
+
+
+def test_preminute_filter_rejects_invalid_quantity_without_faking_cash_proof():
+    from types import SimpleNamespace
+    candidates = [
+        SimpleNamespace(code="000021", planned_qty="not-an-int", setup_ok=True),
+        SimpleNamespace(code="000022", planned_qty=-1, setup_ok=True),
+        SimpleNamespace(code="000023", planned_qty=None, setup_ok=True),
+        SimpleNamespace(code="000024", planned_qty=1, setup_ok=True),
+    ]
+    assert pq.eligible_preminute_codes(candidates=candidates) == ["000024"]
+
+
+def test_actual_pb1_publisher_uses_existing_db_evidence_before_hot_queue():
+    """Guard only a read-only source contract, NOT real BUY authorization."""
+    from pathlib import Path
+    source = Path("trader/pb1_engine.py").read_text(encoding="utf-8")
+    start = source.index("eligible_preminute_codes(")
+    publish = source.index("_priority_status = publish_pb1_priority(", start)
+    assert start < publish
+    section = source[start:publish]
+    for name in ("ok_after_risk", "held_codes", "open_buy_codes",
+                 "today_buy_fill_by_code", "prior_intent_by_key"):
+        assert name in source[max(0, start - 900):publish], name
+    assert "eligible_codes=_priority_codes" in source[publish:publish + 500]
+    assert "is_order_authorization" in Path(
+        "trader/kr/entry_priority_queue.py"
+    ).read_text(encoding="utf-8")
