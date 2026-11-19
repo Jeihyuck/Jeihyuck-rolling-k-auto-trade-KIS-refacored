@@ -19827,81 +19827,11 @@ class PB1Engine:
             buyable_gate_context: dict[str, dict[str, Any]] = {}
             self._buyable_gate_context = buyable_gate_context
             today_buy_codes: set[str] = set()
-            # Only PB1 practice standard BUY publishes pre-minute priorities.
-            # No minute proof is needed to enter this *read-only collector*
-            # queue: avoid the circular "no bars -> no candidate -> no bars".
-            if (
-                str(getattr(self, "STRATEGY_NAME", "")) == "pb1_pullback_close"
-                and str(self.env or "").lower() == "practice"
-                and (
-                    self._is_kr_equity_context()
-                    or (
-                        str(getattr(self, "final30_source", "")).lower() == "kr_canonical_artifact"
-                        and str(getattr(self, "session_kind", "")).lower() in {"am", "pm", "afternoon"}
-                    )
-                )
-                and self.phase in {"entry", "pm_entry"}
-                and not allow_add_to_existing
-            ):
-                try:
-                    from trader.kr.entry_priority_queue import (
-                        eligible_preminute_codes,
-                        publish_pb1_priority,
-                    )
-                    # All of these lists have already been loaded through
-                    # fail-closed order/fill reads above. A known duplicate,
-                    # a held position or a zero-quantity setup is NOT a HOT
-                    # collection target, even if the daily setup scored high.
-                    # This only prioritizes read-only KIS minute collection;
-                    # the existing PB1 order/claim/balance gates still decide.
-                    _priority_blocked_today = [
-                        row.get("code")
-                        for row in today_orders
-                        if str(row.get("side") or "").upper() == "BUY"
-                        and self._is_blocking_open_buy_row(row)
-                    ]
-                    _priority_blocked_keys = [
-                        key for key, row in prior_intent_by_key.items()
-                        if self._is_blocking_open_buy_row(row)
-                    ]
-                    _priority_codes = eligible_preminute_codes(
-                        candidates=ok_after_risk,
-                        held_codes=held_codes,
-                        blocking_buy_codes=[*open_buy_codes, *_priority_blocked_today],
-                        filled_buy_codes=[
-                            code for code, rows in today_buy_fill_by_code.items() if rows
-                        ],
-                        blocking_client_order_keys=_priority_blocked_keys,
-                    )
-                    logger.info(
-                        "[KR][ENTRY_TIMING][PRIORITY_PREFILTER] setup_risk=%s "
-                        "positive_qty_order_free=%s held=%s open_buys=%s filled=%s",
-                        len(ok_after_risk), len(_priority_codes),
-                        len(held_codes), len(open_buy_codes),
-                        sum(bool(rows) for rows in today_buy_fill_by_code.values()),
-                    )
-                    _priority_status = publish_pb1_priority(
-                        date=str(self._today),
-                        account_scope=get_account_key(env=self.env),
-                        eligible_codes=_priority_codes,
-                        held_codes=[c for c in held_codes if c],
-                        allow_add_to_existing=False,
-                        stage=self._entry_stage_name(),
-                    )
-                    logger.info(
-                        "[KR][ENTRY_TIMING][PRIORITY_PUBLISH] state=%s "
-                        "hot=%s warm=%s collection_only=1",
-                        _priority_status.get("state"),
-                        _priority_status.get("hot"), _priority_status.get("warm"),
-                    )
-                except Exception as _priority_err:
-                    # The observer safely falls back to validated PREP Final30.
-                    # A collector/publisher failure cannot delay protective SELL.
-                    logger.warning(
-                        "[KR][ENTRY_TIMING][PRIORITY_PUBLISH_FAIL] type=%s "
-                        "fallback=VERIFIED_PREP_COLLECTION_ONLY",
-                        type(_priority_err).__name__,
-                    )
+            # HOT/WARM is published only AFTER the existing PB1 buyable,
+            # strategy, risk and final-order shortlist has been computed.
+            # Publishing from ok_after_risk here would poll unrelated symbols
+            # and could leave a different three actual BUY candidates without
+            # native minute proofs. The collector remains independent of SELL.
             buyable_gate_max_sec = self._buyable_gate_max_sec()
             buyable_gate_fail_open = self._buyable_gate_fail_open_enabled()
             logger.info("[PB1][STAGE][START] stage=buyable_gate")
@@ -20985,6 +20915,93 @@ class PB1Engine:
                     final_invariants["final_new_orders"] = 0
                 logger.info("[KR_REGIME][BUDGET_INVARIANT] total_tick_cap=%.0f market_budget_sum=%.0f planned_value_sum=%.0f planned_kospi=%.0f planned_kosdaq=%.0f slots_start=%s final_new_orders=%s projected_gross=%.4f valid=%s", total_tick_cap, budget_sum, planned_sum, planned_by_market["KOSPI"], planned_by_market["KOSDAQ"], final_invariants["slots_start"], final_invariants["final_new_orders"], final_invariants["projected_gross_exposure_pct"], int(invariant_valid))
                 atomic_json_write("artifacts/kr_market_budget.json", {"as_of": str(getattr(self, "_now_kst", None) or now_kst()), "base_tick_budget": base_tick_budget, "global_multiplier": snapshot.execution_policy.budget_multiplier, "total_tick_cap": total_tick_cap, "available_cash": float(available_cash_krw or 0), "mtm_equity_krw": float(final_invariants.get("mtm_equity_krw") or 0), "market_budgets": market_budgets, "market_budget_sum": budget_sum, "planned_value_by_market": planned_by_market, "planned_value_sum": planned_sum, "slots_remaining_at_tick_start": final_invariants["slots_start"], "final_new_orders": final_invariants["final_new_orders"], "projected_gross_exposure_pct": final_invariants["projected_gross_exposure_pct"], "invariant_valid": invariant_valid, "invariant_reason": final_invariants.get("reason")})
+            # KR PB1 minute observer receives the exact owner-approved
+            # *pre-submit* shortlist (before the native 1m ENFORCE gate),
+            # not the wider setup/risk list. In practice top3 stays top3.
+            # A missing/stale manifest does not authorize a BUY.
+            _priority_owner = str(getattr(self, "STRATEGY_NAME", "") or "")
+            _priority_phase = str(self.phase or "")
+            _priority_source = str(getattr(self, "final30_source", "") or "").lower()
+            _priority_session = str(getattr(self, "session_kind", "") or "").lower()
+            _priority_kr = (
+                _priority_source == "kr_canonical_artifact"
+                or self._is_kr_equity_context()
+            )
+            _priority_scope_ok = (
+                _priority_owner == "pb1_pullback_close"
+                and str(self.env or "").lower() == "practice"
+                and _priority_kr
+                and _priority_phase in {"entry", "pm_entry"}
+                and not allow_add_to_existing
+            )
+            if str(self.env or "").lower() == "practice" and _priority_kr:
+                logger.info(
+                    "[KR][ENTRY_TIMING][PRIORITY_SCOPE] enabled=%s owner=%s "
+                    "phase=%s session=%s source=%s allow_add=%s final_candidates=%s "
+                    "module=%s",
+                    int(_priority_scope_ok), _priority_owner, _priority_phase,
+                    _priority_session, _priority_source,
+                    int(bool(allow_add_to_existing)), len(orderable_candidates),
+                    __file__,
+                )
+            if _priority_scope_ok:
+                try:
+                    from trader.kr.entry_priority_queue import (
+                        eligible_preminute_codes,
+                        publish_pb1_priority,
+                    )
+                    _priority_blocked_today = [
+                        row.get("code") for row in today_orders
+                        if str(row.get("side") or "").upper() == "BUY"
+                        and self._is_blocking_open_buy_row(row)
+                    ]
+                    _priority_blocked_keys = [
+                        key for key, row in prior_intent_by_key.items()
+                        if self._is_blocking_open_buy_row(row)
+                    ]
+                    _priority_codes = eligible_preminute_codes(
+                        candidates=orderable_candidates,
+                        held_codes=held_codes,
+                        blocking_buy_codes=[*open_buy_codes, *_priority_blocked_today],
+                        filled_buy_codes=[
+                            code for code, rows in today_buy_fill_by_code.items() if rows
+                        ],
+                        blocking_client_order_keys=_priority_blocked_keys,
+                    )
+                    logger.info(
+                        "[KR][ENTRY_TIMING][PRIORITY_PREFILTER] setup_risk=%s "
+                        "final_shortlist=%s eligible=%s blocked_held=%s open_buys=%s",
+                        len(ok_after_risk), len(orderable_candidates),
+                        _priority_codes, len(held_codes), len(open_buy_codes),
+                    )
+                    _priority_status = publish_pb1_priority(
+                        date=str(self._today),
+                        account_scope=get_account_key(env=self.env),
+                        eligible_codes=_priority_codes,
+                        held_codes=[c for c in held_codes if c],
+                        allow_add_to_existing=False,
+                        stage=self._entry_stage_name(),
+                    )
+                    if _priority_status.get("state") != "PUBLISHED":
+                        logger.error(
+                            "[KR][ENTRY_TIMING][PRIORITY_PUBLISH_FAIL] state=%s "
+                            "action=RETRY_NEXT_TICK_BUY_FAIL_CLOSED",
+                            _priority_status.get("state"),
+                        )
+                    else:
+                        logger.info(
+                            "[KR][ENTRY_TIMING][PRIORITY_PUBLISH] state=%s "
+                            "hot=%s warm=%s collection_only=1",
+                            _priority_status.get("state"),
+                            _priority_status.get("hot"),
+                            _priority_status.get("warm"),
+                        )
+                except Exception as _priority_err:
+                    logger.exception(
+                        "[KR][ENTRY_TIMING][PRIORITY_PUBLISH_FAIL] type=%s "
+                        "action=RETRY_NEXT_TICK_BUY_FAIL_CLOSED",
+                        type(_priority_err).__name__,
+                    )
             orderable_codes = [c.code for c in orderable_candidates]
             self._last_orderable_codes = set(orderable_codes)
             actual_buyable_ok_count = len(buyable_ok_codes)
