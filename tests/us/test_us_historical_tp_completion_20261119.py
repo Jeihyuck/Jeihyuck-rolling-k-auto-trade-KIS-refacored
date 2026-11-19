@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy import text
 
 from trader.us.execution.historical_tp_resolution import (
-    EVIDENCE, assess, digest, resolve_historical_tp_at_boundary,
+    EVIDENCE, PRIOR_STAGE_EVIDENCE, assess, digest, resolve_historical_tp_at_boundary,
 )
 from tests.us.test_us_postgres_integration_real import pg_engine
 from tests.us.test_us_residual_flow_20261119 import _seed_boundary_case
@@ -104,6 +104,45 @@ def test_infinite_is_never_a_resolution_target():
     assert not assess(candidate("TQQQ"), snapshot(), witnesses(), SCOPE, now=NOW)["verified"]
 
 
+def settled_prior(original, stage='tp1', order='47288'):
+    return {'trade_date':original['trade_date'],'symbol':original['symbol'],'side':'SELL',
+        'stage':stage,'stage_status':'DONE','position_lifecycle_id':original['position_lifecycle_id'],
+        'trading_epoch_id':SCOPE['trading_epoch_id'],'account_id':None,'strategy_owner':'US_STANDARD',
+        'client_order_key':f"US_PC_{original['trade_date']}_{original['symbol']}_{original['position_lifecycle_id']}_TAKE_PROFIT_{stage.upper()}_R5",
+        'order_no':order,'raw_broker_order_no':'00000'+order,'canonical_broker_order_no':order,
+        'qty_requested':1,'qty_filled':1,'cumulative_filled_qty':1}
+
+
+@pytest.mark.parametrize('symbol', ['HCA','GENERIC','KO'])
+def test_exact_completed_prior_tp_identity_is_not_misattributed_to_unsubmitted_later_stage(symbol):
+    original=candidate(symbol);original.update(stage='tp3',client_order_key=original['client_order_key'].replace('TP2','TP3'))
+    original['state']['meta']['last_stage']='tp3'
+    sells=[broker_row(symbol=symbol,order_no='47288'),broker_row(symbol=symbol,order_no='50414')]
+    known=[settled_prior(original),settled_prior(original,'tp2','50414')]
+    witness=[{**witnesses()[0],'symbol':symbol}]
+    proof=assess(original,snapshot(sells),witness,SCOPE,now=NOW,settled_prior=known)
+    assert proof['verified'] and proof['reason']==PRIOR_STAGE_EVIDENCE
+    assert len(proof['settled_prior_order_sha256'])==2
+
+
+@pytest.mark.parametrize('mismatch', ['stage','cycle','epoch','account','owner','key','same_stage_key',
+    'order','raw_order','canonical_order','qty','cumulative','pending','partial','duplicate'])
+def test_prior_sell_cannot_be_excluded_without_complete_native_prior_stage_identity(mismatch):
+    original=candidate('HCA');known=settled_prior(original);sell=broker_row()
+    changes={'stage':('stage','tp2'),'cycle':('position_lifecycle_id','foreign'),
+        'epoch':('trading_epoch_id','foreign'),'account':('account_id','foreign'),
+        'owner':('strategy_owner','INFINITE'),'key':('client_order_key','made-up'),
+        'same_stage_key':('client_order_key',original['client_order_key']),
+        'order':('order_no','999'),'raw_order':('raw_broker_order_no','999'),
+        'canonical_order':('canonical_broker_order_no','999'),'qty':('qty_filled',0),
+        'cumulative':('cumulative_filled_qty',0),'pending':('stage_status','PENDING')}
+    if mismatch in changes: known[changes[mismatch][0]]=changes[mismatch][1]
+    if mismatch=='partial': sell.update(status='PARTIALLY_FILLED',requested_qty=2,remaining_qty=1)
+    prior=[known,dict(known)] if mismatch=='duplicate' else [known]
+    proof=assess(original,snapshot([sell]),witnesses(),SCOPE,now=NOW,settled_prior=prior)
+    assert not proof['verified'] and proof['reason']=='BROKER_SELL_PRESENT_REQUIRES_ORIGINAL_ATTRIBUTION'
+
+
 def test_nonboundary_does_not_read_database_or_broker(monkeypatch):
     from trader.us.db import repos
     monkeypatch.setattr(repos, "_get_engine_or_none", lambda: pytest.fail("tick recovery"))
@@ -171,6 +210,46 @@ class Reader:
 
 
 @pytest.mark.skipif(not os.getenv('PBCORE_TEST_POSTGRES_URL'),reason='requires PostgreSQL')
+@pytest.mark.parametrize('native_fill', [True,False])
+def test_pg_prior_completed_tp_requires_native_order_fill_and_stage_then_preserves_existing_trades(historical_pg,native_fill):
+    original=candidate('HCA');prior=settled_prior(original)
+    _seed_boundary_case(historical_pg,symbol='HCA',contradiction='NO_CERTIFICATE',epoch=SCOPE['trading_epoch_id'],
+        account=SCOPE['account_id'],cycle=original['position_lifecycle_id'],key=original['client_order_key'])
+    with historical_pg.begin() as conn:
+        for table in ('us_orders','us_fills'):
+            conn.execute(text(f'UPDATE {table} SET client_order_key=:key WHERE client_order_key=\'witness\''),{'key':prior['client_order_key']})
+        for table in ('us_profit_capture_lifecycle','us_order_intents'):
+            conn.execute(text(f'UPDATE {table} SET trade_date=:day WHERE symbol=\'HCA\''),{'day':DAY})
+        conn.execute(text("""INSERT INTO us_profit_capture_lifecycle
+            (trade_date,symbol,position_lifecycle_id,stage,stage_status,client_order_key,
+             requested_qty,cumulative_filled_qty,raw_broker_order_no,canonical_broker_order_no,trading_epoch_id,state)
+            VALUES (:day,'HCA',:cycle,'tp1','DONE',:key,1,1,'0000047288','47288',:epoch,'{}'::jsonb)"""),
+            {'day':DAY,'cycle':original['position_lifecycle_id'],'key':prior['client_order_key'],'epoch':SCOPE['trading_epoch_id']})
+        if not native_fill: conn.execute(text("UPDATE us_fills SET meta='{}'::jsonb WHERE symbol='HCA'"))
+    result=resolve_historical_tp_at_boundary(provider=Reader(),trade_date='2026-11-19',phase='AM_START',source_trade_date=DAY)
+    assert result['released']==(4 if native_fill else 0),result
+    with historical_pg.connect() as conn:
+        assert conn.execute(text("SELECT stage_status FROM us_profit_capture_lifecycle WHERE symbol='HCA' AND stage='tp1'")).scalar_one()=='DONE'
+        assert conn.execute(text('SELECT count(*) FROM us_orders')).scalar_one()==1
+        assert conn.execute(text('SELECT count(*) FROM us_fills')).scalar_one()==1
+        if native_fill:
+            state=conn.execute(text("SELECT stage_status,state FROM us_profit_capture_lifecycle WHERE symbol='HCA' AND stage='tp2'")).one()
+            assert state[0]=='NOT_TRIGGERED' and state[1]['meta']['last_status']=='FAILED'
+            assert state[1]['meta']['last_evidence_type']==PRIOR_STAGE_EVIDENCE
+
+
+@pytest.mark.skipif(not os.getenv('PBCORE_TEST_POSTGRES_URL'),reason='requires PostgreSQL')
+def test_pg_readonly_audit_enumerates_actual_source_days_without_runtime_budget_starvation(historical_pg):
+    from scripts.us_historical_tp_resolution import audit_all_source_days
+    result=audit_all_source_days(provider=Reader(),trade_date='2026-11-19',phase='CLOSE',budget_sec=30)
+    assert result['status']=='OK' and result['eligible']==3 and result['released']==0
+    assert result['all_source_days_audit'] and not result['database_mutated']
+    filtered=resolve_historical_tp_at_boundary(provider=Reader(),trade_date='2026-11-19',phase='CLOSE',
+        apply=False,source_trade_date='2026-11-11')
+    assert filtered['candidate_count']==0 and filtered['checked']==0
+
+
+@pytest.mark.skipif(not os.getenv('PBCORE_TEST_POSTGRES_URL'),reason='requires PostgreSQL')
 @pytest.mark.parametrize('apply',[False,True])
 def test_pg_claimless_stages_reach_original_day_kis_then_atomic_resolution(historical_pg,apply):
     from trader.us.db import repos
@@ -214,7 +293,8 @@ def test_pg_failure_rolls_back_stage_intent_and_audit_without_blocking_peer(hist
 
 
 @pytest.mark.parametrize('symbol',['KO','KR','GENERIC'])
-def test_verified_absence_reaches_the_real_tp2_intent_generator(symbol,monkeypatch):
+@pytest.mark.parametrize('evidence',[EVIDENCE,PRIOR_STAGE_EVIDENCE])
+def test_verified_absence_reaches_the_real_tp2_intent_generator(symbol,evidence,monkeypatch):
     from decimal import Decimal
     from trader.us.market_state_overlay import build_profit_capture_intents
     from tests.us.test_tp_pre_http_retry_proof_20261105 import POSITION
@@ -222,7 +302,7 @@ def test_verified_absence_reaches_the_real_tp2_intent_generator(symbol,monkeypat
     old=candidate(symbol)
     state={'tp1_done':True,'tp2_pending':False,'position_lifecycle_id':old['position_lifecycle_id'],
            'meta':{'tp1_done':True,'tp2_order_keys':[old['client_order_key']], 'last_stage':'tp2',
-                   'last_status':'FAILED','last_evidence_type':EVIDENCE,'tp2_qty':3,'tp2_filled_qty':0}}
+                   'last_status':'FAILED','last_evidence_type':evidence,'tp2_qty':3,'tp2_filled_qty':0}}
     monkeypatch.setattr('trader.us.profit_capture.authoritative_broker_avg',lambda *a,**kw:(Decimal('100'),{}))
     monkeypatch.setattr(repos,'mark_us_profit_capture_stage',lambda *a,**kw:None)
     pos={**POSITION,'symbol':symbol,'position_lifecycle_id':old['position_lifecycle_id']}

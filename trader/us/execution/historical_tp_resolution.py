@@ -2,8 +2,9 @@
 
 No synthetic execution attempt, order, fill or position cycle is created.
 A blank broker response never authorizes release. The historical day must be
-positively witnessed, the authenticated all-status query complete, and the
-entire target-symbol SELL population absent. Native/ambiguous evidence wins.
+positively witnessed and the authenticated all-status query complete. Every
+target SELL must be absent or exactly attributed to a completed prior TP stage.
+Native/ambiguous evidence wins.
 """
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ import hashlib
 import json
 import logging
 import math
+import re
 import time
 from uuid import uuid4
 
@@ -20,6 +22,7 @@ from trader.us.utils.order_no import normalize_us_order_no
 
 logger = logging.getLogger(__name__)
 EVIDENCE = "KIS_ORIGINAL_DAY_NO_ACCEPTED_SELL"
+PRIOR_STAGE_EVIDENCE = "KIS_ORIGINAL_DAY_ONLY_SETTLED_PRIOR_TP_SELLS"
 EARLY_FAILURES = {"US_RECOVERY_SCOPE_UNVERIFIED", "ORDER_DISABLED_DURABLE_LEDGER_UNAVAILABLE"}
 CANDIDATES_SQL = """
  SELECT * FROM us_profit_capture_lifecycle
@@ -44,6 +47,50 @@ WITNESSES_SQL = """
    AND COALESCE(f.meta->>'is_synthetic','false')='false'
    AND f.meta->>'fill_evidence_type' IN ('KIS_ORDER_CUMULATIVE_ACTUAL','KIS_EXECUTION_ACTUAL')
 """
+SETTLED_PRIOR_SQL = """
+ SELECT DISTINCT o.trade_date,o.symbol,o.side,o.order_no,o.qty_requested,o.qty_filled,
+        o.account_id,o.client_order_key,o.meta->>'strategy_owner' AS strategy_owner,
+        s.stage,s.stage_status,s.position_lifecycle_id,s.cumulative_filled_qty,
+        s.raw_broker_order_no,s.canonical_broker_order_no,s.trading_epoch_id
+ FROM us_orders o JOIN us_profit_capture_lifecycle s
+   ON s.client_order_key=o.client_order_key AND s.trading_epoch_id=o.trading_epoch_id
+  AND s.trade_date=o.trade_date AND s.symbol=o.symbol
+ WHERE o.trading_epoch_id=:epoch AND o.trade_date=:day AND o.symbol=:symbol
+   AND o.side='SELL' AND o.status='FILLED' AND s.stage_status='DONE'
+   AND EXISTS (SELECT 1 FROM us_fills f WHERE f.trading_epoch_id=o.trading_epoch_id
+       AND f.trade_date=o.trade_date AND f.symbol=o.symbol AND f.side=o.side
+       AND f.client_order_key=o.client_order_key AND ltrim(f.order_no,'0')=ltrim(o.order_no,'0')
+       AND f.qty>0 AND COALESCE(f.meta->>'is_synthetic','false')='false'
+       AND f.meta->>'fill_evidence_type' IN ('KIS_ORDER_CUMULATIVE_ACTUAL','KIS_EXECUTION_ACTUAL'))
+   AND NOT EXISTS (SELECT 1 FROM us_orders other WHERE other.trading_epoch_id=o.trading_epoch_id
+       AND other.trade_date=o.trade_date AND ltrim(other.order_no,'0')=ltrim(o.order_no,'0')
+       AND other.client_order_key<>o.client_order_key)
+"""
+
+
+def _settled_prior_match(original: dict, broker: dict, known: dict, scope: dict) -> bool:
+    """Attribute by native order identity and completed prior stage, never qty alone."""
+    stage = str(known.get('stage') or '')
+    if stage not in {'tp1','tp2'} or original['stage'] not in {'tp2','tp3'} or stage >= original['stage']:
+        return False
+    prefix = (f"US_PC_{original['trade_date']}_{original['symbol']}_"
+              f"{original['position_lifecycle_id']}_TAKE_PROFIT_{stage.upper()}")
+    qty = number(broker.get('requested_qty'))
+    order = normalize_us_order_no(broker.get('order_no'))
+    return bool(qty and broker.get('status') == 'FILLED' and number(broker.get('filled_qty')) == qty
+        and known.get('stage_status') == 'DONE' and known.get('side') == 'SELL'
+        and str(known.get('trade_date')) == str(original['trade_date'])
+        and known.get('symbol') == original['symbol']
+        and known.get('trading_epoch_id') == scope['trading_epoch_id']
+        and known.get('position_lifecycle_id') == original['position_lifecycle_id']
+        and known.get('strategy_owner') in (None, '', 'US_STANDARD')
+        and known.get('account_id') in (None, '', scope['account_id'], scope.get('raw_account'))
+        and re.fullmatch(re.escape(prefix)+r'(?:_R[1-9][0-9]*)?', str(known.get('client_order_key') or ''))
+        and known.get('client_order_key') != original['client_order_key']
+        and number(known.get('qty_requested')) == qty and number(known.get('qty_filled')) == qty
+        and number(known.get('cumulative_filled_qty')) == qty
+        and all(normalize_us_order_no(known.get(k)) == order for k in
+                ('order_no','raw_broker_order_no','canonical_broker_order_no')))
 
 
 def digest(value) -> str:
@@ -90,7 +137,7 @@ def eligible(row: dict) -> bool:
 
 
 def assess(row: dict, snapshot: dict, witnesses: list[dict], scope: dict,
-           *, now: datetime | None = None) -> dict:
+           *, now: datetime | None = None, settled_prior: list[dict] | None = None) -> dict:
     """A positive day witness is required even for a fully paginated empty book."""
     reject = lambda reason: {"verified": False, "reason": reason}
     if not eligible(row) or str(row.get("trading_epoch_id") or "") != scope.get("trading_epoch_id"):
@@ -117,7 +164,7 @@ def assess(row: dict, snapshot: dict, witnesses: list[dict], scope: dict,
     if not isinstance(rows, list) or snapshot.get("rows_sha256") != digest(rows):
         return reject("ORIGINAL_DAY_SNAPSHOT_INTEGRITY_INVALID")
     if not rows: return reject("EMPTY_HISTORY_IS_NOT_ABSENCE_PROOF")
-    target_sells = []
+    target_sells, prior_orders = [], []
     for r in rows:
         if (not isinstance(r, dict) or r.get("normalization_result") != "normalized"
                 or str(r.get("trade_date") or "").replace("-", "") != day.replace("-", "")
@@ -131,6 +178,11 @@ def assess(row: dict, snapshot: dict, witnesses: list[dict], scope: dict,
             return reject("ORIGINAL_DAY_ROW_SCOPE_OR_QUANTITY_UNVERIFIED")
         # Never identify an unknown historical TP by symbol+quantity alone.
         if str(r["symbol"]).upper() == symbol and r["side"] == "SELL":
+            matches = [k for k in (settled_prior or []) if _settled_prior_match(row, r, k, scope)]
+            if len(matches) == 1:
+                prior_orders.append(digest({'order_no': normalize_us_order_no(r['order_no']),
+                    'key': matches[0]['client_order_key'], 'stage': matches[0]['stage']}))
+                continue
             target_sells.append({"broker_order_sha256": digest(normalize_us_order_no(r["order_no"])),
                 "status": r.get("status"), "requested_qty": r["requested_qty"],
                 "filled_qty": r["filled_qty"], "remaining_qty": r.get("remaining_qty")})
@@ -152,13 +204,14 @@ def assess(row: dict, snapshot: dict, witnesses: list[dict], scope: dict,
                                        "symbol": w["symbol"], "side": w["side"], "trade_date": day})
                 break
     if not witness_hash: return reject("HISTORICAL_DAY_NOT_POSITIVELY_WITNESSED")
-    return {"verified": True, "reason": EVIDENCE, "source_trade_date": day,
+    return {"verified": True, "reason": PRIOR_STAGE_EVIDENCE if prior_orders else EVIDENCE, "source_trade_date": day,
             "symbol": symbol, "stage": row["stage"], "source_cycle": row["position_lifecycle_id"],
             "source_key_sha256": digest(row["client_order_key"]), "account_id": scope["account_id"],
             "trading_epoch_id": scope["trading_epoch_id"], "query_id": query["query_id"],
             "observed_at": snapshot["observed_at"], "snapshot_sha256": snapshot["rows_sha256"],
             "witness_sha256": witness_hash, "pages": query["pages"],
-            "meaning": "NO_ACCEPTED_SELL_IN_VERIFIED_ORIGINAL_DAY_NOT_A_PRE_HTTP_CERTIFICATE"}
+            "settled_prior_order_sha256": prior_orders,
+            "meaning": "NO_UNATTRIBUTED_SELL_IN_VERIFIED_ORIGINAL_DAY_NOT_A_PRE_HTTP_CERTIFICATE"}
 
 
 def _scope(conn) -> dict:
@@ -236,7 +289,8 @@ def _apply(conn, original: dict, snapshot: dict, scope: dict) -> tuple[bool, str
     current_scope = _scope(conn)
     if current_scope != scope: return False, "ACTIVE_SCOPE_CHANGED_DURING_BROKER_QUERY"
     witnesses = [dict(r) for r in conn.execute(text(WITNESSES_SQL), p).mappings().all()]
-    proof = assess(dict(row), snapshot, witnesses, scope)
+    prior = [dict(r) for r in conn.execute(text(SETTLED_PRIOR_SQL), p).mappings().all()]
+    proof = assess(dict(row), snapshot, witnesses, scope, settled_prior=prior)
     if not proof["verified"]: return False, proof["reason"]
     if not _no_local_broker_evidence(conn, dict(row), scope): return False, "LOCAL_BROKER_OR_CLAIM_EVIDENCE_PRESENT"
     if not _intent_valid(conn, dict(row), scope, lock=True):
@@ -247,7 +301,7 @@ def _apply(conn, original: dict, snapshot: dict, scope: dict) -> tuple[bool, str
         WHERE client_order_key=:key AND trading_epoch_id=:epoch AND status='PENDING'"""),
         {**p, "patch": json.dumps(patch)})
     mark_us_profit_capture_stage(p["day"], p["symbol"], p["stage"], order_key=p["key"],
-        position_lifecycle_id=p["cycle"], status="FAILED", evidence_type=EVIDENCE, _conn=conn)
+        position_lifecycle_id=p["cycle"], status="FAILED", evidence_type=proof['reason'], _conn=conn)
     event = {"event_id": str(uuid4()), "trade_date": p["day"],
         "event_type": "TP_HISTORICAL_BROKER_ABSENCE_VERIFIED", "event_timestamp": datetime.now(timezone.utc).isoformat(),
         "session": "BOUNDARY_RECONCILIATION", "session_run_id": None, "tick_id": None,
@@ -261,13 +315,14 @@ def _apply(conn, original: dict, snapshot: dict, scope: dict) -> tuple[bool, str
     if not append_us_order_event(event, _conn=conn): raise RuntimeError("TP_RESOLUTION_AUDIT_NOT_DURABLE")
     state = load_us_profit_capture_state(p["day"], [p["symbol"]], {p["symbol"]: p["cycle"]}, _conn=conn)[p["symbol"]]
     if (state.get(p["stage"]+"_pending") or state.get(p["stage"]+"_done")
-            or state.get("meta", {}).get("last_evidence_type") != EVIDENCE):
+            or state.get("meta", {}).get("last_evidence_type") != proof['reason']):
         raise RuntimeError("TP_RESOLUTION_POSTCONDITION_FAILED")
-    return True, EVIDENCE
+    return True, proof['reason']
 
 
 def resolve_historical_tp_at_boundary(*, provider, trade_date: str, phase: str,
-                                      apply: bool = True, budget_sec: float = 20) -> dict:
+                                      apply: bool = True, budget_sec: float = 20,
+                                      source_trade_date: str | None = None) -> dict:
     result = {"status": "OK", "checked": 0, "released": 0, "eligible": 0,
               "source_days_queried": 0, "source_day_evidence": [],
               "unresolved": [], "observations": [], "database_mutated": False}
@@ -281,7 +336,8 @@ def resolve_historical_tp_at_boundary(*, provider, trade_date: str, phase: str,
         with engine.connect() as conn:
             scope = _scope(conn)
             candidates = [dict(r) for r in conn.execute(text(CANDIDATES_SQL),
-                {"epoch": scope["trading_epoch_id"], "today": trade_date}).mappings().all() if eligible(dict(r))]
+                {"epoch": scope["trading_epoch_id"], "today": trade_date}).mappings().all()
+                if eligible(dict(r)) and (source_trade_date is None or str(r['trade_date']) == source_trade_date)]
         result["candidate_count"] = len(candidates)
         # Stable rotation across AM/Close and days prevents one unavailable
         # old broker day from consuming every boundary's entire read budget.
@@ -314,7 +370,9 @@ def resolve_historical_tp_at_boundary(*, provider, trade_date: str, phase: str,
             with engine.connect() as conn:
                 witnesses = [dict(r) for r in conn.execute(text(WITNESSES_SQL),
                     {"epoch": scope["trading_epoch_id"], "day": day}).mappings().all()]
-            proof = assess(row, snapshots[day], witnesses, scope)
+                prior = [dict(r) for r in conn.execute(text(SETTLED_PRIOR_SQL),
+                    {"epoch": scope["trading_epoch_id"], "day": day, "symbol": row['symbol']}).mappings().all()]
+            proof = assess(row, snapshots[day], witnesses, scope, settled_prior=prior)
             if not proof["verified"]:
                 detail = {**base, "reason": proof["reason"]}
                 if proof.get("broker_sell_observations"):

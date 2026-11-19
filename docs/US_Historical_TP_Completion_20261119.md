@@ -38,9 +38,14 @@ A release requires all of the following:
    account/ACTIVE-epoch relation and authenticated broker match. A witness is not
    retroactively assigned new ownership. A TQQQ row may witness account history;
    its strategy/state is never changed or adopted by a standard-symbol repair.
-4. **No SELL for the target symbol exists anywhere in that complete source-day
-   book.** A matching-looking partial, open, filled, cancelled or rejected SELL
-   is reported for attribution; symbol+quantity is never used to adopt it.
+4. **No unattributed SELL for the target symbol exists in that complete source-day
+   book.** The only exclusion is an exactly identified **completed prior TP**:
+   same native broker number, original day/symbol/cycle/ACTIVE epoch, exact prior
+   stage key (including retry suffix), DONE stage with matching filled quantity,
+   FILLED local order and KIS order, plus actual nonsynthetic DB fill provenance.
+   Both raw and canonical stage broker numbers must agree. Conflicting native
+   order ownership, current/later-stage keys, unknown, partial, open, cancelled or
+   rejected SELLs remain fenced. Symbol+quantity alone never attributes a SELL.
 5. No native attempt/event/order/fill under the original key and no related
    active execution claim or pending SELL. An unrelated TMO claim/order does not
    globally suppress KO/KR. Read-only preview and apply use the same guards.
@@ -49,9 +54,10 @@ A release requires all of the following:
    changes and an immutable **observation**, dated now with the original source
    trade date, commit together. An audit/state failure rolls back that symbol.
 
-The evidence is named `KIS_ORIGINAL_DAY_NO_ACCEPTED_SELL`. It proves **no accepted
-SELL in the verified original-day population**, not that an HTTP call was never
-attempted. It is deliberately not labelled `BROKER_SUBMIT_ABORTED_PRE_IO`.
+The evidence is named `KIS_ORIGINAL_DAY_NO_ACCEPTED_SELL` when the target has no
+SELLs, or `KIS_ORIGINAL_DAY_ONLY_SETTLED_PRIOR_TP_SELLS` when every target SELL is
+exactly attributed to completed earlier stages. Neither proves that an HTTP call
+was never attempted. Neither is labelled `BROKER_SUBMIT_ABORTED_PRE_IO`.
 Only the old derived TP reservation/intent can be closed. No existing order,
 fill, execution claim, position quantity, original contract or cycle is modified.
 
@@ -75,7 +81,7 @@ PostgreSQL cases use production migrations in a disposable service.
 The read-only operator/CI command is:
 
 ```bash
-PYTHONPATH=. python scripts/us_historical_tp_resolution.py --budget-sec 30
+PYTHONPATH=. python scripts/us_historical_tp_resolution.py --all-source-days --budget-sec 30
 ```
 
 It forces order permissions OFF, exposes a GET-only provider facade, and sets the
@@ -92,6 +98,17 @@ branch can then run the authenticated read-only audit. It checks out the exact
 head SHA, has only `contents: read`, does not run on forks/schedules or every push,
 forces the practice endpoint and all order gates OFF, and never applies repairs.
 The old PR243 manual audit workflow/security gates are unchanged.
+
+The read-only audit enumerates actual source dates and grants each date its own
+bounded evidence budget (maximum ten source days; excess is explicitly unresolved).
+This prevents an operator audit from omitting KO after other old days consume a
+production boundary budget. The production AM/Close total budget is unchanged.
+
+The first authenticated audit on 2026-11-19 confirmed KR and PG eligible, but KO
+was budget-deferred. HCA had two real FILLED SELLs. Read-only DB comparison tied
+their native order numbers and keys to DONE TP1/TP2, while the candidate is TP3.
+The final implementation verifies this exact prior-stage distinction generically;
+the first audit's failure is retained as evidence, not relabelled as a pass.
 
 **Code CI success and original KIS evidence success are separate.** Until the real
 original-day audit succeeds, KO/KR's operational resolution remains unverified.

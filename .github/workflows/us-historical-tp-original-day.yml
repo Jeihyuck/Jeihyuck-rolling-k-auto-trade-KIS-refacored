@@ -94,7 +94,7 @@ jobs:
           python-version: '3.11'
       - run: python -m pip install -r requirements.txt psycopg2-binary
       - name: Query KIS original days with no order or database write authority
-        run: python scripts/us_historical_tp_resolution.py --budget-sec 30 --output original-day-tp-readonly.json
+        run: python scripts/us_historical_tp_resolution.py --all-source-days --budget-sec 30 --output original-day-tp-readonly.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:

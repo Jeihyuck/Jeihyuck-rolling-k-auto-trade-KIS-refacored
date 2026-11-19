@@ -28,11 +28,35 @@ def restrict_audit_engine(engine) -> None:
     event.listen(engine,'begin',read_only_transaction)
 
 
+def audit_all_source_days(*, provider, trade_date: str, phase: str, budget_sec: float) -> dict:
+    """Separate read-only evidence budgets; production boundary budget stays unchanged."""
+    from sqlalchemy import text
+    from trader.us.db.repos import _get_engine_or_none
+    from trader.us.execution.historical_tp_resolution import CANDIDATES_SQL, _scope, eligible, resolve_historical_tp_at_boundary
+    with _get_engine_or_none().connect() as conn:
+        scope = _scope(conn)
+        rows = conn.execute(text(CANDIDATES_SQL), {'epoch':scope['trading_epoch_id'],'today':trade_date}).mappings().all()
+        days = sorted({str(r['trade_date']) for r in rows if eligible(dict(r))})
+    results = [resolve_historical_tp_at_boundary(provider=provider,trade_date=trade_date,phase=phase,
+        apply=False,budget_sec=budget_sec,source_trade_date=day) for day in days[:10]]
+    unresolved = [item for r in results for item in r['unresolved']]
+    unresolved += [{'source_trade_date':day,'reason':'AUDIT_SOURCE_DAY_LIMIT'} for day in days[10:]]
+    if any(r['status'] == 'UNAVAILABLE' for r in results):
+        unresolved.append({'reason':'SOURCE_DAY_AUDIT_UNAVAILABLE'})
+    return {'status':'HISTORICAL_TP_UNRESOLVED' if unresolved else 'OK',
+        **{key:sum(r.get(key,0) for r in results) for key in
+            ('checked','released','eligible','source_days_queried','candidate_count')},
+        'source_day_evidence':[item for r in results for item in r['source_day_evidence']],
+        'observations':[item for r in results for item in r['observations']],
+        'unresolved':unresolved,'database_mutated':False,'all_source_days_audit':True}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument('--trade-date', default=datetime.now(ZoneInfo('America/New_York')).date().isoformat())
     parser.add_argument('--phase', choices=['AM_START','CLOSE'], default='CLOSE')
     parser.add_argument('--budget-sec', type=float, default=30)
+    parser.add_argument('--all-source-days', action='store_true')
     parser.add_argument('--output')
     args=parser.parse_args()
     date.fromisoformat(args.trade_date)
@@ -54,8 +78,12 @@ def main() -> int:
         def fork_for_stage(self, **kw): return ReadOnlyProvider(self._reader.fork_for_stage(**kw))
         def get_original_day_order_snapshot(self, day): return self._reader.get_original_day_order_snapshot(day)
 
-    result=resolve_historical_tp_at_boundary(provider=ReadOnlyProvider(USDataProvider(offline=False,env='practice')),
-        trade_date=args.trade_date,phase=args.phase,apply=False,budget_sec=args.budget_sec)
+    reader=ReadOnlyProvider(USDataProvider(offline=False,env='practice'))
+    if args.all_source_days:
+        result=audit_all_source_days(provider=reader,trade_date=args.trade_date,phase=args.phase,budget_sec=args.budget_sec)
+    else:
+        result=resolve_historical_tp_at_boundary(provider=reader,
+            trade_date=args.trade_date,phase=args.phase,apply=False,budget_sec=args.budget_sec)
     result.update(read_only=True,operational_database_repaired=False,
                   scope='US_STANDARD_HISTORICAL_TP_ONLY_NOT_ALL_ACCOUNT_DEBT')
     rendered=json.dumps(result,ensure_ascii=False,indent=2)
