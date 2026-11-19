@@ -209,6 +209,13 @@ def _is_connection_poison_error(exc: BaseException) -> bool:
             "can't change 'autocommit'",
             "can't change autocommit",
             "server closed the connection",
+            # psycopg3/Supabase can drop TLS mid-query. The SQLAlchemy
+            # pooled connection is no longer usable; dispose before retrying
+            # the NEXT independent read. Never fail-open an order/claim check.
+            "ssl connection has been closed unexpectedly",
+            "ssl connection closed unexpectedly",
+            "connection closed unexpectedly",
+            "ssl syscall error",
             "connection already closed",
             "terminating connection",
             "statement timeout",
