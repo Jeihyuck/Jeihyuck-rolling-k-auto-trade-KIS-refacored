@@ -538,7 +538,14 @@ def main() -> None:
     kis = None
     schedule = CandidateSchedule(max_batch=6)
     last_capacity_warning_key = None
+    last_idle_key = None
+    last_idle_logged_at = 0.0
     scope = get_account_key(env="practice")
+    logger.info(
+        "[KR][OPENING_OBSERVER][COLLECTOR_BOOT] date=%s module=%s interval_sec=%s "
+        "collection_scope=VERIFIED_PB1_HOT_WARM_ONLY",
+        today, __file__, args.interval_sec,
+    )
     while True:
         now = now_kst()
         if now.date().isoformat() != today or now.time() > dtime(15, 5):
@@ -588,8 +595,30 @@ def main() -> None:
             last_capacity_warning_key = warning_key
             selected = schedule.select(native_priority, now)
             if not selected:
+                # A missing/mismatched priority manifest means zero broker
+                # 1m requests. Distinguish this P0 fault from a legitimate
+                # owner-selected empty shortlist, without adding COLD I/O.
+                idle_key = (
+                    priority["state"], priority.get("reason"),
+                    tuple(priority["hot"]), tuple(priority["warm"]),
+                )
+                monotonic_now = time.monotonic()
+                if (idle_key != last_idle_key
+                        or monotonic_now - last_idle_logged_at >= 180.0):
+                    severity = (logging.ERROR if priority["state"] == "PREP_FALLBACK"
+                                else logging.INFO)
+                    logger.log(
+                        severity,
+                        "[KR][OPENING_OBSERVER][NO_COLLECTION_TARGET] source=%s "
+                        "reason=%s hot=%s warm=%s cold=%s "
+                        "action=WAIT_FOR_PB1_FINAL_SHORTLIST_BUY_FAIL_CLOSED",
+                        priority["state"], priority.get("reason") or "NO_ELIGIBLE_PREMINUTE_BUY",
+                        len(priority["hot"]), len(priority["warm"]), len(priority["cold"]),
+                    )
+                    last_idle_key, last_idle_logged_at = idle_key, monotonic_now
                 time.sleep(min(10.0, max(2.0, float(args.interval_sec) / 3.0)))
                 continue
+            last_idle_key = None
             logger.info(
                 "[KR][OPENING_OBSERVER][QUEUE] source=%s hot=%s warm=%s cold=%s "
                 "selected=%s full_universe=%s order_authorization=0 native_collection_scope=HOT_WARM_ONLY",
