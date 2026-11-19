@@ -189,7 +189,7 @@ def expected_pending_settlement(*, before: dict, after: dict, orders: list[dict]
     if (reconcile_entry_block or reconcile_only_until_clean or manual_reconcile_required
             or str(before.get("status") or "").upper() != "OK"
             or any(int(before.get(k) or 0) for k in
-                   ("pending_count", "unresolved_count", "unresolved_error_count"))
+                   ("pending_count", "open_order_pending_count", "unresolved_count", "unresolved_error_count"))
             or str(after.get("status") or "").upper() != "ACK_PENDING_RECONCILE"):
         return False
     acknowledged = []

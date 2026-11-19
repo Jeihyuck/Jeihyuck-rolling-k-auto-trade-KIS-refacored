@@ -1535,7 +1535,9 @@ def run_daily_report(
                     report.update(journal_counts)
                     report["daily_orders_sent_total"] = journal_counts["orders_sent_total"]
                     report["daily_orders_ack_total"] = journal_counts["orders_ack_total"]
-                    report["daily_fills_confirmed_total"] = journal_counts["orders_fill_confirmed"]
+                    report["daily_fills_confirmed_total"] = journal_counts.get(
+                        "orders_with_confirmed_fills", journal_counts["orders_fill_confirmed"])
+                    report["daily_fills_confirmed_unit"] = "distinct_orders_with_native_fill_observation"
                     report["daily_aggregate_source"] = "scoped_durable_order_journal"
                     report["buy_order_count"] = journal_counts["buy_orders_count"]
                     report["sell_order_count"] = journal_counts["sell_orders_count"]

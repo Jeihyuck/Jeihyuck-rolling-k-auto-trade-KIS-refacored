@@ -606,6 +606,8 @@ def aggregate_order_events(trade_date: str, *, session_run_id: str | None = None
     ack = {a for a, types in lifecycle.items() if a not in aborted and types & {"BROKER_ACK_RECEIVED", "BROKER_ACK_RECOVERED"}}
     rejected = {a for a, types in lifecycle.items() if a not in aborted and "ORDER_REJECTED" in types}
     filled = {a for a, types in lifecycle.items() if a not in aborted and "ORDER_FILLED" in types}
+    with_fills = {a for a, types in lifecycle.items() if a not in aborted
+                  and types & {"ORDER_FILLED", "ORDER_PARTIALLY_FILLED"}}
     unresolved_submit_count = sum(
         1
         for attempt, types in lifecycle.items()
@@ -627,7 +629,9 @@ def aggregate_order_events(trade_date: str, *, session_run_id: str | None = None
     sell = sum(str(e.get("side") or "").upper() == "SELL" for e in submits.values())
     return {"scope": "trade_day", "orders_sent_total": len(submits), "buy_orders_count": buy,
             "sell_orders_count": sell, "orders_ack_total": len(ack), "orders_reject_total": len(rejected),
-            "orders_fill_confirmed": len(filled), "fill_execution_row_count": len(fill_execution_keys),
+            "orders_fill_confirmed": len(filled), "orders_with_confirmed_fills": len(with_fills),
+            "fill_execution_row_count": len(fill_execution_keys),
+            "journal_fill_observation_count": len(fill_execution_keys),
             "partial_fill_observation_count": len(partial_observation_keys),
             "unresolved_submit_attempt_count": unresolved_submit_count,
             "unique_submit_attempt_count": len(submits),

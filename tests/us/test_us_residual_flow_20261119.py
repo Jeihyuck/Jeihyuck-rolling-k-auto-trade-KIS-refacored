@@ -24,7 +24,7 @@ def test_native_ack_is_expected_settlement_until_independent_fill_reconcile():
 
 
 @pytest.mark.parametrize("change", ["unknown_submit", "db_ack_failed", "missing_number", "prior_pending",
-    "prior_unresolved", "unknown_ack_status", "manual_failure", "extra_pending", "prior_reconcile_gate"])
+    "prior_unresolved", "prior_open", "unknown_ack_status", "manual_failure", "extra_pending", "prior_reconcile_gate"])
 def test_expected_settlement_never_hides_actual_integrity_failure(change):
     args = settled_inputs()
     if change == "unknown_submit": args["orders"].append({"status": "BROKER_SUBMIT_RESULT_UNKNOWN"})
@@ -32,6 +32,7 @@ def test_expected_settlement_never_hides_actual_integrity_failure(change):
     if change == "missing_number": args["orders"][0]["ack"] = {}
     if change == "prior_pending": args["before"]["pending_count"] = 1
     if change == "prior_unresolved": args["before"]["unresolved_count"] = 1
+    if change == "prior_open": args["before"]["open_order_pending_count"] = 1
     if change == "unknown_ack_status": args["after"]["status"] = "ERROR"
     if change == "manual_failure": args["manual_reconcile_required"] = True
     if change == "extra_pending": args["after"]["unresolved_count"] = 2
@@ -333,3 +334,21 @@ def test_postgres_certificate_cannot_change_foreign_intent_scope(pg_engine, monk
     assert result["released"] == 0
     with pg_engine.connect() as conn:
         assert conn.execute(text("SELECT status FROM us_order_intents WHERE client_order_key=:key"), {"key": key}).scalar_one() == "PENDING"
+
+
+
+def test_native_partial_fill_is_confirmed_without_claiming_terminal_completion(monkeypatch):
+    from trader.us.execution import order_journal as journal
+    from trader.us.runner.close_audit import audit_us_close_report
+    events = [{"submit_attempt_id": "partial", "client_order_key": "partial-key", "side": "SELL",
+               "event_type": kind, "broker_order_no": "000123", "cumulative_filled_qty": 2,
+               "trade_date": "2026-11-18", "account_id": "account", "trading_epoch_id": "epoch"}
+              for kind in ("BROKER_SUBMIT_STARTED", "BROKER_ACK_RECEIVED", "DB_ACK_PERSISTED", "ORDER_PARTIALLY_FILLED")]
+    monkeypatch.setattr(journal, "load_order_events", lambda *a, **kw: events)
+    totals = journal.aggregate_order_events("2026-11-18")
+    assert totals["orders_fill_confirmed"] == 0  # remaining native order stays open
+    assert totals["orders_with_confirmed_fills"] == 1
+    report = {**totals, "trade_date": "2026-11-18", "broker_recovery_health": {"available": True},
+              "kis_actual_fill_order_count": 1, "daily_fills_confirmed_total": totals["orders_with_confirmed_fills"],
+              "broker_fill_identity_scope": totals["journal_order_population"]["filled_identity_scope"]}
+    assert audit_us_close_report(report)["findings"] == []
