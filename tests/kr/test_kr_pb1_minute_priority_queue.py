@@ -273,3 +273,95 @@ def test_actual_pb1_publisher_uses_existing_db_evidence_before_hot_queue():
     assert "is_order_authorization" in Path(
         "trader/kr/entry_priority_queue.py"
     ).read_text(encoding="utf-8")
+
+
+def test_20261119_missing_hot_manifest_is_loud_but_never_collects_final30(seed_prep):
+    """Incident replay: yesterday the observer idled after PREP_READY."""
+    date, _ = seed_prep
+    snapshot = pq.collection_priorities(
+        date=date, account_scope="practice:test", now=moment(9, 3)
+    )
+    assert snapshot["state"] == "PREP_FALLBACK"
+    assert snapshot["reason"] == "MISSING_MANIFEST"
+    assert len(snapshot["cold"]) == 30
+    native_only = {**snapshot, "cold": []}
+    assert pq.CandidateSchedule(max_batch=6).select(native_only, moment(9, 3)) == []
+
+
+def test_20261119_actual_final_three_not_filled_to_hot_five(seed_prep):
+    """Only the already shortlisted three get native 1m calls."""
+    from types import SimpleNamespace
+
+    date, _ = seed_prep
+    final_shortlist = [
+        SimpleNamespace(code=code, setup_ok=True, planned_qty=qty,
+                        client_order_key=code + "-BUY")
+        for code, qty in (("000021", 11), ("000023", 62), ("000029", 172))
+    ]
+    eligible = pq.eligible_preminute_codes(candidates=final_shortlist)
+    assert eligible == ["000021", "000023", "000029"]
+    published = pq.publish_pb1_priority(
+        date=date, account_scope="practice:test", eligible_codes=eligible,
+        now=moment(9, 5), stage="PB1-AM",
+    )
+    assert published["hot"] == eligible
+    assert published["warm"] == []
+    priorities = pq.collection_priorities(
+        date=date, account_scope="practice:test", now=moment(9, 6),
+    )
+    assert priorities["state"] == "PB1_ACTIVE"
+    selected = pq.CandidateSchedule(max_batch=6).select(
+        {**priorities, "cold": []}, moment(9, 6),
+    )
+    assert set(selected) == set(eligible)
+    assert len(selected) == 3
+
+
+def test_20261119_final_shortlist_zero_stays_zero_and_never_fake_fills(seed_prep):
+    date, _ = seed_prep
+    published = pq.publish_pb1_priority(
+        date=date, account_scope="practice:test", eligible_codes=[],
+        now=moment(9, 4), stage="PB1-AM",
+    )
+    assert published["state"] == "PUBLISHED"
+    snapshot = pq.collection_priorities(
+        date=date, account_scope="practice:test", now=moment(9, 5),
+    )
+    assert snapshot["state"] == "PB1_ACTIVE"
+    assert snapshot["hot"] == snapshot["warm"] == []
+    assert len(snapshot["cold"]) == 30
+
+
+def test_20261119_publisher_is_after_final_order_shortlist_not_wider_risk_pool():
+    """PR367 incorrectly published from ok_after_risk instead of final orders."""
+    from pathlib import Path
+
+    src = Path("trader/pb1_engine.py").read_text(encoding="utf-8")
+    top3 = src.index("orderable_candidates = orderable_candidates[:3]")
+    kr_finalizer = src.index("orderable_candidates, final_invariants = _finalize_kr_order_candidates(")
+    publish = src.index("_priority_status = publish_pb1_priority(")
+    ready = src.index("orderable_codes = [c.code for c in orderable_candidates]")
+    assert top3 < kr_finalizer < publish < ready
+    publisher = src[kr_finalizer:ready]
+    assert "candidates=orderable_candidates" in publisher
+    assert "eligible_codes=_priority_codes" in publisher
+    assert "[KR][ENTRY_TIMING][PRIORITY_SCOPE]" in publisher
+    assert "_priority_phase in {\"entry\", \"pm_entry\"}" in publisher
+    assert "not allow_add_to_existing" in publisher
+
+    observer = Path("scripts/kr_opening_observer.py").read_text(encoding="utf-8")
+    assert "[KR][OPENING_OBSERVER][NO_COLLECTION_TARGET]" in observer
+    assert 'native_priority = {**priority, "cold": []}' in observer
+
+
+def test_20261119_broken_manifest_reports_precise_reason(seed_prep):
+    date, _ = seed_prep
+    pq.publish_pb1_priority(
+        date=date, account_scope="practice:test",
+        eligible_codes=["000021"], now=moment(9, 1),
+    )
+    expired = pq.collection_priorities(
+        date=date, account_scope="practice:test", now=moment(9, 8),
+    )
+    assert expired["state"] == "PREP_FALLBACK"
+    assert expired["reason"] == "STALE_OR_UNTRUSTED_MANIFEST"
