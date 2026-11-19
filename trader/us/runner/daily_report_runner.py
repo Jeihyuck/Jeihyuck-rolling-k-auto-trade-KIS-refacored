@@ -1533,6 +1533,10 @@ def run_daily_report(
                     report["report_consistency"] = "FAILED"
                 if journal_counts.get("orders_sent_total", 0):
                     report.update(journal_counts)
+                    report["daily_orders_sent_total"] = journal_counts["orders_sent_total"]
+                    report["daily_orders_ack_total"] = journal_counts["orders_ack_total"]
+                    report["daily_fills_confirmed_total"] = journal_counts["orders_fill_confirmed"]
+                    report["daily_aggregate_source"] = "scoped_durable_order_journal"
                     report["buy_order_count"] = journal_counts["buy_orders_count"]
                     report["sell_order_count"] = journal_counts["sell_orders_count"]
                     invariant_ok = (
@@ -2078,7 +2082,7 @@ def run_daily_report(
         _evidence = _audit.get("decision_evidence_5w1h") or {}
         _label = f"{_audit.get('symbol', '?')} {_audit.get('side', '?')}"
         _status = _evidence.get("status") or "MISSING"
-        if _status != "VERIFIED":
+        if _status not in {"VERIFIED", "CURRENT_DECISION_VERIFIED_LEGACY_ENTRY"}:
             md_lines.append(f"- {_label}: evidence={_status}; no verified 5W1H claim")
             continue
         # Quote values are structured observed facts, never generated rationale.
@@ -2086,6 +2090,7 @@ def run_daily_report(
             return str(_value).replace("|", "/").replace("\\n", " ").replace("\\r", " ")
         md_lines.extend([
             f"### {_label} — {_safe_cell(_evidence.get('decision_reason'))}",
+            f"- Evidence status: {_status}",
             f"- Who: {_safe_cell(_evidence.get('strategy_owner'))}",
             f"- What: {_safe_cell(_audit.get('position_lifecycle_id'))}; key={_safe_cell(_audit.get('client_order_key'))}",
             f"- When: {_safe_cell(_evidence.get('when'))}",
@@ -2534,6 +2539,7 @@ def load_us_fills_breakdown(trade_date: str) -> dict:
             engine,
             """
             SELECT side, symbol, order_no, client_order_key, fill_idempotency_key,
+              account_id, trading_epoch_id, trade_date,
               qty, price_usd, COALESCE(meta->>'fill_evidence_type','') AS evidence_type,
               COALESCE((meta->>'is_synthetic')::boolean,(meta->>'synthetic')::boolean,
                        (meta->>'synthetic_fill')::boolean,false) AS is_synthetic,
@@ -2594,11 +2600,18 @@ def load_us_fills_breakdown(trade_date: str) -> dict:
             evidence = str(row.get("evidence_type") or "")
             accounting_active = row.get("accounting_active") is not False
             is_synthetic = (bool(row.get("is_synthetic")) or evidence in {"BALANCE_DELTA_SYNTHETIC", "LEGACY_SYNTHETIC"})
-            order_no = str(row.get("order_no") or "")
+            from trader.us.utils.order_no import normalize_us_order_no
+            order_no = normalize_us_order_no(row.get("order_no"))
             if not order_no or not accounting_active:
                 continue
             (synthetic_orders if is_synthetic else actual_orders).add(order_no)
         synthetic_orders -= actual_orders
+        from trader.us.execution.report_scope import population_scope
+        result["broker_fill_identity_scope"] = population_scope([
+            row for row in unique_rows.values()
+            if row.get("accounting_active") is not False and not row.get("is_synthetic")
+            and str(row.get("evidence_type") or "") not in {"BALANCE_DELTA_SYNTHETIC", "LEGACY_SYNTHETIC"}
+        ], trade_date)
         result["kis_actual_fill_order_count"] = len(actual_orders)
         result["accounting_confirmed_order_count"] = len(actual_orders | synthetic_orders)
     except Exception as exc:

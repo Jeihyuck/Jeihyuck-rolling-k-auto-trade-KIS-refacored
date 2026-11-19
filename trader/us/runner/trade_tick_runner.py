@@ -3062,6 +3062,17 @@ def run_trade_tick(
                 )
                 if len(_eligible) != 1:
                     return
+                try:
+                    from trader.us.decision_evidence_5w1h import attach_standard_sell_evidence
+                    attach_standard_sell_evidence(
+                        _eligible[0], next(p for p in current_positions
+                                           if str(p.get("symbol") or "").upper() == _sym),
+                        decision_at=now.isoformat(),
+                        code_sha=str(os.getenv("US_PINNED_CODE_SHA") or os.getenv("GITHUB_SHA") or "UNKNOWN"),
+                    )
+                except Exception as _proof_exc:
+                    logger.warning("[US_EXIT][EARLY_5W1H_UNAVAILABLE] symbol=%s error=%s",
+                                   _sym, type(_proof_exc).__name__)
                 _early_pilot_attempted_symbols.add(_sym)
                 _early_pilot_intents.append(_eligible[0])
                 # This pilot has a unique, hard-stop-only final choice for
@@ -5185,6 +5196,7 @@ def run_trade_tick(
         "exit_engine_ms": float(tick_context.metrics.get("exit_engine_ms", 0)),
         "market_state_ms": float(tick_context.metrics.get("market_state_ms", 0)),
         "completed_market_cache_hit": int(bool(market_state_overlay.get("completed_market_cache_hit"))),
+        "completed_daily_cache_hits": int(tick_context.counters.get("completed_daily_cache_hits", 0)),
         "tqqq_infinite_ms": float(tick_context.metrics.get("tqqq_infinite_ms", 0)),
         "entry_engine_ms": float(tick_context.metrics.get("entry_engine_ms", 0)),
         "risk_gate_ms": float(tick_context.metrics.get("risk_gate_ms", 0)),
@@ -5264,6 +5276,13 @@ def run_trade_tick(
             )
         )
     )
+    from trader.us.runner.status_contract import expected_pending_settlement
+    _expected_settlement = expected_pending_settlement(
+        before=ack_recon_before_route, after=ack_recon_after_route, orders=orders,
+        reconcile_entry_block=reconcile_entry_block,
+        reconcile_only_until_clean=bool(locals().get("reconcile_only_until_clean", False)),
+        manual_reconcile_required=bool(locals().get("ack_db_failed_buy_stop", False)),
+    )
     runtime_integrity_status = classify_runtime_integrity({
         "system_invariant_failure": locals().get("system_invariant_failure", ""),
         "entry_contract_integrity_block_count": entry_contract_integrity_block_count,
@@ -5271,7 +5290,7 @@ def run_trade_tick(
         "reconcile_only_until_clean": locals().get("reconcile_only_until_clean", False),
         "manual_reconcile_required": locals().get("ack_db_failed_buy_stop", False),
         "unresolved_ack_count": locals().get("unresolved_ack_count", 0),
-        "pending_order_count": int(
+        "pending_order_count": 0 if _expected_settlement else int(
             (ack_recon_after_route.get("unresolved_count")
              if isinstance(ack_recon_after_route, dict)
              else ack_recon.get("unresolved_count", 0))
@@ -5292,7 +5311,7 @@ def run_trade_tick(
     entry_liveness_status = "LIVENESS_DEGRADED" if entry_degraded else "OK"
     reconcile_liveness_status = (
         "RECONCILE_REQUIRED" if runtime_integrity_status == "RECONCILE_REQUIRED"
-        else "OK"
+        else "PENDING_SETTLEMENT" if _expected_settlement else "OK"
     )
     return {
         **latency_metrics,
@@ -5302,6 +5321,10 @@ def run_trade_tick(
         "sell_liveness_status": sell_liveness_status,
         "entry_liveness_status": entry_liveness_status,
         "reconcile_liveness_status": reconcile_liveness_status,
+        "expected_settlement_order_keys": [
+            str(o.get("client_order_key") or (o.get("intent") or {}).get("client_order_key") or "")
+            for o in orders if str(o.get("status") or "").upper() == "ACK"
+        ] if _expected_settlement else [],
         "exit_route_reconcile_required": exit_route_reconcile_required,
         "exit_route_liveness_failure": exit_route_liveness_failure,
         "entry_block_reason": entry_block_reason,

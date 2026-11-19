@@ -36,6 +36,7 @@ class TickExecutionContext:
     blocked_symbol_sides: set[tuple[str, str]] = field(default_factory=set)
     balance_snapshot_at: float | None = None
     fills_snapshot_at: float | None = None
+    completed_daily_cache: dict[tuple, dict] = field(default_factory=dict)
     price_cache: dict[tuple[str, str], Any] = field(default_factory=dict)
     psamount_cache: dict[tuple[str, str, float, str], Any] = field(default_factory=dict)
     prep_status: dict | None = None

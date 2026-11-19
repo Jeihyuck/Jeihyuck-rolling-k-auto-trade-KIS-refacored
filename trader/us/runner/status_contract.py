@@ -175,3 +175,44 @@ def classify_tick_status(tick_result: dict | str | None) -> str:
     if status in WARNING_STATUSES:
         return "warning"
     return "fatal"
+
+
+def expected_pending_settlement(*, before: dict, after: dict, orders: list[dict],
+                                reconcile_entry_block: bool = False,
+                                reconcile_only_until_clean: bool = False,
+                                manual_reconcile_required: bool = False) -> bool:
+    """Only this tick's durable ACK can explain its new pending count.
+
+    Preserve all unknown submits, failed persistence, prior debt and error gates.
+    Close still verifies actual terminal broker evidence independently.
+    """
+    if (reconcile_entry_block or reconcile_only_until_clean or manual_reconcile_required
+            or str(before.get("status") or "").upper() != "OK"
+            or any(int(before.get(k) or 0) for k in
+                   ("pending_count", "unresolved_count", "unresolved_error_count"))
+            or str(after.get("status") or "").upper() != "ACK_PENDING_RECONCILE"):
+        return False
+    acknowledged = []
+    for row in orders:
+        status = str(row.get("status") or "").upper()
+        if (row.get("requires_reconcile") or status.startswith("ORDER_DISABLED_")
+                or status == "US_RECOVERY_SCOPE_UNVERIFIED" or status in {
+            "ACK_DB_FAILED", "BROKER_SUBMIT_RESULT_UNKNOWN", "ERROR",
+            "ACK_JOURNAL_FAILED_RECONCILE_REQUIRED", "DB_ACK_JOURNAL_FAILED_RECONCILE_REQUIRED",
+        }):
+            return False
+        if status == "ACK":
+            intent = row.get("intent") or {}
+            ack = row.get("ack") or {}
+            key = row.get("client_order_key") or intent.get("client_order_key")
+            number = (row.get("broker_order_no") or row.get("order_no")
+                      or ack.get("raw_broker_order_no") or ack.get("order_no")
+                      or ack.get("ODNO") or ack.get("odno"))
+            if not key or not number:
+                return False
+            acknowledged.append(str(key))
+    count = len(acknowledged)
+    return bool(count and len(set(acknowledged)) == count
+                and int(after.get("pending_count") or 0) == count
+                and int(after.get("unresolved_count") or 0) == count
+                and int(after.get("unresolved_error_count") or 0) == 0)

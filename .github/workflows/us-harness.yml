@@ -71,6 +71,12 @@ jobs:
             trader/us/runner/trade_close_runner.py \
             scripts/repair_us_trade_integrity.py
 
+      - name: Run Nov19 residual flow and atomic TP boundary acceptance
+        shell: bash
+        run: |
+          test -n "$PBCORE_TEST_POSTGRES_URL"
+          python -m pytest -q tests/us/test_us_residual_flow_20261119.py
+
       - name: Run US353 TP remainder and multi-symbol isolation acceptance
         shell: bash
         run: |

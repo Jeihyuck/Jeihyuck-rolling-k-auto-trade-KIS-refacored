@@ -3963,6 +3963,7 @@ def release_us_profit_capture_pre_http_abort(
     *, trade_date: str, symbol: str, stage: str,
     position_lifecycle_id: str, client_order_key: str,
     close_intent: bool = False, failure_code: str = "PROVEN_PRE_HTTP_ABORT",
+    _conn: Any = None,
 ) -> bool:
     """Clear a TP intent-only PENDING *only* after proven no-HTTP abort.
 
@@ -3984,7 +3985,8 @@ def release_us_profit_capture_pre_http_abort(
         # a release while the ledger is unavailable.
         return False
 
-    with engine.begin() as conn:
+    from contextlib import nullcontext
+    with (nullcontext(_conn) if _conn is not None else engine.begin()) as conn:
         epoch_id = _active_us_epoch(conn)
         params = {
             "td": str(trade_date), "sym": sym, "stage": stg,

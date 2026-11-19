@@ -1524,6 +1524,8 @@ def route_order(
                     "broker_submit": False, "intent": intent}
     except Exception as exc:
         logger.critical("[US_ORDER][SEMANTIC_FENCE][FAIL_CLOSED] symbol=%s err=%s", symbol, exc)
+        from trader.us.execution.tp_retry_boundary import record_router_abort
+        record_router_abort(intent, checkpoint="semantic_lookup_failed")
         return {
             "status": "ORDER_DISABLED_DURABLE_LEDGER_UNAVAILABLE",
             "reason": "semantic_sell_duplicate_lookup_failed",
@@ -1765,6 +1767,8 @@ def route_order(
                 "[US_ORDER][ORIGINAL_RECOVERY_SCOPE_FENCED] symbol=%s "
                 "side=%s type=%s broker_submit=0", symbol, side, type(exc).__name__,
             )
+            from trader.us.execution.tp_retry_boundary import record_router_abort
+            record_router_abort(intent, checkpoint="original_scope_rejected")
             return {
                 "status": "US_RECOVERY_SCOPE_UNVERIFIED",
                 "reason": str(exc), "broker_submit": False,
@@ -1956,6 +1960,13 @@ def route_order(
             blocked_status = "WARN_DUPLICATE_EXIT_BLOCKED" if (side == "SELL" and duplicate_blocked) else "BLOCKED"
             return {"status": blocked_status, "reason": reason_text, "duplicate_blocked": duplicate_blocked, "intent": intent, "canonical_risk_state": gate_snapshot}
 
+    # This point is reachable only after the actual risk gate (including a
+    # successful resize retry). Capture its result before all durable events.
+    intent.setdefault("meta", {}).update({
+        "risk_gate_result": "ALLOW", "risk_gate_reason": (
+            "tqqq_infinite_risk_check_passed" if is_tqqq_infinite
+            else "canonical_order_risk_check_passed"),
+    })
     # Normalize audit evidence before any journal/DB persistence.  SELL policies
     # must not lose their cost basis merely because they use different reason names.
     intent.setdefault("meta", {})

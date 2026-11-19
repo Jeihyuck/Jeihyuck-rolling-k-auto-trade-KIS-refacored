@@ -96,6 +96,7 @@ def audit_us_order_chains(
     statuses: Counter[str] = Counter()
     broker_verified = 0
     missing_5w1h = 0
+    legacy_entry_unavailable = 0
     integrity_conflicts = 0
     for order in order_audit:
         if not isinstance(order, dict):
@@ -148,7 +149,9 @@ def audit_us_order_chains(
             broker_status = fill_reason if actual_qty is None else "ORDER_CHAIN_INCOMPLETE"
 
         evidence_status = str(order.get("decision_evidence_status") or "").upper()
-        if evidence_status != "VERIFIED":
+        if evidence_status == "CURRENT_DECISION_VERIFIED_LEGACY_ENTRY":
+            legacy_entry_unavailable += 1
+        elif evidence_status != "VERIFIED":
             missing_5w1h += 1
         # An inconsistent fill quantity is an *integrity discrepancy*, not
         # automatic proof of a code implementation defect: the KIS evidence,
@@ -195,6 +198,7 @@ def audit_us_order_chains(
             pre_http_only += 1
     total = len(reports)
     return {
+        "legacy_entry_decision_unavailable_count": legacy_entry_unavailable,
         "status": (
             "VERIFIED" if total and statuses["PENDING_EVIDENCE"] == 0
             and integrity_conflicts == 0

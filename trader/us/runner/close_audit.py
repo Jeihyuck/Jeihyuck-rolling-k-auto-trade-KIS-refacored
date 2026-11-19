@@ -49,16 +49,33 @@ def audit_us_close_report(report: dict[str, Any]) -> dict[str, Any]:
     if str(report.get("close_integrity_status") or "").upper() == "RECONCILE_REQUIRED":
         record("CLOSE_RECONCILIATION_REQUIRED", "P0")
 
+    population = report.get("journal_order_population") or {}
+    journal_scope = population.get("filled_identity_scope")
+    fill_scope = report.get("broker_fill_identity_scope")
+    comparable = True
+    if isinstance(journal_scope, dict) and isinstance(fill_scope, dict):
+        comparable = (journal_scope.get("verified") is True
+                      and fill_scope.get("verified") is True and journal_scope == fill_scope)
+        if not comparable:
+            record("ORDER_FILL_SCOPE_UNVERIFIED", "P1",
+                   note="Order/fill populations must share account, epoch and trade date before totals are compared")
     broker_fills = int(report.get("kis_actual_fill_order_count") or 0)
     local_fills = int(report.get("daily_fills_confirmed_total") or 0)
-    if broker_fills and not local_fills:
+    if comparable and broker_fills and not local_fills:
         record("BROKER_LOCAL_DAILY_AGGREGATE_DIVERGENCE", "P1",
                kis_actual_fill_orders=broker_fills,
                daily_local_confirmed_fills=local_fills,
                note="Different source populations may explain the difference; verify before changing totals")
 
     unique_order_nos = int(report.get("unique_broker_order_count") or 0)
-    if unique_order_nos > broker_fills:
+    population = report.get("journal_order_population") or {}
+    # ACK/open/cancelled orders belong to the order population, not fills.
+    # With explicit trade-day provenance compare only actually filled orders.
+    if (population.get("scope") == "trade_day"
+            and str(population.get("trade_date") or "") == str(report.get("trade_date") or "")
+            and isinstance(population.get("filled_broker_order_numbers"), list)):
+        unique_order_nos = len(population["filled_broker_order_numbers"])
+    if comparable and unique_order_nos > broker_fills:
         record("BROKER_ORDER_NUMBER_COVERAGE_REVIEW", "P1",
                unique_broker_order_count=unique_order_nos,
                kis_actual_fill_orders=broker_fills,
