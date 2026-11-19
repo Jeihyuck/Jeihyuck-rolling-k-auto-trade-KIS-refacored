@@ -582,6 +582,14 @@ def _enrich_single_position(
             enriched["opened_at_source"] = lifecycle.get("opened_at_source") or enriched.get("opened_at_source")
             enriched["holding_trade_days"] = lifecycle.get("holding_trade_days") or enriched.get("holding_trade_days")
             entry_policy = _metadata(lifecycle.get("entry_policy"))
+            from trader.us.position_contract_provenance import carry_entry_policy
+            from trader.us.entry_exit_contract import extract_us_entry_exit_contract
+            original_contract = extract_us_entry_exit_contract(enriched, enriched.get("meta"))
+            entry_policy = carry_entry_policy(entry_policy, {
+                "entry_exit_contract": original_contract,
+                "entry_exit_contract_sha256": original_contract.get("sha256"),
+                "entry_exit_contract_version": original_contract.get("version"),
+            })
             if not _metadata(enriched.get("entry_exit_contract")):
                 frozen_contract = _metadata(entry_policy.get("entry_exit_contract"))
                 if frozen_contract:

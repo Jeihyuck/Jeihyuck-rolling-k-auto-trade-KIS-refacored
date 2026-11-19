@@ -1678,10 +1678,12 @@ def route_order(
                     and _env == "practice"
                     and os.getenv("DRY_RUN","1").strip().lower()
                         in {"0","false","no","off"}
-                    and str(intent.get("symbol") or "").upper() in {
-                        "ABBV", "DHR", "HCA", "KO", "KR", "MCK",
-                        "PFE", "PG", "TMO",
-                    }
+                    and (
+                        not (intent.get("portfolio_epoch_id") or meta.get("portfolio_epoch_id"))
+                        or not (intent.get("position_cycle_id") or meta.get("position_cycle_id"))
+                        or meta.get("forward_management_not_original_buy") is True
+                        or meta.get("legacy_nine_decision_only_provisional") is True
+                    )
                 )
                 if _legacy_nine_applicable:
                     # The regular router initializes the native KIS client

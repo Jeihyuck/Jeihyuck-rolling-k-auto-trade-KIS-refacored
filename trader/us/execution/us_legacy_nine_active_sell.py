@@ -1,4 +1,4 @@
-"""ACTIVE practice-only nine legacy US_STANDARD SELL scope bridge.
+"""ACTIVE practice-only legacy US_STANDARD SELL scope bridge for any symbol.
 
 An ACTIVE-practice-account/ACTIVE-trading-epoch V2 legacy holding may receive
 a prospective management scope for a new SELL, without backdating its original
@@ -24,7 +24,11 @@ from typing import Any
 
 from sqlalchemy import text
 
-from trader.us.execution.us_legacy_carry_in_review import SYMBOLS
+from trader.us.strategy_ownership import is_standard_symbol
+
+
+def eligible_standard_symbol(symbol: str) -> bool:
+    return bool(symbol and is_standard_symbol(symbol))
 
 # Only fully KIS-verified, previous-day terminal original orders are cached.
 # This never caches live holdings, orderable quantity or current-day orders.
@@ -74,13 +78,15 @@ def _classify_immutable_source_order(
 
 
 ORIGINAL_BUY_SQL = """
-SELECT trade_date,order_no,qty_requested,qty_filled,status,meta,account_id
+SELECT trade_date,order_no,qty_requested,qty_filled,status,meta,account_id,
+       trading_epoch_id,portfolio_epoch_id,position_cycle_id,client_order_key
 FROM us_orders WHERE symbol=:symbol AND side='BUY' AND
 trading_epoch_id=:epoch AND env='practice' AND dry_run IS FALSE
 ORDER BY trade_date,id
 """
 FILLS_SQL = """
-SELECT trade_date,order_no,side,qty,meta,account_id
+SELECT trade_date,order_no,side,qty,meta,account_id,
+       trading_epoch_id,portfolio_epoch_id,position_cycle_id,client_order_key
 FROM us_fills WHERE symbol=:symbol AND trading_epoch_id=:epoch
   AND side IN ('BUY','SELL') ORDER BY trade_date,id
 """
@@ -111,7 +117,8 @@ AND status NOT IN ('FILLED','RECONCILED','CANCELLED','REJECTED','BLOCKED','EXPIR
 ORDER BY trade_date,order_no
 """
 SELL_ORDERS_SQL = """
-SELECT trade_date,order_no,qty_requested,qty_filled,status,meta,account_id
+SELECT trade_date,order_no,qty_requested,qty_filled,status,meta,account_id,
+       trading_epoch_id,portfolio_epoch_id,position_cycle_id,client_order_key
 FROM us_orders WHERE symbol=:symbol AND trading_epoch_id=:epoch
 AND side='SELL' AND env='practice' AND dry_run IS FALSE AND trade_date>=:buy_day
 ORDER BY trade_date,order_no
@@ -174,7 +181,7 @@ def _get_broker_safety(client, *, symbol: str, exchange: str,
     from scripts.us_legacy_nine_sell_readiness import _balance_symbols
     try:
         balance = client.get_us_balance(force_refresh=True)
-        bpos, err = _balance_symbols(balance)
+        bpos, err = _balance_symbols(balance, symbols={symbol})
         if err or symbol not in bpos:
             return False, err or "KIS_HOLDING_UNAVAILABLE"
         p = bpos[symbol]
@@ -284,6 +291,44 @@ def _evidence_from_db(conn, *, symbol: str, trade_date: str,
             bmeta.get("position_lifecycle_id")!=f"ENTRY:US_STANDARD:{symbol}"):
         return None,"IMMUTABLE_BUY_ORIGINAL_IDENTITY_UNVERIFIED"
     params["buy_day"]=opened
+    # The original and forward management cycles have different meanings.
+    # Prove the exact relationship; never accept a different cycle by ticker.
+    source_evidence = {"original_cycle": original_cycle, "v2_sha": digest}
+    forward_scope: tuple[str, str, str] | None = None
+
+    def matches_original_or_verified_forward(row: dict) -> bool:
+        nonlocal forward_scope
+        meta = _json(row.get("meta"))
+        life = str(meta.get("position_lifecycle_id") or "")
+        if life == original_cycle:
+            return True
+        if forward_scope is None:
+            forward_scope = _verified_prospective_legacy_scope(
+                conn, evidence=source_evidence, symbol=symbol,
+                raw_account=raw_account, epoch=active_epoch,
+            )
+        portfolio, cycle, account_hash = forward_scope
+        required = {
+            "symbol": symbol, "strategy_owner": "US_STANDARD",
+            "us_legacy_forward_management_version": "US_LEGACY_NINE_V2_SELL_V1",
+            "source_original_runtime_lifecycle_id": original_cycle,
+            "source_original_buy_date": opened,
+            "source_original_buy_order_no": str(buy["order_no"]),
+            "source_original_entry_exit_contract_sha256": digest,
+            "position_lifecycle_id": cycle, "position_cycle_id": cycle,
+            "portfolio_epoch_id": portfolio, "broker_account_hash": account_hash,
+            "trading_epoch_id": active_epoch,
+        }
+        return bool(
+            all(str(meta.get(k) or "") == v for k, v in required.items())
+            and meta.get("forward_management_not_original_buy") is True
+            and meta.get("automated_sell_authorized") is True
+            and str(row.get("trading_epoch_id") or "") == active_epoch
+            and str(row.get("portfolio_epoch_id") or "") == portfolio
+            and str(row.get("position_cycle_id") or "") == cycle
+            and row.get("client_order_key")
+        )
+
     fills=_rows(conn,FILLS_SQL,params)
     if (len([f for f in fills if f.get("side")=="BUY"])!=1 or
             not all(str(f.get("trade_date"))>=opened for f in fills)):
@@ -309,12 +354,12 @@ def _evidence_from_db(conn, *, symbol: str, trade_date: str,
                 return None,"ORIGINAL_BUY_FILL_CONFLICT"
             net+=qty
         elif f["side"]=="SELL":
-            if fm.get("position_lifecycle_id")!=original_cycle:
+            if not matches_original_or_verified_forward(f):
                 return None,"SELL_OTHER_RUNTIME_LIFECYCLE"
             key=(str(f["trade_date"]),str(f["order_no"]).lstrip("0"))
             if key in fill_sells:
                 return None,"DUPLICATE_SELL_FILL_ORIGINAL_KEY"
-            fill_sells[key]=qty
+            fill_sells[key]=(qty, f)
             net-=qty
         else:
             return None,"UNSUPPORTED_FILL_SIDE"
@@ -334,14 +379,22 @@ def _evidence_from_db(conn, *, symbol: str, trade_date: str,
         if not key[1] or key in seen_orders:
             return None,"ORIGINAL_SELL_ORDER_IDENTITY_DUPLICATE"
         seen_orders.add(key)
-        qty=fill_sells.get(key)
+        fill_match=fill_sells.get(key)
+        qty=fill_match[0] if fill_match else None
         meta=_json(order.get("meta"))
         requested=_positive(order.get("qty_requested"))
         recorded=_nonnegative(order.get("qty_filled"))
         status=str(order.get("status") or "").upper()
         if (requested is None or recorded is None
                 or recorded>requested
-                or meta.get("position_lifecycle_id")!=original_cycle):
+                or not matches_original_or_verified_forward(order)):
+            return None,"ORIGINAL_SELL_DB_ORDER_FILL_CONFLICT"
+        if fill_match and (
+            _json(fill_match[1].get("meta")).get("position_lifecycle_id")
+                != meta.get("position_lifecycle_id")
+            or (meta.get("position_lifecycle_id") != original_cycle
+                and fill_match[1].get("client_order_key") != order.get("client_order_key"))
+        ):
             return None,"ORIGINAL_SELL_DB_ORDER_FILL_CONFLICT"
         if qty is None:
             # DB-only historical checks may accept a zero-fill terminal
@@ -414,7 +467,7 @@ def _verified_prospective_legacy_scope(
     merely by being computed.
     """
     from trader.us.execution.recovery_identity import current_us_portfolio_epoch
-    if (symbol not in SYMBOLS or not raw_account or not epoch
+    if (not eligible_standard_symbol(symbol) or not raw_account or not epoch
             or not evidence or not evidence.get("original_cycle")
             or not evidence.get("v2_sha")):
         raise ValueError("LEGACY_FORWARD_SCOPE_UNVERIFIED")
@@ -442,7 +495,7 @@ def build_verified_legacy_stop_obligation_position(
     Current KIS holdings/orders are still separately checked by that router.
     """
     if (position.get("legacy_nine_decision_only_provisional") is not True
-            or str(position.get("symbol") or "").upper() not in SYMBOLS
+            or not eligible_standard_symbol(str(position.get("symbol") or "").upper())
             or os.getenv("KIS_ENV") != "practice"
             or os.getenv("WSL_RUN_MARKET", "").upper() != "US"
             or os.getenv("US_LEGACY_NINE_AUTO_SELL_ACTIVE", "1") != "1"):
@@ -515,7 +568,7 @@ def prove_and_bind_legacy_nine_sell(
             or str(intent.get("side") or "").upper()!="SELL"
             or str(intent.get("strategy_owner") or meta.get("strategy_owner") or "")
                 .upper()!="US_STANDARD"
-            or symbol not in SYMBOLS
+            or not eligible_standard_symbol(symbol)
             or not trade_date or not active_epoch or not raw_account):
         return False,"LEGACY_AUTO_SELL_SCOPE_NOT_ELIGIBLE",None
     try:
@@ -650,7 +703,7 @@ def enrich_legacy_nine_v2_decision_position(
     merely because the Nov-05 fresh risk-state row is empty.
     """
     symbol=str(position.get("symbol") or "").upper()
-    if (symbol not in SYMBOLS or os.getenv("KIS_ENV")!="practice"
+    if (not eligible_standard_symbol(symbol) or os.getenv("KIS_ENV")!="practice"
             or os.getenv("WSL_RUN_MARKET","").upper()!="US"
             or os.getenv("US_LEGACY_NINE_AUTO_SELL_ACTIVE","1")!="1"):
         return position
@@ -671,6 +724,8 @@ def enrich_legacy_nine_v2_decision_position(
         raw_account=get_account_key(env="practice")
         with engine.connect() as conn:
             epoch=str(_active_us_epoch(conn, required=True))
+            if not _row_in_active_practice_scope(position, account=raw_account, epoch=epoch):
+                return position
             rows=_rows(conn,POSITION_SQL,{
                 "symbol":symbol,"today":trade_date,"epoch":epoch,
             })
@@ -714,6 +769,10 @@ def enrich_legacy_nine_v2_decision_position(
         ):
             return position
         out["position_lifecycle_id"]=old_life
+        out["strategy_owner"]="US_STANDARD"
+        out["trading_epoch_id"]=epoch
+        out["account_id"]=raw_account
+        out["lifecycle_identity_status"]="VERIFIED_LEGACY_ORIGINAL"
         meta_out["position_lifecycle_id"]=old_life
         meta_out["entry_exit_contract"]=source_contract
         meta_out["entry_exit_contract_sha256"]=evidence["v2_sha"]

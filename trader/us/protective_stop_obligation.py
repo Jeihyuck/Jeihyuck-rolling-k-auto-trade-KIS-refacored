@@ -23,6 +23,83 @@ class StopObligationUnavailable(RuntimeError):
     pass
 
 
+def refresh_soft_stop_fill_progress(*, provider=None, trade_date: str) -> dict:
+    """AM/CLOSE-only derived accounting from already committed native fills.
+
+    A completed partial soft SELL does not close the remaining position or
+    release any claim. Keep the lifecycle obligation PARTIAL and escalatable.
+    Replays recompute unique order totals rather than adding the fill twice.
+    """
+    import hashlib
+    from sqlalchemy import text
+    from trader.account_state import get_account_key, resolve_env_name
+    from trader.us.db.repos import _active_us_epoch, _get_engine_or_none
+    if resolve_env_name() != "practice":
+        return {"updated": 0}
+    engine = _get_engine_or_none()
+    if engine is None:
+        raise StopObligationUnavailable("STOP_OBLIGATION_DATABASE_UNAVAILABLE")
+    account = get_account_key(env="practice")
+    hashed = hashlib.sha256(account.encode()).hexdigest()
+    with engine.begin() as conn:
+        epoch = _active_us_epoch(conn, required=True)
+        result = conn.execute(text("""
+            WITH proven AS (
+                SELECT d.symbol,d.lifecycle_id,
+                       LEAST(d.target_qty,SUM(f.qty))::integer AS filled
+                FROM us_protective_stop_obligations d
+                JOIN us_fills f ON f.symbol=d.symbol AND f.side='SELL'
+                 AND f.trading_epoch_id=d.trading_epoch_id
+                 AND f.account_id=:hashed
+                 AND f.portfolio_epoch_id=d.portfolio_epoch_id
+                 AND f.position_cycle_id=d.lifecycle_id
+                 AND f.meta->>'position_lifecycle_id'=d.lifecycle_id
+                 AND f.meta->>'fill_evidence_type'='KIS_ORDER_CUMULATIVE_ACTUAL'
+                 AND f.meta->>'is_synthetic'='false'
+                 AND COALESCE(f.meta->>'accounting_active','true')='true'
+                 AND f.filled_at>=d.first_signal_at AND f.trade_date<=CAST(:td AS date)
+                JOIN us_orders o ON o.trading_epoch_id=f.trading_epoch_id
+                 AND o.env=d.env AND o.account_id=f.account_id
+                 AND o.portfolio_epoch_id=f.portfolio_epoch_id
+                 AND o.position_cycle_id=f.position_cycle_id
+                 AND o.trade_date=f.trade_date AND o.symbol=f.symbol AND o.side='SELL'
+                 AND o.client_order_key=f.client_order_key AND o.order_no=f.order_no
+                 AND o.status='FILLED' AND o.qty_filled=f.qty AND o.qty_requested=f.qty
+                 AND o.meta->>'stop_type' IN ('soft_stop','soft_stop_loss')
+                JOIN us_execution_claims c ON c.action_key=o.meta->>'execution_action_key'
+                 AND c.trading_epoch_id=o.trading_epoch_id AND c.env=o.env
+                 AND c.market='US' AND c.account_id=:hashed
+                 AND c.strategy_owner=d.strategy_owner AND c.lifecycle_id=d.lifecycle_id
+                 AND c.portfolio_epoch_id=d.portfolio_epoch_id
+                 AND c.position_cycle_id=d.lifecycle_id
+                 AND c.action_state='SATISFIED' AND c.remaining_target_qty=0
+                 AND c.cumulative_filled_qty>=o.qty_filled
+                WHERE d.trading_epoch_id=:epoch AND d.env='practice'
+                  AND d.account_id=:account AND d.strategy_owner='US_STANDARD'
+                  AND d.symbol<>'TQQQ' AND d.severity=1
+                  AND d.stop_family IN ('soft_stop','soft_stop_loss')
+                  AND d.obligation_state<>'SATISFIED'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM us_fills duplicate
+                      WHERE duplicate.id<>f.id AND duplicate.trading_epoch_id=f.trading_epoch_id
+                        AND duplicate.trade_date=f.trade_date AND duplicate.symbol=f.symbol
+                        AND duplicate.side=f.side AND duplicate.order_no=f.order_no
+                        AND COALESCE(duplicate.meta->>'accounting_active','true')='true'
+                  )
+                GROUP BY d.symbol,d.lifecycle_id,d.target_qty
+            )
+            UPDATE us_protective_stop_obligations d
+               SET confirmed_filled_qty=proven.filled,obligation_state='PARTIAL',updated_at=now()
+              FROM proven
+             WHERE d.trading_epoch_id=:epoch AND d.env='practice' AND d.account_id=:account
+               AND d.strategy_owner='US_STANDARD' AND d.symbol=proven.symbol
+               AND d.lifecycle_id=proven.lifecycle_id AND d.severity=1
+               AND d.obligation_state<>'SATISFIED'
+               AND proven.filled>d.confirmed_filled_qty
+        """), {"account": account, "hashed": hashed, "epoch": epoch, "td": trade_date})
+    return {"updated": int(result.rowcount or 0)}
+
+
 def record_confirmed_stop(position: dict, *, exit_type: str, target_qty: int,
                           pnl_pct: float, signal_price: float, policy: dict,
                           now: datetime | None = None) -> bool:
@@ -224,11 +301,11 @@ def replay_confirmed_protective_intents(
             try:
                 from zoneinfo import ZoneInfo
                 from trader.us.execution.us_legacy_nine_active_sell import (
-                    SYMBOLS as LEGACY_SYMBOLS,
+                    eligible_standard_symbol,
                     enrich_legacy_nine_v2_decision_position,
                     build_verified_legacy_stop_obligation_position,
                 )
-                if original_symbol in LEGACY_SYMBOLS:
+                if eligible_standard_symbol(original_symbol):
                     observed = now or datetime.now(timezone.utc)
                     if observed.tzinfo is None:
                         observed = observed.replace(tzinfo=timezone.utc)
@@ -309,6 +386,11 @@ def replay_confirmed_protective_intents(
             policy_cfg=cfg,position_lifecycle_id=key[1],
             meta_extra={"stop_obligation_replay":True,
                         "stop_obligation_first_signal_at":str(debt.get("first_signal_at") or ""),
+                        # Route legacy replays through the same DB+fresh KIS
+                        # proof as natural strategy signals, even though this
+                        # debt already has a complete management scope.
+                        **({"legacy_nine_decision_only_provisional": True}
+                           if pos.get("legacy_nine_decision_only_provisional") is True else {}),
                         **({"trading_epoch_id":key[3],
                             "portfolio_epoch_id":key[4],
                             "position_cycle_id":key[1]} if require_epoch else {})},

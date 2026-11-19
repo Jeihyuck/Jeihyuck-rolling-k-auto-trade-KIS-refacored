@@ -3110,6 +3110,11 @@ def save_us_position_lifecycle_atomic(symbol: str, trade_date: str, lifecycle: d
             for immutable_field in ("opened_at", "opened_trade_date", "entry_policy"):
                 if prior.get(immutable_field):
                     combined[immutable_field] = prior[immutable_field]
+            from trader.us.position_contract_provenance import carry_entry_policy
+            combined["entry_policy"] = carry_entry_policy(
+                dict(combined.get("entry_policy") or {}),
+                dict(data.get("entry_policy") or {}),
+            )
             combined["high_watermark"] = max(high, float(prior.get("high_watermark") or 0))
             if prior.get("is_open") is False:
                 combined["is_open"] = False
@@ -3133,6 +3138,29 @@ def save_us_position_lifecycle_atomic(symbol: str, trade_date: str, lifecycle: d
         _ensure_us_position_risk_state_table(conn)
         if str(_us_state_epoch_id(conn) or "") != fields["epoch"]:
             raise RuntimeError("US_LIFECYCLE_EPOCH_MISMATCH")
+        # Lock and independently validate a narrow derived-policy correction.
+        # The normal immutable-policy branch below remains unchanged.
+        from trader.us.position_contract_provenance import restore_null_elided_policy
+        repair_entry_policy = 0
+        candidate_policy = dict(data.get("entry_policy") or {})
+        if candidate_policy.get("entry_exit_contract"):
+            prior_row = conn.execute(text("""
+                SELECT state->'lifecycle' AS lifecycle FROM us_position_risk_state
+                WHERE trading_epoch_id=:epoch AND trade_date=:td AND symbol=:sym
+                FOR UPDATE
+            """), {**fields, "td": trade_date, "sym": sym}).mappings().first()
+            prior = dict((prior_row or {}).get("lifecycle") or {})
+            if all(str(prior.get(k) or "") == fields[v] for k, v in (
+                ("lifecycle_id", "life_id"), ("strategy_owner", "owner"),
+                ("account_id", "account"), ("env", "env"),
+                ("trading_epoch_id", "epoch"),
+            )):
+                restored = restore_null_elided_policy(
+                    dict(prior.get("entry_policy") or {}), candidate_policy,
+                )
+                if restored is not None:
+                    data["entry_policy"] = restored
+                    repair_entry_policy = 1
         result = conn.execute(text("""
             INSERT INTO us_position_risk_state
                 (trading_epoch_id, trade_date, symbol, state, updated_at)
@@ -3208,7 +3236,9 @@ def save_us_position_lifecycle_atomic(symbol: str, trade_date: str, lifecycle: d
                             CAST(:data AS jsonb)->'opened_trade_date'
                         ),
                         'entry_policy',
-                        CASE WHEN us_position_risk_state.state->'lifecycle'
+                        CASE WHEN :repair_entry_policy = 1
+                             THEN CAST(:data AS jsonb)->'entry_policy'
+                             WHEN us_position_risk_state.state->'lifecycle'
                                           ->>'lifecycle_id' = :life_id
                               AND COALESCE(
                                us_position_risk_state.state->'lifecycle'->'entry_policy',
@@ -3243,6 +3273,7 @@ def save_us_position_lifecycle_atomic(symbol: str, trade_date: str, lifecycle: d
             **fields, "td": trade_date, "sym": sym,
             "data": _json_param(data), "high": high,
             "confirmed_reentry": confirmed_reentry,
+            "repair_entry_policy": repair_entry_policy,
             "opened_at": data.get("opened_at") or "1970-01-01T00:00:00+00:00",
         }).mappings().first()
         if not result or not isinstance(result.get("lifecycle"), dict):

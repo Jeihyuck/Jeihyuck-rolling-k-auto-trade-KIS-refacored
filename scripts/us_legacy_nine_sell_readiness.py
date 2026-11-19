@@ -51,7 +51,7 @@ def _qty(value: Any) -> int | None:
     return None
 
 
-def _balance_symbols(balance: Any) -> tuple[dict[str, dict], str | None]:
+def _balance_symbols(balance: Any, *, symbols=None) -> tuple[dict[str, dict], str | None]:
     """Require complete non-conflicting KIS cross-exchange balance pages."""
     if (not isinstance(balance, dict)
             or balance.get("rt_cd") != "0"
@@ -61,12 +61,13 @@ def _balance_symbols(balance: Any) -> tuple[dict[str, dict], str | None]:
             or balance.get("balance_conflicts")
             or not isinstance(balance.get("output1"), list)):
         return {}, "FRESH_BROKER_BALANCE_INCOMPLETE"
+    selected = set(SYMBOLS if symbols is None else symbols)
     result = {}
     for row in balance["output1"]:
         if not isinstance(row, dict):
             return {}, "BROKER_BALANCE_ROW_INVALID"
         symbol = str(row.get("ovrs_pdno") or row.get("pdno") or "").upper()
-        if symbol not in SYMBOLS:
+        if symbol not in selected:
             continue
         if symbol in result:
             return {}, "BROKER_DUPLICATE_SYMBOL"

@@ -415,8 +415,9 @@ def run_deferred_recovery_once(*, provider: Any,trade_date: str,
 
 def report_stop_recovery_at_boundary(*, provider: Any, trade_date: str, phase: str) -> None:
     from trader.us.execution.protective_stop_settlement_worker import settle_verified_stop_debts_once
+    from trader.us.protective_stop_obligation import refresh_soft_stop_fill_progress
 
-    for operation in (recover_stop_tp_conflicts_once, settle_verified_stop_debts_once):
+    for operation in (refresh_soft_stop_fill_progress, recover_stop_tp_conflicts_once, settle_verified_stop_debts_once):
         try:
             fork = getattr(provider, "fork_for_stage", None)
             bounded = fork(stage_deadline=time.monotonic() + 10.0) if callable(fork) else provider
