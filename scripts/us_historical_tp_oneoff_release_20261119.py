@@ -118,31 +118,30 @@ def run() -> int:
             text(CANDIDATES_SQL),
             {"epoch": scope["trading_epoch_id"], "today": trade_date},
         ).mappings().all()]
-        validate_candidates(rows)
-    original = {
-        (str(r["trade_date"]), r["symbol"], r["stage"]): r
-        for r in rows
-    }
-
-    provider = OriginalDayGetOnly(USDataProvider(offline=False, env="practice"))
+        if rows:
+            validate_candidates(rows)
+    # A subsequent ready transition can only verify prior evidence.  It must
+    # not reapply old reservations when they have already been released.
+    already_repaired = not rows
     results = []
-    for source_day in sorted({k[0] for k in EXPECTED}):
-        # Operator-invoked CLOSE recovery path: only the existing PR371
-        # evidence-driven reservation release; no broker trading authority.
-        result = resolve_historical_tp_at_boundary(
-            provider=provider, trade_date=trade_date, phase="CLOSE",
-            apply=True, budget_sec=30, source_trade_date=source_day,
-        )
-        results.append({
-            "source_day": source_day,
-            "status": result["status"], "checked": result["checked"],
-            "released": result["released"],
-            "unresolved": result["unresolved"],
-            "source_days_queried": result["source_days_queried"],
-        })
-        if result["status"] != "OK":
-            # Do not continue applying to other source-days after a failure.
-            break
+    if not already_repaired:
+        provider = OriginalDayGetOnly(USDataProvider(offline=False, env="practice"))
+        for source_day in sorted({k[0] for k in EXPECTED}):
+            # The operator invokes only the existing CLOSE repair path;
+            # no broker trading authority is exposed.
+            result = resolve_historical_tp_at_boundary(
+                provider=provider, trade_date=trade_date, phase="CLOSE",
+                apply=True, budget_sec=30, source_trade_date=source_day,
+            )
+            results.append({
+                "source_day": source_day,
+                "status": result["status"], "checked": result["checked"],
+                "released": result["released"],
+                "unresolved": result["unresolved"],
+                "source_days_queried": result["source_days_queried"],
+            })
+            if result["status"] != "OK":
+                break
 
     verified = []
     with engine.connect() as conn:
@@ -150,52 +149,78 @@ def run() -> int:
         if active != scope:
             raise RuntimeError("ONEOFF_ACTIVE_ACCOUNT_EPOCH_CHANGED")
         for key in sorted(EXPECTED):
-            row = original[key]
             current = conn.execute(text("""
                 SELECT * FROM us_profit_capture_lifecycle
                 WHERE trade_date=:day AND symbol=:symbol AND stage=:stage
-                AND position_lifecycle_id=:cycle AND trading_epoch_id=:epoch
+                  AND trading_epoch_id=:epoch
             """), {"day": key[0], "symbol": key[1], "stage": key[2],
-                    "cycle": row["position_lifecycle_id"],
                     "epoch": scope["trading_epoch_id"]}).mappings().one_or_none()
+            original_key = current["client_order_key"] if current else ""
             m = metadata(dict(current)) if current else {}
+            state = (current.get("state") or {}) if current else {}
+            if isinstance(state, str):
+                state = json.loads(state)
+            params = {"key": original_key, "epoch": scope["trading_epoch_id"]}
             audit_count = conn.execute(text("""
                 SELECT count(*) FROM us_order_events
                 WHERE client_order_key=:key AND trading_epoch_id=:epoch
                   AND event_type='TP_HISTORICAL_BROKER_ABSENCE_VERIFIED'
-            """), {"key": row["client_order_key"],
-                    "epoch": scope["trading_epoch_id"]}).scalar_one()
+            """), params).scalar_one()
             orders = conn.execute(text("""
                 SELECT count(*) FROM us_orders WHERE client_order_key=:key
-            """), {"key": row["client_order_key"]}).scalar_one()
+            """), params).scalar_one()
             fills = conn.execute(text("""
                 SELECT count(*) FROM us_fills WHERE client_order_key=:key
-            """), {"key": row["client_order_key"]}).scalar_one()
+            """), params).scalar_one()
+            intents = [r[0] for r in conn.execute(text("""
+                SELECT status FROM us_order_intents
+                WHERE client_order_key=:key AND trading_epoch_id=:epoch
+            """), params).all()]
             verified.append({
                 "symbol": key[1], "source_trade_date": key[0], "stage": key[2],
                 "status": current["stage_status"] if current else "MISSING",
+                "last_status": m.get("last_status"),
                 "evidence": m.get("last_evidence_type"),
+                "stage_pending": state.get(key[2] + "_pending"),
+                "stage_done": state.get(key[2] + "_done"),
                 "audit_observation_count": int(audit_count),
+                "original_intent_statuses": intents,
                 "original_key_order_count": int(orders),
                 "original_key_fill_count": int(fills),
             })
 
-    success = bool(
-        len(results) == 3
-        and sum(x["released"] for x in results) == 4
-        and all(x["status"] == "OK" for x in results)
-        and all(v["status"] == "FAILED"
-                and v["evidence"] in EVIDENCES
-                and v["audit_observation_count"] >= 1
-                and v["original_key_order_count"] == 0
-                and v["original_key_fill_count"] == 0
-                for v in verified)
+    # Production deliberately encodes a terminal FAILED observation as
+    # stage_status=NOT_TRIGGERED, stage_pending=false, meta.last_status=FAILED.
+    # An old PENDING stage is cleared; a false expectation of stage_status
+    # 'FAILED' would mark a real, durable release as a CI error.
+    good_evidence = (
+        len(verified) == len(EXPECTED)
+        and all(
+            v["status"] == "NOT_TRIGGERED"
+            and v["last_status"] == "FAILED"
+            and v["evidence"] in EVIDENCES
+            and v["stage_pending"] is False
+            and v["stage_done"] is False
+            and v["audit_observation_count"] == 1
+            and all(s == "BLOCKED" for s in v["original_intent_statuses"])
+            and v["original_key_order_count"] == 0
+            and v["original_key_fill_count"] == 0
+            for v in verified
+        )
     )
+    applied_all = (
+        len(results) == 3
+        and sum(x["released"] for x in results) == len(EXPECTED)
+        and all(x["status"] == "OK" for x in results)
+    )
+    success = bool(good_evidence and (already_repaired or applied_all))
     output = {
         "oneoff_db_release": "SUCCESS" if success else "UNRESOLVED",
         "scope": "US_STANDARD_ACTIVE_PRACTICE_ONLY",
         "no_kis_orders_or_cancels": True,
-        "original_stage_releases": sum(x["released"] for x in results),
+        "original_stage_releases_this_run": sum(x["released"] for x in results),
+        "already_repaired_read_only_verification": already_repaired,
+        "verified_released_stages": len(verified) if good_evidence else 0,
         "details": verified,
         "source_day_checks": results,
         "current_tp_retries_submitted": 0,
