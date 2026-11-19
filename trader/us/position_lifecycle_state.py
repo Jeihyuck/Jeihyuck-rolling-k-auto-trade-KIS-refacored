@@ -481,7 +481,7 @@ def reconcile_us_position_lifecycles(
     for symbol, pos in current.items():
         qty = _i(pos.get("qty"))
         entry = _position_entry_price(pos)
-        if authoritative and os.getenv("WSL_RUN_MARKET", "").upper() == "US":
+        if os.getenv("WSL_RUN_MARKET", "").upper() == "US":
             from trader.us.execution.us_legacy_nine_active_sell import enrich_legacy_nine_v2_decision_position
             original = enrich_legacy_nine_v2_decision_position(pos, trade_date=trade_date)
             if original.get("legacy_nine_decision_only_provisional") is True:

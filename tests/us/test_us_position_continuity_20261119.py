@@ -160,7 +160,8 @@ def test_legacy_context_never_overwrites_conflicting_input_scope(scenario, monke
 
 
 @pytest.mark.parametrize("symbol", SYMBOLS)
-def test_legacy_provenance_is_linked_before_generic_lifecycle_fence(scenario, monkeypatch, caplog, symbol):
+@pytest.mark.parametrize("authoritative", [True, False])
+def test_legacy_provenance_is_linked_before_generic_lifecycle_fence(scenario, monkeypatch, caplog, symbol, authoritative):
     from trader.us import position_lifecycle_state as lifecycle
     from trader.us.db import repos
     db, _, _ = _generalize(scenario, symbol)
@@ -170,7 +171,7 @@ def test_legacy_provenance_is_linked_before_generic_lifecycle_fence(scenario, mo
     pos = {"symbol": symbol, "qty": 4, "strategy_owner": "US_STANDARD", "entry_price": 100.0, "meta": {}}
     lifecycle.reconcile_us_position_lifecycles(
         positions=[pos], trade_date="2026-11-11", now=datetime.now(timezone.utc),
-        authoritative=True, env="practice",
+        authoritative=authoritative, env="practice",
     )
     assert pos["position_lifecycle_id"] == OLD_CYCLE
     assert pos["lifecycle_identity_status"] == "VERIFIED_LEGACY_ORIGINAL"
@@ -292,6 +293,7 @@ def test_postgres_forward_partial_fill_is_accepted_after_reload(pg_engine, scena
     proof = _apply_forward_fill(scenario)
     monkeypatch.setattr(recovery_identity, "current_us_portfolio_epoch", lambda *a, **kw: PORTFOLIO)
     with pg_engine.begin() as conn:
+        conn.exec_driver_sql("ALTER TABLE us_orders ADD COLUMN IF NOT EXISTS env TEXT DEFAULT 'practice'")
         repos._ensure_us_position_risk_state_table(conn)
         conn.execute(text("DELETE FROM us_position_risk_state WHERE trading_epoch_id=:epoch AND symbol=:symbol"),
                      {"epoch": EPOCH, "symbol": symbol})
@@ -350,6 +352,7 @@ def test_postgres_soft_stop_actual_fill_progress_is_idempotent_and_not_terminal(
     monkeypatch.setattr(repos, "_active_us_epoch", lambda *a, **kw: EPOCH)
     hashed = hashlib.sha256(RAW_ACCOUNT.encode()).hexdigest()
     with pg_engine.begin() as conn:
+        conn.exec_driver_sql("ALTER TABLE us_orders ADD COLUMN IF NOT EXISTS env TEXT DEFAULT 'practice'")
         conn.exec_driver_sql(open("migrations/0058_us_protective_stop_obligations.sql").read())
         for column in ("portfolio_epoch_id", "position_cycle_id"):
             conn.exec_driver_sql(f"ALTER TABLE us_protective_stop_obligations ADD COLUMN IF NOT EXISTS {column} TEXT")
