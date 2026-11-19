@@ -1507,9 +1507,16 @@ def report_historical_order_recovery(*, provider: Any, trade_date: str, phase: s
     except Exception as exc:
         result = {"status": "ERROR", "unresolved_count": 1, "error": type(exc).__name__}
     result["tp_retry_boundary"] = tp_retry
+    from trader.us.execution.historical_tp_resolution import resolve_historical_tp_at_boundary
+    result["historical_tp_resolution"] = resolve_historical_tp_at_boundary(
+        provider=provider, trade_date=trade_date, phase=phase,
+    )
+    _tp_resolution = result["historical_tp_resolution"]
+    result["historical_tp_unresolved_count"] = len(_tp_resolution.get("unresolved") or []) + int(
+        _tp_resolution.get("status") == "UNAVAILABLE")
     unresolved = (
         result.get("status") not in {"OK", "RECOVERED", "NO_ACTIVE_CLAIMS"}
-        or bool(result.get("unresolved_count"))
+        or bool(result.get("unresolved_count")) or bool(result["historical_tp_unresolved_count"])
     )
     logger.log(
         logging.WARNING if unresolved else logging.INFO,

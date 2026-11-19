@@ -283,6 +283,8 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
                 }
                 logger.error("[US_TRADE_CLOSE][BROKER_RECOVERY_HEALTH_ERROR] %s", exc)
             try:
+                broker_recovery_health["historical_tp_resolution"] = historical_recovery.get("historical_tp_resolution") or {}
+                broker_recovery_health["historical_tp_unresolved_count"] = int(historical_recovery.get("historical_tp_unresolved_count") or 0)
                 broker_recovery_health["historical_recovery_unresolved"] = int(
                     historical_recovery.get("unresolved_count") or 0
                 )

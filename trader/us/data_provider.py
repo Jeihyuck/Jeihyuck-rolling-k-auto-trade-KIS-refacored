@@ -1498,6 +1498,27 @@ class USDataProvider:
             "session_generation": getattr(ctx, "session_generation", None) if ctx is not None else None,
         }
 
+    def get_original_day_order_snapshot(self, trade_date: str) -> dict:
+        """Fresh GET-only historical book with per-query completeness evidence.
+
+        Authentication scope alone cannot prove that a broker query completed.
+        Never use an earlier successful query's evidence after an exception.
+        """
+        from copy import deepcopy
+        from trader.us.execution.historical_tp_resolution import digest
+        if self._offline:
+            return {"status": "UNAVAILABLE", "reason": "OFFLINE_BROKER_PROOF_UNAVAILABLE"}
+        client = self._get_client()
+        client._last_us_fills_query_evidence = None
+        rows = self.get_today_orders(trade_date)
+        query = deepcopy(getattr(client, "_last_us_fills_query_evidence", None))
+        scope = self.get_order_lookup_provenance(trade_date)
+        scope.pop("broker_account_no", None)
+        if not isinstance(query, dict) or query.get("complete") is not True:
+            return {"status": "UNAVAILABLE", "reason": "ORIGINAL_DAY_QUERY_NOT_COMPLETE"}
+        return {"status": "OK", "scope": scope, "query": query, "rows": deepcopy(rows),
+                "rows_sha256": digest(rows), "observed_at": datetime.now(timezone.utc).isoformat()}
+
     def get_today_orders(self, trade_date: str) -> list[dict]:
         """Return normalized same-day US broker order status rows."""
         if self._offline:

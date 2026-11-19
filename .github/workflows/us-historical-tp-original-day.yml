@@ -1,0 +1,104 @@
+name: US Historical TP Original-Day Proof
+on:
+  pull_request:
+    branches: [dual-agent]
+    types: [opened, synchronize, ready_for_review]
+    paths:
+      - trader/us/execution/historical_tp_resolution.py
+      - trader/us/execution/kis_us_client.py
+      - trader/us/data_provider.py
+      - scripts/us_historical_tp_resolution.py
+      - tests/us/test_us_historical_tp_completion_20261119.py
+      - .github/workflows/us-historical-tp-original-day.yml
+permissions:
+  contents: read
+jobs:
+  original-day-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: us_tp_ci
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd 'pg_isready -U postgres -d us_tp_ci'
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      PYTHONPATH: .
+      KIS_ENV: practice
+      PBCORE_TEST_POSTGRES_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/us_tp_ci
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install -r requirements.txt psycopg2-binary
+      - name: Verify original-day evidence, atomic repair and existing guards offline
+        run: >-
+          python -m pytest -q
+          tests/us/test_us_historical_tp_completion_20261119.py
+          tests/us/test_us_residual_flow_20261119.py
+          tests/us/test_tp_pre_http_retry_proof_20261105.py
+
+  original-day-kis-readonly:
+    # One explicit ready transition after offline verification, not tokenP
+    # on every code push. No forks, other users/branches, write token or orders.
+    needs: original-day-contract
+    if: >-
+      github.event.action == 'ready_for_review' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.repository == 'Jeihyuck/Jeihyuck-rolling-k-auto-trade-KIS-refacored' &&
+      github.event.pull_request.head.ref == 'codex/us-historical-tp-completion-20261119' &&
+      github.event.pull_request.user.login == 'Jeihyuck'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      PYTHONPATH: .
+      PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+      DATABASE_URL: ${{ secrets.PBCORE_DB_URL }}
+      PGOPTIONS: '-c default_transaction_read_only=on'
+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      KIS_REST_URL: https://openapivts.koreainvestment.com:29443
+      CANO: ${{ secrets.CANO }}
+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+      KIS_ENV: practice
+      TRADING_REGION: US
+      WSL_RUN_MARKET: US
+      OFFLINE_MODE: '0'
+      US_OFFLINE_MODE: '0'
+      KIS_HTTP_BLOCK: '0'
+      US_ORDER_ARMED: '0'
+      US_KIS_ORDER_ALLOWED: '0'
+      DISABLE_REAL_TRADING: '1'
+      DISABLE_LIVE_TRADING: '1'
+      US_LIVE_TRADING_ENABLED: '0'
+      LIVE_TRADING_ENABLED: '0'
+      US_PAPER_TRADING_ENABLED: '0'
+      ALLOW_REAL_ORDER: '0'
+      DRY_RUN: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install -r requirements.txt psycopg2-binary
+      - name: Query KIS original days with no order or database write authority
+        run: python scripts/us_historical_tp_resolution.py --budget-sec 30 --output original-day-tp-readonly.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: original-day-tp-readonly-${{ github.run_id }}
+          path: original-day-tp-readonly.json
+          if-no-files-found: ignore
+          retention-days: 3
