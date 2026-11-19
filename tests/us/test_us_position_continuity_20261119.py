@@ -145,6 +145,39 @@ def test_forward_order_and_fill_must_have_same_execution_key(scenario):
     assert not _authorize(scenario)[0]
 
 
+@pytest.mark.parametrize("symbol", SYMBOLS)
+def test_authoritative_snapshot_then_reload_preserves_legacy_source(scenario, symbol):
+    db, _, intent = _generalize(scenario, symbol)
+    _apply_forward_fill(scenario)
+    db.position["qty"] = 4  # snapshot preceded the latest proven SELL
+    current = {"symbol": symbol, "qty": 3}
+    context = bridge.verified_legacy_snapshot_context(db, position=current, trade_date="2026-11-11", active_epoch=EPOCH)
+    assert context["position_lifecycle_id"] == OLD_CYCLE
+    assert "portfolio_epoch_id" not in context and "position_cycle_id" not in context
+    # Mirror the authoritative writer's persisted source reference and net qty.
+    db.position["qty"] = 3
+    db.position["meta"].update(context)
+    evidence, why = bridge._evidence_from_db(db, symbol=symbol, trade_date="2026-11-11",
+        active_epoch=EPOCH, raw_account=RAW_ACCOUNT, intent=intent)
+    assert evidence, why
+    assert evidence["holding"] == 3
+    assert db.position["position_cycle_id"] is None
+    assert bridge.verified_legacy_snapshot_context(db, position={**current, "qty": 2},
+        trade_date="2026-11-11", active_epoch=EPOCH) is None
+
+
+@pytest.mark.parametrize("bad", ["owner", "cycle", "policy"])
+def test_snapshot_bridge_cannot_overwrite_conflicting_current_provenance(scenario, bad):
+    db, _, _ = _generalize(scenario, "MSFT")
+    pos = {"symbol": "MSFT", "qty": 4}
+    if bad == "owner": pos["strategy_owner"] = "OTHER"
+    if bad == "cycle": pos["position_lifecycle_id"] = "foreign-cycle"
+    if bad == "policy":
+        pos["entry_exit_contract"] = deepcopy(db.position["meta"]["entry_exit_contract"])
+        pos["entry_exit_contract"]["management"]["swing"]["hard_stop"] = .9
+    assert bridge.verified_legacy_snapshot_context(db, position=pos, trade_date="2026-11-11", active_epoch=EPOCH) is None
+
+
 def test_general_bridge_does_not_include_infinite(scenario):
     _generalize(scenario, "TQQQ")
     assert not _authorize(scenario)[0]
@@ -332,6 +365,21 @@ def test_postgres_forward_partial_fill_is_accepted_after_reload(pg_engine, scena
             assert evidence["holding"] == 3
             assert evidence["original_cycle"] == OLD_CYCLE
             assert len(evidence["prior_sell_proofs"]) == 2
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda *a, **kw: EPOCH)
+    assert repos.save_position_snapshot(
+        [{"symbol": symbol, "exchange": "NYSE", "qty": 3, "avg_cost": 100}],
+        trade_date="2026-11-11", authoritative_positions=True,
+        balance_fetch_status="OK", balance_parse_status="OK",
+    ) == 1
+    with pg_engine.connect() as conn:
+        stored = conn.execute(text("SELECT account_id,portfolio_epoch_id,position_cycle_id,meta FROM us_positions WHERE symbol=:symbol AND as_of='2026-11-11'"),
+                              {"symbol": symbol}).mappings().one()
+        assert stored["portfolio_epoch_id"] is None and stored["position_cycle_id"] is None
+        assert stored["meta"]["position_lifecycle_id"] == OLD_CYCLE
+        assert stored["meta"]["lineage_identity_status"] == "VERIFIED_LEGACY_ORIGINAL"
+        evidence, why = bridge._evidence_from_db(conn, symbol=symbol, trade_date="2026-11-11",
+            active_epoch=EPOCH, raw_account=RAW_ACCOUNT, intent=intent)
+        assert evidence, why
     with pg_engine.begin() as conn:
         conn.execute(text("UPDATE us_fills SET client_order_key='different-order' WHERE order_no='5001'"))
     with pg_engine.connect() as conn:

@@ -5735,6 +5735,7 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                 # infer original lifecycle from symbol or a newer unrelated
                 # order. This happens in the existing DB transaction.
                 verified_identity = None
+                verified_legacy_identity = None
                 if (authoritative_positions and balance_fetch_status == "OK"
                         and balance_parse_status == "OK" and trading_epoch_id
                         and int(p.get("qty") or 0) > 0):
@@ -5757,6 +5758,12 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                                     conn=conn, trade_date=str(td), position=p,
                                     trading_epoch_id=trading_epoch_id,
                                 )
+                            if not verified_identity:
+                                from trader.us.execution.us_legacy_nine_active_sell import verified_legacy_snapshot_context
+                                verified_legacy_identity = verified_legacy_snapshot_context(
+                                    conn, position=p, trade_date=str(td),
+                                    active_epoch=str(trading_epoch_id),
+                                )
                     except Exception as exc:
                         verified_identity = None
                         logger.warning(
@@ -5770,6 +5777,11 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                     p.update(verified_identity)
                     logger.info("[US_POSITIONS][ORIGINAL_SCOPE][VERIFIED] symbol=%s owner=US_STANDARD",
                                 p.get("symbol"))
+                elif verified_legacy_identity:
+                    p = dict(p)
+                    p["meta"] = {**dict(p.get("meta") or {}), **verified_legacy_identity}
+                    p.update(verified_legacy_identity)
+                    logger.info("[US_POSITIONS][LEGACY_ORIGINAL][VERIFIED] symbol=%s", p.get("symbol"))
                 avg_cost = float(p.get("avg_cost") or p.get("entry_price") or p.get("avg_price_usd") or 0)
                 current_px = float(p.get("current_px") or p.get("current_price") or p.get("current_price_usd") or 0)
                 # meta에 orderable_qty 등 보존

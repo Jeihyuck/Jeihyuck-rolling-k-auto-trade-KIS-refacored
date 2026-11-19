@@ -214,7 +214,7 @@ def _get_broker_safety(client, *, symbol: str, exchange: str,
 
 def _evidence_from_db(conn, *, symbol: str, trade_date: str,
                       active_epoch: str, raw_account: str,
-                      intent: dict) -> tuple[dict | None,str]:
+                      intent: dict, current_holding_qty: int | None = None) -> tuple[dict | None,str]:
     """Read immutable original facts; no SQL UPDATE or guess from ticker."""
     from trader.us.entry_exit_contract import (
         US_ENTRY_EXIT_CONTRACT_VERSION, extract_us_entry_exit_contract,
@@ -229,6 +229,10 @@ def _evidence_from_db(conn, *, symbol: str, trade_date: str,
     holding=_positive(pos.get("qty"))
     if holding is None or str(pos.get("trading_epoch_id") or "")!=active_epoch:
         return None,"LEGACY_HOLDING_OR_EPOCH_UNVERIFIED"
+    if current_holding_qty is not None:
+        holding = _positive(current_holding_qty)
+        if holding is None:
+            return None,"LEGACY_CURRENT_HOLDING_UNVERIFIED"
     if not _row_in_active_practice_scope(
         pos, account=raw_account, epoch=active_epoch,
     ):
@@ -240,7 +244,7 @@ def _evidence_from_db(conn, *, symbol: str, trade_date: str,
     if any(value not in (None,"") for value in scoped_fields):
         return None,"INCOMPLETE_PARTIALLY_SCOPED_LEGACY_POSITION"
     if any(_json(pos.get("meta")).get(field) not in (None,"") for field in (
-        "position_cycle_id","portfolio_epoch_id","position_lifecycle_id",
+        "position_cycle_id","portfolio_epoch_id",
     )):
         return None,"LEGACY_POSITION_META_SCOPE_CONFLICT"
     contract=extract_us_entry_exit_contract(pos,_json(pos.get("meta")))
@@ -272,6 +276,8 @@ def _evidence_from_db(conn, *, symbol: str, trade_date: str,
         and len(opened)==10
     ):
         return None,"HISTORICAL_RUNTIME_SCOPE_UNVERIFIED"
+    if _json(pos.get("meta")).get("position_lifecycle_id") not in (None, "", original_cycle):
+        return None,"LEGACY_POSITION_META_SCOPE_CONFLICT"
     buys=_rows(conn,ORIGINAL_BUY_SQL,params)
     if len(buys)!=1:
         return None,"ORIGINAL_BUY_NOT_UNIQUE"
@@ -454,6 +460,63 @@ def _evidence_from_db(conn, *, symbol: str, trade_date: str,
         "zero_fill_sell_proofs":zero_fill_sell_proofs,
         "completed_tp_stages":sorted(done),
     },"DB_LEGACY_EVIDENCE_VERIFIED"
+
+
+def verified_legacy_snapshot_context(conn, *, position: dict, trade_date: str,
+                                     active_epoch: str) -> dict | None:
+    """Bind original decision facts to a fresh broker quantity, not a portfolio.
+
+    Used inside the authoritative snapshot transaction. The original columns
+    stay unscoped; the verified historical lifecycle is a source reference.
+    """
+    if (os.getenv("KIS_ENV") != "practice"
+            or os.getenv("WSL_RUN_MARKET", "").upper() != "US"):
+        return None
+    symbol = str(position.get("symbol") or "").upper()
+    if not eligible_standard_symbol(symbol):
+        return None
+    from trader.account_state import get_account_key
+    from trader.us.entry_exit_contract import US_ENTRY_EXIT_CONTRACT_VERSION
+    account = get_account_key(env="practice")
+    if not _row_in_active_practice_scope(position, account=account, epoch=active_epoch):
+        return None
+    source = _rows(conn, POSITION_SQL, {"symbol": symbol, "today": trade_date, "epoch": active_epoch})
+    if len(source) != 1:
+        return None
+    digest = _json(source[0].get("meta")).get("entry_exit_contract_sha256")
+    for obj in (position, _json(position.get("meta"))):
+        if obj.get("entry_exit_contract_sha256") not in (None, "", digest):
+            return None
+    evidence, _ = _evidence_from_db(
+        conn, symbol=symbol, trade_date=trade_date, active_epoch=active_epoch,
+        raw_account=account, current_holding_qty=position.get("qty"),
+        intent={"meta": {"source_entry_contract_sha256": digest,
+                         "source_entry_contract_version": US_ENTRY_EXIT_CONTRACT_VERSION}},
+    )
+    if evidence is None:
+        return None
+    contract = evidence["original_v2_contract"]
+    from trader.us.position_contract_provenance import restore_null_elided_policy
+    for obj in (position, _json(position.get("meta"))):
+        if (any(obj.get(k) not in (None, "", "US_STANDARD") for k in ("strategy_owner", "sleeve_id"))
+                or obj.get("portfolio_epoch_id") or obj.get("position_cycle_id")
+                or obj.get("position_lifecycle_id") not in (None, "", evidence["original_cycle"])):
+            return None
+        claimed = obj.get("entry_exit_contract")
+        if claimed is not None and claimed != contract and restore_null_elided_policy(
+            {"entry_exit_contract": claimed}, {"entry_exit_contract": contract},
+        ) is None:
+            return None
+    management = _json(contract.get("management"))
+    return {
+        "strategy_owner": "US_STANDARD", "account_id": account,
+        "trading_epoch_id": active_epoch,
+        "position_lifecycle_id": evidence["original_cycle"],
+        "entry_exit_contract": contract, "entry_exit_contract_sha256": evidence["v2_sha"],
+        "entry_exit_contract_version": contract["version"],
+        **{k: management[k] for k in ("book", "horizon", "exit_policy") if k in management},
+        "lineage_identity_status": "VERIFIED_LEGACY_ORIGINAL",
+    }
 
 
 
