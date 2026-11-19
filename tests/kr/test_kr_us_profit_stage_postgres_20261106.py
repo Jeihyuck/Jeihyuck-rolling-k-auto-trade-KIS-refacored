@@ -278,6 +278,12 @@ def test_20261119_proven_preack_reject_unblocks_stage_only_for_new_key(stage_db)
         },
     }
     with args["engine"].begin() as conn:
+        # The broad KR CI job creates a pre-epoch legacy orders table before
+        # this disposable PostgreSQL fixture runs. create_all() never alters
+        # an existing table; extend only the TEST database, never production.
+        conn.exec_driver_sql(
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS trading_epoch_id TEXT"
+        )
         conn.execute(sa.insert(schema.orders).values(**order))
     release = release_explicitly_rejected_tp_stage(
         **args, stage="RUNNER_FINAL", client_order_key=original,
