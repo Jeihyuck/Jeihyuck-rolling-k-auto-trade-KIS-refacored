@@ -13349,8 +13349,15 @@ class PB1Engine:
             or resolved_exit_family
         )
         _policy_missing_contract = _position_policy_missing_contract(pos)
-        _policy_adoption_active = is_verified_kr_policy_missing_adoption(pos)
+        # A native PB1 SWING may have a separate signed KR-US V3 profit
+        # contract without EVER claiming the legacy policy-missing adoption.
+        # Avoid false P0 error spam on every SELL tick, but still fail closed
+        # for any position that actually claims that adoption.
         _policy_adoption_claimed = has_kr_policy_missing_adoption_claim(pos)
+        _policy_adoption_active = (
+            is_verified_kr_policy_missing_adoption(pos)
+            if _policy_adoption_claimed else False
+        )
         if _policy_adoption_claimed and not _policy_adoption_active:
             _policy_missing_contract = True
             logger.error(
@@ -15342,6 +15349,37 @@ class PB1Engine:
                 self._register_session_no_sellable(code=code, reason="KIS_NO_SELLABLE_QTY")
                 self.no_sellable_qty_terminal_codes.add(display_code)
             self.orders_repo.mark_error(self.env, client_key, resp if isinstance(resp, dict) else {"resp": resp})
+            if _kr_us_tp_context is not None:
+                # 2026-11-19: KIS explicitly rejected a morning runner SELL
+                # (40570000, no native ODNO); the execution claim became
+                # RETRYABLE but its separate stage journal stayed PENDING.
+                # Release only an exact, durably stored, explicit pre-ACK
+                # business rejection. Ambiguous/accepted/partial SELLs stay
+                # fenced. This does NOT trigger a replacement order here.
+                from trader.kr.us_profit_stage_journal import (
+                    release_explicitly_rejected_tp_stage,
+                )
+                _release = release_explicitly_rejected_tp_stage(
+                    engine=self.orders_repo.engine,
+                    contract=_kr_us_tp_context["contract"],
+                    account_id=_kr_us_tp_context["account_id"],
+                    trading_epoch_id=_kr_us_tp_context["epoch_id"],
+                    position_cycle_id=_kr_us_tp_context["position_cycle_id"],
+                    code=code,
+                    stage=_kr_us_tp_context["stage"],
+                    client_order_key=client_key,
+                    trade_date=self._now_kst.date(),
+                )
+                logger.log(
+                    logging.INFO if _release.accepted else logging.ERROR,
+                    "[KR][TP_STAGE][EXPLICIT_BROKER_REJECT] code=%s "
+                    "stage=%s released=%s reason=%s action=NEXT_TICK_FRESH_GATE_ONLY",
+                    code, _kr_us_tp_context["stage"],
+                    int(_release.accepted), _release.reason,
+                )
+                if not _release.accepted:
+                    exit_eval_payload["reconcile_required"] = 1
+                    exit_eval_payload["tp_stage_rejection_release_reason"] = _release.reason
         self.positions_repo.update_position_fields(
             env=self.env,
             strategy=self.STRATEGY_NAME,

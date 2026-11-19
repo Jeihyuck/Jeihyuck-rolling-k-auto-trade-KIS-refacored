@@ -232,6 +232,26 @@ def reserve_tp_stage(
                 or state.get("contract_sha256") != contract["sha256"]
             ):
                 return StageJournalResult(False, "BLOCK", "STAGE_CONTRACT_CONFLICT")
+            # A definitively KIS-rejected pre-ACK order may be replaced with a
+            # DIFFERENT durable intent after the existing owner order gates
+            # recompute fresh holdings. No accepted/unknown order reaches here.
+            if (
+                state.get("status") == "NOT_TRIGGERED"
+                and state.get("broker_rejection_proven") is True
+                and state.get("rejected_client_order_key")
+                and client_order_key != state.get("rejected_client_order_key")
+                and _exact_qty(state.get("target_qty")) == 0
+                and _exact_qty(state.get("cumulative_filled_qty")) == 0
+                and trade_date.isoformat() >= str(state.get("trade_date") or "")
+            ):
+                state.update({
+                    "status": "PENDING",
+                    "target_qty": quantity,
+                    "client_order_key": client_order_key,
+                    "trade_date": trade_date.isoformat(),
+                    "owner_claimed_once": False,
+                    "broker_rejection_proven": False,
+                })
             if state.get("client_order_key") != client_order_key:
                 return StageJournalResult(False, "BLOCK", "DUPLICATE_OR_OTHER_CLIENT_ORDER_KEY")
             if state.get("status") != "PENDING":
@@ -249,6 +269,162 @@ def reserve_tp_stage(
     except Exception as exc:
         # Missing DB proof never authorizes a broker order.
         return StageJournalResult(False, "BLOCK", f"DURABLE_JOURNAL_UNAVAILABLE:{type(exc).__name__}")
+
+
+
+# Only a direct KIS business rejection that explicitly denies broker acceptance
+# can disarm a previously claimed TP stage. Network errors, timeouts, unknown
+# ACK, partial fills, orderable-zero and other business codes stay fenced.
+_PROVEN_PREACK_REJECT_CODES = frozenset({"40570000"})
+
+
+def _explicit_kis_preack_reject(response: Mapping[str, Any] | None, *, code: str, qty: int) -> bool:
+    if not isinstance(response, Mapping):
+        return False
+    execution = response.get("_order_execution")
+    if not isinstance(execution, Mapping):
+        return False
+    try:
+        submitted = _exact_qty(execution.get("submitted_qty"))
+        requested = _exact_qty(execution.get("requested_qty"))
+    except (ValueError, TypeError):
+        return False
+    output = response.get("output") or {}
+    if not isinstance(output, Mapping):
+        return False
+    return (
+        str(response.get("rt_cd") or "") == "1"
+        and str(response.get("msg_cd") or "") in _PROVEN_PREACK_REJECT_CODES
+        and execution.get("accepted") is False
+        and str(execution.get("side") or "").upper() == "SELL"
+        and str(execution.get("code") or "").zfill(6) == str(code).zfill(6)
+        and submitted == requested == qty > 0
+        and not execution.get("broker_order_id")
+        and not output.get("ODNO")
+    )
+
+
+def release_explicitly_rejected_tp_stage(
+    *, engine: Any, contract: Mapping[str, Any], account_id: str,
+    trading_epoch_id: str, position_cycle_id: str, code: str,
+    stage: str, client_order_key: str, trade_date: date,
+) -> StageJournalResult:
+    """Proof-only, transactionally disarm a rejected *pre-ACK* SELL.
+
+    The exact practice PB1 order must already be durably ERROR with an explicit
+    native KIS rejection. An HTTP ambiguity or accepted/partial original SELL
+    can NEVER release a stage. Next SELL still needs fresh broker balance,
+    zero unresolved SELLs, a NEW client key and a new execution claim.
+    """
+    try:
+        _assert_scope(
+            contract=contract, account_id=account_id,
+            trading_epoch_id=trading_epoch_id, position_cycle_id=position_cycle_id,
+            code=code,
+        )
+        if (stage not in STAGE_NAMES or not str(client_order_key).strip()
+                or not isinstance(trade_date, date)
+                or isinstance(trade_date, datetime)
+                or contract.get("activation_mode") != "ACTIVE_PRACTICE"
+                or engine.dialect.name != "postgresql"):
+            raise ValueError("REJECTION_RELEASE_SCOPE_INVALID")
+    except (ValueError, TypeError, KeyError, AttributeError) as exc:
+        return StageJournalResult(False, "BLOCK", str(exc))
+
+    schema = schema_for_engine(engine)
+    table, orders = schema.job_checkpoints, schema.orders
+    try:
+        with engine.begin() as conn:
+            lock_material = (
+                STAGE_VERSION + "|" + contract["account_sha256"] + "|"
+                + contract["trading_epoch_id"] + "|" + contract["position_cycle_id"]
+                + "|" + contract["sha256"]
+            )
+            lock_key = int.from_bytes(
+                hashlib.sha256(lock_material.encode("utf-8")).digest()[:8],
+                byteorder="big", signed=True,
+            )
+            if conn.execute(
+                sa.text("SELECT pg_try_advisory_xact_lock(:lock_id)"),
+                {"lock_id": lock_key},
+            ).scalar_one() is not True:
+                return StageJournalResult(False, "BLOCK", "REJECTION_RELEASE_CONCURRENT_CLAIM")
+            key = _key(contract, stage)
+            raw = conn.execute(
+                sa.select(table.c.payload).where(table.c.job_key == key)
+                .with_for_update()
+            ).scalar_one_or_none()
+            state = dict(raw or {})
+            if (
+                state.get("version") != STAGE_VERSION
+                or state.get("status") != "PENDING"
+                or state.get("owner_claimed_once") is not True
+                or state.get("contract_sha256") != contract["sha256"]
+                or state.get("client_order_key") != client_order_key
+                or state.get("trade_date") != trade_date.isoformat()
+                or _exact_qty(state.get("cumulative_filled_qty")) != 0
+                or state.get("broker_odno") or state.get("broker_fill_proven")
+            ):
+                return StageJournalResult(False, "BLOCK", "REJECTION_STAGE_NOT_EXACT_PENDING")
+            target = _exact_qty(state.get("target_qty"))
+            order_row = conn.execute(sa.select(orders).where(sa.and_(
+                orders.c.env == "practice",
+                orders.c.client_order_key == client_order_key,
+                orders.c.code == str(code).zfill(6),
+                orders.c.side == "SELL",
+                orders.c.position_cycle_id == str(position_cycle_id),
+                orders.c.trading_epoch_id == str(trading_epoch_id),
+            )).with_for_update()).mappings().one_or_none()
+            if order_row is None:
+                return StageJournalResult(False, "BLOCK", "REJECTION_ORIGINAL_ORDER_MISSING")
+            row = dict(order_row)
+            if (
+                str(row.get("status") or "").upper() != "ERROR"
+                or row.get("kis_odno") or row.get("acked_at")
+                or row.get("broker_order_id") not in (None, "", client_order_key)
+                or _exact_qty(row.get("qty")) != target
+            ):
+                return StageJournalResult(False, "BLOCK", "REJECTION_ORDER_ACK_OR_QTY_AMBIGUOUS")
+            def _dict(value: Any) -> dict:
+                if isinstance(value, dict):
+                    return value
+                if isinstance(value, str):
+                    try:
+                        decoded = json.loads(value)
+                        return decoded if isinstance(decoded, dict) else {}
+                    except (ValueError, TypeError):
+                        return {}
+                return {}
+            request = _dict(row.get("request_json"))
+            response = _dict(row.get("response_json"))
+            if (
+                _dict(request.get("kr_us_tp_contract")).get("sha256") != contract["sha256"]
+                or request.get("kr_us_tp_stage") != stage
+                or not _explicit_kis_preack_reject(response, code=code, qty=target)
+            ):
+                return StageJournalResult(False, "BLOCK", "REJECTION_KIS_IDENTITY_UNPROVEN")
+            attempts = list(state.get("explicit_rejected_attempts") or [])
+            attempts.append({
+                "client_order_key": client_order_key,
+                "qty": target, "trade_date": trade_date.isoformat(),
+                "msg_cd": str(response["msg_cd"]),
+                "order_id": str(row.get("order_id") or ""),
+            })
+            state.update({
+                "status": "NOT_TRIGGERED",
+                "owner_claimed_once": False,
+                "target_qty": 0,
+                "cumulative_filled_qty": 0,
+                "broker_rejection_proven": True,
+                "explicit_rejected_attempts": attempts,
+                "rejected_client_order_key": client_order_key,
+            })
+            conn.execute(sa.update(table).where(table.c.job_key == key).values(
+                updated_ts=datetime.now(timezone.utc), payload=state,
+            ))
+        return StageJournalResult(True, "NOT_TRIGGERED", "KIS_EXPLICIT_PREACK_REJECTION_PROVEN")
+    except Exception as exc:
+        return StageJournalResult(False, "BLOCK", "REJECTION_RELEASE_UNAVAILABLE:" + type(exc).__name__)
 
 
 def observe_broker_stage(

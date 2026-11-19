@@ -86,6 +86,59 @@ def _broker_confirmed_nonexecution(order: dict, requested: int) -> int:
     return cancelled + rejected
 
 
+
+def _explicit_kr_preack_rejection_not_a_broker_order(
+    order: dict, related_fills: list[dict],
+) -> bool:
+    """Exclude only native KIS *pre-ACK* denials from priced SELL accounting.
+
+    A real broker order with ODNO, any fill row, ambiguous HTTP response,
+    cancelled/partial order or unsigned contract stays in the economic audit.
+    This never marks an economic SELL as FILLED or changes a DB row.
+    """
+    if (
+        str(order.get("status") or "").upper() != "ERROR"
+        or str(order.get("side") or "").upper() != "SELL"
+        or related_fills
+        or order.get("kis_odno")
+        or order.get("acked_at")
+    ):
+        return False
+    client_key = str(order.get("client_order_key") or "").strip()
+    if not client_key or order.get("broker_order_id") not in (None, "", client_key):
+        return False
+
+    def _obj(raw: Any) -> dict:
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str):
+            try:
+                decoded = json.loads(raw)
+                return decoded if isinstance(decoded, dict) else {}
+            except (TypeError, ValueError):
+                pass
+        return {}
+
+    request = _obj(order.get("request_json"))
+    response = _obj(order.get("response_json"))
+    contract = _obj(request.get("kr_us_tp_contract"))
+    stage = str(request.get("kr_us_tp_stage") or "")
+    if stage not in {"TP1", "TP2", "TP3", "PROFIT_DEFENSE_PARTIAL", "RUNNER_FINAL"}:
+        return False
+    from trader.kr.us_standard_profit_parity import verified_contract
+    from trader.kr.us_profit_stage_journal import _explicit_kis_preack_reject
+    if (
+        not verified_contract(contract)
+        or contract.get("activation_mode") != "ACTIVE_PRACTICE"
+        or contract.get("code") != str(order.get("code") or "").zfill(6)
+        or str(request.get("strategy_owner") or "") != "PB1"
+    ):
+        return False
+    return _explicit_kis_preack_reject(
+        response, code=str(order.get("code") or ""), qty=order.get("qty"),
+    )
+
+
 def _broker_order_day(value: Any) -> date | None:
     if isinstance(value, datetime):
         timestamp = value
@@ -120,6 +173,7 @@ def audit_sell_settlement(
     gaps = []
     inspected = 0
     excluded_infinite_mirror_orders = 0
+    explicit_preack_rejections_excluded = 0
     bucket_counts = {"today": 0, "historical": 0, "undated": 0}
     certified_mirror_sell_ids = set()
     for position in positions:
@@ -147,6 +201,11 @@ def audit_sell_settlement(
                 )
     for order in orders:
         if str(order.get("side") or "").upper() != "SELL":
+            continue
+        if _explicit_kr_preack_rejection_not_a_broker_order(
+            order, by_order.get(str(order.get("order_id") or ""), []),
+        ):
+            explicit_preack_rejections_excluded += 1
             continue
         if (
             str(order.get("code") or "") == "122630"
@@ -235,6 +294,7 @@ def audit_sell_settlement(
         ),
         "sell_orders_checked": inspected,
         "certified_infinite_mirror_sells_excluded": excluded_infinite_mirror_orders,
+        "explicit_preack_rejections_excluded": explicit_preack_rejections_excluded,
         "gap_count": len(gaps),
         "gaps": gaps,
         "note": "Read-only DB evidence. Broker-native replay requires separate KIS read-only proof.",
@@ -248,10 +308,18 @@ def load_snapshot(engine: sa.Engine, *, env: str, epoch: str, day: date) -> dict
     # All SQL is SELECT-only. The exact trading epoch isolates the account;
     # the date is an *as-of* cutoff, not a lower bound. Previous-day SELL gaps
     # must remain visible until native economic settlement has been proven.
+    # The old SQLite read-only audit fixtures intentionally lack the
+    # post-ACK identity columns; never infer a KIS denial in that case.
+    extra_projection = (
+        "NULL AS client_order_key, NULL AS broker_order_id, "
+        "NULL AS acked_at, NULL AS request_json"
+        if engine.dialect.name == "sqlite"
+        else "client_order_key, broker_order_id, acked_at, request_json"
+    )
     with engine.connect() as conn:
-        orders = [dict(x) for x in conn.execute(text("""
+        orders = [dict(x) for x in conn.execute(text(f"""
             SELECT order_id, code, side, status, qty, kis_odno,
-                   position_cycle_id, response_json, created_at
+                   position_cycle_id, {extra_projection}, response_json, created_at
             FROM public.orders
             WHERE env=:env AND trading_epoch_id=:epoch AND side='SELL'
               AND created_at < :end_utc

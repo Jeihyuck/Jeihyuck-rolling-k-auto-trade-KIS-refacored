@@ -67,6 +67,25 @@ def _unresolved_sell_row(row: Mapping[str, Any]) -> bool:
     if status in {"FILLED", "RECONCILED", "CANCELLED", "REJECTED"}:
         return False
     response = _meta(row.get("response_json"))
+    # A native KIS explicit business reject may have submitted_at set by
+    # mark_submitted() and a local client key copied into broker_order_id.
+    # Neither is a real KIS ODNO. Permit exclusion from unresolved SELLs only
+    # when the original response explicitly denies acceptance and the exact
+    # ERROR row has no native broker number or ACK.
+    if status == "ERROR" and not row.get("kis_odno") and not row.get("acked_at"):
+        from trader.kr.us_profit_stage_journal import _explicit_kis_preack_reject
+        client_key = str(row.get("client_order_key") or "")
+        synthetic_broker_id = row.get("broker_order_id") in (None, "", client_key)
+        request = _meta(row.get("request_json"))
+        if (
+            client_key and synthetic_broker_id
+            and str(request.get("kr_us_tp_stage") or "")
+            and _explicit_kis_preack_reject(
+                response, code=str(row.get("code") or ""),
+                qty=row.get("qty"),
+            )
+        ):
+            return False
     if (
         status == "ERROR"
         and response.get("broker_submit") is False
@@ -92,7 +111,8 @@ def has_unresolved_kr_sell_orders(*, engine: Any, env: str, code: str,
     orders = schema_for_engine(engine).orders
     with engine.connect() as conn:
         rows = conn.execute(sa.select(
-            orders.c.status, orders.c.response_json,
+            orders.c.status, orders.c.response_json, orders.c.request_json,
+            orders.c.code, orders.c.qty, orders.c.client_order_key,
             orders.c.kis_odno, orders.c.broker_order_id,
             orders.c.submitted_at, orders.c.acked_at,
         ).where(

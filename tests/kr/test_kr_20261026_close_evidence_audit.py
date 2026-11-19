@@ -236,3 +236,98 @@ def test_native_individual_kis_fills_are_summed_without_manual_fills():
     missing = audit_sell_settlement(orders=[order], fills=fills[1:], positions=[])
     assert missing["gap_count"] == 1
     assert missing["gaps"][0]["missing_priced_sell_qty"] == 12
+
+
+def _20261119_native_preack_denied_sell(monkeypatch):
+    from datetime import datetime, timezone
+    from trader.kr.us_standard_profit_parity import build_new_swing_parity_contract
+
+    monkeypatch.setenv("KR_SWING_US_PROFIT_MODE", "ACTIVE_PRACTICE")
+    monkeypatch.setenv("KR_SWING_US_PROFIT_DEPLOY_APPROVED", "1")
+    monkeypatch.setenv("KIS_ENV", "practice")
+    contract = build_new_swing_parity_contract(
+        strategy_owner="PB1", exit_policy_family="SWING_STAGED_EXIT",
+        trade_horizon="SWING", position_action="NEW_POSITION_BUY",
+        account_id="practice:20261119", trading_epoch_id="epoch-20261119",
+        position_cycle_id="cycle-20261119", runner_version="US_V3", code="028050",
+    )
+    key = "practice:pb1:2026-11-19:028050:RUNNER_FINAL:8:original"
+    return {
+        "order_id": "original-preopen-denied",
+        "code": "028050", "side": "SELL", "status": "ERROR", "qty": 8,
+        "client_order_key": key, "broker_order_id": key,
+        "kis_odno": None, "acked_at": None,
+        "created_at": datetime(2026, 11, 19, 0, 1, 35, tzinfo=timezone.utc),
+        "request_json": {
+            "strategy_owner": "PB1", "kr_us_tp_contract": contract,
+            "kr_us_tp_stage": "RUNNER_FINAL",
+        },
+        "response_json": {
+            "rt_cd": "1", "msg_cd": "40570000",
+            "_order_execution": {
+                "side": "SELL", "code": "028050",
+                "requested_qty": 8, "submitted_qty": 8,
+                "accepted": False, "broker_order_id": None,
+            },
+        },
+    }
+
+
+def test_20261119_explicit_preack_denial_is_not_fake_priced_sell_gap(monkeypatch):
+    order = _20261119_native_preack_denied_sell(monkeypatch)
+    from datetime import date
+
+    report = audit_sell_settlement(
+        orders=[order], fills=[], positions=[], trade_date=date(2026, 11, 19),
+    )
+    assert report["gap_count"] == 0
+    assert report["today_gap_count"] == 0
+    assert report["sell_orders_checked"] == 0
+    assert report["explicit_preack_rejections_excluded"] == 1
+
+
+def test_20261119_preack_deny_does_not_hide_historical_priced_debt(monkeypatch):
+    order = _20261119_native_preack_denied_sell(monkeypatch)
+    old = {"order_id": "historical-unpriced", "code": "293490",
+           "side": "SELL", "status": "FILLED", "qty": 170}
+    report = audit_sell_settlement(
+        orders=[order, old], fills=[], positions=[],
+    )
+    assert report["gap_count"] == 1
+    assert report["gaps"][0]["order_id"] == "historical-unpriced"
+    assert report["explicit_preack_rejections_excluded"] == 1
+
+
+def test_20261119_preack_deny_exclusion_never_hides_uncertain_or_filled(monkeypatch):
+    import copy
+
+    base = _20261119_native_preack_denied_sell(monkeypatch)
+    mutations = (
+        ("unknown_ack", {"response_json": {"rt_cd": "UNRESOLVED_ACK"}}),
+        ("real_od_no", {"kis_odno": "0000021375"}),
+        ("different_broker_id", {"broker_order_id": "0000021375"}),
+        ("not_error", {"status": "ACKED"}),
+    )
+    for name, patch in mutations:
+        row = copy.deepcopy(base)
+        row.update(patch)
+        report = audit_sell_settlement(orders=[row], fills=[], positions=[])
+        assert report["gap_count"] == 1, name
+        assert report["explicit_preack_rejections_excluded"] == 0, name
+
+    filled = audit_sell_settlement(
+        orders=[base],
+        fills=[{
+            "order_id": base["order_id"], "side": "SELL", "qty": 1,
+            "price": 64100, "evidence_kind": "KIS_INDIVIDUAL_EXECUTION",
+        }],
+        positions=[],
+    )
+    assert filled["gap_count"] == 1
+    assert filled["explicit_preack_rejections_excluded"] == 0
+
+    tampered = copy.deepcopy(base)
+    tampered["request_json"]["kr_us_tp_contract"]["code"] = "122630"
+    assert audit_sell_settlement(
+        orders=[tampered], fills=[], positions=[],
+    )["gap_count"] == 1
