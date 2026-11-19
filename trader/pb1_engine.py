@@ -13349,8 +13349,15 @@ class PB1Engine:
             or resolved_exit_family
         )
         _policy_missing_contract = _position_policy_missing_contract(pos)
-        _policy_adoption_active = is_verified_kr_policy_missing_adoption(pos)
+        # A native PB1 SWING may have a separate signed KR-US V3 profit
+        # contract without EVER claiming the legacy policy-missing adoption.
+        # Avoid false P0 error spam on every SELL tick, but still fail closed
+        # for any position that actually claims that adoption.
         _policy_adoption_claimed = has_kr_policy_missing_adoption_claim(pos)
+        _policy_adoption_active = (
+            is_verified_kr_policy_missing_adoption(pos)
+            if _policy_adoption_claimed else False
+        )
         if _policy_adoption_claimed and not _policy_adoption_active:
             _policy_missing_contract = True
             logger.error(
