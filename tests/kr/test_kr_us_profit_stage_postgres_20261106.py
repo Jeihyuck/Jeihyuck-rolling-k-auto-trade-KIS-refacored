@@ -359,3 +359,23 @@ def test_20261119_explicit_reject_only_and_unknown_ack_stays_fenced():
     corrupted = deepcopy(base)
     corrupted["response_json"]["_order_execution"]["accepted"] = None
     assert _unresolved_sell_row(corrupted) is True
+
+
+@pytest.mark.parametrize("text", [
+    "SSL connection has been closed unexpectedly",
+    "psycopg.OperationalError: SSL connection closed unexpectedly",
+    "OperationalError: connection closed unexpectedly",
+    "SSL SYSCALL error: EOF detected",
+])
+def test_20261119_psycopg_ssl_disconnect_is_poisoned_connection(text):
+    from trader.db.engine import _is_connection_poison_error
+
+    assert _is_connection_poison_error(RuntimeError(text))
+
+
+def test_20261119_business_reject_not_database_disconnect():
+    from trader.db.engine import _is_connection_poison_error
+
+    assert not _is_connection_poison_error(
+        RuntimeError("KIS business rejection 40570000")
+    )
