@@ -326,6 +326,14 @@ def test_postgres_forward_partial_fill_is_accepted_after_reload(pg_engine, scena
     proof = _apply_forward_fill(scenario)
     monkeypatch.setattr(recovery_identity, "current_us_portfolio_epoch", lambda *a, **kw: PORTFOLIO)
     with pg_engine.begin() as conn:
+        # The lean US fixture omits shared epoch tables. The real snapshot
+        # reader must still query the genuine ACTIVE account/epoch relation.
+        epoch_ddl = open("migrations/0052_unified_trading_epoch.sql").read().split("INSERT INTO trading_epochs(", 1)[0]
+        conn.exec_driver_sql(epoch_ddl)
+        conn.execute(text("""INSERT INTO trading_epochs(trading_epoch_id,env,account_id,status,reason)
+            VALUES (:epoch,'practice',:account,'ACTIVE','CONTINUITY_TEST')
+            ON CONFLICT(trading_epoch_id) DO UPDATE SET account_id=EXCLUDED.account_id,
+              env=EXCLUDED.env,status='ACTIVE'"""), {"epoch": EPOCH, "account": RAW_ACCOUNT})
         conn.exec_driver_sql("ALTER TABLE us_orders ADD COLUMN IF NOT EXISTS env TEXT DEFAULT 'practice'")
         repos._ensure_us_position_risk_state_table(conn)
         conn.execute(text("DELETE FROM us_position_risk_state WHERE trading_epoch_id=:epoch AND symbol=:symbol"),
