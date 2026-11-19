@@ -2972,7 +2972,7 @@ def run_trade_session(
         )
         reconcile_liveness_status = _worst_tick_health_status(
             results, "reconcile_liveness_status",
-            {"OK": 0, "RECONCILE_REQUIRED": 1},
+            {"OK": 0, "PENDING_SETTLEMENT": 1, "RECONCILE_REQUIRED": 2},
         )
         exit_route_liveness_failure = any(
             bool((tick or {}).get("exit_route_liveness_failure"))

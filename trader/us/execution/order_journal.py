@@ -578,6 +578,7 @@ def broker_submission_possible_for_client_key(events: list[dict], client_order_k
 
 def aggregate_order_events(trade_date: str, *, session_run_id: str | None = None) -> dict:
     """Aggregate immutable unique submit attempts; reconciliation never adds submits."""
+    from trader.us.utils.order_no import normalize_us_order_no
     events = load_order_events(trade_date, session_run_id=session_run_id)
     submits: dict[str, dict] = {}
     lifecycle: dict[str, set[str]] = {}
@@ -605,6 +606,8 @@ def aggregate_order_events(trade_date: str, *, session_run_id: str | None = None
     ack = {a for a, types in lifecycle.items() if a not in aborted and types & {"BROKER_ACK_RECEIVED", "BROKER_ACK_RECOVERED"}}
     rejected = {a for a, types in lifecycle.items() if a not in aborted and "ORDER_REJECTED" in types}
     filled = {a for a, types in lifecycle.items() if a not in aborted and "ORDER_FILLED" in types}
+    with_fills = {a for a, types in lifecycle.items() if a not in aborted
+                  and types & {"ORDER_FILLED", "ORDER_PARTIALLY_FILLED"}}
     unresolved_submit_count = sum(
         1
         for attempt, types in lifecycle.items()
@@ -618,16 +621,37 @@ def aggregate_order_events(trade_date: str, *, session_run_id: str | None = None
             )
         )
     )
+    from trader.us.execution.report_scope import population_scope
+    filled_scope = population_scope([
+        e for e in events if e.get("event_type") in {"ORDER_FILLED", "ORDER_PARTIALLY_FILLED"}
+    ], trade_date)
     buy = sum(str(e.get("side") or "").upper() == "BUY" for e in submits.values())
     sell = sum(str(e.get("side") or "").upper() == "SELL" for e in submits.values())
     return {"scope": "trade_day", "orders_sent_total": len(submits), "buy_orders_count": buy,
             "sell_orders_count": sell, "orders_ack_total": len(ack), "orders_reject_total": len(rejected),
-            "orders_fill_confirmed": len(filled), "fill_execution_row_count": len(fill_execution_keys),
+            "orders_fill_confirmed": len(filled), "orders_with_confirmed_fills": len(with_fills),
+            "fill_execution_row_count": len(fill_execution_keys),
+            "journal_fill_observation_count": len(fill_execution_keys),
             "partial_fill_observation_count": len(partial_observation_keys),
             "unresolved_submit_attempt_count": unresolved_submit_count,
             "unique_submit_attempt_count": len(submits),
             "unique_client_order_count": len({e.get('client_order_key') for e in submits.values()}),
-            "unique_broker_order_count": len({e.get('broker_order_no') for e in events if e.get('broker_order_no')})}
+            "unique_broker_order_count": len({
+                normalize_us_order_no(e.get("canonical_broker_order_no") or e.get("broker_order_no")
+                                      or e.get("raw_broker_order_no"))
+                for e in events if e.get("canonical_broker_order_no") or e.get("broker_order_no")
+                                   or e.get("raw_broker_order_no")}),
+            "journal_order_population": {
+                "scope": "session" if session_run_id else "trade_day", "trade_date": trade_date,
+                "filled_identity_scope": filled_scope,
+                "acknowledged_orders": len(ack), "filled_orders": len(filled),
+                "unfilled_acknowledged_orders": len(ack - filled),
+                "filled_broker_order_numbers": sorted({
+                    normalize_us_order_no(e.get("canonical_broker_order_no") or e.get("broker_order_no")
+                                          or e.get("raw_broker_order_no"))
+                    for e in events if e.get("event_type") in {"ORDER_FILLED", "ORDER_PARTIALLY_FILLED"}
+                    and (e.get("canonical_broker_order_no") or e.get("broker_order_no") or e.get("raw_broker_order_no"))}),
+            }}
 
 
 def order_audit_timelines(trade_date: str) -> dict[str, dict]:
@@ -1467,6 +1491,8 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
 
 def report_historical_order_recovery(*, provider: Any, trade_date: str, phase: str) -> dict:
     """Attempt old claims once at a session boundary and report unresolved debt."""
+    from trader.us.execution.tp_retry_boundary import repair_tp_retries_at_boundary
+    tp_retry = repair_tp_retries_at_boundary(trade_date=trade_date, phase=phase)
     try:
         deadline = time.monotonic() + 10.0
         fork = getattr(provider, "fork_for_stage", None)
@@ -1480,6 +1506,7 @@ def report_historical_order_recovery(*, provider: Any, trade_date: str, phase: s
         )
     except Exception as exc:
         result = {"status": "ERROR", "unresolved_count": 1, "error": type(exc).__name__}
+    result["tp_retry_boundary"] = tp_retry
     unresolved = (
         result.get("status") not in {"OK", "RECOVERED", "NO_ACTIVE_CLAIMS"}
         or bool(result.get("unresolved_count"))

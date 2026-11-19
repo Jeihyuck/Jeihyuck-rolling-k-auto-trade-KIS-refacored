@@ -1139,6 +1139,33 @@ class USDataProvider:
         }
 
     def get_completed_daily_prices_result(
+        self, symbol: str, exchange: str, *, trade_date: str,
+        required_bars: int = 260, allow_http_sync: bool,
+    ) -> dict:
+        # Completed bars are immutable for this tick's trade date. Live quotes,
+        # balances, claims and pre-HTTP SELL checks never use this cache.
+        from copy import deepcopy
+        ctx = self._tick_context
+        if ctx is None or self._stage_cancelled():
+            return self._get_completed_daily_prices_result_uncached(
+                symbol, exchange, trade_date=trade_date,
+                required_bars=required_bars, allow_http_sync=allow_http_sync)
+        cache = getattr(ctx, "completed_daily_cache", None)
+        if cache is None:
+            cache = {}
+            ctx.completed_daily_cache = cache
+        key = (str(symbol).upper(), str(exchange).upper(), str(trade_date), int(required_bars))
+        if key in cache:
+            ctx.count("completed_daily_cache_hits")
+            return deepcopy(cache[key])
+        result = self._get_completed_daily_prices_result_uncached(
+            symbol, exchange, trade_date=trade_date,
+            required_bars=required_bars, allow_http_sync=allow_http_sync)
+        if result.get("quality") == "OK" and not self._stage_cancelled():
+            cache[key] = deepcopy(result)
+        return result
+
+    def _get_completed_daily_prices_result_uncached(
         self,
         symbol: str,
         exchange: str,
@@ -1168,7 +1195,7 @@ class USDataProvider:
                         "db_latest": None, "expected_latest": None, "invalid_close_count": 0,
                         "duplicate_count": 0, "http_sync_attempted": False,
                         "http_sync_succeeded": False}
-            audit = audit_us_daily_history(symbol=symbol, before_date=trade_date, required_bars=required)
+            audit = audit_us_daily_history(symbol=symbol, before_date=trade_date, required_bars=required, rows=rows)
             if self._stage_cancelled():
                 return {"rows": [], "quality": "CANCELLED", "valid_bar_count": 0,
                         "db_latest": None, "expected_latest": None, "invalid_close_count": 0,
@@ -1177,8 +1204,9 @@ class USDataProvider:
         except Exception as exc:
             logger.error("[US_OHLCV][DB_ERROR] symbol=%s code=US_DAILY_DB_UNAVAILABLE err=%s", symbol, exc)
             return {"rows": [], "quality": "DB_ERROR", "valid_bar_count": 0, "db_latest": None, "expected_latest": None, "invalid_close_count": 0, "duplicate_count": 0, "http_sync_attempted": False, "http_sync_succeeded": False}
+        from trader.us.dates import canonical_us_bar_date
         expected_latest = previous_completed_us_session(trade_date)
-        db_latest = get_latest_us_daily_date(symbol=symbol, before_date=trade_date)
+        db_latest = canonical_us_bar_date(max((str(r.get("date") or "") for r in rows), default=""))
         from trader.us.dates import canonical_us_bar_date
         audit_last_date = canonical_us_bar_date(audit.get("last_date"))
         invalid_close_count = int(audit.get("invalid_close_count") or 0)
@@ -1209,7 +1237,7 @@ class USDataProvider:
             total_fetched += len(fetched or [])
             total_upserted += upsert_us_daily_bars(symbol=symbol, bars=fetched, source="KIS_US_DAILY")
             rows = load_recent_us_daily_bars(symbol=symbol, before_date=trade_date, limit=required)
-            db_latest = get_latest_us_daily_date(symbol=symbol, before_date=trade_date)
+            db_latest = canonical_us_bar_date(max((str(r.get("date") or "") for r in rows), default=""))
 
         if db_latest == expected_latest and len(rows) < required:
             from trader.us.dates import canonical_us_bar_date
@@ -1226,8 +1254,8 @@ class USDataProvider:
         logger.info("[US_OHLCV][BACKFILL] symbol=%s before_count=%d target=%d fetched=%d pages=%s", symbol, len(rows), required, total_fetched, pages)
         logger.info("[US_OHLCV][UPSERT] symbol=%s fetched=%d upserted=%d", symbol, total_fetched, total_upserted)
         rows = load_recent_us_daily_bars(symbol=symbol, before_date=trade_date, limit=required)
-        audit = audit_us_daily_history(symbol=symbol, before_date=trade_date, required_bars=required)
-        db_latest = get_latest_us_daily_date(symbol=symbol, before_date=trade_date)
+        audit = audit_us_daily_history(symbol=symbol, before_date=trade_date, required_bars=required, rows=rows)
+        db_latest = canonical_us_bar_date(max((str(r.get("date") or "") for r in rows), default=""))
         audit_last_date = canonical_us_bar_date(audit.get("last_date"))
         invalid_close_count = int(audit.get("invalid_close_count") or 0)
         duplicate_count = int(audit.get("duplicate_count") or 0)

@@ -155,6 +155,11 @@ def summarize_order_evidence(meta: dict, *, side: str) -> dict:
         if isinstance(contract, dict):
             record = (contract.get("entry_provenance") or {}).get(key)
     if not isinstance(record, dict):
+        if side == "SELL":
+            from trader.us.sell_decision_observation import summarize_sell_observation
+            observation = summarize_sell_observation(meta)
+            if observation is not None:
+                return observation
         return {"status": "MISSING", "evidence_hash": None}
     if not verify_decision_evidence(record) or (record.get("what") or {}).get("side") != side:
         return {"status": "INVALID", "evidence_hash": None}
@@ -203,6 +208,13 @@ def attach_standard_sell_evidence(
     entry = provenance.get("entry_decision_evidence_5w1h")
     expected = provenance.get("entry_decision_evidence_sha256")
     if not isinstance(entry, dict) or not verify_decision_evidence(entry) or expected != entry.get("sha256"):
+        # Record today's decision even when the historical BUY predates 5W1H.
+        # Invalid existing BUY evidence is never replaced by a legacy proof.
+        if entry is None and expected is None:
+            from trader.us.sell_decision_observation import attach_sell_observation
+            if attach_sell_observation(intent, position, decision_at=decision_at, code_sha=code_sha):
+                intent_meta["exit_decision_evidence_status"] = "CURRENT_DECISION_VERIFIED_LEGACY_ENTRY"
+                return "CURRENT_DECISION_VERIFIED_LEGACY_ENTRY"
         intent_meta["exit_decision_evidence_status"] = "ENTRY_PROOF_MISSING_OR_INVALID"
         return "ENTRY_PROOF_MISSING_OR_INVALID"
     cycle = str(position.get("position_lifecycle_id") or pos_meta.get("position_lifecycle_id") or "")

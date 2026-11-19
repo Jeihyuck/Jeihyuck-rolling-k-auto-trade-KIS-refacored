@@ -209,8 +209,12 @@ def upsert_us_daily_bars(*, symbol: str, bars: list[dict], source: str = "KIS_US
     return len(clean)
 
 
-def audit_us_daily_history(*, symbol: str, before_date: str, required_bars: int = 260) -> dict:
-    rows = load_recent_us_daily_bars(symbol=symbol, before_date=before_date, limit=required_bars)
+def audit_us_daily_history(*, symbol: str, before_date: str, required_bars: int = 260,
+                           rows: list[dict] | None = None) -> dict:
+    # The provider can supply its exact DB snapshot, avoiding a second query
+    # and an inconsistent quality check if ingestion commits between reads.
+    if rows is None:
+        rows = load_recent_us_daily_bars(symbol=symbol, before_date=before_date, limit=required_bars)
     dates = [canonical_us_bar_date(r.get("date")) for r in rows]
     dates = [d for d in dates if d]
     invalid = sum(1 for r in rows if _num(r.get("close")) is None or (_num(r.get("close")) or 0) <= 0)
