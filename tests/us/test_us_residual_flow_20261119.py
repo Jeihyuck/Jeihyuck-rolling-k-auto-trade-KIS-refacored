@@ -297,3 +297,39 @@ def test_partial_pre_io_boundary_uses_original_atomic_claim_checks(monkeypatch):
     assert not _release_certificate_row(conn, row, {"account_id": "account", "trading_epoch_id": "epoch"})
     assert captured["_conn"] is conn
     assert captured["close_intent"] is True
+
+
+def test_cancelled_unfilled_day_is_not_a_missing_fill_population():
+    from trader.us.runner.close_audit import audit_us_close_report
+    empty = {"verified": False, "trade_date": "2026-11-18", "reason": "EMPTY_OR_MIXED_SOURCE_SCOPE"}
+    report = {"trade_date": "2026-11-18", "broker_recovery_health": {"available": True},
+              "kis_actual_fill_order_count": 0, "daily_fills_confirmed_total": 0, "unique_broker_order_count": 1,
+              "journal_order_population": {"scope": "trade_day", "trade_date": "2026-11-18",
+                  "filled_identity_scope": empty, "filled_broker_order_numbers": []},
+              "broker_fill_identity_scope": empty}
+    assert audit_us_close_report(report)["findings"] == []
+
+
+@pytest.mark.skipif(not os.getenv("PBCORE_TEST_POSTGRES_URL"), reason="requires disposable PostgreSQL")
+@pytest.mark.parametrize("mismatch", ["account_id", "lifecycle"])
+def test_postgres_certificate_cannot_change_foreign_intent_scope(pg_engine, monkeypatch, mismatch):
+    from sqlalchemy import text
+    from trader.us.db import repos
+    from trader.us.execution.tp_retry_boundary import repair_tp_retries_at_boundary
+    epoch, account, cycle = "residual-epoch", "residual-account", "original-cycle"
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda *a, **kw: epoch)
+    monkeypatch.setattr(repos, "_us_state_epoch_id", lambda *a, **kw: epoch)
+    monkeypatch.setattr(repos, "_us_execution_claim_scope", lambda: {
+        "env": "practice", "account_id": account, "trading_epoch_id": epoch})
+    key = f"US_PC_2026-11-11_KO_{cycle}_TAKE_PROFIT_TP2"
+    _seed_boundary_case(pg_engine, symbol="KO", contradiction=None, epoch=epoch, account=account, cycle=cycle, key=key)
+    with pg_engine.begin() as conn:
+        if mismatch == "account_id":
+            conn.execute(text("UPDATE us_order_intents SET account_id='foreign-account' WHERE client_order_key=:key"), {"key": key})
+        else:
+            conn.execute(text("UPDATE us_order_intents SET meta=CAST(:meta AS jsonb) WHERE client_order_key=:key"),
+                         {"key": key, "meta": json.dumps({"position_lifecycle_id": "foreign-cycle"})})
+    result = repair_tp_retries_at_boundary(trade_date="2026-11-18", phase="AM")
+    assert result["released"] == 0
+    with pg_engine.connect() as conn:
+        assert conn.execute(text("SELECT status FROM us_order_intents WHERE client_order_key=:key"), {"key": key}).scalar_one() == "PENDING"

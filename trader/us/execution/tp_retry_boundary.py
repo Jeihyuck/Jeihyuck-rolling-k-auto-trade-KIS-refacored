@@ -92,6 +92,23 @@ def _release_certificate_row(conn, row: dict, scope: dict) -> bool:
     for table in ("us_execution_attempts", "us_orders", "us_fills"):
         if conn.execute(text(f"SELECT 1 FROM {table} WHERE client_order_key=:key LIMIT 1"), params).scalar_one_or_none() is not None:
             return False
+    # An existing intent may be missing on a pre-intent abort. If present,
+    # lock and verify every recorded source field before changing its state.
+    intent_row = conn.execute(text("""
+        SELECT trade_date,symbol,side,status,account_id,trading_epoch_id,qty,meta
+          FROM us_order_intents WHERE client_order_key=:key FOR UPDATE
+    """), params).mappings().one_or_none()
+    if intent_row:
+        im = intent_row.get("meta") or {}
+        declared_account = intent_row.get("account_id") or im.get("broker_account_hash")
+        if (str(intent_row.get("trade_date") or "") != params["td"]
+                or intent_row.get("symbol") != params["sym"] or intent_row.get("side") != "SELL"
+                or intent_row.get("trading_epoch_id") != params["epoch"]
+                or intent_row.get("status") not in {"PENDING", "BLOCKED"}
+                or (declared_account and declared_account != params["account"])
+                or (im.get("position_lifecycle_id") and im["position_lifecycle_id"] != params["cycle"])
+                or im.get("strategy_owner", "US_STANDARD") != "US_STANDARD"):
+            return False
     # This closes a local intent only. Never invent a historical transaction.
     conn.execute(text("""
         UPDATE us_order_intents SET status='BLOCKED',

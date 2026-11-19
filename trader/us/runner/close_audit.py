@@ -53,7 +53,12 @@ def audit_us_close_report(report: dict[str, Any]) -> dict[str, Any]:
     journal_scope = population.get("filled_identity_scope")
     fill_scope = report.get("broker_fill_identity_scope")
     comparable = True
-    if isinstance(journal_scope, dict) and isinstance(fill_scope, dict):
+    has_fill_population = bool(
+        int(report.get("kis_actual_fill_order_count") or 0)
+        or int(report.get("daily_fills_confirmed_total") or 0)
+        or population.get("filled_broker_order_numbers")
+    )
+    if has_fill_population and isinstance(journal_scope, dict) and isinstance(fill_scope, dict):
         comparable = (journal_scope.get("verified") is True
                       and fill_scope.get("verified") is True and journal_scope == fill_scope)
         if not comparable:
