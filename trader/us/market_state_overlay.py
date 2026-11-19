@@ -1208,7 +1208,11 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
                     last_stage = str(stage_meta.get("last_stage") or "").lower()
                     pre_http_abort = (
                         last_status == "FAILED"
-                        and last_evidence in {"BROKER_SUBMIT_ABORTED_PRE_IO", "ROUTER_ABORTED_BEFORE_CLAIM"}
+                        and last_evidence in {
+                            "BROKER_SUBMIT_ABORTED_PRE_IO", "ROUTER_ABORTED_BEFORE_CLAIM",
+                            "KIS_ORIGINAL_DAY_NO_ACCEPTED_SELL",
+                            "KIS_ORIGINAL_DAY_ONLY_SETTLED_PRIOR_TP_SELLS",
+                        }
                         and (not state.get(f"{stage}_broker_order_no")
                              or stage_filled_qty > 0)
                     )

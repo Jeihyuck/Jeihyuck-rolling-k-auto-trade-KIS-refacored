@@ -1276,7 +1276,13 @@ class KisUSClient:
         seen_cursors: set[tuple[str, str]] = set()
         # Query-specific evidence: only a completed cursor walk may be certified.
         # This is read-only metadata, not proof that historic broker orders exist.
+        from uuid import uuid4
         self._last_us_fills_query_evidence = {
+            "query_id": str(uuid4()),
+            "all_symbols": params.get("PDNO") == "",
+            "all_sides": params.get("SLL_BUY_DVSN") == "00",
+            "all_statuses": params.get("CCLD_NCCS_DVSN") == "00",
+            "all_exchanges": params.get("OVRS_EXCG_CD") == "",
             "complete": False, "us_trade_date": requested_us_date,
             "broker_kst_start": broker_start_date,
             "broker_kst_end": broker_end_date, "pages": 0,
@@ -1332,6 +1338,7 @@ class KisUSClient:
                 )
                 # Emit only counts/dates; no account details or raw KIS pages.
                 self._last_us_fills_query_evidence = {
+                    **self._last_us_fills_query_evidence,
                     "complete": True, "us_trade_date": requested_us_date,
                     "broker_kst_start": broker_start_date,
                     "broker_kst_end": broker_end_date,

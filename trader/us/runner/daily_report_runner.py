@@ -2154,6 +2154,9 @@ def run_daily_report(
     }
     if session == "close" and historical_unresolved:
         report["warnings"].append(f"HISTORICAL_RECOVERY_UNRESOLVED:{historical_unresolved}")
+    report["historical_tp_resolution"] = _broker_health.get("historical_tp_resolution") or {}
+    if session == "close" and _broker_health.get("historical_tp_unresolved_count"):
+        report["warnings"].append("HISTORICAL_TP_UNRESOLVED:" + str(_broker_health["historical_tp_unresolved_count"]))
     broker_health_errors = (
         _broker_recovery_health_errors(report.get("broker_recovery_health"))
         if session == "close" and not offline else []
