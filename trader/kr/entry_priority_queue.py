@@ -277,8 +277,14 @@ def collection_priorities(*, date: str, account_scope: str,
         return {"state": "PB1_ACTIVE", "hot": list(raw["hot"]),
                 "warm": list(raw["warm"]), "cold": list(raw["cold"]),
                 "code_sha": observed_sha}
-    except (FileNotFoundError, ValueError, TypeError, KeyError, OSError, AttributeError):
-        return {"state": "PREP_FALLBACK",
+    except (FileNotFoundError, ValueError, TypeError, KeyError, OSError, AttributeError) as exc:
+        # Not an authorization failure: preserve Final30, but the observer
+        # must disclose why HOT/WARM is empty rather than idle silently.
+        reason = ("MISSING_MANIFEST" if isinstance(exc, FileNotFoundError)
+                  else "STALE_OR_UNTRUSTED_MANIFEST"
+                  if str(exc) == "STALE_OR_UNTRUSTED_MANIFEST"
+                  else "INVALID_MANIFEST_" + type(exc).__name__.upper())
+        return {"state": "PREP_FALLBACK", "reason": reason,
                 "hot": [], "warm": [], "cold": prep["codes"]}
 
 
