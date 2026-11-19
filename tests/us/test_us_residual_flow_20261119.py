@@ -180,7 +180,8 @@ def test_postgres_boundary_release_requires_exact_certificate_and_no_broker_evid
     repos.reset_memory_stores()
     _seed_boundary_case(pg_engine, symbol=symbol, contradiction=contradiction,
                         epoch=epoch, account=account, cycle=cycle, key=key)
-    first = repair_tp_retries_at_boundary(trade_date="2026-11-18", phase="AM")
+    # Use the actual production trade_session_runner boundary name.
+    first = repair_tp_retries_at_boundary(trade_date="2026-11-18", phase="AM_START")
     assert first["status"] != "UNAVAILABLE", first
     assert first["released"] == (0 if contradiction else 1)
     with pg_engine.connect() as conn:
@@ -352,3 +353,34 @@ def test_native_partial_fill_is_confirmed_without_claiming_terminal_completion(m
               "kis_actual_fill_order_count": 1, "daily_fills_confirmed_total": totals["orders_with_confirmed_fills"],
               "broker_fill_identity_scope": totals["journal_order_population"]["filled_identity_scope"]}
     assert audit_us_close_report(report)["findings"] == []
+
+
+from tests.us.test_us_legacy_nine_active_sell_20261111 import scenario, _authorize, OLD_CYCLE
+
+
+@pytest.mark.parametrize("tamper", [False, True])
+def test_forward_abort_certificate_binds_original_stage_using_pr368_proof(scenario, monkeypatch, tamper):
+    from trader.us.db import repos
+    from trader.us.execution import order_journal
+    from trader.us.execution.tp_retry_boundary import record_router_abort
+    db, client, intent = scenario
+    ok, reason, proof = _authorize(scenario)
+    assert ok, reason
+    intent["client_order_key"] = f"US_PC_2026-11-11_ABBV_{OLD_CYCLE}_TAKE_PROFIT_TP2"
+    runtime = intent["position_lifecycle_id"]
+    assert runtime != OLD_CYCLE
+    monkeypatch.setattr(repos, "_us_execution_claim_scope", lambda: {
+        "env": "practice", "account_id": intent["meta"]["broker_account_hash"],
+        "trading_epoch_id": intent["meta"]["trading_epoch_id"]})
+    recorded = []
+    monkeypatch.setattr(order_journal, "append_order_event", lambda kind, event, **kw: recorded.append((kind, event, kw)))
+    if tamper:
+        intent["meta"]["source_original_runtime_lifecycle_id"] = "another-original-cycle"
+    assert record_router_abort(intent, checkpoint="original_scope_rejected") is (not tamper)
+    if tamper:
+        assert not recorded
+    else:
+        assert recorded[0][1]["position_lifecycle_id"] == OLD_CYCLE
+        assert recorded[0][1]["meta"]["router_abort_runtime_lifecycle_id"] == runtime
+        assert recorded[0][2]["require_db"] is True
+        assert intent["position_lifecycle_id"] == runtime  # no source or runtime retagging

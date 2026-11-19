@@ -15,7 +15,7 @@ Evidence: `nullim-dual-agent-us-logs-20261119-070002.tar.gz`, US trade date 2026
 
 ## Validation
 
-`tests/us/test_us_residual_flow_20261119.py` adds 70 passing cases with a disposable PostgreSQL instance, including eleven actual PostgreSQL cases. `.github/workflows/us-harness.yml` runs these explicitly with PostgreSQL before the existing full US/native-claim/partial-fill acceptance and all-scenario harness. Existing PR #368 continuity regressions remain part of the full suite.
+`tests/us/test_us_residual_flow_20261119.py` adds 72 passing cases with a disposable PostgreSQL instance, including eleven actual PostgreSQL cases. `.github/workflows/us-harness.yml` runs these explicitly with PostgreSQL before the existing full US/native-claim/partial-fill acceptance and all-scenario harness. Existing PR #368 continuity regressions remain part of the full suite.
 
 The full US suite, native PostgreSQL scenarios, KR regression suite and repository CI are required for the final PR head. Exact final counts and job links belong to the PR checks/merge report; the focused result alone is not a claim that all CI passed.
 

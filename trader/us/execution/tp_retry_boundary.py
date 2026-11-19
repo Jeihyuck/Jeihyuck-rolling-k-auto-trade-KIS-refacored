@@ -20,8 +20,13 @@ def record_router_abort(intent: dict, *, checkpoint: str) -> bool:
     symbol = str(intent.get("symbol") or "").upper()
     stage = str(meta.get("profit_capture_stage") or "").lower()
     owner = str(intent.get("strategy_owner") or meta.get("strategy_owner") or "US_STANDARD")
-    cycle = str(intent.get("position_lifecycle_id") or meta.get("position_lifecycle_id") or "")
+    runtime_cycle = str(intent.get("position_lifecycle_id") or meta.get("position_lifecycle_id") or "")
     key = str(intent.get("client_order_key") or "")
+    from trader.us.profit_capture import tp_stage_lifecycle_from_order_proof
+    try:
+        cycle = tp_stage_lifecycle_from_order_proof(runtime_cycle, meta, client_order_key=key)
+    except ValueError:
+        return False
     if (intent.get("side") != "SELL" or symbol == "TQQQ" or owner != "US_STANDARD"
             or stage not in {"tp1", "tp2", "tp3"} or not cycle
             or not key.startswith(f"US_PC_{intent.get('trade_date')}_{symbol}_{cycle}_TAKE_PROFIT_{stage.upper()}")
@@ -34,9 +39,10 @@ def record_router_abort(intent: dict, *, checkpoint: str) -> bool:
         if scope.get("env") != "practice" or not scope.get("trading_epoch_id") or not scope.get("account_id"):
             return False
         proof_intent = {**intent, "strategy_owner": "US_STANDARD", "submit_attempt_id": str(uuid4()),
-                        "broker_account_hash": scope["account_id"],
+                        "broker_account_hash": scope["account_id"], "position_lifecycle_id": cycle,
                         "trading_epoch_id": scope["trading_epoch_id"],
-                        "meta": {**meta, "router_abort_checkpoint": checkpoint}}
+                        "meta": {**meta, "router_abort_checkpoint": checkpoint,
+                                 "router_abort_runtime_lifecycle_id": runtime_cycle}}
         append_order_event(CERTIFICATE, proof_intent, require_db=True)
         return True
     except Exception as exc:
@@ -101,12 +107,20 @@ def _release_certificate_row(conn, row: dict, scope: dict) -> bool:
     if intent_row:
         im = intent_row.get("meta") or {}
         declared_account = intent_row.get("account_id") or im.get("broker_account_hash")
+        declared_cycle = str(im.get("position_lifecycle_id") or "")
+        if declared_cycle:
+            from trader.us.profit_capture import tp_stage_lifecycle_from_order_proof
+            try:
+                declared_cycle = tp_stage_lifecycle_from_order_proof(
+                    declared_cycle, im, client_order_key=params["key"])
+            except ValueError:
+                return False
         if (str(intent_row.get("trade_date") or "") != params["td"]
                 or intent_row.get("symbol") != params["sym"] or intent_row.get("side") != "SELL"
                 or intent_row.get("trading_epoch_id") != params["epoch"]
                 or intent_row.get("status") not in {"PENDING", "BLOCKED"}
                 or (declared_account and declared_account != params["account"])
-                or (im.get("position_lifecycle_id") and im["position_lifecycle_id"] != params["cycle"])
+                or (declared_cycle and declared_cycle != params["cycle"])
                 or im.get("strategy_owner", "US_STANDARD") != "US_STANDARD"):
             return False
     # This closes a local intent only. Never invent a historical transaction.
@@ -132,7 +146,8 @@ def _release_certificate_row(conn, row: dict, scope: dict) -> bool:
 
 
 def repair_tp_retries_at_boundary(*, trade_date: str, phase: str) -> dict:
-    if str(phase).upper() not in {"AM", "CLOSE"}:
+    # trade_session_runner's production opening boundary is named AM_START.
+    if str(phase).upper() not in {"AM", "AM_START", "CLOSE"}:
         return {"status": "SKIPPED_NOT_BOUNDARY", "released": 0}
     from trader.us.db.repos import _get_engine_or_none, _us_execution_claim_scope
     result = {"status": "OK", "released": 0, "unverified": [], "checked": 0}
