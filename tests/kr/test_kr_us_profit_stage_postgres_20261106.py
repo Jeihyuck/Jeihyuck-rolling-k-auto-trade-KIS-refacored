@@ -230,3 +230,132 @@ def test_broker_stage_shared_connection_rolls_back_with_outer_transaction(stage_
             assert observed.accepted, observed.reason
             raise RuntimeError("INJECTED_OUTER_ROLLBACK")
     assert load_frozen_stage_states(**args)["TP1"]["status"] == "PENDING"
+
+
+def test_20261119_proven_preack_reject_unblocks_stage_only_for_new_key(stage_db):
+    """KIS 40570000 explicit reject; no ODNO/fill; next fresh intent may differ in qty."""
+    from trader.kr.us_profit_stage_journal import (
+        release_explicitly_rejected_tp_stage, _key,
+    )
+    from trader.kr.us_standard_profit_parity import _canonical_sha
+    from datetime import datetime, timezone
+    args = dict(stage_db)
+    contract = dict(args["contract"])
+    contract["activation_mode"] = "ACTIVE_PRACTICE"
+    contract["sha256"] = _canonical_sha({
+        key: value for key, value in contract.items() if key != "sha256"
+    })
+    args["contract"] = contract
+    _prove_three_tp_stages(args)
+    original = "20261119-samsung-ea-8-rejected"
+    trade_day = date(2026, 11, 19)
+    assert reserve_tp_stage(
+        **args, stage="RUNNER_FINAL", target_qty=8,
+        client_order_key=original, trade_date=trade_day,
+    ).accepted
+
+    schema = schema_for_engine(args["engine"])
+    order = {
+        "env": "practice", "strategy": "pb1_pullback_close",
+        "sid": 1, "mode": 1, "code": "005930", "market": "KR",
+        "side": "SELL", "ord_type": "MARKET", "qty": 8,
+        "stage": "KR_US_RUNNER_FINAL", "client_order_key": original,
+        "trading_epoch_id": args["trading_epoch_id"],
+        "position_cycle_id": args["position_cycle_id"],
+        "status": "ERROR", "kis_odno": None, "acked_at": None,
+        "submitted_at": datetime.now(timezone.utc),
+        "broker_order_id": original,
+        "request_json": {
+            "kr_us_tp_contract": contract, "kr_us_tp_stage": "RUNNER_FINAL",
+        },
+        "response_json": {
+            "rt_cd": "1", "msg_cd": "40570000",
+            "_order_execution": {
+                "side": "SELL", "code": "005930", "requested_qty": 8,
+                "submitted_qty": 8, "accepted": False,
+                "broker_order_id": None,
+            },
+        },
+    }
+    with args["engine"].begin() as conn:
+        conn.execute(sa.insert(schema.orders).values(**order))
+    release = release_explicitly_rejected_tp_stage(
+        **args, stage="RUNNER_FINAL", client_order_key=original,
+        trade_date=trade_day,
+    )
+    assert release.accepted, release.reason
+    snapshot = load_frozen_stage_states(**args)["RUNNER_FINAL"]
+    assert snapshot["status"] == "NOT_TRIGGERED"
+    assert snapshot["rejected_client_order_key"] == original
+    assert not reserve_tp_stage(
+        **args, stage="RUNNER_FINAL", target_qty=8,
+        client_order_key=original, trade_date=trade_day,
+    ).accepted
+    assert reserve_tp_stage(
+        **args, stage="RUNNER_FINAL", target_qty=6,
+        client_order_key="fresh-after-verified-balance",
+        trade_date=trade_day + timedelta(days=1),
+    ).accepted
+    assert not reserve_tp_stage(
+        **args, stage="RUNNER_FINAL", target_qty=6,
+        client_order_key="fresh-after-verified-balance",
+        trade_date=trade_day + timedelta(days=1),
+    ).accepted
+
+
+@pytest.mark.parametrize("mutation", [
+    {"code": "OTHER_ERROR"},
+    {"accepted": True},
+    {"broker_order_id": "REAL-KIS-ODNO"},
+    {"submitted_qty": 7},
+    {"side": "BUY"},
+])
+def test_20261119_preack_reject_proof_never_fakes_acceptance(mutation):
+    from trader.kr.us_profit_stage_journal import _explicit_kis_preack_reject
+
+    resp = {
+        "rt_cd": "1", "msg_cd": "40570000",
+        "_order_execution": {
+            "side": "SELL", "code": "028050",
+            "requested_qty": 8, "submitted_qty": 8,
+            "accepted": False, "broker_order_id": None,
+        },
+    }
+    if "code" in mutation:
+        resp["msg_cd"] = mutation["code"]
+    else:
+        resp["_order_execution"].update(mutation)
+    assert not _explicit_kis_preack_reject(resp, code="028050", qty=8)
+
+
+def test_20261119_explicit_reject_only_and_unknown_ack_stays_fenced():
+    from trader.kr.us_profit_execution_router import _unresolved_sell_row
+
+    key = "practice:pb1:028050:EXIT:SELL:KR_US_RUNNER_FINAL"
+    base = {
+        "code": "028050", "qty": 8, "status": "ERROR",
+        "client_order_key": key,
+        "broker_order_id": key,
+        "kis_odno": None, "acked_at": None,
+        "submitted_at": "2026-11-19T00:01:41Z",
+        "request_json": {"kr_us_tp_stage": "RUNNER_FINAL"},
+        "response_json": {
+            "rt_cd": "1", "msg_cd": "40570000",
+            "_order_execution": {
+                "side": "SELL", "code": "028050",
+                "requested_qty": 8, "submitted_qty": 8,
+                "accepted": False, "broker_order_id": None,
+            },
+        },
+    }
+    assert _unresolved_sell_row(base) is False
+    from copy import deepcopy
+    unknown = deepcopy(base)
+    unknown["response_json"] = {"rt_cd": "UNRESOLVED_ACK"}
+    assert _unresolved_sell_row(unknown) is True
+    acked = deepcopy(base)
+    acked["kis_odno"] = "0000052241"
+    assert _unresolved_sell_row(acked) is True
+    corrupted = deepcopy(base)
+    corrupted["response_json"]["_order_execution"]["accepted"] = None
+    assert _unresolved_sell_row(corrupted) is True
