@@ -481,6 +481,20 @@ def reconcile_us_position_lifecycles(
     for symbol, pos in current.items():
         qty = _i(pos.get("qty"))
         entry = _position_entry_price(pos)
+        if os.getenv("WSL_RUN_MARKET", "").upper() == "US":
+            from trader.us.execution.us_legacy_nine_active_sell import enrich_legacy_nine_v2_decision_position
+            original = enrich_legacy_nine_v2_decision_position(pos, trade_date=trade_date)
+            if original.get("legacy_nine_decision_only_provisional") is True:
+                pos.update(original)
+                # Legacy source identity is proven, but it is not an original
+                # canonical portfolio epoch. Do not fabricate one or report
+                # a failed lookup; the broker router separately proves the
+                # forward management scope when a real SELL signal arrives.
+                logger.info(
+                    "[US_POSITION][LIFECYCLE][LEGACY_ORIGINAL_LINK_VERIFIED] symbol=%s",
+                    symbol,
+                )
+                continue
         identity = _position_identity(pos, env=env)
         identity = _bind_authoritative_position_identity(
             pos,
@@ -610,6 +624,13 @@ def reconcile_us_position_lifecycles(
                 lifecycle["holding_trade_days"] = _i(lifecycle.get("holding_trade_days"), 1) + 1
                 lifecycle["last_holding_day_counted"] = trade_date
             identity["position_lifecycle_id"] = str(lifecycle.get("lifecycle_id") or "")
+        # A derived risk row must not overwrite the exact signed BUY payload.
+        # Reuse it only after the account/epoch/cycle match above; null loss is
+        # repaired from the valid original, never by recomputing a signature.
+        from trader.us.position_contract_provenance import carry_entry_policy
+        lifecycle["entry_policy"] = carry_entry_policy(
+            dict(lifecycle.get("entry_policy") or {}), _entry_policy(pos),
+        )
         lifecycle["identity_status"] = "IDENTIFIED"
         if _persisted_current_lifecycle is not None and lifecycle == _persisted_current_lifecycle:
             # Exact no-op: avoiding a remote DB write does not discard a real
