@@ -239,7 +239,35 @@ def test_20261119_proven_preack_reject_unblocks_stage_only_for_new_key(stage_db)
     )
     from trader.kr.us_standard_profit_parity import _canonical_sha
     from datetime import datetime, timezone
-    args = dict(stage_db)
+    # The large KR contracts workflow creates an intentionally minimal
+    # legacy "orders" table for other tests. Our full execution-contract test
+    # must not mutate that shared table or mistake it for the production
+    # schema. Run this test in its own disposable PostgreSQL search_path.
+    root_engine = stage_db["engine"]
+    isolated_schema = "kr_rejected_tp_" + uuid4().hex
+    with root_engine.begin() as conn:
+        conn.exec_driver_sql(f'CREATE SCHEMA "{isolated_schema}"')
+    isolated_engine = sa.create_engine(
+        str(root_engine.url), future=True,
+        connect_args={"options": f"-c search_path={isolated_schema}"},
+    )
+    try:
+        schema_for_engine(isolated_engine).metadata.create_all(isolated_engine)
+        args = dict(stage_db, engine=isolated_engine)
+        _test_20261119_preack_reject_in_isolated_db(args)
+    finally:
+        isolated_engine.dispose()
+        with root_engine.begin() as conn:
+            conn.exec_driver_sql(f'DROP SCHEMA IF EXISTS "{isolated_schema}" CASCADE')
+
+
+def _test_20261119_preack_reject_in_isolated_db(args):
+    from trader.kr.us_profit_stage_journal import (
+        release_explicitly_rejected_tp_stage,
+    )
+    from trader.kr.us_standard_profit_parity import _canonical_sha
+    from datetime import datetime, timezone
+
     contract = dict(args["contract"])
     contract["activation_mode"] = "ACTIVE_PRACTICE"
     contract["sha256"] = _canonical_sha({
@@ -278,12 +306,6 @@ def test_20261119_proven_preack_reject_unblocks_stage_only_for_new_key(stage_db)
         },
     }
     with args["engine"].begin() as conn:
-        # The broad KR CI job creates a pre-epoch legacy orders table before
-        # this disposable PostgreSQL fixture runs. create_all() never alters
-        # an existing table; extend only the TEST database, never production.
-        conn.exec_driver_sql(
-            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS trading_epoch_id TEXT"
-        )
         conn.execute(sa.insert(schema.orders).values(**order))
     release = release_explicitly_rejected_tp_stage(
         **args, stage="RUNNER_FINAL", client_order_key=original,
