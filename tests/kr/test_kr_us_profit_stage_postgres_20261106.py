@@ -248,7 +248,7 @@ def test_20261119_proven_preack_reject_unblocks_stage_only_for_new_key(stage_db)
     with root_engine.begin() as conn:
         conn.exec_driver_sql(f'CREATE SCHEMA "{isolated_schema}"')
     isolated_engine = sa.create_engine(
-        str(root_engine.url), future=True,
+        root_engine.url, future=True,
         connect_args={"options": f"-c search_path={isolated_schema}"},
     )
     try:
