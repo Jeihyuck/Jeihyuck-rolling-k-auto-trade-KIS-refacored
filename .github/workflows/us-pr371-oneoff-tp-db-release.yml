@@ -1,0 +1,102 @@
+name: US PR371 One-Off Original-Day TP DB Release
+
+on:
+  pull_request:
+    branches: [dual-agent]
+    types: [opened, synchronize, ready_for_review]
+    paths:
+      - scripts/us_historical_tp_oneoff_release_20261119.py
+      - tests/us/test_us_historical_tp_oneoff_operator_20261119.py
+      - .github/workflows/us-pr371-oneoff-tp-db-release.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: us-pr371-oneoff-tp-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  verify-no-secret-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: us_tp_ci
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres -d us_tp_ci"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      PYTHONPATH: .
+      KIS_ENV: practice
+      PBCORE_TEST_POSTGRES_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/us_tp_ci
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install -r requirements.txt psycopg2-binary
+      - name: Verify strict operator, historical KIS and database guards without secrets
+        run: >-
+          python -m pytest -q
+          tests/us/test_us_historical_tp_oneoff_operator_20261119.py
+          tests/us/test_us_historical_tp_completion_20261119.py
+          tests/us/test_us_residual_flow_20261119.py
+          tests/us/test_tp_pre_http_retry_proof_20261105.py
+
+  release-practice-db:
+    needs: verify-no-secret-contract
+    if: >-
+      github.event.action == 'ready_for_review' &&
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.repository == 'Jeihyuck/Jeihyuck-rolling-k-auto-trade-KIS-refacored' &&
+      github.event.pull_request.head.ref == 'ops/us-original-day-tp-db-release-20261119' &&
+      github.event.pull_request.base.ref == 'dual-agent' &&
+      github.event.pull_request.user.login == 'Jeihyuck'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PYTHONPATH: .
+      US_TP_ONEOFF_RELEASE: AUTHORIZED_PR371_PRACTICE_REPAIR
+      PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+      DATABASE_URL: ${{ secrets.PBCORE_DB_URL }}
+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      KIS_REST_URL: https://openapivts.koreainvestment.com:29443
+      CANO: ${{ secrets.CANO }}
+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+      KIS_ENV: practice
+      TRADING_REGION: US
+      WSL_RUN_MARKET: US
+      OFFLINE_MODE: '0'
+      US_OFFLINE_MODE: '0'
+      KIS_HTTP_BLOCK: '0'
+      US_ORDER_ARMED: '0'
+      US_KIS_ORDER_ALLOWED: '0'
+      DISABLE_REAL_TRADING: '1'
+      DISABLE_LIVE_TRADING: '1'
+      US_LIVE_TRADING_ENABLED: '0'
+      LIVE_TRADING_ENABLED: '0'
+      US_PAPER_TRADING_ENABLED: '0'
+      ALLOW_REAL_ORDER: '0'
+      DRY_RUN: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install -r requirements.txt psycopg2-binary
+      - name: Re-query authenticated KIS original dates, release exactly four old TP reservations and verify DB
+        run: python scripts/us_historical_tp_oneoff_release_20261119.py
