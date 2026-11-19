@@ -308,11 +308,18 @@ def load_snapshot(engine: sa.Engine, *, env: str, epoch: str, day: date) -> dict
     # All SQL is SELECT-only. The exact trading epoch isolates the account;
     # the date is an *as-of* cutoff, not a lower bound. Previous-day SELL gaps
     # must remain visible until native economic settlement has been proven.
+    # The old SQLite read-only audit fixtures intentionally lack the
+    # post-ACK identity columns; never infer a KIS denial in that case.
+    extra_projection = (
+        "NULL AS client_order_key, NULL AS broker_order_id, "
+        "NULL AS acked_at, NULL AS request_json"
+        if engine.dialect.name == "sqlite"
+        else "client_order_key, broker_order_id, acked_at, request_json"
+    )
     with engine.connect() as conn:
-        orders = [dict(x) for x in conn.execute(text("""
+        orders = [dict(x) for x in conn.execute(text(f"""
             SELECT order_id, code, side, status, qty, kis_odno,
-                   position_cycle_id, client_order_key, broker_order_id,
-                   acked_at, request_json, response_json, created_at
+                   position_cycle_id, {extra_projection}, response_json, created_at
             FROM public.orders
             WHERE env=:env AND trading_epoch_id=:epoch AND side='SELL'
               AND created_at < :end_utc
