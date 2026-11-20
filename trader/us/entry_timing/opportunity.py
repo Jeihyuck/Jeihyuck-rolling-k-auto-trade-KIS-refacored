@@ -310,6 +310,55 @@ def evaluate_price_opportunity(
                      stop_reference=stop, target_reference=target, rr=rr)
 
 
+
+def select_us_executable_buy_price(
+    *, requested_limit: Any, raw_cap: Any, fresh_ask: Any,
+    stop_reference: Any, target_reference: Any, min_rr: Any,
+    max_stop_distance: Any,
+) -> tuple[float | None, str]:
+    """Choose a native-cent limit *below* every signed strategy ceiling.
+
+    This is only a price/geometry calculation, NOT a timing signal or order
+    permission. Never round a 4dp cap upward, expand a ceiling, or synthesize
+    a missing ask. US overseas stock limit submissions currently use cents;
+    adapter/native grid changes require a separately verified venue rule.
+    """
+    from decimal import Decimal, InvalidOperation, ROUND_FLOOR
+
+    def decimal(value: Any) -> Decimal:
+        result = Decimal(str(value))
+        if not result.is_finite():
+            raise ValueError("non_finite")
+        return result
+
+    try:
+        requested = decimal(requested_limit)
+        cap = decimal(raw_cap)
+        ask = decimal(fresh_ask)
+        stop = decimal(stop_reference)
+        target = decimal(target_reference)
+        rr_floor = decimal(min_rr)
+        max_risk = decimal(max_stop_distance)
+    except (InvalidOperation, ValueError, TypeError):
+        return None, "EXECUTABLE_PRICE_EVIDENCE_INVALID"
+    if (min(requested, cap, ask, stop, target) <= 0
+            or not (0 < max_risk < 1) or rr_floor < 1):
+        return None, "EXECUTABLE_PRICE_EVIDENCE_INVALID"
+    tick = Decimal("0.01")
+    candidate = (min(requested, cap) / tick).to_integral_value(
+        rounding=ROUND_FLOOR,
+    ) * tick
+    if candidate <= 0 or candidate < ask:
+        return None, "ASK_ABOVE_EXECUTABLE_LIMIT"
+    if not stop < candidate < target:
+        return None, "EXECUTABLE_PRICE_GEOMETRY_INVALID"
+    risk = (candidate - stop) / candidate
+    rr = (target - candidate) / (candidate - stop)
+    if risk > max_risk or rr < rr_floor:
+        return None, "EXECUTABLE_PRICE_RISK_INVALID"
+    return float(candidate), "EXECUTABLE_PRICE_VALID"
+
+
 def effective_mode(environ: dict | None = None) -> str:
     """Policy approval and practice guard before any BUY permission change."""
     import os
@@ -472,13 +521,12 @@ def pre_submit_timing_check(intent: dict, *, now_epoch: float, fresh_ws_quote: d
     price = finite(intent.get("limit_price"))
     if cap is None or cap <= 0 or price is None or price <= 0 or price > cap + 1e-6:
         return False, "TIMING_PRICE_CAP_VIOLATED"
-    # Native overseas stock limit orders use two-decimal dollar prices. Never
-    # approve a 4-decimal intent whose HALF_UP submitted cent price exceeds cap.
-    from decimal import Decimal, ROUND_HALF_UP
-    submitted_cent_price = Decimal(str(price)).quantize(
-        Decimal("0.01"), rounding=ROUND_HALF_UP,
-    )
-    if submitted_cent_price > Decimal(str(cap)):
+    # A signed intent must already contain the exact broker-executable price.
+    # No HALF_UP or hidden broker conversion after the timing/size binding.
+    from decimal import Decimal
+    submitted_price = Decimal(str(price))
+    if (submitted_price != submitted_price.quantize(Decimal("0.01"))
+            or submitted_price > Decimal(str(cap))):
         return False, "TIMING_PRICE_CAP_VIOLATED"
     if not isinstance(fresh_ws_quote, dict):
         return False, "TIMING_WS_QUOTE_MISSING"
@@ -490,7 +538,8 @@ def pre_submit_timing_check(intent: dict, *, now_epoch: float, fresh_ws_quote: d
             received > now_epoch + 1 or now_epoch - received > max_quote_age or
             last <= 0 or ask < bid or bid <= 0):
         return False, "TIMING_WS_QUOTE_STALE"
-    if ask > cap + 1e-6 or (ask - bid) / ((ask + bid) / 2) > 0.003:
+    if (ask > cap + 1e-6 or ask > price + 1e-9
+            or (ask - bid) / ((ask + bid) / 2) > 0.003):
         return False, "TIMING_BROKER_PRICE_MOVED"
     decision_price = finite(proof.get("decision_price"))
     stop_ref = finite(proof.get("structural_stop_reference"))
