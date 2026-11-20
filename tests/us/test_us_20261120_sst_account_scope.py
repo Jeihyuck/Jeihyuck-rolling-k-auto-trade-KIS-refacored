@@ -47,7 +47,7 @@ def test_real_conflicts_and_double_hash_fail_closed():
         _position(account=wrong),
         _position(meta_account="someone-else"),
         _position(claimed_hash=wrong),
-        _position(account=""),
+        _position(account="", meta_account=""),
     ]:
         with patch.dict("os.environ", {"KIS_ENV": "practice",
                                        "WSL_RUN_MARKET": "US"}):
