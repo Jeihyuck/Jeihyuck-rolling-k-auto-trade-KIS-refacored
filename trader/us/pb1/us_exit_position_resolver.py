@@ -147,6 +147,33 @@ def _position_identity(pos: dict, *, env: str) -> dict[str, str]:
 
     position_env = value("env", "trading_env") or str(env or "").strip().lower()
     account_id = value("account_id", "account_key")
+    # Position snapshots store a broker SHA256 account identifier while
+    # historical lifecycle source records may carry the trusted raw key.
+    # Normalize only an exact authenticated raw/hash pair. Do not double-hash
+    # or silently adopt a conflicting copied account identity.
+    if position_env.lower() == "practice":
+        import os
+        if os.getenv("WSL_RUN_MARKET", "").upper() == "US":
+            claims = (pos.get("account_id"), meta.get("account_id"))
+            hashes = (pos.get("broker_account_hash"), meta.get("broker_account_hash"))
+            nonempty = {str(x).strip() for x in claims if x not in (None, "")}
+            if any(x not in (None, "") for x in hashes) or len(nonempty) > 1:
+                try:
+                    from trader.account_state import get_account_key
+                    from trader.us.account_scope_identity import verify_us_account_scope
+                    checked = verify_us_account_scope(
+                        trusted_raw_account=get_account_key(env="practice"),
+                        claims=claims, declared_hashes=hashes,
+                    )
+                    account_id = checked.raw_account if checked else ""
+                except (RuntimeError, ValueError, TypeError, KeyError, ImportError):
+                    account_id = ""
+                if not account_id:
+                    # Never fill an explicitly conflicted identity from a
+                    # credential lookup or an unrelated account history row.
+                    return {"env": position_env.lower(), "account_id": "",
+                            "trading_epoch_id": "", "strategy_owner": "",
+                            "position_lifecycle_id": ""}
     if not account_id:
         try:
             from trader.account_state import get_account_key
@@ -541,6 +568,45 @@ def _enrich_single_position(
         "exchange": exchange,
         "qty": qty,
     }
+
+    # An invalid derivative must NOT automatically suppress an independently
+    # verified original BUY policy. Resolve from a uniquely matched,
+    # native-cumulative KIS original only for the current account/epoch/cycle.
+    # The fallback is read-only, never re-signs or persists the derivative,
+    # and does not expand the policy when partial/ADD quantities disagree.
+    if identity_is_current and trade_date:
+        try:
+            from trader.us.entry_exit_contract import us_entry_exit_contract_integrity_state
+            _contract_state = us_entry_exit_contract_integrity_state(
+                enriched, enriched.get("meta"),
+            )
+            if _contract_state == "INVALID":
+                from trader.us.verified_original_contract_resolver import (
+                    restore_verified_us_original_contract,
+                )
+                restored, recovery_reason = restore_verified_us_original_contract(
+                    enriched, identity=identity, current_trade_date=trade_date,
+                )
+                if restored is not None:
+                    enriched = restored
+                    logger.warning(
+                        "[US_EXIT_RESOLVER][ORIGINAL_POLICY_RESTORED] "
+                        "symbol=%s source=SIGNED_NATIVE_ORIGINAL "
+                        "action=RUNTIME_DERIVATIVE_QUARANTINED",
+                        symbol,
+                    )
+                else:
+                    logger.error(
+                        "[US_EXIT_RESOLVER][ORIGINAL_POLICY_UNVERIFIED] "
+                        "symbol=%s reason=%s action=KEEP_EXISTING_POLICY_FENCE",
+                        symbol, recovery_reason,
+                    )
+        except (RuntimeError, ValueError, TypeError, OSError, ImportError) as exc:
+            logger.error(
+                "[US_EXIT_RESOLVER][ORIGINAL_POLICY_LOOKUP_FAILED] "
+                "symbol=%s error_type=%s action=KEEP_EXISTING_POLICY_FENCE",
+                symbol, type(exc).__name__,
+            )
 
     if ep is not None and ep > 0:
         enriched["entry_price"] = ep
