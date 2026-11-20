@@ -1479,25 +1479,49 @@ def generate_entry_intents(
             logger.info("[US_ENTRY_CANDIDATE] symbol=%s position_state=NOT_HELD candidate_action=NEW_BUY position_action=%s", symbol, position_action)
 
         limit_price = round(price * (1 + float(os.getenv("US_LIMIT_PRICE_BAND_PCT", "0.005"))), 4)
-        # Broker/risk economics must use the final executable price, not the decision quote.
-        # The router intentionally fail-closes when qty * limit_price != notional_usd.
-        notional = round(qty * limit_price, 4)
-
-        import hashlib
-        # Price-cap trial policy applies ONLY to explicitly approved
-        # US_STANDARD new BUY entries, after true 1-minute timing proof.
+        # A READY 1m opportunity has a 4dp strategy ceiling, but the native
+        # overseas BUY is submitted at cent precision. Quantize DOWN before
+        # sizing, durable intent, signed binding or broker-side conversion.
+        # Other owners, TQQQ, VCP and held additions keep their own rules.
         if (
             position_action == "NEW_POSITION_BUY"
             and _opportunity_mode == "ENFORCE"
             and isinstance(_price_opportunity, dict)
         ):
-            _ceiling = _as_float_or_none(_price_opportunity.get("max_entry_price"))
-            if _ceiling is None or _ceiling < price:
-                track_skip(symbol, "ENTRY_TIMING_PRICE_CEILING_UNAVAILABLE")
+            from trader.us.entry_timing.opportunity import select_us_executable_buy_price
+            limit_price, _price_reason = select_us_executable_buy_price(
+                requested_limit=limit_price,
+                raw_cap=_price_opportunity.get("max_entry_price"),
+                fresh_ask=(_opportunity_quote or {}).get("ask"),
+                stop_reference=_price_opportunity.get("structural_stop_reference"),
+                target_reference=_price_opportunity.get("structural_target_reference"),
+                min_rr=float(os.getenv("US_OPPORTUNITY_MIN_REFERENCE_RR", "1.5")),
+                max_stop_distance=float(os.getenv("US_OPPORTUNITY_MAX_STOP_DISTANCE", "0.025")),
+            )
+            if limit_price is None:
+                track_skip(symbol, "ENTRY_TIMING_EXECUTABLE_PRICE_WAIT", {
+                    "reason": _price_reason,
+                    "max_entry_price": _price_opportunity.get("max_entry_price"),
+                })
                 continue
-            limit_price = round(min(limit_price, _ceiling), 4)
-        # Broker/risk economics must use the final executable price, not the decision quote.
-        # The router intentionally fail-closes when qty * limit_price != notional_usd.
+            # The earlier risk clamp used the signal quote, not final order
+            # economics. Recheck against the higher/lower executable limit,
+            # never increase this candidate's already approved quantity.
+            _final_risk = _risk_clamp_new_buy_size(
+                symbol=symbol, price=limit_price,
+                signal_target_notional=float(sizing["notional_usd"]),
+                account_equity=capital_usd_cap,
+                current_symbol_market_value=0.0,
+                remaining_buy_budget=available_cash_usd,
+            )
+            qty = min(qty, int(_final_risk.get("final_qty") or 0))
+            if qty < 1:
+                track_skip(symbol, "INSUFFICIENT_CAPACITY_AT_EXECUTABLE_PRICE", _final_risk)
+                continue
+            sizing["projected_weight"] = _final_risk.get("projected_weight", 0.0)
+            sizing["allowed_notional"] = _final_risk.get("allowed_notional")
+        # One immutable order price/quantity flows into notional, intent,
+        # source contract and native request.
         notional = round(qty * limit_price, 4)
 
         import hashlib
