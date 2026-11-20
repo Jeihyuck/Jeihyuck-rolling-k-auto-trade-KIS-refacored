@@ -18,6 +18,8 @@ They keep the same public/runtime contract while fixing review edge cases:
 from __future__ import annotations
 
 import logging
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Any
 
 import sqlalchemy as sa
@@ -92,6 +94,48 @@ def _update_exact_open_position_fields(
     return True
 
 
+_KR_TIMEZONE = ZoneInfo("Asia/Seoul")
+
+
+def _same_proven_kr_trade_day(order_at: Any, fill_at: Any) -> bool:
+    """Broker order numbers can repeat: never link across trading days."""
+    def day(value: Any):
+        if isinstance(value, str):
+            try:
+                value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        if not isinstance(value, datetime) or value.tzinfo is None:
+            return None
+        return value.astimezone(_KR_TIMEZONE).date()
+    left, right = day(order_at), day(fill_at)
+    return left is not None and left == right
+
+
+def _unowned_fill_exact_scope(fill: dict, order: dict, *, env: str, strategy: str) -> bool:
+    """A missing fill.order_id is not permission to guess its BUY lineage."""
+    if (str(order.get("env") or "") != env
+            or str(order.get("strategy") or "") != strategy
+            or str(fill.get("env") or "") != env
+            or base._normalize_code(fill.get("code")) != base._normalize_code(order.get("code"))
+            or str(fill.get("market") or "") != str(order.get("market") or "")
+            or str(fill.get("side") or "").upper() != str(order.get("side") or "").upper()
+            or not _same_proven_kr_trade_day(order.get("created_at"), fill.get("filled_at"))):
+        return False
+    if not str(fill.get("market") or "").strip() or not str(fill.get("side") or "").strip():
+        return False
+    for key in ("trading_epoch_id", "portfolio_epoch_id", "position_cycle_id"):
+        claimed = str(fill.get(key) or "").strip()
+        if claimed and claimed != str(order.get(key) or "").strip():
+            return False
+    # A cumulative watermark is NOT a sequence of independent daily fills.
+    # The native cumulative writer/reconciler owns its delta and identity.
+    meta = base._json_dict(fill.get("fill_meta_json"))
+    if str(meta.get("evidence_kind") or "") == "KIS_ORDER_CUMULATIVE_EXECUTION":
+        return False
+    return True
+
+
 def _link_unowned_daily_fills_fixed(*, engine, env: str, strategy: str) -> dict[str, int]:
     """Link daily fills by broker order and apply cumulative BUY deltas exactly once."""
     schema = schema_for_engine(engine)
@@ -110,33 +154,67 @@ def _link_unowned_daily_fills_fixed(*, engine, env: str, strategy: str) -> dict[
     for kis_odno, new_rows in by_odno.items():
         if not kis_odno:
             continue
-        with engine.begin() as conn:
-            order_row = conn.execute(
+        # KIS ODNO alone is not globally unique. Do not associate fills
+        # with the newest arbitrary order across day/code/side/owner/cycle.
+        anchor = new_rows[0]
+        with engine.connect() as conn:
+            candidates = conn.execute(
                 sa.select(schema.orders).where(
                     sa.and_(
                         schema.orders.c.env == env,
                         schema.orders.c.strategy == strategy,
+                        schema.orders.c.code == base._normalize_code(anchor.get("code")),
+                        schema.orders.c.market == anchor.get("market"),
+                        schema.orders.c.side == str(anchor.get("side") or "").upper(),
                         sa.or_(
                             schema.orders.c.kis_odno == kis_odno,
                             schema.orders.c.broker_order_id == kis_odno,
                         ),
                     )
-                ).order_by(schema.orders.c.created_at.desc()).limit(1)
-            ).mappings().first()
-            if not order_row:
-                continue
-            order = dict(order_row)
-            order_id = order.get("order_id")
+                ).limit(2)
+            ).mappings().all()
+        if len(candidates) != 1:
+            logger.warning(
+                "[KR_BROKER_TRUTH][FILL_LINK][UNVERIFIED] kis_odno=%s matching_orders=%s",
+                kis_odno, len(candidates),
+            )
+            continue
+        order = dict(candidates[0])
+        # A mixed order-number group or missing/conflicting original scope is
+        # never partially linked; preserve rows for an independent KIS review.
+        if not all(_unowned_fill_exact_scope(
+            row, order, env=env, strategy=strategy,
+        ) for row in new_rows):
+            logger.warning(
+                "[KR_BROKER_TRUTH][FILL_LINK][SCOPE_UNVERIFIED] code=%s kis_odno=%s action=KEEP_UNLINKED",
+                base._normalize_code(anchor.get("code")), kis_odno,
+            )
+            continue
+        order_id = order.get("order_id")
+        if not order_id or not order.get("position_cycle_id") or not order.get("portfolio_epoch_id"):
+            continue
+        with engine.begin() as conn:
             for fill in new_rows:
-                conn.execute(
+                result = conn.execute(
                     sa.update(schema.fills)
-                    .where(schema.fills.c.fill_id == fill.get("fill_id"))
+                    .where(
+                        sa.and_(
+                            schema.fills.c.fill_id == fill.get("fill_id"),
+                            schema.fills.c.order_id.is_(None),
+                            schema.fills.c.env == env,
+                            schema.fills.c.code == order.get("code"),
+                            schema.fills.c.market == order.get("market"),
+                            schema.fills.c.side == order.get("side"),
+                        )
+                    )
                     .values(
                         order_id=order_id,
                         position_cycle_id=order.get("position_cycle_id"),
                         portfolio_epoch_id=order.get("portfolio_epoch_id"),
                     )
                 )
+                if int(result.rowcount or 0) != 1:
+                    raise RuntimeError("KR_UNOWNED_FILL_LINK_CONCURRENT_CHANGE")
                 linked += 1
 
         # Re-read every execution already attributed to this durable order. This
