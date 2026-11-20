@@ -1018,6 +1018,36 @@ def generate_entry_intents(
         input_symbols_count, unique_symbols_count, skipped_duplicates, len(candidates)
     )
 
+    # Publish the pre-1m scored candidates BEFORE evaluating the strict
+    # minute gate. Otherwise the observer cannot collect the native evidence
+    # required to turn a candidate READY. This is only collection priority;
+    # it cannot create an intent or bypass risk/owner/timing gates.
+    if (
+        os.getenv("KIS_ENV", "practice").lower() == "practice"
+        and os.getenv("US_OPENING_OBSERVER_ENABLED", "0") == "1"
+        and str(os.getenv("US_ENTRY_WINDOW_SCOPE") or "").strip()
+    ):
+        try:
+            from trader.us.entry_timing.opening_observer import publish_preminute_candidates
+            _priority_stats = publish_preminute_candidates(
+                env="practice",
+                scope=str(os.getenv("US_ENTRY_WINDOW_SCOPE")).strip(),
+                trade_date=_resolve_us_trade_date(now),
+                candidates=candidates,
+            )
+            logger.info(
+                "[US_ENTRY][PRIORITY_PUBLISH] source=PREMINUTE "
+                "hot=%d warm=%d candidates=%d generation=%s order_authorized=0",
+                _priority_stats["hot"], _priority_stats["warm"],
+                len(candidates), _priority_stats["generation"],
+            )
+        except (OSError, ValueError, RuntimeError, ImportError) as _priority_exc:
+            logger.warning(
+                "[US_ENTRY][PRIORITY_PUBLISH_FAIL] type=%s "
+                "action=KEEP_ORIGINAL_BUY_GATES",
+                type(_priority_exc).__name__,
+            )
+
     intents: list[dict] = []
     added_count = 0
     held_candidates_evaluated_for_add = 0
