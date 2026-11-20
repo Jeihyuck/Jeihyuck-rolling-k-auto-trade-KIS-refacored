@@ -434,9 +434,78 @@ def _evidence_file(env: str, account_scope: str, code: str, now: datetime) -> Pa
                         digest, now.date().isoformat(), f"{str(code).zfill(6)}.json")
 
 
+
+# Native-quote validity is independent of the minute-bar proof's as_of.
+# Re-persisting a bar must never refresh the age of a previously verified VWAP.
+VWAP_EVIDENCE_TTL_SECONDS = 120.0
+
+
+def _fresh_vwap_provenance(
+    proof: dict | None, *, env: str, account_scope: str,
+    code: str, now: datetime,
+) -> dict | None:
+    if not isinstance(proof, dict):
+        return None
+    expected_scope = hashlib.sha256(str(account_scope).encode("utf-8")).hexdigest()
+    if (proof.get("env") != str(env).lower()
+            or proof.get("account_scope_sha256") != expected_scope
+            or proof.get("code") != str(code).zfill(6)
+            or proof.get("trade_date") != now.date().isoformat()):
+        return None
+    source = proof.get("quote_source")
+    if source == "KIS_REST_INQUIRE_PRICE":
+        if proof.get("source_identity") != "AUTHENTICATED_REST_REQUEST_BOUND":
+            return None
+    elif source == "KIS_WEBSOCKET":
+        if proof.get("source_identity") not in ("KIS_WS_PARSED_SYMBOL", "KIS_WS_SUBSCRIPTION_BOUND"):
+            return None
+    else:
+        return None
+    for key in ("native_at", "received_at", "verified_at"):
+        try:
+            timestamp = datetime.fromisoformat(str(proof.get(key) or ""))
+            if timestamp.tzinfo is None:
+                return None
+            stamp = timestamp.astimezone(KST)
+            age = (now - stamp).total_seconds()
+            if age < -10 or age > VWAP_EVIDENCE_TTL_SECONDS:
+                return None
+            if stamp.date() != now.date():
+                return None
+        except (ValueError, TypeError, OverflowError):
+            return None
+    return proof
+
+
+def _contradictory_vwap_quote_claim(
+    claims: dict | None, *, code: str, now: datetime,
+) -> bool:
+    """Missing fields may be transient; explicit wrong identity cannot reuse cache."""
+    if not isinstance(claims, dict):
+        return False
+    day = str(claims.get("trade_date") or "").replace("-", "")
+    if day and day != now.strftime("%Y%m%d"):
+        return True
+    for key in ("symbol", "requested_symbol"):
+        value = str(claims.get(key) or "").strip()
+        if value and value.removeprefix("A").zfill(6) != str(code).zfill(6):
+            return True
+    market = str(claims.get("market") or "").upper()
+    if market and market not in ("KR", "J"):
+        return True
+    source = str(claims.get("source") or "").upper()
+    identity = str(claims.get("source_identity") or "")
+    if source and source not in ("KIS_REST_INQUIRE_PRICE", "KIS_WEBSOCKET"):
+        return True
+    if source == "KIS_REST_INQUIRE_PRICE" and identity and identity != "AUTHENTICATED_REST_REQUEST_BOUND":
+        return True
+    return False
+
+
 def save_opening_proof(*, env: str, account_scope: str, code: str,
                        now: datetime, raw_bars: list[dict], vwap: float | None,
-                       vwap_source: str) -> dict:
+                       vwap_source: str, vwap_provenance: dict | None = None,
+                       vwap_quote_claims: dict | None = None) -> dict:
     """Merge attested native complete minutes with durable conflict quarantine.
 
     Previously stored opening bars can be reused, but never synthesized.
@@ -559,6 +628,36 @@ def save_opening_proof(*, env: str, account_scope: str, code: str,
                     added += 1
                 merged[key] = bar
 
+            # Native VWAP has its own original quote/receipt timestamps.
+            # A failed subsequent quote does not erase an independently verified
+            # unexpired VWAP, but no bar write may extend its effective TTL.
+            # Legacy provenance-free VWAP remains usable only for its original
+            # write and is never promoted to a reusable verified observation.
+            new_value = _positive(vwap) if vwap_source == "KIS_NATIVE_WEIGHTED_AVG" else None
+            current_provenance = _fresh_vwap_provenance(
+                vwap_provenance, env=env, account_scope=account_scope,
+                code=code, now=now,
+            )
+            old_provenance = _fresh_vwap_provenance(
+                (previous or {}).get("vwap_provenance"),
+                env=env, account_scope=account_scope, code=code, now=now,
+            )
+            if new_value is not None and (vwap_provenance is None or current_provenance):
+                effective_vwap = new_value
+                effective_provenance = current_provenance
+                effective_source = "KIS_NATIVE_WEIGHTED_AVG"
+            elif (old_provenance and _positive((previous or {}).get("vwap")) is not None
+                  and not _contradictory_vwap_quote_claim(
+                      vwap_quote_claims, code=code, now=now,
+                  )):
+                effective_vwap = _positive(previous["vwap"])
+                effective_provenance = old_provenance
+                effective_source = "KIS_NATIVE_WEIGHTED_AVG"
+            else:
+                effective_vwap = None
+                effective_provenance = None
+                effective_source = "UNKNOWN"
+
             # An unresolved conflicting native minute remains a hard block
             # through process restarts, even if no new data arrived this pass.
             bars = [merged[key] for key in sorted(merged)]
@@ -572,8 +671,9 @@ def save_opening_proof(*, env: str, account_scope: str, code: str,
                      "time": datetime.fromisoformat(bar["timestamp"]).strftime("%H%M%S")}
                     for bar in bars
                 ],
-                "vwap": _positive(vwap),
-                "vwap_source": vwap_source if _positive(vwap) else "UNKNOWN",
+                "vwap": effective_vwap,
+                "vwap_source": effective_source,
+                "vwap_provenance": effective_provenance,
                 "source_conflicts": sorted(conflicts),
                 "conflict_observations": observations,
                 "resolved_source_conflicts": resolved_history[-100:],
@@ -659,7 +759,15 @@ def evaluate_proof_for_candidate(*, env: str, account_scope: str, code: str,
     return evaluate_price_aware_entry(
         style=style, rows=payload["bars"], now=now,
         vwap=payload["vwap"],
-        vwap_verified=payload["vwap_source"] == "KIS_NATIVE_WEIGHTED_AVG",
+        vwap_verified=(
+            payload["vwap_source"] == "KIS_NATIVE_WEIGHTED_AVG"
+            and (payload.get("vwap_provenance") is None or
+                 _fresh_vwap_provenance(
+                     payload["vwap_provenance"], env=env,
+                     account_scope=account_scope, code=code,
+                     now=now.astimezone(KST),
+                 ) is not None)
+        ),
         pivot=pivot, trigger_ok=trigger_ok, setup_ok=setup_ok,
         order_price=order_price,
     )
