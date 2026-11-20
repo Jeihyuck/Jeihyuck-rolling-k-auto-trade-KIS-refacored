@@ -25,6 +25,36 @@ def scope_for_position(position: dict) -> tuple[str, str, str]:
     owner = str(position.get("strategy_owner") or meta.get("strategy_owner") or life.get("strategy_owner") or "").upper().strip()
     lifecycle = str(position.get("position_lifecycle_id") or meta.get("position_lifecycle_id") or life.get("lifecycle_id") or "").strip()
     account = str(position.get("account_id") or meta.get("account_id") or life.get("account_id") or "").strip()
+    # A broker snapshot can carry the SHA256 account id while its original
+    # lifecycle meta carries the raw account key. The stop/revision DB uses
+    # the raw account identity. Only map them when a trusted practice account
+    # key proves exact SHA256 equality; reject conflicting embedded claims.
+    # This MUST NOT treat string length or a metadata "verified" flag as proof.
+    if os.getenv("WSL_RUN_MARKET", "").upper() == "US":
+        try:
+            from trader.account_state import get_account_key
+            from trader.us.account_scope_identity import verify_us_account_scope
+            if str(os.getenv("KIS_ENV", "practice")).lower() != "practice":
+                return "", "", ""
+            verified_account = verify_us_account_scope(
+                trusted_raw_account=get_account_key(env="practice"),
+                claims=(
+                    position.get("account_id"), meta.get("account_id"),
+                    life.get("account_id"),
+                ),
+                declared_hashes=(
+                    position.get("broker_account_hash"),
+                    meta.get("broker_account_hash"),
+                    life.get("broker_account_hash"),
+                ),
+            )
+            if verified_account is None:
+                return "", "", ""
+            account = verified_account.raw_account
+        except (RuntimeError, ValueError, TypeError, ImportError, KeyError):
+            # Credential lookup or conflicting account identities cannot
+            # promote an unverified STOP or policy revision.
+            return "", "", ""
     if owner != "US_STANDARD" or not lifecycle or not account or not symbol or symbol == "TQQQ":
         return "", "", ""
     return symbol, lifecycle, account
