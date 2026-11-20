@@ -253,6 +253,161 @@ def standard_entry_pairs(watchlist: list[dict], limit: int = 30) -> list[tuple[s
     return pairs
 
 
+
+def priority_manifest_path(*, env: str, scope: str, trade_date: str,
+                           base: str | Path = "runtime/private") -> Path:
+    """Same scoped day as the bar DB, different atomic read-only manifest."""
+    return store_path(env=env, account_scope=scope, trade_date=trade_date,
+                      base=base).with_suffix(".priority.json")
+
+
+def publish_preminute_candidates(
+    *, env: str, scope: str, trade_date: str, candidates: list[tuple],
+    now_epoch: float | None = None, hot_limit: int = 4, warm_limit: int = 8,
+    base: str | Path = "runtime/private",
+) -> dict:
+    """Publish a non-authorizing, pre-1m shortlist without KIS network I/O.
+
+    Call before the actual 1m ENFORCE gate to avoid candidate starvation.
+    Eligible scores are pre-minute facts, not an executable BUY. An atomic
+    replace keeps observers from consuming truncated/part-written JSON.
+    """
+    import tempfile
+    epoch = time.time() if now_epoch is None else float(now_epoch)
+    if env != "practice" or not scope or not math.isfinite(epoch):
+        raise ValueError("US_PRIORITY_SCOPE_INVALID")
+    ranked = []
+    seen = set()
+    from trader.us.symbols import resolve_exchange
+    for candidate in candidates:
+        if not isinstance(candidate, (tuple, list)) or len(candidate) < 5:
+            continue
+        score, raw_symbol, raw_exchange, _price, meta = candidate[:5]
+        sym = str(raw_symbol or "").strip().upper()
+        meta = meta if isinstance(meta, dict) else {}
+        owner = str(meta.get("strategy_owner") or "US_STANDARD").upper()
+        if not sym or sym == "TQQQ" or owner != "US_STANDARD" or sym in seen:
+            continue
+        try:
+            score_value = float(score)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not math.isfinite(score_value) or score_value <= 0:
+            continue
+        exchange = str(raw_exchange or resolve_exchange(sym) or "").upper()
+        exchange = {"NASD": "NASDAQ", "NAS": "NASDAQ", "NYS": "NYSE",
+                    "AMS": "AMEX"}.get(exchange, exchange)
+        if exchange not in {"NASDAQ", "NYSE", "AMEX"}:
+            continue
+        seen.add(sym)
+        ranked.append({"symbol": sym, "exchange": exchange, "score": score_value,
+                       "position_state": str(meta.get("position_state") or "")})
+    # First prioritize new candidates; retained/add BUY candidates are still
+    # eligible for WARM collection and are not treated as global excludes.
+    ranked.sort(key=lambda row: row["position_state"] == "HELD")
+    hot = ranked[:max(0, min(30, int(hot_limit)))]
+    warm = ranked[len(hot):len(hot) + max(0, min(30, int(warm_limit)))]
+    payload = {
+        "schema": "US_PREMINUTE_PRIORITY_V1", "env": env,
+        "owner": "US_STANDARD", "trade_date": trade_date,
+        "scope_sha256": hashlib.sha256((env + ":" + scope).encode()).hexdigest(),
+        "created_epoch": epoch, "expires_epoch": epoch + 180.0,
+        "generation": str(os.getpid()) + ":" + str(epoch),
+        "hot": [{"symbol": x["symbol"], "exchange": x["exchange"]} for x in hot],
+        "warm": [{"symbol": x["symbol"], "exchange": x["exchange"]} for x in warm],
+        "is_order_authorization": False,
+    }
+    path = priority_manifest_path(env=env, scope=scope, trade_date=trade_date, base=base)
+    temp_name = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix=path.name + ".",
+            suffix=".tmp", delete=False,
+        ) as stream:
+            temp_name = stream.name
+            json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_name, path)
+    finally:
+        if temp_name is not None:
+            try:
+                Path(temp_name).unlink(missing_ok=True)
+            except OSError:
+                pass
+    return {"hot": len(hot), "warm": len(warm), "generation": payload["generation"]}
+
+
+def load_preminute_priority(
+    *, env: str, scope: str, trade_date: str,
+    pairs: list[tuple[str, str]], now_epoch: float | None = None,
+    base: str | Path = "runtime/private",
+) -> tuple[dict[str, list[tuple[str, str]]], str]:
+    """Return validated HOT/WARM/COLD, or explicit MISSING/STALE/INVALID."""
+    available = {sym: exch for sym, exch in pairs}
+    fallback = {"HOT": [], "WARM": [], "COLD": list(pairs)}
+    path = priority_manifest_path(env=env, scope=scope, trade_date=trade_date, base=base)
+    try:
+        if not path.is_file():
+            return fallback, "MISSING"
+        if path.stat().st_size > 65536:
+            return fallback, "INVALID"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        epoch = time.time() if now_epoch is None else float(now_epoch)
+        if (not isinstance(payload, dict)
+                or payload.get("schema") != "US_PREMINUTE_PRIORITY_V1"
+                or payload.get("owner") != "US_STANDARD"
+                or payload.get("env") != env
+                or payload.get("trade_date") != trade_date
+                or payload.get("is_order_authorization") is not False
+                or payload.get("scope_sha256") != hashlib.sha256(
+                    (env + ":" + scope).encode()).hexdigest()):
+            return fallback, "INVALID"
+        created = float(payload["created_epoch"])
+        expires = float(payload["expires_epoch"])
+        if not all(map(math.isfinite, (created, expires, epoch))):
+            return fallback, "INVALID"
+        if created > epoch + 5 or expires > created + 180.0 + 1e-5:
+            return fallback, "INVALID"
+        if expires < epoch:
+            return fallback, "STALE"
+        lanes: dict[str, list[tuple[str, str]]] = {"HOT": [], "WARM": [], "COLD": []}
+        selected = set()
+        for lane, cap in (("HOT", 4), ("WARM", 8)):
+            rows = payload.get(lane.lower())
+            if not isinstance(rows, list) or len(rows) > cap:
+                return fallback, "INVALID"
+            for raw in rows:
+                if not isinstance(raw, dict):
+                    return fallback, "INVALID"
+                sym = str(raw.get("symbol") or "").upper()
+                exch = str(raw.get("exchange") or "").upper()
+                if sym not in available or exch != available[sym] or sym in selected:
+                    return fallback, "INVALID"
+                selected.add(sym)
+                lanes[lane].append((sym, exch))
+        lanes["COLD"] = [p for p in pairs if p[0] not in selected]
+        return lanes, "VALID"
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return fallback, "INVALID"
+
+
+def next_priority_pair(
+    lanes: dict[str, list[tuple[str, str]]],
+    *, slot: int, offsets: dict[str, int],
+) -> tuple[tuple[str, str], str] | None:
+    """Fixed 4:1:1 request budget, with non-starving low-priority discovery."""
+    schedule = ("HOT", "HOT", "HOT", "HOT", "WARM", "COLD")
+    preferred = schedule[slot % len(schedule)]
+    for tier in (preferred, "HOT", "WARM", "COLD"):
+        lane = lanes.get(tier) or []
+        if lane:
+            pos = offsets.get(tier, 0)
+            offsets[tier] = pos + 1
+            return lane[pos % len(lane)], tier
+    return None
+
+
 def run_observer(*, env: str, trade_date: str, scope: str,
                  parent_pid: int, watchlist: list[dict],
                  min_interval_sec: float = 10.0,
@@ -279,6 +434,8 @@ def run_observer(*, env: str, trade_date: str, scope: str,
     start = time.monotonic()
     next_poll = 0.0
     pointer = 0
+    priority_offsets = {"HOT": 0, "WARM": 0, "COLD": 0}
+    last_priority_state = None
     fetch_enabled = os.getenv("US_OPENING_OBSERVER_BAR_FETCH_ENABLED", "1") == "1"
     try:
         while os.getppid() == parent_pid and time.monotonic() - start <= max_runtime_sec:
@@ -297,8 +454,25 @@ def run_observer(*, env: str, trade_date: str, scope: str,
                 for _i in range(0, len(pairs), 16):
                     subscribe_many(pairs[_i:_i + 16], env=env, timeout_sec=0.3)
                 next_subscription_refresh = time.monotonic() + 30.0
-            symbol, exchange = pairs[pointer % len(pairs)]
+            lanes, priority_state = load_preminute_priority(
+                env=env, scope=scope, trade_date=trade_date,
+                pairs=pairs, now_epoch=time.time(),
+            )
+            if pointer == 0 or priority_state != last_priority_state:
+                LOG.info(
+                    "[US_OPENING_OBSERVER][PRIORITY_SCOPE] state=%s hot=%d warm=%d cold=%d "
+                    "source=PREMINUTE_NOT_ORDER_AUTHORITY",
+                    priority_state, len(lanes["HOT"]), len(lanes["WARM"]),
+                    len(lanes["COLD"]),
+                )
+            last_priority_state = priority_state
+            picked = next_priority_pair(lanes, slot=pointer, offsets=priority_offsets)
             pointer += 1
+            if picked is None:
+                LOG.warning("[US_OPENING_OBSERVER][NO_COLLECTION_TARGET] action=NO_ORDER")
+                next_poll = time.monotonic() + interval
+                continue
+            (symbol, exchange), tier = picked
             next_poll = time.monotonic() + interval
             try:
                 quote = get_quote(symbol, exchange, env=env, timeout_sec=0.13)
