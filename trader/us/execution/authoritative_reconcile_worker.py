@@ -301,6 +301,10 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
         _mark_soft_stop_stages_from_records(
             fills["fills"],trade_date=trade_date,status="FILLED",
         )
+    # Do not attribute native fill-driven TP/stop state DB work to the
+    # later active-claim replay phase. The original 17s replay observation
+    # may include these independent commits in pre-fix telemetry.
+    phase.mark("current_fill_stage_updates")
     replay=replay_order_journal(
         trade_date,session_run_id=session_run_id,
         tick_id="stage4-"+writer_generation,
@@ -315,6 +319,7 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
     phase.mark("ack_reconcile")
     _mark_trend_stages_from_records(ack,trade_date=trade_date,status="FILLED")
     _mark_soft_stop_stages_from_records(ack,trade_date=trade_date,status="FILLED")
+    phase.mark("ack_stage_updates")
     # This writer also owns previously verified account reservation cleanups;
     # the RESERVATION_ONLY child must not run in WORKER mode.
     from trader.us.execution.reservation_reconcile_worker import (
@@ -323,7 +328,7 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
     reservation=reconcile_proven_reservations_once(
         env="practice",trade_date=trade_date,
     )
-    phase.mark("reservation_reconcile_and_stage_updates")
+    phase.mark("reservation_reconcile")
     if int(reservation.get("unresolved") or 0)>0:
         logger.warning("[US_STAGE4][RESERVATION_DEFERRED] unresolved=%s",
                        reservation.get("unresolved"))
