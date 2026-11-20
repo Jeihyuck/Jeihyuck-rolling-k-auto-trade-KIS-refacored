@@ -190,6 +190,61 @@ def verified_native_kr_vwap(quote: dict, *, code: str, observed_at: datetime) ->
     return value, "VERIFIED_NATIVE_KIS_VWAP"
 
 
+
+def _verified_vwap_provenance(
+    quote: dict, *, code: str, env: str, account_scope: str,
+    observed_at: datetime,
+) -> dict | None:
+    """Bind already-verified native VWAP to the original KIS quote clocks.
+
+    Must only be called after verified_native_kr_vwap() has passed; this
+    adapter cannot independently turn an unverified quote into proof.
+    Never persist a raw account ID or rewrite old receipt timestamps.
+    """
+    import hashlib
+
+    raw = quote.get("raw") if isinstance(quote.get("raw"), dict) else {}
+    def field(key):
+        return quote[key] if key in quote else raw.get(key)
+    try:
+        day = str(field("stck_bsop_date") or "").replace("-", "")
+        clock = str(field("stck_cntg_hour") or "").zfill(6)
+        native_at = datetime.strptime(day + clock, "%Y%m%d%H%M%S").replace(tzinfo=KST)
+        received = quote.get("received_at")
+        if isinstance(received, (float, int)):
+            received_at = datetime.fromtimestamp(float(received), tz=KST)
+        elif isinstance(received, datetime):
+            received_at = received
+        else:
+            received_at = datetime.fromisoformat(str(received).replace("Z", "+00:00"))
+        if received_at.tzinfo is None:
+            return None
+        source = str(quote.get("source") or raw.get("source") or "").upper()
+        if source == "KIS_REST_INQUIRE_PRICE":
+            identity = str(quote.get("source_identity") or "")
+        elif source == "KIS_WEBSOCKET":
+            # This is the validated subscription symbol binding, not a REST identity.
+            identity = "KIS_WS_PARSED_SYMBOL"
+        else:
+            return None
+        return {
+            "env": str(env).lower(),
+            "account_scope_sha256": hashlib.sha256(
+                str(account_scope).encode("utf-8"),
+            ).hexdigest(),
+            "code": str(code).zfill(6),
+            "trade_date": observed_at.astimezone(KST).date().isoformat(),
+            "quote_source": source,
+            "source_identity": identity,
+            "native_at": native_at.isoformat(),
+            "received_at": received_at.astimezone(KST).isoformat(),
+            "verified_at": observed_at.astimezone(KST).isoformat(),
+        }
+    except (ValueError, TypeError, OSError, OverflowError):
+        return None
+
+
+
 # Per-process bounded backoff. Historical candles may need several sessions
 # of REST recovery; never block PB1's time-critical SELL route.
 _OPENING_REPAIR_NEXT: dict[str, tuple[float, int]] = {}
@@ -348,11 +403,31 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
             quote_day = str(quote["stck_bsop_date"] if "stck_bsop_date" in quote
                             else raw.get("stck_bsop_date") or "").replace("-", "")
             quote_clock = quote["stck_cntg_hour"] if "stck_cntg_hour" in quote else raw.get("stck_cntg_hour")
+            vwap_attestation = (
+                _verified_vwap_provenance(
+                    quote, code=code, env="practice", account_scope=scope,
+                    observed_at=proof_now,
+                ) if verified_vwap else None
+            )
+            if verified_vwap and vwap_attestation is None:
+                verified_vwap = False
+                vwap_status = "VWAP_QUOTE_PROVENANCE_UNVERIFIED"
+                vwap = None
+            vwap_claims = {
+                "trade_date": quote_day,
+                "symbol": quote.get("symbol") or raw.get("symbol"),
+                "requested_symbol": quote.get("requested_symbol"),
+                "market": quote.get("market") or raw.get("market"),
+                "source": quote.get("source") or raw.get("source"),
+                "source_identity": quote.get("source_identity"),
+            }
             result = save_opening_proof(
                 env="practice", account_scope=scope, code=code,
                 now=proof_now, raw_bars=data,
                 vwap=vwap if verified_vwap else None,
                 vwap_source="KIS_NATIVE_WEIGHTED_AVG" if verified_vwap else "UNKNOWN",
+                vwap_provenance=vwap_attestation,
+                vwap_quote_claims=vwap_claims,
             )
             # Report and evaluate the persisted *merged* evidence, not merely
             # this REST response: a partial fetch can complement prior candles.
@@ -389,6 +464,8 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
                             vwap=vwap if verified_vwap else None,
                             vwap_source=("KIS_NATIVE_WEIGHTED_AVG"
                                          if verified_vwap else "UNKNOWN"),
+                            vwap_provenance=vwap_attestation,
+                            vwap_quote_claims=vwap_claims,
                         )
                         persisted = load_opening_proof(
                             env="practice", account_scope=scope, code=code,
