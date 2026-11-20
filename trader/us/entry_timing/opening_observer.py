@@ -49,6 +49,16 @@ def open_store(path: Path) -> sqlite3.Connection:
         observed_utc TEXT NOT NULL,
         PRIMARY KEY (trade_date,symbol,owner,minute_et,source)
     );
+    CREATE TABLE IF NOT EXISTS bar_conflicts (
+        trade_date TEXT NOT NULL, symbol TEXT NOT NULL, owner TEXT NOT NULL,
+        minute_et TEXT NOT NULL, source TEXT NOT NULL,
+        incoming_sha256 TEXT NOT NULL, original_row_json TEXT NOT NULL,
+        incoming_row_json TEXT NOT NULL, observed_utc TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'UNRESOLVED',
+        PRIMARY KEY (trade_date,symbol,owner,minute_et,source,incoming_sha256)
+    );
+    CREATE INDEX IF NOT EXISTS ix_us_minute_unresolved
+    ON bar_conflicts(trade_date,symbol,owner,minute_et,status);
     CREATE TABLE IF NOT EXISTS quote_samples (
         trade_date TEXT NOT NULL, symbol TEXT NOT NULL, owner TEXT NOT NULL,
         received_epoch REAL NOT NULL, last REAL NOT NULL, source TEXT NOT NULL,
@@ -82,12 +92,31 @@ def persist_bars(db: sqlite3.Connection, *, trade_date: str, symbol: str,
                 (trade_date, symbol.upper(), owner, row["time_et"]),
             ).fetchone()
             payload = json.dumps(row, sort_keys=True, separators=(",", ":"), allow_nan=False)
-            if prior and prior[0] == payload:
+            if prior:
+                if prior[0] == payload:
+                    continue
+                # Completed native minutes may be corrected or conflict. A
+                # second observation is *not* automatically authoritative.
+                # Preserve both payloads, quarantine only this minute, and
+                # require independent native correction evidence to resolve.
+                db.execute(
+                    "INSERT OR IGNORE INTO bar_conflicts "
+                    "(trade_date,symbol,owner,minute_et,source,incoming_sha256,"
+                    "original_row_json,incoming_row_json,observed_utc,status) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,'UNRESOLVED')",
+                    (trade_date, symbol.upper(), owner, row["time_et"],
+                     "KIS_OVERSEAS_1M",
+                     hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+                     prior[0], payload, timestamp),
+                )
+                LOG.warning(
+                    "[US_OPENING_OBSERVER][COMPLETED_BAR_CONFLICT] "
+                    "symbol=%s minute=%s action=QUARANTINE_NO_REWRITE",
+                    symbol.upper(), row["time_et"],
+                )
                 continue
             db.execute(
-                "INSERT INTO verified_bars VALUES(?,?,?,?,?,?,?) "
-                "ON CONFLICT(trade_date,symbol,owner,minute_et,source) "
-                "DO UPDATE SET row_json=excluded.row_json, observed_utc=excluded.observed_utc",
+                "INSERT INTO verified_bars VALUES(?,?,?,?,?,?,?)",
                 (trade_date, symbol.upper(), owner, row["time_et"],
                  "KIS_OVERSEAS_1M", payload, timestamp),
             )
@@ -101,7 +130,13 @@ def load_bars(db: sqlite3.Connection, *, trade_date: str, symbol: str,
         return []
     rows = db.execute(
         "SELECT row_json FROM verified_bars WHERE trade_date=? AND symbol=? "
-        "AND owner=? AND source='KIS_OVERSEAS_1M' ORDER BY minute_et DESC LIMIT ?",
+        "AND owner=? AND source='KIS_OVERSEAS_1M' "
+        "AND NOT EXISTS (SELECT 1 FROM bar_conflicts c "
+        "WHERE c.trade_date=verified_bars.trade_date "
+        "AND c.symbol=verified_bars.symbol AND c.owner=verified_bars.owner "
+        "AND c.minute_et=verified_bars.minute_et AND c.source=verified_bars.source "
+        "AND c.status='UNRESOLVED') "
+        "ORDER BY minute_et DESC LIMIT ?",
         (trade_date, symbol.upper(), owner, max(1, min(450, limit))),
     ).fetchall()
     return [json.loads(row[0]) for row in reversed(rows)]
