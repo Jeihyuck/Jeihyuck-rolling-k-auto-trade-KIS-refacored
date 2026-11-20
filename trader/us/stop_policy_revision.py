@@ -31,30 +31,39 @@ def scope_for_position(position: dict) -> tuple[str, str, str]:
     # key proves exact SHA256 equality; reject conflicting embedded claims.
     # This MUST NOT treat string length or a metadata "verified" flag as proof.
     if os.getenv("WSL_RUN_MARKET", "").upper() == "US":
-        try:
-            from trader.account_state import get_account_key
-            from trader.us.account_scope_identity import verify_us_account_scope
-            if str(os.getenv("KIS_ENV", "practice")).lower() != "practice":
+        claims = (
+            position.get("account_id"), meta.get("account_id"),
+            life.get("account_id"),
+        )
+        declared_hashes = (
+            position.get("broker_account_hash"),
+            meta.get("broker_account_hash"),
+            life.get("broker_account_hash"),
+        )
+        nonempty_claims = {str(v).strip() for v in claims if v not in (None, "")}
+        has_explicit_hash = any(v not in (None, "") for v in declared_hashes)
+        # A legacy raw-only stop-debt replay has ONE existing account key and
+        # no declared broker hash: keep the pre-existing exact debt match.
+        # Stop DB write later independently checks account against the trusted
+        # KIS practice key; do not require that credential for a read-only
+        # historical replay. Mixed scopes or explicit hashes MUST verify.
+        if has_explicit_hash or len(nonempty_claims) > 1:
+            try:
+                from trader.account_state import get_account_key
+                from trader.us.account_scope_identity import verify_us_account_scope
+                if str(os.getenv("KIS_ENV", "practice")).lower() != "practice":
+                    return "", "", ""
+                verified_account = verify_us_account_scope(
+                    trusted_raw_account=get_account_key(env="practice"),
+                    claims=claims, declared_hashes=declared_hashes,
+                )
+                if verified_account is None:
+                    return "", "", ""
+                account = verified_account.raw_account
+            except (RuntimeError, ValueError, TypeError, ImportError, KeyError):
+                # Conflicting account identities cannot promote an unverified
+                # policy revision, durable stop, or SELL authority.
                 return "", "", ""
-            verified_account = verify_us_account_scope(
-                trusted_raw_account=get_account_key(env="practice"),
-                claims=(
-                    position.get("account_id"), meta.get("account_id"),
-                    life.get("account_id"),
-                ),
-                declared_hashes=(
-                    position.get("broker_account_hash"),
-                    meta.get("broker_account_hash"),
-                    life.get("broker_account_hash"),
-                ),
-            )
-            if verified_account is None:
-                return "", "", ""
-            account = verified_account.raw_account
-        except (RuntimeError, ValueError, TypeError, ImportError, KeyError):
-            # Credential lookup or conflicting account identities cannot
-            # promote an unverified STOP or policy revision.
-            return "", "", ""
     if owner != "US_STANDARD" or not lifecycle or not account or not symbol or symbol == "TQQQ":
         return "", "", ""
     return symbol, lifecycle, account
