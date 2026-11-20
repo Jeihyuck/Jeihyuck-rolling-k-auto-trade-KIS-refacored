@@ -97,7 +97,7 @@ def _update_exact_open_position_fields(
 _KR_TIMEZONE = ZoneInfo("Asia/Seoul")
 
 
-def _same_proven_kr_trade_day(order_at: Any, fill_at: Any) -> bool:
+def _same_proven_kr_trade_day(order_at: Any, fill_at: Any, *, sqlite_fixture: bool = False) -> bool:
     """Broker order numbers can repeat: never link across trading days."""
     def day(value: Any):
         if isinstance(value, str):
@@ -105,14 +105,18 @@ def _same_proven_kr_trade_day(order_at: Any, fill_at: Any) -> bool:
                 value = datetime.fromisoformat(value.replace("Z", "+00:00"))
             except ValueError:
                 return None
-        if not isinstance(value, datetime) or value.tzinfo is None:
+        if not isinstance(value, datetime):
             return None
+        if value.tzinfo is None:
+            # SQLite test fixtures do not round-trip timezone information;
+            # never reinterpret a production/Postgres naive timestamp.
+            return value.date() if sqlite_fixture else None
         return value.astimezone(_KR_TIMEZONE).date()
     left, right = day(order_at), day(fill_at)
     return left is not None and left == right
 
 
-def _unowned_fill_exact_scope(fill: dict, order: dict, *, env: str, strategy: str) -> bool:
+def _unowned_fill_exact_scope(fill: dict, order: dict, *, env: str, strategy: str, sqlite_fixture: bool = False) -> bool:
     """A missing fill.order_id is not permission to guess its BUY lineage."""
     if (str(order.get("env") or "") != env
             or str(order.get("strategy") or "") != strategy
@@ -120,7 +124,7 @@ def _unowned_fill_exact_scope(fill: dict, order: dict, *, env: str, strategy: st
             or base._normalize_code(fill.get("code")) != base._normalize_code(order.get("code"))
             or str(fill.get("market") or "") != str(order.get("market") or "")
             or str(fill.get("side") or "").upper() != str(order.get("side") or "").upper()
-            or not _same_proven_kr_trade_day(order.get("created_at"), fill.get("filled_at"))):
+            or not _same_proven_kr_trade_day(order.get("created_at"), fill.get("filled_at"), sqlite_fixture=sqlite_fixture)):
         return False
     if not str(fill.get("market") or "").strip() or not str(fill.get("side") or "").strip():
         return False
@@ -184,6 +188,7 @@ def _link_unowned_daily_fills_fixed(*, engine, env: str, strategy: str) -> dict[
         # never partially linked; preserve rows for an independent KIS review.
         if not all(_unowned_fill_exact_scope(
             row, order, env=env, strategy=strategy,
+            sqlite_fixture=engine.dialect.name == "sqlite",
         ) for row in new_rows):
             logger.warning(
                 "[KR_BROKER_TRUTH][FILL_LINK][SCOPE_UNVERIFIED] code=%s kis_odno=%s action=KEEP_UNLINKED",
