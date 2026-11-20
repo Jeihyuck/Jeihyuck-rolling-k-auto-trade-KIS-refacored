@@ -11,10 +11,51 @@ from datetime import date
 from typing import Callable
 
 
+
+def _no_intervening_order_for_original(
+    *, symbol: str, epoch: str, account: str, portfolio: str, cycle: str,
+    original_trade_date: str, current_trade_date: str,
+    original_client_key: str, original_order_no: str,
+) -> bool:
+    """Read-only PostgreSQL proof of a single untouched BUY cycle.
+
+    Never infer zero intervening activity from current share count alone:
+    an ADD and a SELL could cancel numerically while changing source lots.
+    """
+    import hashlib
+    from sqlalchemy import text
+    from trader.us.db.repos import _get_engine_or_none
+
+    engine = _get_engine_or_none()
+    if engine is None:
+        return False
+    hashed = hashlib.sha256(account.encode("utf-8")).hexdigest()
+    with engine.connect() as conn:
+        amount = conn.execute(text("""
+            SELECT COUNT(*)
+              FROM us_orders
+             WHERE trading_epoch_id=:epoch AND account_id=:account_hash
+               AND portfolio_epoch_id=:portfolio AND position_cycle_id=:cycle
+               AND symbol=:symbol AND side IN ('BUY','SELL')
+               AND trade_date BETWEEN CAST(:opened AS date) AND CAST(:today AS date)
+               AND (
+                   client_order_key IS DISTINCT FROM :source_key
+                   OR order_no IS DISTINCT FROM :source_no
+               )
+        """), {
+            "epoch": epoch, "account_hash": hashed, "portfolio": portfolio,
+            "cycle": cycle, "symbol": symbol, "opened": original_trade_date,
+            "today": current_trade_date,
+            "source_key": original_client_key, "source_no": original_order_no,
+        }).scalar_one()
+    return int(amount) == 0
+
+
 def restore_verified_us_original_contract(
     position: dict, *, identity: dict[str, str],
     current_trade_date: str,
     original_lookup: Callable[..., dict | None] | None = None,
+    no_intervening_lookup: Callable[..., bool] | None = None,
 ) -> tuple[dict | None, str]:
     """Return an ephemeral corrected copy, or fail closed with a reason.
 
@@ -100,6 +141,23 @@ def restore_verified_us_original_contract(
         and source_meta.get("lineage_resolution") == "EXACT_ORIGINAL_KIS_CUMULATIVE_FULL_BUY"
     ):
         return None, "ORIGINAL_BUY_PROOF_SCOPE_MISMATCH"
+
+    # An identical current quantity is not sufficient after an ADD/SELL
+    # round-trip or open submit attempt. Require zero other local orders in
+    # the same verified original lifecycle after the source native BUY.
+    checker = no_intervening_lookup or _no_intervening_order_for_original
+    try:
+        no_other_order = checker(
+            symbol=symbol, epoch=epoch, account=raw_account,
+            portfolio=portfolio, cycle=cycle,
+            original_trade_date=opened, current_trade_date=current_trade_date,
+            original_client_key=str(proof["client_order_key"]),
+            original_order_no=str(proof["order_no"]),
+        )
+    except Exception:
+        no_other_order = False
+    if no_other_order is not True:
+        return None, "ORIGINAL_CYCLE_INTERVENING_ORDER_UNVERIFIED"
 
     digest = signed["sha256"]
     for source in (position, meta):
