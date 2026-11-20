@@ -187,6 +187,73 @@ def test_signed_buy_fill_crash_then_recovery_and_native_sell_once():
         ).mappings().all()
     assert len(rows) == 2  # exact KIS BUY and SELL cumulative order identities
 
+    # FINAL v3: a separate new-process SELL must keep the same original
+    # immutable BUY lineage after partial SELL, then close exactly six shares.
+    final_key = "pr354-final-" + uuid4().hex
+    final_sell_id, created = orders.create_intent_idempotent(
+        env=env, run_id=None, strategy=owner, sid=1, mode=1,
+        code=code, market=market, side="SELL", ord_type="LIMIT",
+        qty=6, limit_price=2200, stage="TP_FINAL",
+        client_order_key=final_key,
+        request_json={"source_buy_order_id": str(order_id)},
+        status="CREATED", account_id=account,
+        portfolio_epoch_id=portfolio, position_cycle_id=cycle,
+    )
+    assert created
+    assert orders.mark_submitted(
+        env, final_key, "0000005004", {"rt_cd": "0"},
+    ) == "SUBMITTED"
+    final_native = dict(
+        native_buy, order_id=str(final_sell_id), side="SELL",
+        qty=6, price=2200.0, kis_odno="0000005004",
+        trade_id="KR_KIS_CUM:PR354_FINAL_SELL",
+        raw_json={"kis_response": {
+            "ord_dt": "20261106", "pdno": code,
+            "odno": "0000005004", "tot_ccld_qty": "6",
+            "tot_ccld_amt": "13200",
+        }},
+    )
+    fills.upsert_fill(**final_native)
+    restarted = PositionsRepo(engine)
+    applied = restarted.reconcile_sell_execution(
+        env=env, strategy=owner, sid=1, mode=1,
+        code=code, market=market, confirmed_cumulative_qty=6,
+        fill_price=2200.0, filled_at=stamp,
+        position_cycle_id=cycle, portfolio_epoch_id=portfolio,
+        order_id=str(final_sell_id), pre_order_holding_qty=6,
+        broker_holding_qty=0, native_original_order_price_proof=True,
+    )
+    assert applied["qty_applied"] == 6
+    repeated_final = restarted.reconcile_sell_execution(
+        env=env, strategy=owner, sid=1, mode=1,
+        code=code, market=market, confirmed_cumulative_qty=6,
+        fill_price=2200.0, filled_at=stamp,
+        position_cycle_id=cycle, portfolio_epoch_id=portfolio,
+        order_id=str(final_sell_id), pre_order_holding_qty=6,
+        broker_holding_qty=0, native_original_order_price_proof=True,
+    )
+    assert repeated_final["qty_applied"] == 0
+    with engine.connect() as conn:
+        closed = dict(conn.execute(
+            sa.select(schema.positions).where(
+                schema.positions.c.position_cycle_id == cycle,
+                schema.positions.c.portfolio_epoch_id == portfolio,
+                schema.positions.c.code == code,
+            )
+        ).mappings().one())
+        final_fills = conn.execute(
+            sa.select(schema.fills.c.order_id).where(
+                schema.fills.c.position_cycle_id == cycle,
+            )
+        ).all()
+    assert closed["status"] == "CLOSED"
+    assert closed["qty"] == 0
+    assert closed["entry_meta_json"]["entry_contract_sha256"] == frozen["entry_contract_sha256"]
+    assert closed["entry_meta_json"]["source_buy_order_id"] == str(order_id)
+    assert closed["entry_exit_plan_json"] == plan
+    assert abs(float(closed["realized_pnl"]) - 1600.0) < 0.01
+    assert len(final_fills) == 3
+
 
 def test_pyramid_add_preserves_original_signed_buy_provenance():
     """An ADD order may change quantity/cost, never the root BUY identity."""
