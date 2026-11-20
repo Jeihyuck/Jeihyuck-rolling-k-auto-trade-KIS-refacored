@@ -32,9 +32,22 @@ def _stable_value(value: Any) -> Any:
 
 
 def fills_digest(fills: list[dict]) -> str:
-    payload = [_stable_value(row) for row in fills]
-    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=True,
-                         separators=(",", ":"), allow_nan=False).encode("utf-8")
+    """Digest the *multiset* of KIS cumulative rows, not their HTTP order.
+
+    Broker query ordering is not immutable execution evidence. A reordered
+    response with exactly the same rows must not trigger another expensive
+    DB write. Keep duplicates (and all stable field values): a changed
+    cumulative quantity, price, identity or added/removed row must invalidate
+    the memo. Do not treat this digest as proof of a successful persistence.
+    """
+    canonical_rows = [
+        json.dumps(_stable_value(row), sort_keys=True, ensure_ascii=True,
+                   separators=(",", ":"), allow_nan=False)
+        for row in fills
+    ]
+    canonical_rows.sort()
+    encoded = json.dumps(canonical_rows, separators=(",", ":"),
+                         ensure_ascii=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
