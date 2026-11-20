@@ -418,7 +418,7 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
                 "symbol": quote.get("symbol") or raw.get("symbol"),
                 "requested_symbol": quote.get("requested_symbol"),
                 "market": quote.get("market") or raw.get("market"),
-                "source": quote_origin,
+                "source": quote.get("source") or raw.get("source"),
                 "source_identity": quote.get("source_identity"),
             }
             result = save_opening_proof(
