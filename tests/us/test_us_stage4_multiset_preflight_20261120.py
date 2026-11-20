@@ -136,3 +136,35 @@ def test_stage4_reordered_native_rows_are_not_repersisted_but_changes_are(monkey
     assert len(saved) == 3
     cycle(more)
     assert len(saved) == 4, "failed save must never be treated as durable evidence"
+
+
+@pytest.mark.parametrize("reason", [
+    "FILL_ORIGINAL_SCOPE_UNVERIFIED",
+    "FILL_ORIGINAL_ORDER_NOT_FOUND",
+    "FILL_ORDER_NOT_FOUND",
+    "FILL_EPOCH_COLLISION",
+])
+def test_unstored_original_fill_is_not_memoized_as_success(monkeypatch, reason):
+    """Simulate production repo's deliberate original-order validation skip.
+
+    Failing to classify these values led Stage4 to report save=OK despite no
+    durable fill, then memo-hit future KIS cycles as if DB had saved it.
+    """
+    from trader.us.db import repos
+
+    def rejected_save(fills, trade_date):
+        assert trade_date == "2026-11-20"
+        fills[0]["save_status"] = reason
+        return 0
+
+    monkeypatch.setattr(repos, "save_fills", rejected_save)
+    monkeypatch.setattr(repos, "_LAST_SAVE_FILLS_ERROR", None)
+    native = [deepcopy(_fills()[0])]
+    result = repos.save_fills_with_result(native, trade_date="2026-11-20")
+    assert result["status"] == reason
+    assert result["inserted_count"] == 0
+    assert result["error_status_counts"] == {reason: 1}
+
+    memo = VerifiedFillPersistenceMemo()
+    memo.mark_persisted_digest(fills_digest(native), status=result["status"])
+    assert memo.should_persist(native), "missing native fill must be retried"
