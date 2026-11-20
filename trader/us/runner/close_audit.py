@@ -92,8 +92,9 @@ def audit_us_close_report(report: dict[str, Any]) -> dict[str, Any]:
         "findings": findings,
         "p0_count": sum(item["severity"] == "P0" for item in findings),
         "p1_count": sum(item["severity"] == "P1" for item in findings),
-        "requires_manual_verification": bool(findings) or (
-            five_axis["strict_status"] != "VERIFIED"
-        ),
+        # Preserve the legacy cross-source diagnostic contract. The stricter
+        # five-axis result is additive, not a change to existing risk gates.
+        "requires_manual_verification": bool(findings),
+        "five_axis_requires_verification": five_axis["strict_status"] != "VERIFIED",
         "five_axis": five_axis,
     }
