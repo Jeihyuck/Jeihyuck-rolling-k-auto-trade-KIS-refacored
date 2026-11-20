@@ -92,6 +92,7 @@ def test_runtime_bad_copy_recovers_only_separately_proven_original():
     restored, reason = restore_verified_us_original_contract(
         position, identity=_identity(), current_trade_date="2026-11-19",
         original_lookup=lookup,
+        no_intervening_lookup=lambda **_: True,
     )
     assert reason == "RESTORED_FROM_VERIFIED_NATIVE_ORIGINAL"
     assert restored is not position
@@ -121,6 +122,7 @@ def test_cross_account_epoch_cycle_and_qty_never_recover():
         restored, reason = restore_verified_us_original_contract(
             p, identity=_identity(), current_trade_date="2026-11-19",
             original_lookup=lookup,
+        no_intervening_lookup=lambda **_: True,
         )
         assert restored is None, (changed, reason)
 
@@ -136,6 +138,7 @@ def test_disagreeing_copy_digest_or_version_not_unconditionally_adopted():
         restored, reason = restore_verified_us_original_contract(
             p, identity=_identity(), current_trade_date="2026-11-19",
             original_lookup=lambda **_: _proof(original),
+            no_intervening_lookup=lambda **_: True,
         )
         assert restored is None, (altered, reason)
 
@@ -147,6 +150,7 @@ def test_invalid_independent_original_cannot_be_normalized_into_truth():
     restored, reason = restore_verified_us_original_contract(
         _position(original), identity=_identity(), current_trade_date="2026-11-19",
         original_lookup=lambda **_: untrusted,
+        no_intervening_lookup=lambda **_: True,
     )
     assert restored is None
     assert reason == "ORIGINAL_POLICY_HASH_INVALID"
@@ -160,12 +164,14 @@ def test_tqqq_and_already_valid_policy_are_not_recovered():
     assert restore_verified_us_original_contract(
         p, identity=_identity(), current_trade_date="2026-11-19",
         original_lookup=lambda **_: _proof(original),
+            no_intervening_lookup=lambda **_: True,
     )[0] is None
     p = _position(original)
     p["meta"]["entry_exit_contract"] = original
     assert restore_verified_us_original_contract(
         p, identity=_identity(), current_trade_date="2026-11-19",
         original_lookup=lambda **_: _proof(original),
+            no_intervening_lookup=lambda **_: True,
     )[1] == "NO_INVALID_RUNTIME_COPY"
 
 
@@ -176,7 +182,10 @@ def test_exit_enrichment_reads_proven_source_but_does_not_change_broker_qty():
         with patch("trader.account_state.get_account_key", return_value=RAW), (
              patch("trader.us.pb1.us_exit_position_resolver._identity_is_current", return_value=True)), (
              patch("trader.us.original_buy_lineage.load_verified_us_original_buy_scope",
-                   return_value=_proof(original))):
+                   return_value=_proof(original))), (
+             patch("trader.us.verified_original_contract_resolver._no_intervening_order_for_original",
+                   return_value=True)):
+
             restored = _enrich_single_position(
                 p, trade_date="2026-11-19", env="practice",
                 preloaded_risk_candidates=[],
@@ -186,3 +195,14 @@ def test_exit_enrichment_reads_proven_source_but_does_not_change_broker_qty():
     assert restored["position_lifecycle_view"]["contract_integrity"] == "VALID"
     assert verify_us_entry_exit_contract(restored["meta"]["entry_exit_contract"])
     assert p["meta"]["entry_exit_contract"] != original
+
+
+def test_equal_current_shares_after_intervening_order_are_not_safe():
+    original = _source()
+    restored, reason = restore_verified_us_original_contract(
+        _position(original), identity=_identity(), current_trade_date="2026-11-19",
+        original_lookup=lambda **_: _proof(original),
+        no_intervening_lookup=lambda **_: False,
+    )
+    assert restored is None
+    assert reason == "ORIGINAL_CYCLE_INTERVENING_ORDER_UNVERIFIED"
