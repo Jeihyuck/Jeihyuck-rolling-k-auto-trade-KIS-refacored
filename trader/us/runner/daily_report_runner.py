@@ -2127,6 +2127,27 @@ def run_daily_report(
         )
     md_lines.append("")
 
+    # Independently report what each evidence source can actually prove.
+    # A broker-confirmed fill does NOT imply immutable policy, economics,
+    # historical claim or WSL worker readiness verification.
+    if session in (None, "close"):
+        _five_axis = (report.get("cross_source_close_audit") or {}).get("five_axis") or {}
+        md_lines.extend([
+            "## Close — Five Independent Evidence Axes (Read-Only)",
+            "",
+            f"- Strict verdict: {_five_axis.get('strict_status', 'UNVERIFIED')}",
+            f"- Verified axes: {_five_axis.get('verified_axis_count', 0)} / 5",
+        ])
+        for _axis_name, _axis in (_five_axis.get("axes") or {}).items():
+            md_lines.append(
+                f"- {_axis_name}: {_axis.get('status', 'UNVERIFIED')}; "
+                f"authority={_axis.get('authority', 'UNKNOWN')}"
+            )
+        md_lines.extend([
+            "- This summary never authorizes broker orders or certifies live KIS practice.",
+            "",
+        ])
+
     if session:
         md_lines.append(f"**Session**: {session.upper()}")
         md_lines.append("")

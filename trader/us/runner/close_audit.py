@@ -86,9 +86,15 @@ def audit_us_close_report(report: dict[str, Any]) -> dict[str, Any]:
                kis_actual_fill_orders=broker_fills,
                note="Open/cancelled orders and number normalization require independent verification")
 
+    from trader.us.runner.close_five_axis_audit import build_us_close_five_axis_audit
+    five_axis = build_us_close_five_axis_audit(report)
     return {
         "findings": findings,
         "p0_count": sum(item["severity"] == "P0" for item in findings),
         "p1_count": sum(item["severity"] == "P1" for item in findings),
+        # Preserve the legacy cross-source diagnostic contract. The stricter
+        # five-axis result is additive, not a change to existing risk gates.
         "requires_manual_verification": bool(findings),
+        "five_axis_requires_verification": five_axis["strict_status"] != "VERIFIED",
+        "five_axis": five_axis,
     }
