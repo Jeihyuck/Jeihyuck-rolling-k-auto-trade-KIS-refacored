@@ -783,6 +783,27 @@ def build_authorized_portfolio_guard_intents(
             raw_qty = int(position.get("qty") or position.get("holding_qty") or 0)
             if raw_qty <= 0:
                 continue
+            # Prove original signed BUY lineage and current owner epoch
+            # BEFORE recording an irreversible stage reservation. Otherwise
+            # an absent contract would strand a PLANNED action with zero
+            # broker POSTs, blocking the sleeve indefinitely.
+            original_cycle = str(
+                position.get("position_cycle_id")
+                or meta.get("position_cycle_id") or ""
+            )
+            source_sha = str(meta.get("entry_exit_contract_sha256") or "")
+            source_version = str(meta.get("entry_exit_contract_version") or "")
+            original_epoch = str(
+                position.get("portfolio_epoch_id")
+                or meta.get("portfolio_epoch_id") or ""
+            )
+            if (
+                not original_cycle or not source_sha or not source_version
+                or original_epoch != portfolio
+            ):
+                raise PortfolioGuardUnavailable(
+                    "PORT_GUARD_ORIGINAL_BUY_CONTRACT_SCOPE_UNVERIFIED"
+                )
             quote = get_quote(
                 sym, resolve_quote_exchange(sym), env="practice",
                 max_age_sec=float(policy["quote_ttl_sec"]), timeout_sec=0.12,
