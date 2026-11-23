@@ -19,6 +19,7 @@ from trader.us.symbols import normalize_us_exchange
 logger = logging.getLogger(__name__)
 
 SOURCE_TTL_SEC = 5.0
+TRUSTED_QUOTE_SOURCES = {"KIS_LIVE", "KIS_CACHE", "KIS_WEBSOCKET", "KIS_WEBSOCKET_COLLECTOR"}
 
 
 def _source_epoch(raw: Any) -> float | None:
@@ -28,10 +29,15 @@ def _source_epoch(raw: Any) -> float | None:
         if isinstance(raw, (int, float)):
             value = float(raw)
         else:
-            value = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-            if value.tzinfo is None or value.utcoffset() is None:
-                return None
-            value = value.astimezone(timezone.utc).timestamp()
+            text = str(raw).strip()
+            try:
+                value = float(text)
+            except ValueError:
+                value = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if isinstance(value, datetime):
+                if value.tzinfo is None or value.utcoffset() is None:
+                    return None
+                value = value.astimezone(timezone.utc).timestamp()
     except (TypeError, ValueError, OSError, OverflowError):
         return None
     return value if math.isfinite(value) and value > 0 else None
@@ -143,11 +149,11 @@ def refresh_tp_source_quotes(
             source_at is not None
             and 0 <= now_epoch - source_at <= SOURCE_TTL_SEC
             and math.isfinite(price) and price > 0
-            and quality == "FRESH"
+            and quality in {"FRESH", "FRESH_CACHE"}
             and not price_quote.get("stale")
             and not price_quote.get("suspect")
             and not price_quote.get("_stale_date")
-            and source not in {"", "UNKNOWN"}
+            and source in TRUSTED_QUOTE_SOURCES
         ):
             logger.warning(
                 "[US_TP][SOURCE_REFRESH_UNVERIFIED] symbol=%s source=%s quality=%s action=retain_stale_block",
