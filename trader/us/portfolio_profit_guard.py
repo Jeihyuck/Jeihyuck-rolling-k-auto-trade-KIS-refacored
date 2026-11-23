@@ -122,6 +122,7 @@ def verified_sleeve_pnl(
     fills: list[dict], positions: list[dict], *,
     snapshot_at: datetime, account_hash: str, trading_epoch_id: str,
     quote_ttl_sec: Decimal, max_skew_sec: Decimal,
+    broker_full_balance_verified: bool = False,
 ) -> tuple[Decimal, dict]:
     """Strict KIS-native fill economics, no arbitrary cash allocation.
 
@@ -132,6 +133,8 @@ def verified_sleeve_pnl(
     """
     if snapshot_at.tzinfo is None:
         raise ValueError("PORT_GUARD_SNAPSHOT_NAIVE")
+    if broker_full_balance_verified is not True:
+        raise ValueError("PORT_GUARD_FULL_NATIVE_BALANCE_UNVERIFIED")
     if not fills:
         raise ValueError("PORT_GUARD_NATIVE_LEDGER_EMPTY")
     book: dict[str, dict] = {}
@@ -171,8 +174,10 @@ def verified_sleeve_pnl(
             slot["net_qty"] -= qty
             slot["sells"] += amount
             sell_total += amount
-        if slot["net_qty"] < 0:
-            raise ValueError("PORT_GUARD_NEGATIVE_NATIVE_POSITION")
+    # Cumulative out-of-order native fill rows are order-independent. Check
+    # final net after the full ledger, not after each input row.
+    if any(a["net_qty"] < 0 for a in book.values()):
+        raise ValueError("PORT_GUARD_NEGATIVE_NATIVE_POSITION")
     holdings = {}
     for p in positions:
         if p.get("strategy_owner") != "US_STANDARD" or str(p.get("symbol") or "").upper() == "TQQQ":
@@ -198,14 +203,22 @@ def verified_sleeve_pnl(
             raise ValueError("PORT_GUARD_BALANCE_NOT_NATIVE")
         points.append(asof)
         holdings[sym] = {"qty": qty, "orderable": orderable, "mark": mark}
-    if not points or (max(points) - min(points)).total_seconds() > max_skew_sec:
+    if points and Decimal(str((max(points) - min(points)).total_seconds())) > max_skew_sec:
         raise ValueError("PORT_GUARD_SNAPSHOT_SKEW")
-    if set(book) != set(holdings):
-        # Closed positions must be represented as qty=0 native rows so we can
-        # prove full-history net and no hidden owner/IPO/transfer mismatch.
+    # A fully closed symbol is naturally absent from current KIS holdings.
+    # No mark is needed for a proven native net_qty==0, but every open symbol
+    # and every current KIS symbol must agree with the cumulative fill ledger.
+    if any(sym not in book for sym in holdings) or any(
+        amount["net_qty"] > 0 and sym not in holdings
+        for sym, amount in book.items()
+    ):
         raise ValueError("PORT_GUARD_UNACCOUNTED_POSITION")
     marked = Decimal("0")
     for sym, amounts in book.items():
+        if sym not in holdings:
+            if amounts["net_qty"] != 0:
+                raise ValueError("PORT_GUARD_KIS_LEDGER_NET_MISMATCH")
+            continue
         if amounts["net_qty"] != holdings[sym]["qty"]:
             raise ValueError("PORT_GUARD_KIS_LEDGER_NET_MISMATCH")
         marked += amounts["net_qty"] * holdings[sym]["mark"]
