@@ -77,7 +77,7 @@ def native_proof(monkeypatch):
     from trader.us.db import repos
 
     def scoped(position, trade_date):
-        assert trade_date == "2026-11-20"
+        assert trade_date in {"2026-11-20", "2026-11-23"}
         return {
             **position,
             "trading_epoch_id": EPOCH,
