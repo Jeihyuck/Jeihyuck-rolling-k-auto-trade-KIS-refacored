@@ -388,3 +388,220 @@ def assert_portfolio_guard_native_pre_http(
         "[US_PORT_GUARD][PRE_HTTP_AUTHORIZED] symbol=%s action=%s stage=%s",
         sym, expected_key, meta.get("portfolio_guard_stage_no"),
     )
+
+
+def build_authorized_portfolio_guard_intents(
+    *, current_positions: list[dict], trade_date: str,
+    env: str, authoritative_native_balance: bool,
+    excluded_sell_symbols: set[str],
+) -> list[dict]:
+    """Eligible only AFTER normal stop/TP SELLs have been routed.
+
+    Fetch owner-scoped native-fill economics and complete fresh KIS quote
+    evidence, then commit HWM plus stable intent reservation atomically.
+    Authorization remains independent of original signed BUY provenance.
+    Returns intents for the EXISTING canonical router, never HTTP itself.
+    Any invalid observation silently returns no new portfolio intent while
+    the pre-existing individual risk exits remain uninterrupted.
+    """
+    if (
+        os.getenv("US_PORTFOLIO_GUARD_ACTIVE", "0") != "1"
+        or env != "practice"
+        or os.getenv("KIS_ENV", "").lower() != "practice"
+        or not authoritative_native_balance
+        or os.getenv("US_WS_COLLECTOR_ENABLED", "0") != "1"
+        or os.getenv("US_SHARED_KIS_LIMITER_ENABLED", "0") != "1"
+    ):
+        return []
+    from trader.account_state import get_account_key
+    from trader.us.db.repos import _get_engine_or_none, _active_us_epoch
+    from trader.us.execution.recovery_identity import current_us_portfolio_epoch
+    from trader.us.portfolio_profit_guard import verified_sleeve_pnl, _utc
+    from trader.us.strategy_ownership import owner_for_symbol, STANDARD_OWNER
+    from trader.us.symbols import resolve_quote_exchange
+    from trader.marketdata.us_ws_collector import get_quote
+    from decimal import ROUND_FLOOR
+    from datetime import timedelta
+    raw_account = get_account_key(env="practice")
+    if not raw_account:
+        return []
+    account_hash = hashlib.sha256(raw_account.encode()).hexdigest()
+    engine = _get_engine_or_none()
+    if engine is None:
+        return []
+    try:
+        now = datetime.now(timezone.utc)
+        with engine.begin() as conn:
+            epoch = str(_active_us_epoch(conn, required=True))
+            portfolio = current_us_portfolio_epoch(
+                conn, env="practice", account_key=raw_account,
+                trading_epoch_id=epoch, strategy_owner="US_STANDARD",
+            )
+            approved = _get_policy(
+                conn, account_hash=account_hash, epoch=epoch,
+                portfolio=portfolio, now=now,
+            )
+            if approved is None:
+                return []
+            policy, manifest_digest = approved
+            native_fills = conn.execute(text("""
+                SELECT trade_date,symbol,side,qty,price_usd,order_no,
+                       client_order_key,account_id,trading_epoch_id,meta
+                FROM public.us_fills
+                WHERE trading_epoch_id=:epoch
+                  AND meta->>'strategy_owner'='US_STANDARD'
+                ORDER BY trade_date,id
+            """), {"epoch": epoch}).mappings().all()
+        fill_proof = []
+        for fill in native_fills:
+            meta = fill["meta"] if isinstance(fill["meta"], dict) else {}
+            if str(fill.get("account_id") or "") not in (raw_account, account_hash):
+                raise PortfolioGuardUnavailable("PORT_GUARD_FILL_ACCOUNT_MISMATCH")
+            fill_proof.append({
+                "symbol": str(fill["symbol"]).upper(),
+                "side": fill["side"], "qty": fill["qty"],
+                "price_usd": fill["price_usd"], "order_no": fill["order_no"],
+                "client_order_key": fill["client_order_key"],
+                "trade_date": str(fill["trade_date"]),
+                "strategy_owner": meta.get("strategy_owner"),
+                "account_hash": account_hash, "trading_epoch_id": epoch,
+                "fill_evidence_type": meta.get("fill_evidence_type"),
+                "is_synthetic": meta.get("is_synthetic") or meta.get("synthetic"),
+            })
+        enriched_by_symbol: dict[str, dict] = {}
+        native_valuations = []
+        all_position_symbols = set()
+        for position in current_positions:
+            sym = str(position.get("symbol") or "").upper()
+            if not sym or sym in all_position_symbols:
+                raise PortfolioGuardUnavailable("PORT_GUARD_NATIVE_POSITION_DUPLICATE")
+            all_position_symbols.add(sym)
+            registered_owner = owner_for_symbol(sym)
+            if registered_owner != STANDARD_OWNER:
+                continue  # TQQQ Infinite has its own sleeve
+            meta = position.get("meta") if isinstance(position.get("meta"), dict) else {}
+            if str(position.get("strategy_owner") or meta.get("strategy_owner") or "") != "US_STANDARD":
+                raise PortfolioGuardUnavailable("PORT_GUARD_UNKNOWN_BUY_OWNER")
+            raw_qty = int(position.get("qty") or position.get("holding_qty") or 0)
+            if raw_qty <= 0:
+                continue
+            quote = get_quote(
+                sym, resolve_quote_exchange(sym), env="practice",
+                max_age_sec=float(policy["quote_ttl_sec"]), timeout_sec=0.12,
+            )
+            if not isinstance(quote, dict) or quote.get("bid") in (None, "", 0, "0"):
+                raise PortfolioGuardUnavailable("PORT_GUARD_NATIVE_BID_UNAVAILABLE")
+            bid = _decimal(quote["bid"])
+            raw_ts = quote.get("received_at")
+            if isinstance(raw_ts, (int, float)) and raw_ts > 0:
+                source_ts = datetime.fromtimestamp(raw_ts, timezone.utc)
+            elif isinstance(raw_ts, str) and raw_ts.replace(".", "", 1).isdigit():
+                source_ts = datetime.fromtimestamp(float(raw_ts), timezone.utc)
+            else:
+                source_ts = _utc(raw_ts)
+            pos_cycle = str(position.get("position_cycle_id") or meta.get("position_cycle_id") or "")
+            orderable_qty = position.get("orderable_qty")
+            if orderable_qty is None:
+                raise PortfolioGuardUnavailable("PORT_GUARD_KIS_ORDERABLE_MISSING")
+            latest = {
+                "symbol": sym, "strategy_owner": "US_STANDARD",
+                "account_hash": account_hash, "trading_epoch_id": epoch,
+                "holding_qty": raw_qty, "orderable_qty": int(orderable_qty),
+                "mark_bid_usd": str(bid), "mark_source": "KIS_BID",
+                "snapshot_native_kis": True, "quote_asof_utc": source_ts.isoformat(),
+                "position_cycle_id": pos_cycle,
+                "verified_entry_usd": str(
+                    position.get("broker_avg_price") or position.get("avg_cost")
+                    or position.get("entry_price") or ""
+                ),
+            }
+            native_valuations.append(latest)
+            enriched_by_symbol[sym] = position
+        snapshot_at = datetime.now(timezone.utc)
+        pnl, economics = verified_sleeve_pnl(
+            fill_proof, native_valuations,
+            snapshot_at=snapshot_at, account_hash=account_hash,
+            trading_epoch_id=epoch,
+            quote_ttl_sec=_decimal(policy["quote_ttl_sec"]),
+            max_skew_sec=_decimal(policy["max_snapshot_skew_sec"]),
+            broker_full_balance_verified=True,
+        )
+        snapshot_id = hashlib.sha256(canonical({
+            "policy_sha256": manifest_digest, "epoch": epoch,
+            "portfolio": portfolio, "quote_asof": [
+                [p["symbol"], p["quote_asof_utc"], p["holding_qty"], p["mark_bid_usd"]]
+                for p in sorted(native_valuations, key=lambda p: p["symbol"])
+            ],
+            "native_fill_count": len(fill_proof), "pnl_usd": str(pnl),
+        })).hexdigest()
+        with engine.begin() as conn:
+            stage_plan = persist_guard_observation_and_reserve(
+                conn, account_hash=account_hash,
+                trading_epoch_id=epoch, portfolio_epoch_id=portfolio,
+                verified_pnl_usd=pnl, verified_accounting=economics,
+                complete_native_positions=native_valuations,
+                snapshot_id=snapshot_id, snapshot_at=snapshot_at,
+                existing_sell_symbols={
+                    str(symbol).upper() for symbol in excluded_sell_symbols
+                },
+            )
+        if stage_plan.get("state") != "PLANNED":
+            return []
+        output = []
+        for p in stage_plan["intents"]:
+            position = enriched_by_symbol[p["symbol"]]
+            meta = position.get("meta") if isinstance(position.get("meta"), dict) else {}
+            cycle = str(p["position_cycle_id"])
+            if (not cycle
+                    or cycle != str(position.get("position_cycle_id") or meta.get("position_cycle_id") or "")
+                    or str(position.get("portfolio_epoch_id") or meta.get("portfolio_epoch_id") or "") != portfolio):
+                raise PortfolioGuardUnavailable("PORT_GUARD_ORIGINAL_POSITION_SCOPE_INVALID")
+            native = next(v for v in native_valuations if v["symbol"] == p["symbol"])
+            bid = _decimal(native["mark_bid_usd"])
+            limit = (bid * Decimal("0.998")).quantize(Decimal("0.01"), rounding=ROUND_FLOOR)
+            if limit <= 0:
+                raise PortfolioGuardUnavailable("PORT_GUARD_EXECUTABLE_PRICE_INVALID")
+            original_sha = str(meta.get("entry_exit_contract_sha256") or "")
+            original_version = str(meta.get("entry_exit_contract_version") or "")
+            if not original_sha or not original_version:
+                raise PortfolioGuardUnavailable("PORT_GUARD_ORIGINAL_BUY_CONTRACT_MISSING")
+            guard_meta = {
+                **meta,
+                "portfolio_guard_action_key": p["action_key"],
+                "portfolio_guard_policy_digest": manifest_digest,
+                "portfolio_guard_policy_id": policy["policy_id"],
+                "portfolio_guard_policy_version": policy["policy_version"],
+                "portfolio_guard_episode_id": p["episode_id"],
+                "portfolio_guard_stage_no": p["stage_no"],
+                "portfolio_guard_portfolio_epoch_id": portfolio,
+                "portfolio_guard_trading_epoch_id": epoch,
+                "portfolio_guard_quote_asof_utc": native["quote_asof_utc"],
+                "portfolio_guard_verified_bid_usd": native["mark_bid_usd"],
+                "source_entry_contract_sha256": original_sha,
+                "source_entry_contract_version": original_version,
+                "position_lifecycle_id": cycle,
+            }
+            output.append({
+                "symbol": p["symbol"], "exchange": resolve_quote_exchange(p["symbol"]),
+                "side": "SELL", "qty": p["qty"], "available_qty": p["qty"],
+                "limit_price": float(limit), "notional_usd": float(limit * p["qty"]),
+                "strategy": "us_portfolio_profit_guard",
+                "strategy_owner": "US_STANDARD",
+                "exit_type": "portfolio_profit_guard",
+                "exit_reason": "PORTFOLIO_PROFIT_GIVEBACK",
+                "reason": "US_STANDARD_PROVEN_SIGNED_PORTFOLIO_GIVEBACK",
+                "trade_date": trade_date,
+                "client_order_key": p["action_key"],
+                "semantic_action": "US_PORTFOLIO_GIVEBACK_STAGE_" + str(p["stage_no"]),
+                "position_lifecycle_id": cycle, "position_cycle_id": cycle,
+                "portfolio_epoch_id": portfolio, "trading_epoch_id": epoch,
+                "broker_account_hash": account_hash,
+                "partial_allowed": True, "meta": guard_meta,
+            })
+        return output
+    except Exception as exc:
+        logger.warning(
+            "[US_PORT_GUARD][DATA_OR_RESERVATION_INVALID] error_type=%s action=no_portfolio_sell",
+            type(exc).__name__,
+        )
+        return []
