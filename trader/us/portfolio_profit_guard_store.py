@@ -144,6 +144,7 @@ def reconcile_guard_native_order_actions(
             SELECT COALESCE(SUM(qty),0) AS qty
             FROM public.us_fills
             WHERE symbol=:symbol AND side='SELL'
+              AND account_id=:account
               AND trading_epoch_id=:epoch AND portfolio_epoch_id=:portfolio
               AND position_cycle_id=:cycle
               AND client_order_key=:key
@@ -152,6 +153,7 @@ def reconcile_guard_native_order_actions(
               AND COALESCE((meta->>'accounting_active')::boolean,true)=true
         """), {"symbol":row["symbol"],"epoch":epoch,
                "portfolio":portfolio,"cycle":row["position_cycle_id"],
+               "account":account_hash,
                "key":row["action_key"]}).mappings().one()
         native_filled = int(actual["qty"] or 0)
         if native_filled != observed_qty:
