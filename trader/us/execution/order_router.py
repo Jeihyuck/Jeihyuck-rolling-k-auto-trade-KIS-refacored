@@ -2481,6 +2481,7 @@ def route_order(
         ):
             from trader.us.execution.recovery_identity import (
                 USRecoveryScope, assert_preexisting_us_claim_scope,
+                assert_no_conflicting_us_legacy_stop_claim,
             )
             from trader.us.db.repos import _get_engine_or_none
             _us_claim_scope = USRecoveryScope(
@@ -2497,6 +2498,24 @@ def route_order(
             if _preclaim_engine is None:
                 raise RuntimeError("US_CLAIM_SCOPE_DB_UNAVAILABLE")
             with _preclaim_engine.begin() as _preclaim_conn:
+                # A prior unknown one-share legacy stop under a fluctuating
+                # PnL action key is not a new order entitlement. This checks
+                # the same native-verified account/epoch/cycle *before* the
+                # new semantic claim can be created.
+                _legacy_stop_meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+                if (
+                    side == "SELL" and account_env == "practice"
+                    and _legacy_stop_meta.get("us_legacy_forward_management_version")
+                        == "US_LEGACY_NINE_V2_SELL_V1"
+                    and str(intent.get("exit_type") or "") in {
+                        "soft_stop_loss", "persistent_soft_stop_full_exit",
+                        "hard_stop_loss", "hard_stop_full_exit",
+                    }
+                ):
+                    assert_no_conflicting_us_legacy_stop_claim(
+                        _preclaim_conn, scope=_us_claim_scope,
+                        prospective_action_key=claim_identity.action_key,
+                    )
                 assert_preexisting_us_claim_scope(
                     _preclaim_conn, action_key=claim_identity.action_key,
                     scope=_us_claim_scope,
