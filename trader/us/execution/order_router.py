@@ -3133,7 +3133,14 @@ def route_order(
         # decision/claim latency cannot bypass a newly triggered episode.
         if (
             side == "BUY"
-            and str(intent.get("strategy_owner") or "").upper() == "US_STANDARD"
+            and str(
+                intent.get("strategy_owner")
+                or (
+                    intent.get("meta", {}).get("strategy_owner")
+                    if isinstance(intent.get("meta"), dict) else ""
+                )
+                or ""
+            ).upper() == "US_STANDARD"
             and (
                 os.getenv("US_PORTFOLIO_GUARD_ACTIVE", "0") == "1"
                 or os.getenv("US_PORTFOLIO_GUARD_REENTRY_GUARD_ENABLED", "0") == "1"
