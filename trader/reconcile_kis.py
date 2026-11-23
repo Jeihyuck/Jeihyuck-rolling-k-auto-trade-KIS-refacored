@@ -1846,6 +1846,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
 
     order_count = 0
     fill_count = 0
+    verified_infinite_owner_orders = 0
     filled_codes: list[str] = []
     execution_claim_observation_failures: list[dict[str, str]] = []
     for row in rows or []:
@@ -1905,6 +1906,38 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                 )
                 if kr_scope is not None:
                     raise RuntimeError("KR_RECONCILE_SOURCE_LOOKUP_UNVERIFIED") from exc
+        # KR_INFINITE writes an independent durable intent/fill journal. A
+        # fully authenticated KIS row owned by that sleeve must not be
+        # synthesized into the PB1 orders/fills ledger. Conversely, any
+        # unknown owner, contradictory native quantity, or double claim
+        # must preserve the existing fail-closed account boundary.
+        if kr_scope is not None and strict_sell_targets is None:
+            from trader.kr.infinite.daily_ccld_owner import (
+                prove_kr_infinite_daily_owner,
+            )
+            verified_infinite = prove_kr_infinite_daily_owner(
+                engine=engine, scope=kr_scope,
+                broker_row=broker_row, code=code, side=side,
+                kis_odno=kis_odno, order_date=order_time.date(),
+                broker_authenticated=(
+                    str(resp.get("rt_cd") or "") == "0"
+                    and not resp.get("_diag_stub")
+                    and str(resp.get("_ccld_status") or "ok").lower() == "ok"
+                ),
+            )
+            if verified_infinite is not None:
+                if source_order is not None:
+                    raise RuntimeError("KR_RECONCILE_DOUBLE_OWNER_CLAIM_BLOCK")
+                verified_infinite_owner_orders += 1
+                logger.info(
+                    "[KR_RECONCILE][CROSS_OWNER_VERIFIED] "
+                    "owner=%s code=%s side=%s odno=%s filled_qty=%s "
+                    "action=SKIP_PB1_ECONOMIC_WRITE",
+                    verified_infinite["owner"], code, side,
+                    verified_infinite["kis_odno"],
+                    verified_infinite["filled_qty"],
+                )
+                continue
         if strict_sell_targets is not None and not source_order:
             # A KIS ACK may have succeeded while orders.kis_odno failed to
             # persist (2026-10-30 NeoSem). The strict original-day all-pages
@@ -1936,6 +1969,14 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
             # Never synthesize a current-account source identity from only a
             # symbol/ODNO; in particular, a prior-account order is not ours.
             if source_order is None:
+                logger.error(
+                    "[KR_RECONCILE][SOURCE_UNATTRIBUTED] "
+                    "code=%s side=%s kis_odno=%s order_date=%s "
+                    "epoch=%s action=KEEP_UNRESOLVED_BLOCK_BUY",
+                    code, side, str(kis_odno or "MISSING"),
+                    order_time.date().isoformat(),
+                    kr_scope.trading_epoch_id,
+                )
                 raise RuntimeError("KR_RECONCILE_SOURCE_UNATTRIBUTED_KEEP_UNRESOLVED")
             with engine.connect() as owner_conn:
                 if not order_matches_recovery_scope(
@@ -3330,6 +3371,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
         "ok": not bool(degraded_reason),
         "orders": order_count,
         "fills": fill_count,
+        "verified_infinite_owner_orders": verified_infinite_owner_orders,
         "degraded": degraded_reason,
         "ccld_status": ccld_status,
         "filled_codes": filled_codes,

@@ -21489,6 +21489,65 @@ class PB1Engine:
                         "results": [],
                     }
                     if not entry_allowed:
+                        # An order fence must NEVER suppress the read-only 1m
+                        # diagnosis. This does not invoke broker methods or
+                        # grant entry authority: it explains missed setups.
+                        if self.env == "practice" and self.STRATEGY_NAME == "pb1_pullback_close":
+                            from trader.kr.opening_bar_contract import evaluate_proof_for_candidate
+                            for _cf in orderable_candidates:
+                                _features = _cf.features if isinstance(_cf.features, dict) else {}
+                                _style = str(
+                                    _features.get("entry_style_selected")
+                                    or _features.get("entry_setup_family") or ""
+                                ).strip().upper()
+                                if _style in {"MOMENTUM", "PULLBACK", "BREAKOUT"}:
+                                    _style = "ENTRY_" + _style
+                                try:
+                                    _reference = float(
+                                        _features.get("entry_price") or _features.get("close") or 0
+                                    )
+                                    _observed = evaluate_proof_for_candidate(
+                                        env=self.env,
+                                        account_scope=get_account_key(env=self.env),
+                                        code=str(_cf.code).zfill(6),
+                                        now=now_kst(),
+                                        style=_style,
+                                        setup_ok=bool(
+                                            _features.get("setup_ok", _cf.setup_ok)
+                                        ),
+                                        trigger_ok=bool(
+                                            _features.get("breakout_trigger_ok")
+                                            or _features.get("trigger_ok")
+                                        ),
+                                        pivot=_features.get("pivot"),
+                                        order_price=_reference,
+                                    )
+                                    _features["blocked_timing_observation"] = {
+                                        "state": _observed.get("state"),
+                                        "reason": _observed.get("reason"),
+                                        "latest_bar_ts": _observed.get("latest_bar_ts"),
+                                        "entry_gate": str(entry_reason or "ENTRY_DISABLED"),
+                                        "is_order_authorization": False,
+                                        "order_reference_is_broker_limit": False,
+                                    }
+                                    logger.info(
+                                        "[KR][ENTRY][BLOCKED_1M_OBSERVATION] "
+                                        "code=%s style=%s state=%s reason=%s "
+                                        "latest_bar=%s gate=%s "
+                                        "broker_limit_proven=0 order_authorization=0",
+                                        _cf.code, _style, _observed.get("state"),
+                                        _observed.get("reason"),
+                                        _observed.get("latest_bar_ts"),
+                                        str(entry_reason or "ENTRY_DISABLED"),
+                                    )
+                                except Exception as _obs_err:
+                                    # Observation is diagnostic only; a corrupt
+                                    # local bar proof must never crash a tick.
+                                    logger.warning(
+                                        "[KR][ENTRY][BLOCKED_1M_OBSERVATION][UNKNOWN] "
+                                        "code=%s error_type=%s order_authorization=0",
+                                        _cf.code, type(_obs_err).__name__,
+                                    )
                         logger.info(
                             "[ORDER_SUBMIT][SKIP] reason=LIVE_GATE_BLOCKED count=%s",
                             len(orderable_candidates),
@@ -21499,6 +21558,10 @@ class PB1Engine:
                             {
                                 "skipped": 1,
                                 "skipped_reason": str(entry_reason or "ENTRY_DISABLED"),
+                                "timing_observation": (
+                                    (_cf.features or {}).get("blocked_timing_observation")
+                                    if isinstance(_cf.features, dict) else None
+                                ),
                                 "terminal_event": "FINAL_SKIP",
                             }
                             for _cf in orderable_candidates
@@ -21655,7 +21718,19 @@ class PB1Engine:
                         or "entry_order_plan" in str(r).lower()
                         or "entry_exit_plan" in str(r).lower()
                     ]
-                    if top_policy_blocker and not plan_skip_reasons:
+                    if not entry_allowed:
+                        final_status = (
+                            "BLOCKED_RECONCILE"
+                            if str(entry_reason) == "historical_recovery_unverified"
+                            else "OK_NO_TRADE"
+                        )
+                        final_notes = str(entry_reason or "ENTRY_DISABLED")
+                        logger.warning(
+                            "[KR][ORDER_ZERO_API][GATE_BLOCKED] "
+                            "order_candidates=%s api_submitted=0 reason=%s",
+                            len(orderable_candidates), final_notes,
+                        )
+                    elif top_policy_blocker and not plan_skip_reasons:
                         final_status = "OK_NO_TRADE"
                         final_notes = top_policy_blocker
                         logger.info(
@@ -21672,7 +21747,8 @@ class PB1Engine:
                         )
                     os.environ["PB1_LAST_RESULT_STATUS"] = final_status
                     os.environ["PB1_LAST_EXIT_REASON"] = final_notes
-                    if os.getenv("PB1_HARD_FAIL_ON_CANDIDATE_WITHOUT_API_SUBMIT", "0") == "1":
+                    if (final_status == "RETRYABLE_ORDER_BUILD_ERROR"
+                            and os.getenv("PB1_HARD_FAIL_ON_CANDIDATE_WITHOUT_API_SUBMIT", "0") == "1"):
                         raise RuntimeError(
                             f"[KR][ORDER_ZERO_API][FAIL] order_candidates={len(orderable_candidates)} api_submitted=0"
                         )
