@@ -459,6 +459,15 @@ def persist_guard_observation_and_reserve(
         })
         if result.rowcount == 1:
             inserted.append({**decision, "action_key": action_key})
+    if not inserted:
+        # Existing episode/stage/cycle action can never be silently
+        # overwritten to issue another native order after restart.
+        # It may be COMPLETE, but this stage's fixed exposure target is
+        # not yet independently proven satisfied: operator review.
+        return {
+            "state": "BLOCKED", "intents": [],
+            "reason": "GUARD_ACTION_IDENTITY_ALREADY_RESERVED",
+        }
     conn.execute(text("""
         UPDATE public.us_portfolio_guard_state SET state='PLANNED',updated_at=now()
         WHERE policy_id=:policy_id AND policy_version=:policy_version
