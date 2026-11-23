@@ -3281,8 +3281,20 @@ def run_trade_tick(
                 allow_new_symbols = True
                 logger.warning("[US_ENTRY][CRASH_REBOUND_LIMIT] exposure_multiplier=%s max_new_positions=%s prep_reason=%s", market_state_overlay.get("exposure_multiplier"), market_state_overlay.get("effective_max_new_positions"), prep_reason)
         existing_sell_symbols = {str(i.get("symbol") or "").upper().strip() for i in exit_intents if str(i.get("side") or "").upper() == "SELL"}
+        # P0: the source quote from early exit snapshots can expire while
+        # unrelated DB/market-state I/O runs. Recheck TP-only copies just
+        # before the TP decision; the native router still requires a separate
+        # executable KIS quote and authoritative stage/claim permission.
+        tp_decision_positions = current_positions
+        if real_order_mode and not offline and not force_now:
+            from trader.us.execution.tp_signal_quote_refresh import (
+                refresh_tp_source_quotes,
+            )
+            tp_decision_positions = refresh_tp_source_quotes(
+                current_positions, provider,
+            )
         profit_capture_intents = build_profit_capture_intents(
-            current_positions, market_state_overlay, existing_sell_symbols,
+            tp_decision_positions, market_state_overlay, existing_sell_symbols,
             now=now, trade_date=trade_date,
             defer_pending_until_claim=(real_order_mode and not offline),
             # Tick-start calendar time is not the end of TP evaluation.
