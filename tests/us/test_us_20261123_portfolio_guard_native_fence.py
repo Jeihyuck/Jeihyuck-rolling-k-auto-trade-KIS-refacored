@@ -35,6 +35,12 @@ def _policy():
         "mark_source": "KIS_BID",
         "activation_profit_usd": "100", "quote_ttl_sec": "5",
         "max_snapshot_skew_sec": "3", "rearm_mode": "OPERATOR_SIGNED_NEW_EPISODE",
+        "selection_method": "NATIVE_UNDERPERFORMER_FIRST",
+        "reentry_mode": "SIGNED_RELEASE_AFTER_COOLDOWN",
+        "reentry_min_cooldown_seconds": "3600",
+        "reentry_min_recovery_fraction": "0.1",
+        "min_order_notional_usd": "1",
+        "max_order_notional_usd": "1000000",
         "stages": [{"giveback_fraction": "0.25", "cumulative_reduction_fraction": "0.20"}],
     }
     doc["hmac_sha256"] = hmac.new(KEY.encode(),canonical(doc),hashlib.sha256).hexdigest()
