@@ -49,6 +49,20 @@ def _policy():
 NOW = datetime(2026, 11, 23, 15, 0, tzinfo=timezone.utc)
 ACTION = "US_PPG_test-native-action"
 
+class _NativeKis:
+    def get_us_balance(self, force_refresh=False):
+        assert force_refresh is True
+        return {
+            "rt_cd": "0", "balance_authoritative": True,
+            "balance_complete": True, "failed_exchanges": {},
+            "output1": [{
+                "ovrs_pdno": "KO", "ovrs_cblc_qty": "5",
+                "ord_psbl_qty": "5", "ovrs_excg_cd": "NASD",
+            }],
+            "output2": {},
+        }
+
+
 
 def _intent():
     return {
@@ -113,6 +127,8 @@ def allow_native(monkeypatch):
     from trader import account_state
     monkeypatch.setenv("US_PORTFOLIO_GUARD_ACTIVE", "1")
     monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("US_ATOMIC_CLAIM_OUTBOX_ENABLED", "1")
+    monkeypatch.setenv("US_ACCOUNT_RESERVATION_MODE", "ENFORCE")
     monkeypatch.setenv("US_PORTFOLIO_GUARD_SIGNING_KEY", KEY)
     raw = "fixture-native-account"
     monkeypatch.setattr(account_state, "get_account_key", lambda **kw: raw)
@@ -161,6 +177,7 @@ def test_positive_native_policy_and_durable_action_authorization(allow_native):
     intent, conn, *_ = allow_native
     assert_portfolio_guard_native_pre_http(
         intent, now=NOW, actual_qty=2, actual_limit_price=Decimal("99.8"),
+        kis_client=_NativeKis(),
     )
     assert any("FOR UPDATE" in query for query in conn.reads)
 
@@ -180,6 +197,7 @@ def test_native_policy_action_quote_or_fence_mismatch_blocks(allow_native, mutat
     with pytest.raises(PortfolioGuardUnavailable):
         assert_portfolio_guard_native_pre_http(
             intent, now=NOW, actual_qty=2, actual_limit_price=Decimal("99.8"),
+        kis_client=_NativeKis(),
         )
 
 
@@ -189,4 +207,5 @@ def test_native_policy_hard_off_never_submits(allow_native, monkeypatch):
     with pytest.raises(PortfolioGuardUnavailable, match="NOT_OPERATOR_ACTIVE"):
         assert_portfolio_guard_native_pre_http(
             intent, now=NOW, actual_qty=2, actual_limit_price=Decimal("99.8"),
+        kis_client=_NativeKis(),
         )
