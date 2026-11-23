@@ -3564,6 +3564,78 @@ def run_trade_tick(
             len(_early_pilot_attempted_symbols), len(_all_exit_orders),
         )
 
+    # Portfolio giveback is a separately operator-signed SELL policy, not a
+    # second owner or a replacement for the existing frozen V2/V3 stops/TP.
+    # Regular protective exits execute FIRST; absent a signed, complete native
+    # balance plus stage/claim authority the guard emits no broker-capable
+    # intention. Default OFF (no approved operator policy exists yet).
+    if (
+        os.getenv("US_PORTFOLIO_GUARD_ACTIVE", "0") == "1"
+        and real_order_mode and not offline and not force_now
+        and env == "practice" and authoritative_recon
+        and tick_context.remaining_sec() > 8.0
+    ):
+        try:
+            from trader.us.portfolio_profit_guard_store import (
+                build_authorized_portfolio_guard_intents,
+            )
+            _already_selected_sell_symbols = {
+                str(i.get("symbol") or "").upper()
+                for i in _late_exit_intents
+                if str(i.get("side") or "").upper() == "SELL"
+            }
+            _already_selected_sell_symbols.update(
+                str(o.get("intent", {}).get("symbol") or "").upper()
+                for o in exit_route_result.get("orders", [])
+                if isinstance(o, dict)
+                and isinstance(o.get("intent"), dict)
+                and str(o["intent"].get("side") or "").upper() == "SELL"
+            )
+            _guard_intents = build_authorized_portfolio_guard_intents(
+                current_positions=current_positions,
+                trade_date=trade_date, env=env,
+                authoritative_native_balance=authoritative_recon,
+                excluded_sell_symbols=_already_selected_sell_symbols,
+            )
+            if _guard_intents:
+                _guard_routed = route_exit_orders_immediately(
+                    _guard_intents, buy_daily_notional=0.0,
+                    position_count=position_count, effective_budget=effective_budget,
+                    signal_only=signal_only, kis_order_allowed=kis_order_allowed,
+                    current_position_symbols=current_position_symbols,
+                    context=tick_context, kis_client=routing_kis_client,
+                )
+                _all_guard_route_orders = (
+                    list(exit_route_result.get("orders", []))
+                    + list(_guard_routed.get("orders", []))
+                )
+                _all_guard_route_decisions = (
+                    list(exit_route_result.get("decisions", []))
+                    + list(_guard_routed.get("decisions", []))
+                )
+                _sent, _ack, _rejected, _blocked = _routed_order_truth_counts(
+                    _all_guard_route_orders
+                )
+                exit_route_result = {
+                    **exit_route_result,
+                    "orders": _all_guard_route_orders,
+                    "decisions": _all_guard_route_decisions,
+                    "sent": _sent, "ack": _ack,
+                    "rejected": _rejected, "blocked": _blocked,
+                    "sell_notional_routed": _routed_sell_notional(
+                        _all_guard_route_orders
+                    ),
+                    "exit_notional_routed": _routed_sell_notional(
+                        _all_guard_route_orders
+                    ),
+                }
+        except Exception as _guard_exc:
+            logger.error(
+                "[US_PORT_GUARD][TICK_SKIPPED] exception_type=%s "
+                "action=retain_completed_protective_sells",
+                type(_guard_exc).__name__,
+            )
+
     # BUY-specific committed notional is loaded only after protective sells
     # have passed the existing router, durability fences and broker boundary.
     # Do not treat a SELL intent or ACK as new cash/buying power.
