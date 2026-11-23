@@ -1619,3 +1619,67 @@ def test_v3_signed_partial_claim_fences_repeated_crossday_broker_submission(monk
     assert second["status"] == "ORDER_FENCED_UNRESOLVED_ACTION"
     assert broker.calls == 1
     assert claim_repo.health()["unresolved_execution_actions"] == 1
+
+
+def test_port_guard_canonical_native_mock_sell_post_after_signed_pre_http(monkeypatch):
+    """PORT-04: actual route_order reaches mock native SELL only after auth."""
+    from trader.us import portfolio_profit_guard_store as guard
+    _, claim_repo, broker = _route_fixture(monkeypatch)
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("US_PORTFOLIO_GUARD_ACTIVE", "1")
+    validated = []
+    monkeypatch.setattr(
+        guard, "assert_portfolio_guard_native_pre_http",
+        lambda intent, **kw: validated.append((intent["symbol"], kw["actual_qty"])),
+    )
+    intent = _intent(
+        "2026-11-23", side="SELL", qty=2,
+        action="US_PORTFOLIO_GIVEBACK_STAGE_1",
+        client_order_key="US_PPG_mock_signed_stage_1",
+    )
+    intent["exit_type"] = "portfolio_profit_guard"
+    intent["position_cycle_id"] = "route-test-lifecycle"
+    intent["meta"] = {
+        "portfolio_guard_action_key": intent["client_order_key"],
+        "portfolio_guard_policy_digest": "a" * 64,
+        "portfolio_guard_episode_id": "mock-episode-a",
+        "portfolio_guard_stage_no": 1,
+    }
+    result = route_order(
+        intent, kis_client=broker,
+        total_portfolio_usd=10000, available_cash_usd=10000,
+    )
+    assert result["status"] == "ACK"
+    assert validated == [("TEST_SYMBOL", 2)]
+    assert broker.calls == 1
+
+
+def test_port_guard_canonical_native_mock_reject_never_posts(monkeypatch):
+    """PORT-05/10: native POST cannot run on missing/invalid policy proof."""
+    from trader.us import portfolio_profit_guard_store as guard
+    _, claim_repo, broker = _route_fixture(monkeypatch)
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("US_PORTFOLIO_GUARD_ACTIVE", "1")
+    def no_permission(*args, **kwargs):
+        raise guard.PortfolioGuardUnavailable("SIGNATURE_MISSING")
+    monkeypatch.setattr(guard, "assert_portfolio_guard_native_pre_http", no_permission)
+    intent = _intent(
+        "2026-11-23", side="SELL", qty=2,
+        action="US_PORTFOLIO_GIVEBACK_STAGE_1",
+        client_order_key="US_PPG_mock_unsigned_stage_1",
+    )
+    intent["exit_type"] = "portfolio_profit_guard"
+    intent["position_cycle_id"] = "route-test-lifecycle"
+    intent["meta"] = {
+        "portfolio_guard_action_key": intent["client_order_key"],
+        "portfolio_guard_policy_digest": "a" * 64,
+        "portfolio_guard_episode_id": "mock-episode-b",
+        "portfolio_guard_stage_no": 1,
+    }
+    result = route_order(
+        intent, kis_client=broker,
+        total_portfolio_usd=10000, available_cash_usd=10000,
+    )
+    assert result["status"] != "ACK"
+    assert broker.calls == 0
+    assert result.get("broker_submit") is False
