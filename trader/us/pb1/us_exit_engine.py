@@ -346,7 +346,29 @@ def _verified_legacy_forward_soft_stop_partial(
     forward_cycle = str(soft_exec.get("position_lifecycle_id") or "")
     risk = position.get("risk_state") or {}
     trade_date = str(risk.get("trade_date") or "")[:10]
-    if not (order_no and client_key and forward_cycle and trade_date):
+    # A persisted first partial may belong to the preceding US trade day.
+    # Its broker order must be fetched by the original event day, while
+    # current account/epoch/net holdings are re-proved AS OF today. Never
+    # look up yesterday's order under today's daily risk-state date.
+    raw_first_at = str(soft_exec.get("first_soft_stop_at") or "").strip()
+    if not (
+        raw_first_at.endswith("Z")
+        or "+" in raw_first_at[10:]
+        or "-" in raw_first_at[10:]
+    ):
+        return False, "PERSISTENT_SOFT_STOP_FIRST_EVENT_TIME_UNVERIFIED"
+    try:
+        from zoneinfo import ZoneInfo
+        first_seen = datetime.fromisoformat(raw_first_at.replace("Z", "+00:00"))
+        first_trade_date = first_seen.astimezone(
+            ZoneInfo("America/New_York")
+        ).date().isoformat()
+    except (TypeError, ValueError, OverflowError):
+        return False, "PERSISTENT_SOFT_STOP_FIRST_EVENT_TIME_UNVERIFIED"
+    if (
+        not (order_no and client_key and forward_cycle and trade_date)
+        or first_trade_date > trade_date
+    ):
         return False, "PERSISTENT_SOFT_STOP_FORWARD_ORDER_IDENTITY_MISSING"
     # The current-day original is re-proved for every prospective bridge.
     # No ticker-only match, migration of historical rows or synthetic scope.
@@ -367,7 +389,8 @@ def _verified_legacy_forward_soft_stop_partial(
             return False, "PERSISTENT_SOFT_STOP_FORWARD_SCOPE_MISMATCH"
         order = load_us_order_for_fill(
             order_no=order_no, client_order_key=client_key,
-            symbol=str(position.get("symbol") or "").upper(), trade_date=trade_date,
+            symbol=str(position.get("symbol") or "").upper(),
+            trade_date=first_trade_date,
         ) or {}
     except Exception as exc:
         logger.warning(
@@ -384,6 +407,7 @@ def _verified_legacy_forward_soft_stop_partial(
     from trader.us.utils.order_no import normalize_us_order_no
     if (
         str(order.get("side") or "").upper() != "SELL"
+        or str(order.get("trade_date") or "")[:10] != first_trade_date
         or str(order.get("status") or "").upper() not in {"FILLED", "RECONCILED", "CANCELLED"}
         or filled_qty < first_qty
         or str(order.get("client_order_key") or "") != client_key
@@ -444,7 +468,26 @@ def _confirmed_soft_stop_partial_fill_for_current_lifecycle(position: dict) -> t
     )
     state_lifecycle = str(lifecycle_state.get("lifecycle_id") or "").strip()
     if not state_lifecycle and position.get("legacy_nine_decision_only_provisional") is True:
-        return _verified_legacy_forward_soft_stop_partial(position, soft_exec)
+        # Today's risk row may start with no first-partial execution state
+        # after AM/PM rollover. Only an independently proven earlier native
+        # first fill can be reused, and only for the original ongoing cycle.
+        historical = position.get("_legacy_prior_soft_stop_execution_candidate")
+        candidate = (
+            soft_exec
+            if bool(soft_exec.get("soft_stop_partial_done"))
+            else historical if isinstance(historical, dict) else soft_exec
+        )
+        # Cache only for this ephemeral decision snapshot. Restart and next
+        # tick must re-prove DB original + broker first-fill identity.
+        proof_token = (str(candidate.get("order_no") or ""),
+                       str(candidate.get("client_order_key") or ""),
+                       str(position.get("qty") or ""))
+        cached = position.get("_legacy_forward_stop_proof_this_snapshot")
+        if isinstance(cached, tuple) and cached[0] == proof_token:
+            return cached[1]
+        verdict = _verified_legacy_forward_soft_stop_partial(position, candidate)
+        position["_legacy_forward_stop_proof_this_snapshot"] = (proof_token, verdict)
+        return verdict
     if (
         not current_lifecycle
         or not state_lifecycle
@@ -1540,6 +1583,24 @@ def prepare_exit_position_snapshots(
                         **({"policy_revision": "PB1_STOP_3_6_V1"}
                            if pos.get("_verified_pb1_stop_revision") else {}),
                     )
+                    # Keep a previous-day partial-fill *candidate* only in
+                    # this snapshot. It receives no execution authority until
+                    # the original BUY, forward cycle and native first order
+                    # are independently re-proven at the decision gate.
+                    _prior_risk = pos.get("risk_state")
+                    _prior_risk = _prior_risk if isinstance(_prior_risk, dict) else {}
+                    _prior_state = _prior_risk.get("state")
+                    _prior_state = _prior_state if isinstance(_prior_state, dict) else {}
+                    _prior_soft = _prior_state.get("soft_stop_execution")
+                    if (
+                        isinstance(_prior_soft, dict)
+                        and _prior_soft.get("soft_stop_partial_done") is True
+                        and str(_prior_risk.get("trade_date") or "")[:10]
+                            < str(risk_state.get("trade_date") or "")[:10]
+                        and str(pos.get("strategy_owner") or "").upper() == "US_STANDARD"
+                        and str(pos.get("symbol") or "").upper() != "TQQQ"
+                    ):
+                        pos["_legacy_prior_soft_stop_execution_candidate"] = dict(_prior_soft)
                     pos["risk_state"] = risk_state
                     pos["soft_stop_breach_count"] = int(risk_state.get("soft_stop_breach_count") or 0)
                     soft_exec = ((risk_state.get("state") or {}).get("soft_stop_execution") or {})
