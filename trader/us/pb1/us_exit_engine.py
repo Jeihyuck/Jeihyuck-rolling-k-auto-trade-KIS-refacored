@@ -381,7 +381,7 @@ def _verified_legacy_forward_soft_stop_partial(
         filled_qty = int(order.get("qty_filled") or 0)
     except (TypeError, ValueError, OverflowError):
         filled_qty = 0
-    from trader.us.execution.kis_us_response_parser import normalize_us_order_no
+    from trader.us.utils.order_no import normalize_us_order_no
     if (
         str(order.get("side") or "").upper() != "SELL"
         or str(order.get("status") or "").upper() not in {"FILLED", "RECONCILED", "CANCELLED"}
