@@ -3097,6 +3097,39 @@ def route_order(
                 "[US_ORDER][TIMING_PRE_HTTP_PASS] symbol=%s order_limit=%s",
                 symbol_upper, intent.get("limit_price"),
             )
+        # The portfolio giveback SELL must not be undone by an immediate
+        # momentum/pullback/BREAKOUT BUY. Treat the signed episode as a shared
+        # US_STANDARD buying-power reduction, NOT a replacement for individual
+        # strategy eligibility. The guard is checked at native POST, so earlier
+        # decision/claim latency cannot bypass a newly triggered episode.
+        if (
+            side == "BUY"
+            and str(intent.get("strategy_owner") or "").upper() == "US_STANDARD"
+            and (
+                os.getenv("US_PORTFOLIO_GUARD_ACTIVE", "0") == "1"
+                or os.getenv("US_PORTFOLIO_GUARD_REENTRY_GUARD_ENABLED", "0") == "1"
+            )
+        ):
+            try:
+                from datetime import datetime as _guard_dt, timezone as _guard_tz
+                from decimal import Decimal as _GuardDecimal
+                from trader.us.portfolio_profit_guard_store import (
+                    assert_portfolio_guard_reentry_budget,
+                )
+                assert_portfolio_guard_reentry_budget(
+                    intent,
+                    order_notional_usd=(_GuardDecimal(str(price)) * qty),
+                    now=_guard_dt.now(_guard_tz.utc),
+                )
+            except Exception as _reentry_exc:
+                logger.error(
+                    "[US_PORT_GUARD][BUY_REENTRY_FENCED] symbol=%s reason_type=%s",
+                    symbol_upper, type(_reentry_exc).__name__,
+                )
+                raise KisUSPreSubmitError(
+                    "US_PORT_GUARD_REENTRY_UNVERIFIED_BEFORE_HTTP"
+                ) from _reentry_exc
+
         # A portfolio-level SELL has its own authorization contract, separate
         # from every original BUY V2/V3 and the discretionary TP path.
         # Re-prove this EXACT policy/action/native quote at the real KIS
