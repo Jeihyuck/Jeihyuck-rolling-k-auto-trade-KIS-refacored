@@ -107,20 +107,34 @@ CREATE TABLE IF NOT EXISTS public.us_portfolio_guard_reentry_release (
   CONSTRAINT ck_us_portfolio_guard_release_window CHECK (expires_at > effective_at)
 );
 
--- Durable BUY budget consumed *before* the KIS native HTTP boundary.
--- Keep reservations after unknown POST/ACK failure: they can be released
--- only by separately verified, audited broker cancellation.
+-- Single-use signed reentry budget reservations; never release from ACK alone.
 CREATE TABLE IF NOT EXISTS public.us_portfolio_guard_reentry_buy_reservations (
   policy_id text NOT NULL,
   policy_version text NOT NULL,
-  env text NOT NULL CHECK(env='practice'),
-  account_hash text NOT NULL CHECK(account_hash ~ '^[0-9a-f]{64}
+  env text NOT NULL CHECK (env='practice'),
+  account_hash text NOT NULL CHECK (length(account_hash)=64),
+  trading_epoch_id text NOT NULL,
+  portfolio_epoch_id text NOT NULL,
+  episode_id text NOT NULL,
+  client_order_key text NOT NULL,
+  notional_usd numeric(20,6) NOT NULL CHECK (notional_usd > 0),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (policy_id,policy_version,env,account_hash,trading_epoch_id,
+               portfolio_epoch_id,episode_id,client_order_key),
+  UNIQUE (client_order_key),
+  FOREIGN KEY (policy_id,policy_version,env,account_hash,trading_epoch_id,
+               portfolio_epoch_id,episode_id)
+    REFERENCES public.us_portfolio_guard_reentry_release (
+      policy_id,policy_version,env,account_hash,trading_epoch_id,
+      portfolio_epoch_id,episode_id
+    )
+);
+
+-- Default-deny RLS for every internal broker-control ledger.
 ALTER TABLE public.us_portfolio_guard_policy ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.us_portfolio_guard_state ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.us_portfolio_guard_actions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.us_portfolio_guard_reentry_release ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.us_portfolio_guard_reentry_buy_reservations ENABLE ROW LEVEL SECURITY;
--- Public API access stays denied: all five ledger tables have RLS ON
--- with NO anon/authenticated policies, regardless of default grants.
--- Explicit role REVOKEs are deployment-environment-specific and are
--- deliberately excluded from the portable, transactional migration.
+-- The portable migration creates NO anon/authenticated RLS policies.
+-- Do not grant public REST API access to native trading control tables.
