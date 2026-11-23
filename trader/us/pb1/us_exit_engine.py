@@ -477,17 +477,11 @@ def _confirmed_soft_stop_partial_fill_for_current_lifecycle(position: dict) -> t
             if bool(soft_exec.get("soft_stop_partial_done"))
             else historical if isinstance(historical, dict) else soft_exec
         )
-        # Cache only for this ephemeral decision snapshot. Restart and next
-        # tick must re-prove DB original + broker first-fill identity.
-        proof_token = (str(candidate.get("order_no") or ""),
-                       str(candidate.get("client_order_key") or ""),
-                       str(position.get("qty") or ""))
-        cached = position.get("_legacy_forward_stop_proof_this_snapshot")
-        if isinstance(cached, tuple) and cached[0] == proof_token:
-            return cached[1]
-        verdict = _verified_legacy_forward_soft_stop_partial(position, candidate)
-        position["_legacy_forward_stop_proof_this_snapshot"] = (proof_token, verdict)
-        return verdict
+        # Two independent decision gates may call this function; reverify
+        # the original and native first fill on each call. Do not mutate
+        # the caller's position or cache an authorization that could become
+        # stale after a broker/claim state transition.
+        return _verified_legacy_forward_soft_stop_partial(position, candidate)
     if (
         not current_lifecycle
         or not state_lifecycle
