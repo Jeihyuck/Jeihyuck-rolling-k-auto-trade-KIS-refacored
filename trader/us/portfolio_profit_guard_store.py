@@ -664,7 +664,10 @@ def build_authorized_portfolio_guard_intents(
                 portfolio=portfolio, now=now,
             )
             if approved is None:
-                return []
+                # This mode is an executable order feature. A missing signed
+                # manifest is NOT SHADOW, not successful ACTIVE, and never
+                # authority to submit a discretionary portfolio SELL.
+                raise PortfolioGuardUnavailable("GUARD_STARTUP_NO_ACTIVE_SIGNED_POLICY")
             policy, manifest_digest = approved
             # Per-symbol broker/order claim conflict fence across session and
             # prior trade dates.  A pending/unknown economic SELL cannot be
