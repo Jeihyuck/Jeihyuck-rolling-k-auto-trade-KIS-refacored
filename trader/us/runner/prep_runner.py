@@ -180,7 +180,10 @@ def _evaluate_benchmark_daily_gate(
         }
 
     final_quality_ok = context_quality == "ok" and not context_missing
-    benchmark_daily_failed = bool(missing_symbols)
+    # A context-level stale/unknown benchmark is still a BUY blocker even
+    # when each successful sync row claims OK.  Never upgrade a degraded
+    # market context to fresh solely because missing_symbols is empty.
+    benchmark_daily_failed = bool(missing_symbols or context_quality != "ok")
 
     # market overlay + rotation context가 최종 OK면 stale sync 실패 이력은 gate 사유에서 제외한다.
     if allow_new_buy and final_quality_ok and not missing_symbols:
@@ -392,6 +395,7 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         exchange_failed_symbols = set(registry_summary["failed_symbols"])
         dynamic_universe_result["exchange_resolution_failed_symbols"] = sorted(exchange_failed_symbols)
         sync_ok: list[str] = []
+        sync_ok_evidence: dict[str, dict] = {}
         sync_failed: list[dict] = []
         for sym in sorted(sync_symbols):
             if sym in exchange_failed_symbols:
@@ -406,6 +410,17 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
                     result = {"quality": "OK" if rows else "INSUFFICIENT_HISTORY", "valid_bar_count": len(rows or []), "db_latest": None, "expected_latest": None}
                 if result.get("quality") == "OK":
                     sync_ok.append(sym)
+                    # Preserve the actual post-sync completed-bar evidence.
+                    # Previously a successful row was flattened to only
+                    # {symbol, quality: OK}, deleting db_latest/expected_latest
+                    # and preventing the terminal benchmark gate from auditing
+                    # whether backfill actually resolved a stale day.
+                    sync_ok_evidence[sym] = {
+                        "symbol": sym, "quality": "OK",
+                        "db_latest": result.get("db_latest"),
+                        "expected_latest": result.get("expected_latest"),
+                        "valid_bar_count": result.get("valid_bar_count"),
+                    }
                 else:
                     sync_failed.append({
                         "symbol": sym,
@@ -428,7 +443,7 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
             "exchange_resolution_failures": registry_summary["failures"],
             "open_position_sync_failed_symbols": [x["symbol"] for x in sync_failed if x["symbol"] in open_position_symbols],
             "benchmark_sync_failed_symbols": [x["symbol"] for x in sync_failed if x["symbol"] in benchmark_symbols],
-            "daily_sync_quality_by_symbol": {x["symbol"]: x for x in sync_failed} | {s: {"symbol": s, "quality": "OK"} for s in sync_ok},
+            "daily_sync_quality_by_symbol": {x["symbol"]: x for x in sync_failed} | sync_ok_evidence,
         }
         logger.info("[US_PREP][DAILY_SYNC] %s", daily_sync_summary)
     except Exception as exc:
