@@ -120,62 +120,7 @@ ALTER TABLE public.us_portfolio_guard_state ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.us_portfolio_guard_actions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.us_portfolio_guard_reentry_release ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.us_portfolio_guard_reentry_buy_reservations ENABLE ROW LEVEL SECURITY;
--- Development PostgreSQL containers do not create Supabase API roles.
--- Revoke only roles which actually exist; RLS still defaults to deny.
-DO $guard_auth_roles$ BEGIN
- IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='anon') THEN
-   REVOKE ALL ON TABLE public.us_portfolio_guard_policy,
-                       public.us_portfolio_guard_state,
-                       public.us_portfolio_guard_actions,
-                       public.us_portfolio_guard_reentry_release,
-                       public.us_portfolio_guard_reentry_buy_reservations FROM anon;
- END IF;
- IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='authenticated') THEN
-   REVOKE ALL ON TABLE public.us_portfolio_guard_policy,
-                       public.us_portfolio_guard_state,
-                       public.us_portfolio_guard_actions,
-                       public.us_portfolio_guard_reentry_release,
-                       public.us_portfolio_guard_reentry_buy_reservations FROM authenticated;
- END IF;
-END; $guard_auth_roles$;
-),
-  trading_epoch_id text NOT NULL,
-  portfolio_epoch_id text NOT NULL,
-  episode_id text NOT NULL,
-  client_order_key text NOT NULL,
-  notional_usd numeric(20,6) NOT NULL CHECK(notional_usd>0),
-  created_at timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (policy_id,policy_version,env,account_hash,trading_epoch_id,
-               portfolio_epoch_id,episode_id,client_order_key),
-  UNIQUE (client_order_key),
-  FOREIGN KEY (policy_id,policy_version,env,account_hash,trading_epoch_id,
-               portfolio_epoch_id,episode_id)
-    REFERENCES public.us_portfolio_guard_reentry_release (
-      policy_id,policy_version,env,account_hash,trading_epoch_id,
-      portfolio_epoch_id,episode_id
-    )
-);
-
--- Guard tables are internal broker-control ledgers, never public REST APIs.
-ALTER TABLE public.us_portfolio_guard_policy ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.us_portfolio_guard_state ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.us_portfolio_guard_actions ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.us_portfolio_guard_reentry_release ENABLE ROW LEVEL SECURITY;
--- Development PostgreSQL containers do not create Supabase API roles.
--- Revoke only roles which actually exist; RLS still defaults to deny.
-DO $guard_auth_roles$ BEGIN
- IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='anon') THEN
-   REVOKE ALL ON TABLE public.us_portfolio_guard_policy,
-                       public.us_portfolio_guard_state,
-                       public.us_portfolio_guard_actions,
-                       public.us_portfolio_guard_reentry_release,
-                       public.us_portfolio_guard_reentry_buy_reservations FROM anon;
- END IF;
- IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='authenticated') THEN
-   REVOKE ALL ON TABLE public.us_portfolio_guard_policy,
-                       public.us_portfolio_guard_state,
-                       public.us_portfolio_guard_actions,
-                       public.us_portfolio_guard_reentry_release,
-                       public.us_portfolio_guard_reentry_buy_reservations FROM authenticated;
- END IF;
-END $guard_auth_roles$;
+-- Public API access stays denied: all five ledger tables have RLS ON
+-- with NO anon/authenticated policies, regardless of default grants.
+-- Explicit role REVOKEs are deployment-environment-specific and are
+-- deliberately excluded from the portable, transactional migration.
