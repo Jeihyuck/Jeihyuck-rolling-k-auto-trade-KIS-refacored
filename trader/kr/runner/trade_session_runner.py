@@ -651,6 +651,12 @@ def normalize_kr_session_completion(
         return "FAILED", "PB1_ADVISORY_LOCK_UNAVAILABLE", 0, 1
     if pb1_exit_reason_s == "PB1_RESULT_MISSING":
         return "FAILED", "PB1_RESULT_MISSING", 0, 1
+    if pb1_status_u == "BLOCKED_RECONCILE":
+        # A denied buy was *safe*, not a malformed order or successful tick.
+        # The scheduler must keep retrying independent fresh broker proof.
+        return "BLOCKED_RECONCILE", (
+            pb1_exit_reason_s or "historical_recovery_unverified"
+        ), 0, 1
     policy_block_reasons = {
         "BUYABLE_EXISTING_HOLDING_KIS",
         "BUYABLE_TODAY_BUY_EXISTS",
