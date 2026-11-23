@@ -10,6 +10,8 @@ import os
 import json
 import hashlib
 import hmac
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -22,11 +24,14 @@ from sqlalchemy import create_engine, text
 from trader.us.portfolio_profit_guard import canonical, policy_digest
 from trader.us.portfolio_profit_guard_store import (
     persist_guard_observation_and_reserve,
+    assert_portfolio_guard_reentry_budget,
+    PortfolioGuardUnavailable,
 )
 
 URL = os.getenv("PBCORE_TEST_POSTGRES_URL")
 KEY = "synthetic-test-only-" + "X" * 45
-ACCOUNT = "a" * 64
+RAW_ACCOUNT = "unit-pg-account"
+ACCOUNT = hashlib.sha256(RAW_ACCOUNT.encode()).hexdigest()
 EPOCH = "unit-pg-epoch"
 PORT = "unit-pg-portfolio"
 CYCLE = "test-ko-cycle"
@@ -63,6 +68,17 @@ def store(monkeypatch):
                 status text,
                 qty_filled integer,
                 meta jsonb
+            );
+            CREATE TABLE IF NOT EXISTS public.us_order_intents (
+                id bigserial primary key,
+                client_order_key text NOT NULL UNIQUE,
+                account_id text,
+                trading_epoch_id text,
+                portfolio_epoch_id text,
+                side text,
+                symbol text,
+                notional_usd numeric,
+                created_at timestamptz DEFAULT now()
             );
             CREATE TABLE IF NOT EXISTS public.us_fills (
                 id bigserial primary key,
@@ -267,3 +283,104 @@ def test_pg_no_buy_or_sell_during_unknown_action(store):
         )).scalar_one()
     assert held["intents"] == []
     assert rows == 1
+
+
+def test_reentry_two_workers_serialized_budget_and_retry_fenced(store, monkeypatch):
+    """PORT-12 concurrent BUY worker race uses one durable spend reservation."""
+    engine, now = store
+    from trader.us.db import repos
+    from trader.us.execution import recovery_identity
+    from trader import account_state
+
+    monkeypatch.setenv("US_PORTFOLIO_GUARD_ACTIVE", "1")
+    monkeypatch.setenv("US_ACCOUNT_RESERVATION_MODE", "ENFORCE")
+    monkeypatch.setenv("US_ATOMIC_CLAIM_OUTBOX_ENABLED", "1")
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("US_PORTFOLIO_GUARD_REARM_SIGNING_KEY", KEY)
+    monkeypatch.setattr(account_state, "get_account_key", lambda **kw: RAW_ACCOUNT)
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: engine)
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda *args, **kw: EPOCH)
+    monkeypatch.setattr(
+        recovery_identity, "current_us_portfolio_epoch", lambda *args, **kw: PORT,
+    )
+
+    effective = now - timedelta(minutes=2)
+    release = {
+        "purpose": "US_STANDARD_PORTFOLIO_REENTRY_RELEASE_V1",
+        "env": "practice", "sleeve": "US_STANDARD",
+        "account_hash": ACCOUNT,
+        "trading_epoch_id": EPOCH, "portfolio_epoch_id": PORT,
+        "policy_id": "pg-ci", "policy_version": "v1",
+        "episode_id": "episode-ci",
+        "max_new_buy_notional_usd": "100",
+        "effective_at": effective.isoformat(),
+        "expires_at": (now + timedelta(hours=1)).isoformat(),
+    }
+    with engine.begin() as conn:
+        proof = conn.execute(text("""
+            SELECT authorization_sha256 FROM public.us_portfolio_guard_policy
+            WHERE policy_id='pg-ci'
+        """)).scalar_one()
+        release["policy_sha256"] = proof
+        release_hash = hashlib.sha256(canonical(release)).hexdigest()
+        release["hmac_sha256"] = hmac.new(
+            KEY.encode(), canonical(release), hashlib.sha256,
+        ).hexdigest()
+        conn.execute(text("""
+            INSERT INTO public.us_portfolio_guard_state
+            (policy_id,policy_version,env,account_hash,trading_epoch_id,
+             portfolio_epoch_id,sleeve,accounting_method,baseline_provenance,
+             high_water_pnl_usd,latest_pnl_usd,last_snapshot_id,last_snapshot_at,
+             episode_id,episode_anchor,state,stage_no)
+            VALUES ('pg-ci','v1','practice',:account,:epoch,:portfolio,
+                    'US_STANDARD','NATIVE_FILLS_PLUS_FRESH_KIS_MARK_V1',
+                    '{}'::jsonb,100,90,'verified-recovery',:now,'episode-ci',
+                    CAST(:anchor AS jsonb),'COMPLETE',1)
+        """), {"account":ACCOUNT,"epoch":EPOCH,"portfolio":PORT,"now":now,
+               "anchor":json.dumps({
+                   "triggered_at_utc":(now-timedelta(hours=1)).isoformat(),
+                   "triggered_pnl_usd":"75","initial_hwm_usd":"100"
+               })})
+        conn.execute(text("""
+            INSERT INTO public.us_portfolio_guard_reentry_release
+            (policy_id,policy_version,env,account_hash,trading_epoch_id,
+             portfolio_epoch_id,episode_id,release_sha256,release_json,
+             effective_at,expires_at)
+            VALUES ('pg-ci','v1','practice',:account,:epoch,:portfolio,'episode-ci',
+                    :digest,CAST(:document AS jsonb),:effective,:expires)
+        """), {"account":ACCOUNT,"epoch":EPOCH,"portfolio":PORT,
+               "digest":release_hash,"document":json.dumps(release),
+               "effective":effective,"expires":now+timedelta(hours=1)})
+        for idx in range(2):
+            conn.execute(text("""
+                INSERT INTO public.us_order_intents
+                (client_order_key,account_id,trading_epoch_id,
+                 portfolio_epoch_id,side,symbol,notional_usd)
+                VALUES (:key,:account,:epoch,:portfolio,'BUY','KO',60)
+            """), {"key":"budget-buy-"+str(idx),"account":ACCOUNT,
+                   "epoch":EPOCH,"portfolio":PORT})
+
+    def submit_mock(key):
+        try:
+            assert_portfolio_guard_reentry_budget(
+                {"side":"BUY","strategy_owner":"US_STANDARD",
+                 "symbol":"KO","client_order_key":key},
+                order_notional_usd=Decimal("60"), now=now,
+            )
+            return "RESERVED"
+        except PortfolioGuardUnavailable as exc:
+            return str(exc)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(submit_mock, ("budget-buy-0","budget-buy-1")))
+    assert results.count("RESERVED") == 1, results
+    assert sum("RISK_BUDGET_EXCEEDED" in row for row in results) == 1, results
+    with engine.begin() as conn:
+        rows = conn.execute(text("""
+            SELECT client_order_key,notional_usd
+            FROM public.us_portfolio_guard_reentry_buy_reservations
+        """)).mappings().all()
+        assert len(rows) == 1
+        assert rows[0]["notional_usd"] == Decimal("60")
+    # A local retry may not create a duplicate budget reservation or HTTP.
+    assert "BUY_KEY_ALREADY_RESERVED" in submit_mock(rows[0]["client_order_key"])
