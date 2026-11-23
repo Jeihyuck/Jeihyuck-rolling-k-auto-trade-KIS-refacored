@@ -120,6 +120,8 @@ def _fill(sym, side, qty, price, no):
         "account_hash": ACCOUNT, "trading_epoch_id": EPOCH,
         "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
         "is_synthetic": False,
+        "native_fee_proof": True,
+        "commission_usd": "0", "tax_usd": "0",
     }
 
 
@@ -138,7 +140,9 @@ def _pnl(fills, positions, **kwargs):
         fills, positions,
         snapshot_at=STAMP, account_hash=ACCOUNT, trading_epoch_id=EPOCH,
         quote_ttl_sec=Decimal("5"), max_skew_sec=Decimal("3"),
-        broker_full_balance_verified=True, **kwargs,
+        broker_full_balance_verified=True,
+        broker_cash_ledger_complete=True,
+        cash_events=[], **kwargs,
     )
 
 
@@ -246,3 +250,58 @@ def test_inactive_guard_close_is_explicit_off_and_cannot_touch_kis_or_db(monkeyp
     assert portfolio_guard_close_health(env="practice", offline=True) == {
         "status": "OFF", "orders_checked": 0,
     }
+
+
+def test_verified_net_cash_changes_profit_without_external_capital_miscount():
+    buy = _fill("KO", "BUY", 10, "100", "net-buy")
+    sell = _fill("KO", "SELL", 5, "110", "net-sell")
+    buy["commission_usd"] = "2.25"
+    sell["commission_usd"] = "1.75"
+    sell["tax_usd"] = "0.50"
+    one_native_dividend = [{
+        "event_id": "kis-cash-123",
+        "strategy_owner": "US_STANDARD",
+        "account_hash": ACCOUNT, "trading_epoch_id": EPOCH,
+        "evidence_type": "KIS_NATIVE_CASH_CONFIRMED",
+        "event_type": "DIVIDEND_CASH",
+        "occurred_at_utc": (STAMP - timedelta(minutes=1)).isoformat(),
+        "amount_usd": "3.25",
+    }]
+    net, proof = verified_sleeve_pnl(
+        [buy, sell], [_position()],
+        snapshot_at=STAMP, account_hash=ACCOUNT, trading_epoch_id=EPOCH,
+        quote_ttl_sec=Decimal("5"), max_skew_sec=Decimal("3"),
+        broker_full_balance_verified=True,
+        broker_cash_ledger_complete=True,
+        cash_events=one_native_dividend,
+    )
+    # Gross $75 = sale $550 + holding $525 - purchase $1000.
+    # Net = $75 - $4.00 fees - $0.50 tax + $3.25 dividend.
+    assert net == Decimal("73.75")
+    assert proof["commissions_usd"] == Decimal("4.00")
+    assert proof["broker_cash_adjustments_usd"] == Decimal("3.25")
+    # A second row with the same broker cash event id may not double-count.
+    with pytest.raises(ValueError, match="CASH_EVENT_SCOPE_OR_SOURCE"):
+        verified_sleeve_pnl(
+            [buy, sell], [_position()], snapshot_at=STAMP,
+            account_hash=ACCOUNT, trading_epoch_id=EPOCH,
+            quote_ttl_sec=Decimal("5"), max_skew_sec=Decimal("3"),
+            broker_full_balance_verified=True,
+            broker_cash_ledger_complete=True,
+            cash_events=one_native_dividend + one_native_dividend,
+        )
+
+
+def test_missing_proven_costs_or_cash_ledger_cannot_authorize_guard_sell():
+    rows = [_fill("KO","BUY",10,"100","fee-buy"),
+            _fill("KO","SELL",5,"110","fee-sell")]
+    with pytest.raises(ValueError, match="NET_CASH_EVENTS_UNVERIFIED"):
+        verified_sleeve_pnl(
+            rows, [_position()], snapshot_at=STAMP, account_hash=ACCOUNT,
+            trading_epoch_id=EPOCH, quote_ttl_sec=Decimal("5"),
+            max_skew_sec=Decimal("3"),broker_full_balance_verified=True,
+        )
+    broken = dict(rows[0])
+    broken.pop("native_fee_proof")
+    with pytest.raises(ValueError, match="BROKER_FEES_UNVERIFIED"):
+        _pnl([broken,rows[1]], [_position()])
