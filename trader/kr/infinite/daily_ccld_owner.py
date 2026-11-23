@@ -71,7 +71,7 @@ def prove_kr_infinite_daily_owner(
     # order quantity. If KIS explicitly reports 0/invalid fills, do not hide it.
     if not order_present or native_order_qty is None:
         return None
-    if fill_present and native_fill_qty is None:
+    if not fill_present or native_fill_qty is None:
         return None
 
     query = sa.text("""
