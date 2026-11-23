@@ -83,9 +83,55 @@ def persist_bars(db: sqlite3.Connection, *, trade_date: str, symbol: str,
         return 0
     verified = normalize_bars(native_rows, trade_date=trade_date, now_et=now_et)
     timestamp = datetime.now(timezone.utc).isoformat()
+    # normalize_bars intentionally produces one bar per completed minute for
+    # ordinary decisions. Before that deduplication can hide contradictory
+    # native rows inside a SINGLE KIS response, compare the normalized source
+    # rows independently and keep both versions as durable conflict evidence.
+    _batch_versions: dict[str, dict[str, str]] = {}
+    for raw in native_rows or []:
+        for normalized in normalize_bars(
+            [raw], trade_date=trade_date, now_et=now_et,
+        ):
+            payload = json.dumps(
+                normalized, sort_keys=True, separators=(",", ":"), allow_nan=False,
+            )
+            minute = normalized["time_et"]
+            _batch_versions.setdefault(minute, {})[
+                hashlib.sha256(payload.encode("utf-8")).hexdigest()
+            ] = payload
+    _batch_conflicts = {
+        minute: versions for minute, versions in _batch_versions.items()
+        if len(versions) > 1
+    }
     changed = 0
     with db:
+        for minute, versions in _batch_conflicts.items():
+            payloads = list(versions.values())
+            original = payloads[0]
+            for new_payload in payloads[1:]:
+                db.execute(
+                    "INSERT OR IGNORE INTO bar_conflicts "
+                    "(trade_date,symbol,owner,minute_et,source,incoming_sha256,"
+                    "original_row_json,incoming_row_json,observed_utc,status) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,'UNRESOLVED')",
+                    (
+                        trade_date, symbol.upper(), owner, minute,
+                        "KIS_OVERSEAS_1M",
+                        hashlib.sha256(new_payload.encode("utf-8")).hexdigest(),
+                        original, new_payload, timestamp,
+                    ),
+                )
+            LOG.warning(
+                "[US_OPENING_OBSERVER][SAME_BATCH_NATIVE_BAR_CONFLICT] "
+                "symbol=%s minute=%s variants=%d action=QUARANTINE_NO_REWRITE",
+                symbol.upper(), minute, len(payloads),
+            )
         for row in verified:
+            if row["time_et"] in _batch_conflicts:
+                # Never let an arbitrary response ordering select an authority
+                # for the conflicted minute. Existing trusted rows are also
+                # excluded by load_bars() via the durable conflict quarantine.
+                continue
             prior = db.execute(
                 "SELECT row_json FROM verified_bars WHERE trade_date=? AND symbol=? "
                 "AND owner=? AND minute_et=? AND source='KIS_OVERSEAS_1M'",
