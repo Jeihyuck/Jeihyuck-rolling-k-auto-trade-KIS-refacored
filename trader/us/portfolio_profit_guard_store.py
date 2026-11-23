@@ -185,6 +185,7 @@ def persist_guard_observation_and_reserve(
     verified_accounting: dict, complete_native_positions: list[dict],
     snapshot_id: str, snapshot_at: datetime,
     existing_sell_symbols: set[str],
+    native_verified_sold_qty_by_cycle: dict[str, int] | None = None,
 ) -> dict:
     """One PostgreSQL transaction holds policy/state/episode lock until commit.
 
@@ -202,6 +203,13 @@ def persist_guard_observation_and_reserve(
     if any(p.get("snapshot_native_kis") is not True for p in complete_native_positions):
         raise PortfolioGuardUnavailable("PORT_GUARD_KIS_POSITION_PROOF_MISSING")
     pnl = _decimal(verified_pnl_usd)
+    if native_verified_sold_qty_by_cycle is None:
+        raise PortfolioGuardUnavailable("PORT_GUARD_NATIVE_SELL_LEDGER_REQUIRED")
+    if any(
+        not cycle or isinstance(qty, bool) or not isinstance(qty, int) or qty < 0
+        for cycle, qty in native_verified_sold_qty_by_cycle.items()
+    ):
+        raise PortfolioGuardUnavailable("PORT_GUARD_NATIVE_SELL_LEDGER_INVALID")
     auth = _get_policy(
         conn, account_hash=account_hash, epoch=trading_epoch_id,
         portfolio=portfolio_epoch_id, now=snapshot_at,
@@ -292,10 +300,26 @@ def persist_guard_observation_and_reserve(
             _decimal(p["holding_qty"]) * _decimal(p["mark_bid_usd"])
             for p in complete_native_positions
         )
+        original_lots = {
+            str(p["position_cycle_id"]): {
+                "symbol": str(p["symbol"]).upper(),
+                "reference_price_usd": str(_decimal(p["mark_bid_usd"])),
+                "initial_holding_qty": int(p["holding_qty"]),
+                "initial_native_sell_qty": int(native_verified_sold_qty_by_cycle.get(
+                    str(p["position_cycle_id"]), 0,
+                )),
+            }
+            for p in complete_native_positions
+            if str(p.get("position_cycle_id") or "")
+        }
+        if len(original_lots) != len(complete_native_positions):
+            raise PortfolioGuardUnavailable("PORT_GUARD_REFERENCE_CYCLE_MISSING_OR_DUPLICATE")
         episode_anchor = {
             "snapshot_id": snapshot_id,
+            "triggered_at_utc": snapshot_at.isoformat(),
             "reference_exposure_usd": str(reference_exposure),
             "initial_hwm_usd": str(hwm),
+            "original_lots": original_lots,
         }
         conn.execute(text("""
             UPDATE public.us_portfolio_guard_state
@@ -338,15 +362,32 @@ def persist_guard_observation_and_reserve(
     """), {**scope, "episode": current_episode}).mappings().all()
     if any(a["state"] not in ("COMPLETE",) for a in existing_actions):
         return {"state": "PARTIAL", "intents": [], "reason": "PREVIOUS_ACTION_NOT_TERMINAL"}
-    reduced = sum(
-        _decimal(a["cumulative_verified_fill_qty"])
-        * _decimal((a["decision_json"] or {})["reference_price_usd"])
-        for a in existing_actions
-    )
+    # Include ALL independently proven post-trigger native SELLs, including
+    # the ordinary hard/soft stop and TP fills. No double accounting for
+    # portfolio guard executions. Every share is valued at frozen trigger bid.
+    original_lots = episode_anchor.get("original_lots")
+    if not isinstance(original_lots, dict):
+        raise PortfolioGuardUnavailable("PORT_GUARD_ORIGINAL_LOTS_PROOF_MISSING")
+    reduced = Decimal("0")
+    for cycle, original in original_lots.items():
+        before = int(original["initial_native_sell_qty"])
+        actual = native_verified_sold_qty_by_cycle.get(cycle)
+        if actual is None or actual < before:
+            raise PortfolioGuardUnavailable("PORT_GUARD_SELL_LEDGER_REGRESSED")
+        sold_since = actual - before
+        if sold_since > int(original["initial_holding_qty"]):
+            raise PortfolioGuardUnavailable("PORT_GUARD_SELL_MORE_THAN_INITIAL_HOLDINGS")
+        reduced += Decimal(sold_since) * _decimal(original["reference_price_usd"])
+    if reduced > reference_exposure:
+        raise PortfolioGuardUnavailable("PORT_GUARD_REDUCED_VALUE_OVERFLOW")
     target_plans = plan_verified_guard_sell(
         complete_native_positions, policy=policy, stage_no=stage,
         reference_exposure_usd=reference_exposure, already_reduced_usd=reduced,
         excluded_symbols=existing_sell_symbols,
+        episode_reference_prices={
+            cycle: original["reference_price_usd"]
+            for cycle, original in original_lots.items()
+        },
     )
     if not target_plans:
         return {"state": "PARTIAL", "intents": [],
@@ -587,15 +628,22 @@ def build_authorized_portfolio_guard_intents(
             }
             native_fills = conn.execute(text("""
                 SELECT trade_date,symbol,side,qty,price_usd,order_no,
-                       client_order_key,account_id,trading_epoch_id,meta
+                       client_order_key,account_id,trading_epoch_id,
+                       portfolio_epoch_id,position_cycle_id,meta
                 FROM public.us_fills
                 WHERE trading_epoch_id=:epoch
-                  AND meta->>'strategy_owner'='US_STANDARD'
                 ORDER BY trade_date,id
             """), {"epoch": epoch}).mappings().all()
         fill_proof = []
         for fill in native_fills:
             meta = fill["meta"] if isinstance(fill["meta"], dict) else {}
+            symbol_owner = owner_for_symbol(str(fill.get("symbol") or ""))
+            if symbol_owner != STANDARD_OWNER:
+                continue
+            if (meta.get("strategy_owner") != "US_STANDARD"
+                    or str(fill.get("portfolio_epoch_id") or "") != portfolio
+                    or not fill.get("position_cycle_id")):
+                raise PortfolioGuardUnavailable("PORT_GUARD_FILL_OWNER_PORTFOLIO_CYCLE_UNVERIFIED")
             if str(fill.get("account_id") or "") not in (raw_account, account_hash):
                 raise PortfolioGuardUnavailable("PORT_GUARD_FILL_ACCOUNT_MISMATCH")
             fill_proof.append({
@@ -608,7 +656,18 @@ def build_authorized_portfolio_guard_intents(
                 "account_hash": account_hash, "trading_epoch_id": epoch,
                 "fill_evidence_type": meta.get("fill_evidence_type"),
                 "is_synthetic": meta.get("is_synthetic") or meta.get("synthetic"),
+                "position_cycle_id": str(fill["position_cycle_id"]),
             })
+        # Original owner BUY/SELL cycle evidence, not order-intent guesses.
+        sell_qty_by_cycle: dict[str, int] = {}
+        for proof in fill_proof:
+            if proof["fill_evidence_type"] != "KIS_ORDER_CUMULATIVE_ACTUAL":
+                raise PortfolioGuardUnavailable("PORT_GUARD_NATIVE_FILL_NOT_PROVEN")
+            if proof["side"] == "SELL":
+                cycle = proof["position_cycle_id"]
+                sell_qty_by_cycle[cycle] = (
+                    sell_qty_by_cycle.get(cycle, 0) + int(proof["qty"])
+                )
         # Profit-ranking cost basis is derived from verified original
         # native BUY fills, never a mutable position or provider average.
         # This changes no original BUY and never invents a new cost basis.
@@ -707,6 +766,7 @@ def build_authorized_portfolio_guard_intents(
                 existing_sell_symbols={
                     str(symbol).upper() for symbol in excluded_sell_symbols
                 } | pending_standard_symbols,
+                native_verified_sold_qty_by_cycle=sell_qty_by_cycle,
             )
         if stage_plan.get("state") != "PLANNED":
             return []
