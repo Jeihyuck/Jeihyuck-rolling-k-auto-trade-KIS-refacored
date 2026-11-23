@@ -205,3 +205,38 @@ def test_plan_fixed_episode_percent_not_repeated_on_remaining_balance():
         reference_exposure_usd=Decimal("500"), already_reduced_usd=Decimal("0"),
         excluded_symbols={"KO", "PG"},
     ) == []
+
+
+def test_unresolved_native_other_strategy_sell_symbol_is_not_eligible_for_guard():
+    doc, _ = _authorize(_policy())
+    blocked = {
+        **_position("DHR", qty=1, mark="90"),
+        "position_cycle_id": "forward-dhr-cycle",
+        "verified_entry_usd": "100",
+        "unresolved_sell": True,
+    }
+    other = {
+        **_position("KO", qty=7, mark="100"),
+        "position_cycle_id": "verified-ko-cycle",
+        "verified_entry_usd": "95",
+    }
+    planned = plan_verified_guard_sell(
+        [blocked, other], policy=doc, stage_no=1,
+        reference_exposure_usd=Decimal("1000"),
+        already_reduced_usd=Decimal("0"),
+        excluded_symbols=set(),
+    )
+    assert planned
+    assert all(row["symbol"] != "DHR" for row in planned)
+
+
+def test_inactive_guard_close_is_explicit_off_and_cannot_touch_kis_or_db(monkeypatch):
+    from trader.us.portfolio_profit_guard_store import portfolio_guard_close_health
+    monkeypatch.setenv("US_PORTFOLIO_GUARD_ACTIVE", "0")
+    assert portfolio_guard_close_health(env="practice", offline=False) == {
+        "status": "OFF", "orders_checked": 0,
+    }
+    monkeypatch.setenv("US_PORTFOLIO_GUARD_ACTIVE", "1")
+    assert portfolio_guard_close_health(env="practice", offline=True) == {
+        "status": "OFF", "orders_checked": 0,
+    }
