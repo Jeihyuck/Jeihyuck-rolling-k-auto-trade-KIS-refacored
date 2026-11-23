@@ -1230,6 +1230,13 @@ def assert_portfolio_guard_reentry_budget(
             or _decimal(saved["notional_usd"]) > _decimal(order_notional_usd)
         ):
             raise PortfolioGuardUnavailable("GUARD_REENTRY_BUY_INTENT_SCOPE_OR_VALUE_INVALID")
+        duplicate = conn.execute(text("""
+            SELECT client_order_key
+            FROM public.us_portfolio_guard_reentry_buy_reservations
+            WHERE client_order_key=:key
+        """), {"key":key_value}).first()
+        if duplicate is not None:
+            raise PortfolioGuardUnavailable("GUARD_REENTRY_BUY_KEY_ALREADY_RESERVED")
         reserved = conn.execute(text("""
             SELECT COALESCE(SUM(notional_usd),0) AS amount
             FROM public.us_portfolio_guard_reentry_buy_reservations
