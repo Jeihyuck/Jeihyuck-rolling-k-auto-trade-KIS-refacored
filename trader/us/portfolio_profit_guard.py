@@ -142,6 +142,8 @@ def verified_sleeve_pnl(
     snapshot_at: datetime, account_hash: str, trading_epoch_id: str,
     quote_ttl_sec: Decimal, max_skew_sec: Decimal,
     broker_full_balance_verified: bool = False,
+    broker_cash_ledger_complete: bool = False,
+    cash_events: list[dict] | None = None,
 ) -> tuple[Decimal, dict]:
     """Strict KIS-native fill economics, no arbitrary cash allocation.
 
@@ -156,10 +158,16 @@ def verified_sleeve_pnl(
         raise ValueError("PORT_GUARD_FULL_NATIVE_BALANCE_UNVERIFIED")
     if not fills:
         raise ValueError("PORT_GUARD_NATIVE_LEDGER_EMPTY")
+    # Trading-profit is NOT a 'net PnL' if commission, tax and cash
+    # distributions have not been authoritatively checked. Missing broker
+    # events cannot be replaced by silently asserting that they are $0.
+    if broker_cash_ledger_complete is not True or not isinstance(cash_events, list):
+        raise ValueError("PORT_GUARD_NET_CASH_EVENTS_UNVERIFIED")
     book: dict[str, dict] = {}
     unique: set[tuple] = set()
     points = []
     buy_total = sell_total = Decimal("0")
+    commissions = taxes = distributions = Decimal("0")
     for f in fills:
         if (str(f.get("strategy_owner") or "") != "US_STANDARD"
                 or str(f.get("symbol") or "").upper() == "TQQQ"
@@ -179,6 +187,14 @@ def verified_sleeve_pnl(
         price = _decimal(f.get("price_usd"))
         if qty <= 0 or qty != qty.to_integral_value() or price <= 0:
             raise ValueError("PORT_GUARD_FILL_ECONOMICS_INVALID")
+        if f.get("native_fee_proof") is not True:
+            raise ValueError("PORT_GUARD_BROKER_FEES_UNVERIFIED")
+        fee = _decimal(f.get("commission_usd"))
+        tax = _decimal(f.get("tax_usd"))
+        if fee < 0 or tax < 0:
+            raise ValueError("PORT_GUARD_COST_NEGATIVE")
+        commissions += fee
+        taxes += tax
         identity = (sym, side, day, order, client, qty, price)
         if identity in unique:
             raise ValueError("PORT_GUARD_DUPLICATE_NATIVE_FILL")
@@ -241,9 +257,32 @@ def verified_sleeve_pnl(
         if amounts["net_qty"] != holdings[sym]["qty"]:
             raise ValueError("PORT_GUARD_KIS_LEDGER_NET_MISMATCH")
         marked += amounts["net_qty"] * holdings[sym]["mark"]
-    pnl = sell_total + marked - buy_total
+    cash_ids = set()
+    for event in cash_events:
+        if not isinstance(event, dict):
+            raise ValueError("PORT_GUARD_CASH_EVENT_INVALID")
+        event_id = str(event.get("event_id") or "")
+        if (not event_id or event_id in cash_ids
+                or event.get("strategy_owner") != "US_STANDARD"
+                or event.get("account_hash") != account_hash
+                or event.get("trading_epoch_id") != trading_epoch_id
+                or event.get("evidence_type") != "KIS_NATIVE_CASH_CONFIRMED"
+                or event.get("event_type") not in (
+                    "DIVIDEND_CASH", "CORPORATE_CASH_ADJUSTMENT",
+                )):
+            raise ValueError("PORT_GUARD_CASH_EVENT_SCOPE_OR_SOURCE_INVALID")
+        cash_ids.add(event_id)
+        when = _utc(event.get("occurred_at_utc"))
+        if when > snapshot_at.astimezone(timezone.utc):
+            raise ValueError("PORT_GUARD_CASH_EVENT_FUTURE")
+        distributions += _decimal(event.get("amount_usd"))
+    pnl = sell_total + marked - buy_total - commissions - taxes + distributions
     return pnl, {"buy_total": buy_total, "sell_total": sell_total,
                  "marked_open_equity": marked,
+                 "commissions_usd": commissions, "taxes_usd": taxes,
+                 "broker_cash_adjustments_usd": distributions,
+                 "verified_cash_event_count": len(cash_events),
+                 "broker_cash_ledger_complete": True,
                  "method": "NATIVE_FILLS_PLUS_FRESH_KIS_MARK_V1"}
 
 
