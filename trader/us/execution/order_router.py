@@ -1013,6 +1013,25 @@ def _semantic_action_instance(
         # Neither price, trade date nor quantity may create a second
         # discretionary partial/final economic action for this lifecycle.
         return sha
+    if (
+        side == "SELL" and owner == "US_STANDARD"
+        and action.strip().upper().startswith("US_PORTFOLIO_GIVEBACK_STAGE_")
+    ):
+        # Unlike a once-only discretionary trim, two independently signed
+        # episodes must have distinct native economic action identities.
+        # PnL prose, tick timestamp, transient requested_qty never enter key.
+        guard_key = str(meta.get("portfolio_guard_action_key") or "")
+        episode = str(meta.get("portfolio_guard_episode_id") or "")
+        policy_digest = str(meta.get("portfolio_guard_policy_digest") or "")
+        cycle = str(intent.get("position_cycle_id") or meta.get("position_cycle_id") or "")
+        if (
+            not guard_key.startswith("US_PPG_")
+            or guard_key != str(intent.get("client_order_key") or "")
+            or not episode or not cycle
+            or len(policy_digest) != 64
+        ):
+            raise ValueError("US_PORT_GUARD_NATIVE_ACTION_IDENTITY_MISSING")
+        return "PORT_GUARD_ACTION:" + guard_key
     if side == "BUY" and owner == "TQQQ_INFINITE":
         if trade_date is None:
             raise ValueError("TQQQ Infinite BUY action requires a valid trade date")
