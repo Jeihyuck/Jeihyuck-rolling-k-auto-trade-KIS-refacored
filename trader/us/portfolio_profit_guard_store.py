@@ -179,6 +179,33 @@ def reconcile_guard_native_order_actions(
     return {"state": "OK", "updated": changes}
 
 
+def proven_episode_sells_at_frozen_prices(
+    episode_anchor: dict, native_sells_by_cycle: dict[str, int],
+) -> Decimal:
+    """Count only actual KIS-filled shares after trigger at ORIGINAL prices.
+
+    TP/stop and portfolio SELLs reduce the same cumulative exposure target.
+    Mark-to-market price drops and unconfirmed attempts NEVER count.
+    """
+    original_lots = episode_anchor.get("original_lots")
+    if not isinstance(original_lots, dict) or not original_lots:
+        raise PortfolioGuardUnavailable("PORT_GUARD_ORIGINAL_LOTS_PROOF_MISSING")
+    reduced = Decimal("0")
+    for cycle, original in original_lots.items():
+        before = int(original["initial_native_sell_qty"])
+        actual = native_sells_by_cycle.get(cycle, 0)
+        if isinstance(actual, bool) or not isinstance(actual, int) or actual < before:
+            raise PortfolioGuardUnavailable("PORT_GUARD_SELL_LEDGER_REGRESSED")
+        sold_since = actual - before
+        if sold_since > int(original["initial_holding_qty"]):
+            raise PortfolioGuardUnavailable("PORT_GUARD_SELL_MORE_THAN_INITIAL_HOLDINGS")
+        reduced += Decimal(sold_since) * _decimal(original["reference_price_usd"])
+    cap = _decimal(episode_anchor["reference_exposure_usd"])
+    if reduced > cap:
+        raise PortfolioGuardUnavailable("PORT_GUARD_REDUCED_VALUE_OVERFLOW")
+    return reduced
+
+
 def persist_guard_observation_and_reserve(
     conn, *, account_hash: str, trading_epoch_id: str,
     portfolio_epoch_id: str, verified_pnl_usd: Decimal,
@@ -369,18 +396,9 @@ def persist_guard_observation_and_reserve(
     original_lots = episode_anchor.get("original_lots")
     if not isinstance(original_lots, dict):
         raise PortfolioGuardUnavailable("PORT_GUARD_ORIGINAL_LOTS_PROOF_MISSING")
-    reduced = Decimal("0")
-    for cycle, original in original_lots.items():
-        before = int(original["initial_native_sell_qty"])
-        actual = native_verified_sold_qty_by_cycle.get(cycle, 0)
-        if actual < before:
-            raise PortfolioGuardUnavailable("PORT_GUARD_SELL_LEDGER_REGRESSED")
-        sold_since = actual - before
-        if sold_since > int(original["initial_holding_qty"]):
-            raise PortfolioGuardUnavailable("PORT_GUARD_SELL_MORE_THAN_INITIAL_HOLDINGS")
-        reduced += Decimal(sold_since) * _decimal(original["reference_price_usd"])
-    if reduced > reference_exposure:
-        raise PortfolioGuardUnavailable("PORT_GUARD_REDUCED_VALUE_OVERFLOW")
+    reduced = proven_episode_sells_at_frozen_prices(
+        episode_anchor, native_verified_sold_qty_by_cycle,
+    )
     target_plans = plan_verified_guard_sell(
         complete_native_positions, policy=policy, stage_no=stage,
         reference_exposure_usd=reference_exposure, already_reduced_usd=reduced,
