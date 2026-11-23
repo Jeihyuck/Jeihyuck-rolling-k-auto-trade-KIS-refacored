@@ -183,3 +183,27 @@ def test_protective_sell_symbols_are_never_refetched_by_tp_path():
     assert [call[0] for call in provider.calls] == ["KO"]
     assert refreshed[0] is a
     assert refreshed[1] is not b
+
+
+def test_origin_rejects_fake_fresh_provider_even_when_timestamp_valid():
+    row = _position()
+    quote = {"last": "110", "quality": "fresh", "source": "UNVERIFIED_MARKETDATA",
+             "asof_epoch": time.time()}
+    assert refresh_tp_source_quotes([row], _SafeProvider(quote))[0] is row
+
+
+def test_provider_string_unix_asof_is_verified_without_rewriting_receive_time():
+    row = _position()
+    quote = {"last": "110", "quality": "fresh", "source": "KIS_LIVE",
+             "asof_epoch": str(time.time())}
+    changed = refresh_tp_source_quotes([row], _SafeProvider(quote))[0]
+    assert changed["current_price"] == 110.0
+    assert changed["resolved_quote_source"] == "KIS_LIVE"
+    assert 0 <= time.time() - changed["resolved_quote_asof"] <= 5
+
+
+def test_forged_received_at_without_broker_asof_cannot_refresh():
+    row = _position()
+    quote = {"last": "110", "quality": "fresh", "source": "KIS_LIVE",
+             "received_at": time.time()}
+    assert refresh_tp_source_quotes([row], _SafeProvider(quote))[0] is row
