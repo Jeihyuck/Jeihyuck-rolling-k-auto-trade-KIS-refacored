@@ -143,7 +143,7 @@ def reconcile_guard_native_order_actions(
         actual = conn.execute(text("""
             SELECT COALESCE(SUM(qty),0) AS qty
             FROM public.us_fills
-            WHERE symbol=:symbol AND side='SELL' AND env='practice'
+            WHERE symbol=:symbol AND side='SELL'
               AND trading_epoch_id=:epoch AND portfolio_epoch_id=:portfolio
               AND position_cycle_id=:cycle
               AND client_order_key=:key
