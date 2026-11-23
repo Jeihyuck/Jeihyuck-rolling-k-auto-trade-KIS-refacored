@@ -21540,7 +21540,9 @@ class PB1Engine:
                                         _observed.get("latest_bar_ts"),
                                         str(entry_reason or "ENTRY_DISABLED"),
                                     )
-                                except (TypeError, ValueError, OSError) as _obs_err:
+                                except Exception as _obs_err:
+                                    # Observation is diagnostic only; a corrupt
+                                    # local bar proof must never crash a tick.
                                     logger.warning(
                                         "[KR][ENTRY][BLOCKED_1M_OBSERVATION][UNKNOWN] "
                                         "code=%s error_type=%s order_authorization=0",
