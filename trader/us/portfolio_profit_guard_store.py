@@ -558,6 +558,33 @@ def build_authorized_portfolio_guard_intents(
             if approved is None:
                 return []
             policy, manifest_digest = approved
+            # Per-symbol broker/order claim conflict fence across session and
+            # prior trade dates.  A pending/unknown economic SELL cannot be
+            # treated as a new portfolio-guard tranche just because the
+            # other strategy's client key differs.
+            native_pending = conn.execute(text("""
+                SELECT DISTINCT symbol FROM public.us_orders
+                WHERE env='practice' AND trading_epoch_id=:epoch
+                  AND side='SELL'
+                  AND COALESCE(meta->>'strategy_owner','US_STANDARD')='US_STANDARD'
+                  AND status NOT IN ('FILLED','RECONCILED',
+                                     'CANCELLED','CANCELED','REJECTED','EXPIRED')
+            """), {"epoch": epoch}).mappings().all()
+            unresolved_claim_cycles = conn.execute(text("""
+                SELECT DISTINCT position_cycle_id FROM public.us_execution_claims
+                WHERE env='practice' AND market='US'
+                  AND account_id=:account AND trading_epoch_id=:epoch
+                  AND strategy_owner='US_STANDARD'
+                  AND action_state IN ('OPEN','IN_FLIGHT','UNCERTAIN',
+                                       'PARTIALLY_SATISFIED','RETRYABLE')
+            """), {"account": account_hash, "epoch": epoch}).mappings().all()
+            blocked_cycles = {
+                str(v["position_cycle_id"]) for v in unresolved_claim_cycles
+                if v.get("position_cycle_id")
+            }
+            pending_standard_symbols = {
+                str(v["symbol"]).upper() for v in native_pending if v.get("symbol")
+            }
             native_fills = conn.execute(text("""
                 SELECT trade_date,symbol,side,qty,price_usd,order_no,
                        client_order_key,account_id,trading_epoch_id,meta
@@ -646,6 +673,9 @@ def build_authorized_portfolio_guard_intents(
                 "mark_bid_usd": str(bid), "mark_source": "KIS_BID",
                 "snapshot_native_kis": True, "quote_asof_utc": source_ts.isoformat(),
                 "position_cycle_id": pos_cycle,
+                "unresolved_sell": (
+                    sym in pending_standard_symbols or pos_cycle in blocked_cycles
+                ),
                 "verified_entry_usd": str(native_buy_cost / native_buy_qty),
             }
             native_valuations.append(latest)
@@ -676,7 +706,7 @@ def build_authorized_portfolio_guard_intents(
                 snapshot_id=snapshot_id, snapshot_at=snapshot_at,
                 existing_sell_symbols={
                     str(symbol).upper() for symbol in excluded_sell_symbols
-                },
+                } | pending_standard_symbols,
             )
         if stage_plan.get("state") != "PLANNED":
             return []
