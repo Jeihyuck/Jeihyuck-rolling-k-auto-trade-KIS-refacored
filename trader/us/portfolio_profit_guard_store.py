@@ -275,3 +275,116 @@ def persist_guard_observation_and_reserve(
     """), scope)
     return {"state": "PLANNED", "intents": inserted, "hwm": str(hwm),
             "pnl": str(pnl), "episode_id": current_episode}
+
+
+def assert_portfolio_guard_native_pre_http(
+    intent: dict, *, now: datetime, actual_qty: int,
+    actual_limit_price: Decimal,
+) -> None:
+    """Independent signed-policy + durable-stage check at KIS POST boundary.
+
+    No bearer authority is inferred from exit_type or an intent-only hash.
+    This check must run AFTER the generic canonical router fences, and the
+    broker order is still subject to fresh KIS holdings/price and Stage4.
+    """
+    if os.getenv("US_PORTFOLIO_GUARD_ACTIVE", "0") != "1":
+        raise PortfolioGuardUnavailable("PORT_GUARD_NOT_OPERATOR_ACTIVE")
+    if os.getenv("KIS_ENV", "").lower() != "practice":
+        raise PortfolioGuardUnavailable("PORT_GUARD_PRACTICE_ONLY")
+    if now.tzinfo is None:
+        raise PortfolioGuardUnavailable("PORT_GUARD_HTTP_TIME_UNVERIFIED")
+    meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+    sym = str(intent.get("symbol") or "").upper()
+    if (
+        intent.get("side") != "SELL"
+        or intent.get("exit_type") != "portfolio_profit_guard"
+        or intent.get("strategy_owner") != "US_STANDARD"
+        or sym == "TQQQ"
+        or not sym
+        or actual_qty <= 0
+        or _decimal(actual_limit_price) <= 0
+    ):
+        raise PortfolioGuardUnavailable("PORT_GUARD_ORDER_OWNER_OR_AMOUNT_INVALID")
+    expected_key = str(meta.get("portfolio_guard_action_key") or "")
+    if not expected_key.startswith("US_PPG_"):
+        raise PortfolioGuardUnavailable("PORT_GUARD_ACTION_KEY_MISSING")
+    if str(intent.get("client_order_key") or "") != expected_key:
+        raise PortfolioGuardUnavailable("PORT_GUARD_ORIGINAL_ACTION_IDENTITY_MISMATCH")
+    from trader.account_state import get_account_key
+    from trader.us.db.repos import _active_us_epoch, _get_engine_or_none
+    from trader.us.execution.recovery_identity import current_us_portfolio_epoch
+    raw_account = get_account_key(env="practice")
+    if not raw_account:
+        raise PortfolioGuardUnavailable("PORT_GUARD_ACCOUNT_UNVERIFIED")
+    account_hash = hashlib.sha256(raw_account.encode()).hexdigest()
+    engine = _get_engine_or_none()
+    if engine is None:
+        raise PortfolioGuardUnavailable("PORT_GUARD_DATABASE_UNAVAILABLE")
+    with engine.begin() as conn:
+        epoch = str(_active_us_epoch(conn, required=True))
+        portfolio = current_us_portfolio_epoch(
+            conn, env="practice", account_key=raw_account,
+            trading_epoch_id=epoch, strategy_owner="US_STANDARD",
+        )
+        manifest = _get_policy(
+            conn, account_hash=account_hash, epoch=epoch,
+            portfolio=portfolio, now=now,
+        )
+        if manifest is None:
+            raise PortfolioGuardUnavailable("PORT_GUARD_POLICY_NOT_ACTIVE")
+        policy, digest = manifest
+        if (
+            str(meta.get("portfolio_guard_policy_digest") or "") != digest
+            or str(meta.get("portfolio_guard_policy_id") or "") != policy["policy_id"]
+            or str(meta.get("portfolio_guard_policy_version") or "") != policy["policy_version"]
+            or str(meta.get("portfolio_guard_portfolio_epoch_id") or "") != portfolio
+            or str(meta.get("portfolio_guard_trading_epoch_id") or "") != epoch
+        ):
+            raise PortfolioGuardUnavailable("PORT_GUARD_POLICY_INTENT_MISMATCH")
+        try:
+            source_quote_at = datetime.fromisoformat(
+                str(meta.get("portfolio_guard_quote_asof_utc") or "").replace("Z", "+00:00")
+            )
+        except (TypeError, ValueError) as exc:
+            raise PortfolioGuardUnavailable("PORT_GUARD_NATIVE_QUOTE_TIME_MISSING") from exc
+        if source_quote_at.tzinfo is None:
+            raise PortfolioGuardUnavailable("PORT_GUARD_NATIVE_QUOTE_TIME_NAIVE")
+        age = Decimal(str((now - source_quote_at).total_seconds()))
+        if not (0 <= age <= _decimal(policy["quote_ttl_sec"])):
+            raise PortfolioGuardUnavailable("PORT_GUARD_NATIVE_QUOTE_EXPIRED")
+        mark_bid = _decimal(meta.get("portfolio_guard_verified_bid_usd"))
+        if mark_bid <= 0 or _decimal(actual_limit_price) > mark_bid:
+            raise PortfolioGuardUnavailable("PORT_GUARD_LIMIT_ABOVE_NATIVE_BID")
+        rows = conn.execute(text("""
+            SELECT symbol,position_cycle_id,stage_no,episode_id,
+                   target_qty,cumulative_verified_fill_qty,reserved_qty,
+                   state,manifest_sha256
+            FROM public.us_portfolio_guard_actions
+            WHERE action_key=:action
+              AND policy_id=:policy AND policy_version=:version
+              AND env='practice' AND account_hash=:account
+              AND trading_epoch_id=:epoch AND portfolio_epoch_id=:portfolio
+            FOR UPDATE
+        """), {
+            "action": expected_key, "policy": policy["policy_id"],
+            "version": policy["policy_version"], "account": account_hash,
+            "epoch": epoch, "portfolio": portfolio,
+        }).mappings().all()
+        if len(rows) != 1:
+            raise PortfolioGuardUnavailable("PORT_GUARD_DURABLE_ACTION_MISSING")
+        action = dict(rows[0])
+        if (
+            action["manifest_sha256"] != digest
+            or action["symbol"] != sym
+            or action["position_cycle_id"] != str(intent.get("position_cycle_id") or "")
+            or action["stage_no"] != int(meta.get("portfolio_guard_stage_no") or 0)
+            or action["episode_id"] != str(meta.get("portfolio_guard_episode_id") or "")
+            or action["state"] not in ("PLANNED",)
+            or int(action["target_qty"]) - int(action["cumulative_verified_fill_qty"]) != actual_qty
+            or int(action["reserved_qty"]) > 0
+        ):
+            raise PortfolioGuardUnavailable("PORT_GUARD_DURABLE_STAGE_OR_QTY_FENCED")
+    logger.info(
+        "[US_PORT_GUARD][PRE_HTTP_AUTHORIZED] symbol=%s action=%s stage=%s",
+        sym, expected_key, meta.get("portfolio_guard_stage_no"),
+    )
