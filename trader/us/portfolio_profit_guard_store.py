@@ -453,7 +453,7 @@ def persist_guard_observation_and_reserve(
 
 def assert_portfolio_guard_native_pre_http(
     intent: dict, *, now: datetime, actual_qty: int,
-    actual_limit_price: Decimal,
+    actual_limit_price: Decimal, kis_client: Any = None,
 ) -> None:
     """Independent signed-policy + durable-stage check at KIS POST boundary.
 
@@ -463,6 +463,13 @@ def assert_portfolio_guard_native_pre_http(
     """
     if os.getenv("US_PORTFOLIO_GUARD_ACTIVE", "0") != "1":
         raise PortfolioGuardUnavailable("PORT_GUARD_NOT_OPERATOR_ACTIVE")
+    if (
+        os.getenv("US_ATOMIC_CLAIM_OUTBOX_ENABLED", "0") != "1"
+        or os.getenv("US_ACCOUNT_RESERVATION_MODE", "") != "ENFORCE"
+    ):
+        raise PortfolioGuardUnavailable("PORT_GUARD_SHARED_RESERVATION_REQUIRED")
+    if kis_client is None or not callable(getattr(kis_client, "get_us_balance", None)):
+        raise PortfolioGuardUnavailable("PORT_GUARD_NATIVE_KIS_BALANCE_UNAVAILABLE")
     if os.getenv("KIS_ENV", "").lower() != "practice":
         raise PortfolioGuardUnavailable("PORT_GUARD_PRACTICE_ONLY")
     if now.tzinfo is None:
@@ -484,6 +491,29 @@ def assert_portfolio_guard_native_pre_http(
         raise PortfolioGuardUnavailable("PORT_GUARD_ACTION_KEY_MISSING")
     if str(intent.get("client_order_key") or "") != expected_key:
         raise PortfolioGuardUnavailable("PORT_GUARD_ORIGINAL_ACTION_IDENTITY_MISMATCH")
+    # A genuine, fresh KIS balance must still authorize every share after
+    # the ordinary stop/TP claims have been made; the planning snapshot is
+    # NOT a broker orderable authority at POST.
+    from trader.us.data_provider import normalize_us_balance
+    raw_balance = kis_client.get_us_balance(force_refresh=True)
+    if (
+        not isinstance(raw_balance, dict)
+        or raw_balance.get("balance_authoritative") is not True
+        or raw_balance.get("balance_complete") is not True
+        or raw_balance.get("failed_exchanges")
+    ):
+        raise PortfolioGuardUnavailable("PORT_GUARD_NATIVE_BALANCE_INCOMPLETE")
+    normalized_balance = normalize_us_balance(raw_balance)
+    if normalized_balance.get("balance_parse_status") != "OK":
+        raise PortfolioGuardUnavailable("PORT_GUARD_NATIVE_BALANCE_PARSE_FAILED")
+    native_positions = [
+        p for p in normalized_balance.get("positions", [])
+        if str(p.get("symbol") or "").upper() == sym
+    ]
+    if len(native_positions) != 1:
+        raise PortfolioGuardUnavailable("PORT_GUARD_NATIVE_HOLDING_AMBIGUOUS")
+    if int(native_positions[0].get("orderable_qty") or 0) < actual_qty:
+        raise PortfolioGuardUnavailable("PORT_GUARD_NATIVE_ORDERABLE_EXCEEDED")
     from trader.account_state import get_account_key
     from trader.us.db.repos import _active_us_epoch, _get_engine_or_none
     from trader.us.execution.recovery_identity import current_us_portfolio_epoch
