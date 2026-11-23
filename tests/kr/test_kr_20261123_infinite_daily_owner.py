@@ -131,3 +131,43 @@ def test_state_cycle_mismatch_fails_closed(db):
              WHERE cycle_id='cycle-1'
         """))
     assert verify(db) is None
+
+
+def test_old_claim_debt_is_not_permission_and_not_global_veto():
+    """Exact current-day broker proof is the BUY authority, never old debt."""
+    from trader.kr.historical_recovery_journal import (
+        RecoveryLane, current_tick_reconcile_proves_buy_safe,
+    )
+
+    lane = RecoveryLane(
+        "CURRENT_ONLY", "journal", reason="HISTORICAL_UNRESOLVED"
+    )
+    proven = {
+        "ok": True,
+        "degraded": None,
+        "historical_recovery_executed": False,
+        "current_only_fresh_broker_proven": True,
+        "unresolved_broker_activity": False,
+        "frozen_contract_invariant_violations": 0,
+        "verified_infinite_owner_orders": 1,
+        "execution_claim_health": {
+            "available": True,
+            "unresolved_execution_actions": 2,
+            "unresolved_source_date_prior": 2,
+            "unresolved_source_date_current": 0,
+            "unresolved_source_date_other_or_unknown": 0,
+        },
+    }
+    assert current_tick_reconcile_proves_buy_safe(
+        lane=lane, result=proven, durable_record_ok=True,
+    )
+    assert not current_tick_reconcile_proves_buy_safe(
+        lane=lane,
+        result={**proven, "ok": False, "degraded": "KIS_DAILY_CCLD_UNPROVEN"},
+        durable_record_ok=True,
+    )
+    assert not current_tick_reconcile_proves_buy_safe(
+        lane=lane,
+        result={**proven, "unresolved_broker_activity": True},
+        durable_record_ok=True,
+    )
