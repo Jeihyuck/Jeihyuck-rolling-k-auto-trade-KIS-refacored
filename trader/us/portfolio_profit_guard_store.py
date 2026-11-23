@@ -937,3 +937,167 @@ def portfolio_guard_close_health(*, env: str, offline: bool) -> dict:
         )
         return {"status": "UNVERIFIED", "orders_checked": 0,
                 "manual_reconcile_required": True}
+
+def assert_portfolio_guard_reentry_budget(
+    intent: dict, *, order_notional_usd: Decimal, now: datetime,
+) -> None:
+    """An executed portfolio reduction cannot be instantly re-bought.
+
+    An HMAC signed, cooldown-and-recovery-gated episode release is necessary.
+    This does not override ordinary Minervini/VCP/1m entry conditions and
+    cannot authorize any previously forbidden BUY. A missing DB is a fence.
+    """
+    if not (
+        os.getenv("US_PORTFOLIO_GUARD_ACTIVE", "0") == "1"
+        or os.getenv("US_PORTFOLIO_GUARD_REENTRY_GUARD_ENABLED", "0") == "1"
+    ):
+        return
+    meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+    if (intent.get("side") != "BUY"
+            or str(intent.get("strategy_owner") or meta.get("strategy_owner") or "").upper()
+                != "US_STANDARD"):
+        return
+    if os.getenv("KIS_ENV", "").lower() != "practice":
+        raise PortfolioGuardUnavailable("GUARD_REENTRY_PRACTICE_ONLY")
+    if now.tzinfo is None or _decimal(order_notional_usd) <= 0:
+        raise PortfolioGuardUnavailable("GUARD_REENTRY_ORDER_VALUE_UNVERIFIED")
+    if (
+        os.getenv("US_ATOMIC_CLAIM_OUTBOX_ENABLED", "0") != "1"
+        or os.getenv("US_ACCOUNT_RESERVATION_MODE", "") != "ENFORCE"
+    ):
+        raise PortfolioGuardUnavailable("GUARD_REENTRY_SHARED_RESERVATION_REQUIRED")
+    from trader.account_state import get_account_key
+    from trader.us.db.repos import _active_us_epoch, _get_engine_or_none
+    from trader.us.execution.recovery_identity import current_us_portfolio_epoch
+    from trader.us.portfolio_profit_guard import verify_portfolio_policy, _utc
+    import hmac
+    raw_account = get_account_key(env="practice")
+    if not raw_account:
+        raise PortfolioGuardUnavailable("GUARD_REENTRY_ACCOUNT_MISSING")
+    acct = hashlib.sha256(raw_account.encode()).hexdigest()
+    engine = _get_engine_or_none()
+    if engine is None:
+        raise PortfolioGuardUnavailable("GUARD_REENTRY_DB_MISSING")
+    with engine.begin() as conn:
+        epoch = str(_active_us_epoch(conn, required=True))
+        portfolio = current_us_portfolio_epoch(
+            conn, env="practice", account_key=raw_account,
+            trading_epoch_id=epoch, strategy_owner="US_STANDARD",
+        )
+        episodes = conn.execute(text("""
+            SELECT s.policy_id,s.policy_version,s.episode_id,s.stage_no,
+                   s.high_water_pnl_usd,s.latest_pnl_usd,s.last_snapshot_at,
+                   s.episode_anchor,s.state,
+                   p.authorization_json,p.authorization_sha256,
+                   r.release_json,r.release_sha256
+            FROM public.us_portfolio_guard_state s
+            JOIN public.us_portfolio_guard_policy p
+              ON p.policy_id=s.policy_id
+             AND p.policy_version=s.policy_version
+             AND p.env=s.env AND p.account_hash=s.account_hash
+             AND p.trading_epoch_id=s.trading_epoch_id
+             AND p.portfolio_epoch_id=s.portfolio_epoch_id
+            LEFT JOIN public.us_portfolio_guard_reentry_release r
+              ON r.policy_id=s.policy_id AND r.policy_version=s.policy_version
+             AND r.env=s.env AND r.account_hash=s.account_hash
+             AND r.trading_epoch_id=s.trading_epoch_id
+             AND r.portfolio_epoch_id=s.portfolio_epoch_id
+             AND r.episode_id=s.episode_id
+            WHERE s.env='practice' AND s.account_hash=:account
+              AND s.trading_epoch_id=:epoch AND s.portfolio_epoch_id=:portfolio
+              AND s.episode_id IS NOT NULL
+            FOR SHARE OF s
+        """), {"account": acct, "epoch": epoch, "portfolio": portfolio}).mappings().all()
+        if not episodes:
+            return
+        if len(episodes) != 1:
+            raise PortfolioGuardUnavailable("GUARD_REENTRY_MULTIPLE_EPISODES_REQUIRE_REVIEW")
+        state = dict(episodes[0])
+        approved_policy, digest = verify_portfolio_policy(
+            state["authorization_json"],
+            signing_key=os.getenv("US_PORTFOLIO_GUARD_SIGNING_KEY", ""),
+            account_hash=acct, trading_epoch_id=epoch,
+            portfolio_epoch_id=portfolio, now_utc=now,
+        )
+        if digest != state["authorization_sha256"]:
+            raise PortfolioGuardUnavailable("GUARD_REENTRY_POLICY_DIGEST_MISMATCH")
+        if state["state"] not in ("COMPLETE", "REARM_WAIT"):
+            raise PortfolioGuardUnavailable("GUARD_REENTRY_STAGED_RISK_REDUCTION_ACTIVE")
+        unsettled = conn.execute(text("""
+            SELECT count(*) AS unresolved
+            FROM public.us_portfolio_guard_actions
+            WHERE env='practice' AND account_hash=:account
+              AND trading_epoch_id=:epoch AND portfolio_epoch_id=:portfolio
+              AND policy_id=:policy AND policy_version=:version
+              AND episode_id=:episode
+              AND (state<>'COMPLETE' OR target_qty<>cumulative_verified_fill_qty)
+        """), {"account":acct,"epoch":epoch,"portfolio":portfolio,
+               "policy":state["policy_id"],"version":state["policy_version"],
+               "episode":state["episode_id"]}).mappings().one()
+        if int(unsettled["unresolved"] or 0) != 0:
+            raise PortfolioGuardUnavailable("GUARD_REENTRY_UNSETTLED_SELL")
+        signed_release = state.get("release_json")
+        if not isinstance(signed_release, dict):
+            raise PortfolioGuardUnavailable("GUARD_REENTRY_OPERATOR_RELEASE_MISSING")
+        release_body = {
+            k: v for k, v in signed_release.items() if k != "hmac_sha256"
+        }
+        key = os.getenv("US_PORTFOLIO_GUARD_REARM_SIGNING_KEY", "")
+        if len(key.encode()) < 32:
+            raise PortfolioGuardUnavailable("GUARD_REENTRY_RELEASE_KEY_MISSING")
+        signed = hmac.new(
+            key.encode(), canonical(release_body), hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(
+            signed, str(signed_release.get("hmac_sha256") or ""),
+        ):
+            raise PortfolioGuardUnavailable("GUARD_REENTRY_RELEASE_SIGNATURE_INVALID")
+        required = {
+            "purpose": "US_STANDARD_PORTFOLIO_REENTRY_RELEASE_V1",
+            "env": "practice", "sleeve": "US_STANDARD",
+            "account_hash": acct, "trading_epoch_id": epoch,
+            "portfolio_epoch_id": portfolio,
+            "policy_id": state["policy_id"],
+            "policy_version": state["policy_version"],
+            "policy_sha256": digest,
+            "episode_id": state["episode_id"],
+        }
+        if any(release_body.get(k) != v for k,v in required.items()):
+            raise PortfolioGuardUnavailable("GUARD_REENTRY_RELEASE_SCOPE_INVALID")
+        if hashlib.sha256(canonical(release_body)).hexdigest() != state["release_sha256"]:
+            raise PortfolioGuardUnavailable("GUARD_REENTRY_RELEASE_DIGEST_MISMATCH")
+        start = _utc(release_body.get("effective_at"))
+        expires = _utc(release_body.get("expires_at"))
+        if not (start <= now.astimezone(timezone.utc) < expires):
+            raise PortfolioGuardUnavailable("GUARD_REENTRY_RELEASE_EXPIRED")
+        anchor = state.get("episode_anchor") or {}
+        trigger_at = _utc(anchor.get("triggered_at_utc"))
+        since = Decimal(str((now - trigger_at).total_seconds()))
+        if since < _decimal(approved_policy["reentry_min_cooldown_seconds"]):
+            raise PortfolioGuardUnavailable("GUARD_REENTRY_COOLDOWN_NOT_DONE")
+        peak = _decimal(anchor.get("initial_hwm_usd"))
+        triggered = _decimal(anchor.get("triggered_pnl_usd"))
+        current = _decimal(state.get("latest_pnl_usd"))
+        recovery_fraction = _decimal(
+            approved_policy["reentry_min_recovery_fraction"]
+        )
+        if current < triggered + (peak - triggered) * recovery_fraction:
+            raise PortfolioGuardUnavailable("GUARD_REENTRY_PROFIT_NOT_RECOVERED")
+        snapshot_age = Decimal(str((now - state["last_snapshot_at"]).total_seconds()))
+        if snapshot_age < 0 or snapshot_age > _decimal(approved_policy["quote_ttl_sec"]):
+            raise PortfolioGuardUnavailable("GUARD_REENTRY_PNL_SNAPSHOT_STALE")
+        released_budget = _decimal(release_body.get("max_new_buy_notional_usd"))
+        if released_budget <= 0:
+            raise PortfolioGuardUnavailable("GUARD_REENTRY_BUY_BUDGET_MISSING")
+        already = conn.execute(text("""
+            SELECT COALESCE(SUM(notional_usd),0) AS amount
+            FROM public.us_order_intents
+            WHERE account_id=:account AND trading_epoch_id=:epoch
+              AND portfolio_epoch_id=:portfolio
+              AND side='BUY' AND status NOT IN
+                ('CANCELLED','CANCELED','REJECTED','BLOCKED','DRY_RUN')
+              AND created_at>=:release_at
+        """), {"account":acct,"epoch":epoch,"portfolio":portfolio,
+               "release_at":start}).mappings().one()
+        if _decimal(already["amount"]) + _decimal(order_notional_usd) > released_budget:
+            raise PortfolioGuardUnavailable("GUARD_REENTRY_RISK_BUDGET_EXCEEDED")
