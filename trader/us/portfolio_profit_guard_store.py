@@ -738,3 +738,112 @@ def build_authorized_portfolio_guard_intents(
             type(exc).__name__,
         )
         return []
+
+
+def portfolio_guard_close_health(*, env: str, offline: bool) -> dict:
+    """Read-only Close statement; never treat an ACK as an executed SELL.
+
+    OFF means no policy is active. With a signed active policy, every planned
+    native order must have a FULL native cumulative fill proof before Close
+    can say COMPLETE. UNKNOWN and missed remaining quantity are explicitly
+    reported, without rescue POST / automatic cancellation.
+    """
+    if (
+        os.getenv("US_PORTFOLIO_GUARD_ACTIVE", "0") != "1"
+        or env != "practice" or offline
+    ):
+        return {"status": "OFF", "orders_checked": 0}
+    from trader.account_state import get_account_key
+    from trader.us.db.repos import _get_engine_or_none, _active_us_epoch
+    from trader.us.execution.recovery_identity import current_us_portfolio_epoch
+    try:
+        raw_account = get_account_key(env="practice")
+        engine = _get_engine_or_none()
+        if not raw_account or engine is None:
+            raise PortfolioGuardUnavailable("GUARD_CLOSE_ACCOUNT_OR_DB_MISSING")
+        account_hash = hashlib.sha256(raw_account.encode()).hexdigest()
+        now = datetime.now(timezone.utc)
+        with engine.connect() as conn:
+            epoch = str(_active_us_epoch(conn, required=True))
+            portfolio = current_us_portfolio_epoch(
+                conn, env="practice", account_key=raw_account,
+                trading_epoch_id=epoch, strategy_owner="US_STANDARD",
+            )
+            authorized = _get_policy(
+                conn, account_hash=account_hash, epoch=epoch,
+                portfolio=portfolio, now=now,
+            )
+            if authorized is None:
+                return {"status": "UNAUTHORIZED", "orders_checked": 0}
+            policy, digest = authorized
+            scope = {
+                "policy_id": policy["policy_id"],
+                "version": policy["policy_version"],
+                "account": account_hash, "epoch": epoch, "portfolio": portfolio,
+            }
+            states = conn.execute(text("""
+                SELECT stage_no,state,high_water_pnl_usd,latest_pnl_usd,
+                       last_snapshot_at,episode_id
+                FROM public.us_portfolio_guard_state
+                WHERE policy_id=:policy_id AND policy_version=:version
+                  AND env='practice' AND account_hash=:account
+                  AND trading_epoch_id=:epoch AND portfolio_epoch_id=:portfolio
+            """), scope).mappings().all()
+            if len(states) != 1:
+                return {
+                    "status": "BASELINE_OR_STATE_UNVERIFIED",
+                    "orders_checked": 0,
+                }
+            state = dict(states[0])
+            actions = conn.execute(text("""
+                SELECT action_key,stage_no,target_qty,cumulative_verified_fill_qty,
+                       state,manifest_sha256
+                FROM public.us_portfolio_guard_actions
+                WHERE policy_id=:policy_id AND policy_version=:version
+                  AND env='practice' AND account_hash=:account
+                  AND trading_epoch_id=:epoch AND portfolio_epoch_id=:portfolio
+            """), scope).mappings().all()
+        outcomes = []
+        for action in actions:
+            if action["manifest_sha256"] != digest:
+                raise PortfolioGuardUnavailable("GUARD_CLOSE_MANIFEST_MISMATCH")
+            target = int(action["target_qty"])
+            filled = int(action["cumulative_verified_fill_qty"])
+            status = str(action["state"])
+            if target <= 0 or filled < 0 or filled > target:
+                raise PortfolioGuardUnavailable("GUARD_CLOSE_FILL_OVERFLOW")
+            complete = status == "COMPLETE" and target == filled
+            outcomes.append({
+                "action_key": action["action_key"],
+                "stage": int(action["stage_no"]),
+                "target_qty": target,
+                "native_verified_filled_qty": filled,
+                "remaining_qty": target - filled,
+                "complete": complete,
+                "state": status,
+            })
+        stage_no = int(state["stage_no"])
+        if stage_no > 0 and not outcomes:
+            health = "TRIGGER_WITHOUT_NATIVE_ACTION_PROOF"
+        elif any(not v["complete"] for v in outcomes):
+            health = "REQUIRES_NATIVE_RECONCILIATION"
+        elif outcomes:
+            health = "COMPLETE"
+        else:
+            health = "WATCH"
+        return {
+            "status": health,
+            "orders_checked": len(outcomes),
+            "stage_no": stage_no,
+            "hwm_usd": str(state["high_water_pnl_usd"]),
+            "latest_pnl_usd": str(state["latest_pnl_usd"]),
+            "last_snapshot_at": str(state["last_snapshot_at"]),
+            "orders": outcomes,
+        }
+    except Exception as exc:
+        logger.error(
+            "[US_PORT_GUARD][CLOSE_READONLY_ERROR] type=%s action=REPORT_UNVERIFIED",
+            type(exc).__name__,
+        )
+        return {"status": "UNVERIFIED", "orders_checked": 0,
+                "manual_reconcile_required": True}
