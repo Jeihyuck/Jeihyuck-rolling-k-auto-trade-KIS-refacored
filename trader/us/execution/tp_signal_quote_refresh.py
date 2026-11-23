@@ -56,6 +56,7 @@ def _quote_epoch(position: dict) -> float | None:
 def refresh_tp_source_quotes(
     positions: list[dict], provider: Any, *,
     budget_sec: float = 3.0, max_reads: int = 4,
+    exclude_symbols: set[str] | None = None,
 ) -> list[dict]:
     """Return copies with a verified fresh source quote, or original rows.
 
@@ -80,6 +81,7 @@ def refresh_tp_source_quotes(
     if budget <= 0 or reads_allowed <= 0:
         return rows
     deadline = time.monotonic() + budget
+    excluded = {str(s).upper() for s in (exclude_symbols or set())}
     refreshed: list[dict] = []
     reads = 0
     for row in rows:
@@ -95,7 +97,8 @@ def refresh_tp_source_quotes(
             held_qty = int(row.get("qty") or row.get("holding_qty") or 0)
         except (ValueError, TypeError, OverflowError):
             held_qty = 0
-        if owner != "US_STANDARD" or symbol == "TQQQ" or not symbol or held_qty <= 0:
+        if (owner != "US_STANDARD" or symbol == "TQQQ" or not symbol
+                or held_qty <= 0 or symbol in excluded):
             refreshed.append(row)
             continue
 
