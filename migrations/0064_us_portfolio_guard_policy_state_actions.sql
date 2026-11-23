@@ -137,7 +137,7 @@ DO $guard_auth_roles$ BEGIN
                        public.us_portfolio_guard_reentry_release,
                        public.us_portfolio_guard_reentry_buy_reservations FROM authenticated;
  END IF;
-END $guard_auth_roles$;
+END; $guard_auth_roles$;
 ),
   trading_epoch_id text NOT NULL,
   portfolio_epoch_id text NOT NULL,
