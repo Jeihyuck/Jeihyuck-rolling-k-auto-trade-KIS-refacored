@@ -319,3 +319,82 @@ def test_policy_recovery_refuses_multiple_open_lifecycles_without_cross_write() 
     for position_id in (first["position_id"], second["position_id"]):
         assert by_id[position_id]["exit_policy_family"] == "POLICY_MISSING"
         assert by_id[position_id]["policy_source"] is None
+
+
+def test_unowned_fill_cannot_attach_by_kis_odno_to_wrong_symbol_or_multiple_orders() -> None:
+    """PR v3: ODNO alone is not the original BUY lineage proof."""
+    engine = _db()
+    schema = schema_for_engine(engine)
+    ts = now_kst()
+    epoch, cycle = str(uuid4()), str(uuid4())
+    order_numbers = []
+    with engine.begin() as conn:
+        for n in range(2):
+            oid = str(uuid4())
+            order_numbers.append(oid)
+            conn.execute(sa.insert(schema.orders).values(
+                order_id=oid, env="practice", strategy=STRATEGY,
+                sid=1, mode=1, code="005930", market="KOSPI",
+                side="BUY", ord_type="LIMIT", qty=5, stage="ENTRY",
+                client_order_key="collision-" + str(n) + "-" + oid,
+                status="ACKED", kis_odno="0000012345",
+                broker_order_id="0000012345", created_at=ts,
+                portfolio_epoch_id=epoch, position_cycle_id=cycle,
+            ))
+    repo = FillsRepo(engine)
+    repo.upsert_fill(
+        env="practice", run_id=None, order_id=None, kis_odno="0000012345",
+        trade_id="unowned-collision", code="005930", market="KOSPI",
+        side="BUY", qty=1, price=100000.0, fee=0.0, tax=0.0,
+        filled_at=ts, raw_json={"source": "daily_ccld"},
+        fill_meta_json={"fill_source": "daily_ccld"},
+    )
+    outcome = _link_unowned_daily_fills_fixed(
+        engine=engine, env="practice", strategy=STRATEGY,
+    )
+    assert outcome == {"linked_fills": 0, "positions_promoted": 0}
+    with engine.connect() as conn:
+        linked = conn.execute(sa.select(schema.fills.c.order_id)).scalar_one()
+    assert linked is None
+
+
+def test_unowned_fill_wrong_code_or_cumulative_watermark_remains_unlinked() -> None:
+    """No cross-symbol BUY reparenting or cumulative quantity double-counting."""
+    engine = _db()
+    schema = schema_for_engine(engine)
+    ts = now_kst()
+    oid = str(uuid4())
+    with engine.begin() as conn:
+        conn.execute(sa.insert(schema.orders).values(
+            order_id=oid, env="practice", strategy=STRATEGY,
+            sid=1, mode=1, code="005930", market="KOSPI",
+            side="BUY", ord_type="LIMIT", qty=3, stage="ENTRY",
+            client_order_key="scope-" + oid, status="ACKED",
+            kis_odno="0000012345", created_at=ts,
+            portfolio_epoch_id=str(uuid4()), position_cycle_id=str(uuid4()),
+        ))
+    fills = FillsRepo(engine)
+    fills.upsert_fill(
+        env="practice", run_id=None, order_id=None, kis_odno="0000012345",
+        trade_id="wrong-code", code="000660", market="KOSPI",
+        side="BUY", qty=1, price=100000.0, fee=0.0, tax=0.0,
+        filled_at=ts, raw_json={"source": "daily_ccld"},
+        fill_meta_json={"fill_source": "daily_ccld"},
+    )
+    fills.upsert_fill(
+        env="practice", run_id=None, order_id=None, kis_odno="0000012345",
+        trade_id="native-cumulative", code="005930", market="KOSPI",
+        side="BUY", qty=3, price=100000.0, fee=0.0, tax=0.0,
+        filled_at=ts, raw_json={"source": "daily_ccld"},
+        fill_meta_json={"evidence_kind": "KIS_ORDER_CUMULATIVE_EXECUTION"},
+    )
+    result = _link_unowned_daily_fills_fixed(
+        engine=engine, env="practice", strategy=STRATEGY,
+    )
+    assert result == {"linked_fills": 0, "positions_promoted": 0}
+    with engine.connect() as conn:
+        attached = conn.execute(
+            sa.select(sa.func.count()).select_from(schema.fills)
+            .where(schema.fills.c.order_id.is_not(None))
+        ).scalar_one()
+    assert attached == 0
