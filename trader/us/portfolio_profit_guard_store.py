@@ -745,13 +745,15 @@ def build_authorized_portfolio_guard_intents(
         for proof in fill_proof:
             if proof["side"] != "BUY":
                 continue
-            sym = str(proof["symbol"]).upper()
+            # Multiple lifecycles of the same ticker cannot donate cost basis
+            # to an unrelated current original BUY.
+            cycle_key = str(proof["position_cycle_id"])
             qty_filled = _decimal(proof["qty"])
             price_filled = _decimal(proof["price_usd"])
             old_qty, old_cost = native_buy_totals.get(
-                sym, (Decimal("0"), Decimal("0")),
+                cycle_key, (Decimal("0"), Decimal("0")),
             )
-            native_buy_totals[sym] = (
+            native_buy_totals[cycle_key] = (
                 old_qty + qty_filled,
                 old_cost + qty_filled * price_filled,
             )
@@ -791,7 +793,7 @@ def build_authorized_portfolio_guard_intents(
             if orderable_qty is None:
                 raise PortfolioGuardUnavailable("PORT_GUARD_KIS_ORDERABLE_MISSING")
             native_buy_qty, native_buy_cost = native_buy_totals.get(
-                sym, (Decimal("0"), Decimal("0")),
+                pos_cycle, (Decimal("0"), Decimal("0")),
             )
             if native_buy_qty <= 0 or native_buy_cost <= 0:
                 raise PortfolioGuardUnavailable("PORT_GUARD_NATIVE_BUY_COST_MISSING")
