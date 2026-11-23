@@ -3097,6 +3097,29 @@ def route_order(
                 "[US_ORDER][TIMING_PRE_HTTP_PASS] symbol=%s order_limit=%s",
                 symbol_upper, intent.get("limit_price"),
             )
+        # A portfolio-level SELL has its own authorization contract, separate
+        # from every original BUY V2/V3 and the discretionary TP path.
+        # Re-prove this EXACT policy/action/native quote at the real KIS
+        # pre-HTTP callback (after rate-limiter / Stage4 / claim latency).
+        if side == "SELL" and str(intent.get("exit_type") or "") == "portfolio_profit_guard":
+            try:
+                from datetime import datetime as _dt_now, timezone as _tz_now
+                from decimal import Decimal as _Decimal
+                from trader.us.portfolio_profit_guard_store import (
+                    assert_portfolio_guard_native_pre_http,
+                )
+                assert_portfolio_guard_native_pre_http(
+                    intent, now=_dt_now.now(_tz_now.utc),
+                    actual_qty=qty, actual_limit_price=_Decimal(str(price)),
+                )
+            except Exception as _guard_exc:
+                logger.error(
+                    "[US_PORT_GUARD][NATIVE_POST_FENCED] symbol=%s reason_type=%s",
+                    symbol_upper, type(_guard_exc).__name__,
+                )
+                raise KisUSPreSubmitError(
+                    "US_PORT_GUARD_POLICY_OR_STAGE_UNVERIFIED_BEFORE_HTTP"
+                ) from _guard_exc
         observation_error = _record_claim_observation(
             "SUBMITTED", None, authoritative=False,
         )
