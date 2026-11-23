@@ -96,7 +96,7 @@ def point_in_time_sector_strength(*, stock_bars: list[dict],
     dates = common[-64:]
     # Reject gaps where a provider omitted a session present for a peer.
     # In a normal US equities calendar the three must share each session.
-    if any(set(series) & set(dates) != set(dates) for series in (stock, sector, spy)):
+    if any(sorted(series)[-64:] != dates for series in (stock, sector, spy)):
         raise SectorResearchEvidenceError("UNALIGNED_COMPLETED_DAILY_BARS")
 
     def ret(series: dict[date, float], window: int) -> float:
