@@ -1969,6 +1969,14 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
             # Never synthesize a current-account source identity from only a
             # symbol/ODNO; in particular, a prior-account order is not ours.
             if source_order is None:
+                logger.error(
+                    "[KR_RECONCILE][SOURCE_UNATTRIBUTED] "
+                    "code=%s side=%s kis_odno=%s order_date=%s "
+                    "epoch=%s action=KEEP_UNRESOLVED_BLOCK_BUY",
+                    code, side, str(kis_odno or "MISSING"),
+                    order_time.date().isoformat(),
+                    kr_scope.trading_epoch_id,
+                )
                 raise RuntimeError("KR_RECONCILE_SOURCE_UNATTRIBUTED_KEEP_UNRESOLVED")
             with engine.connect() as owner_conn:
                 if not order_matches_recovery_scope(
