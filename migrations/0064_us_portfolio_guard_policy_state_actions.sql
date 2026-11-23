@@ -80,3 +80,40 @@ CREATE TABLE IF NOT EXISTS public.us_portfolio_guard_actions (
 
 CREATE INDEX IF NOT EXISTS ix_us_portfolio_guard_actions_pending_0064
   ON public.us_portfolio_guard_actions(account_hash,trading_epoch_id,portfolio_epoch_id,state,updated_at);
+
+-- Signed, per-episode BUY-cap release; the portfolio guard's original
+-- HWM/trigger and SELL facts remain immutable for audit. Missing release
+-- always holds risk budget rather than silently restoring it.
+CREATE TABLE IF NOT EXISTS public.us_portfolio_guard_reentry_release (
+  policy_id text NOT NULL,
+  policy_version text NOT NULL,
+  env text NOT NULL CHECK (env='practice'),
+  account_hash text NOT NULL CHECK(account_hash ~ '^[0-9a-f]{64}$'),
+  trading_epoch_id text NOT NULL,
+  portfolio_epoch_id text NOT NULL,
+  episode_id text NOT NULL,
+  release_sha256 text NOT NULL CHECK(release_sha256 ~ '^[0-9a-f]{64}$'),
+  release_json jsonb NOT NULL,
+  effective_at timestamptz NOT NULL,
+  expires_at timestamptz NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (policy_id,policy_version,env,account_hash,trading_epoch_id,
+               portfolio_epoch_id,episode_id),
+  FOREIGN KEY(policy_id,policy_version,env,account_hash,trading_epoch_id,
+              portfolio_epoch_id)
+    REFERENCES public.us_portfolio_guard_policy(
+      policy_id,policy_version,env,account_hash,trading_epoch_id,portfolio_epoch_id
+    ),
+  CONSTRAINT ck_us_portfolio_guard_release_window CHECK (expires_at > effective_at)
+);
+
+-- Guard tables are internal broker-control ledgers, never public REST APIs.
+ALTER TABLE public.us_portfolio_guard_policy ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.us_portfolio_guard_state ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.us_portfolio_guard_actions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.us_portfolio_guard_reentry_release ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON TABLE public.us_portfolio_guard_policy,
+                    public.us_portfolio_guard_state,
+                    public.us_portfolio_guard_actions,
+                    public.us_portfolio_guard_reentry_release
+  FROM anon, authenticated;
