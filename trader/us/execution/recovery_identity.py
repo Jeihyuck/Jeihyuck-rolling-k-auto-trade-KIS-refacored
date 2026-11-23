@@ -244,6 +244,47 @@ def assert_preexisting_us_claim_scope(conn, *, action_key: str,
             raise USRecoveryIdentityError(column.upper() + "_MISMATCH")
 
 
+
+
+def assert_no_conflicting_us_legacy_stop_claim(
+    conn, *, scope: USRecoveryScope, prospective_action_key: str,
+) -> None:
+    """Block a *new* legacy stop action while another action is unresolved.
+
+    Historic V2 DHR soft-stop actions used fluctuating PnL/tick explanation
+    text as the semantic key. A fresh stable STOP action MUST NOT bypass an
+    earlier UNCERTAIN attempt simply by having a different action_key.
+    Current/same-action retries still use the native claim/outbox fence.
+    Only the exact verified account+epoch+owner+management cycle participates;
+    this gate never cancels, resubmits, or promotes an uncertain broker order.
+    """
+    if (
+        scope.strategy_owner != "US_STANDARD"
+        or scope.env != "practice"
+        or not scope.account_id or len(scope.account_id) != 64
+        or not scope.trading_epoch_id or not scope.position_cycle_id
+        or not prospective_action_key
+    ):
+        raise USRecoveryIdentityError("LEGACY_STOP_CLAIM_FENCE_SCOPE_UNVERIFIED")
+    rows = conn.execute(text("""
+        SELECT action_key,action_state FROM us_execution_claims
+        WHERE env=:env AND account_id=:account AND market='US'
+          AND trading_epoch_id=:epoch AND strategy_owner='US_STANDARD'
+          AND position_cycle_id=:cycle
+          AND action_key<>:prospective_key
+          AND action_state IN (
+            'OPEN', 'IN_FLIGHT', 'UNCERTAIN',
+            'PARTIALLY_SATISFIED', 'RETRYABLE'
+          )
+        LIMIT 1 FOR UPDATE
+    """), {
+        "env": scope.env, "account": scope.account_id,
+        "epoch": scope.trading_epoch_id, "cycle": scope.position_cycle_id,
+        "prospective_key": prospective_action_key,
+    }).mappings().all()
+    if rows:
+        raise USRecoveryIdentityError("US_LEGACY_STOP_OTHER_ACTION_UNRESOLVED")
+
 def persist_us_claim_scope(conn, *, action_key: str,
                            scope: USRecoveryScope) -> None:
     """Same original action can only carry one owner portfolio and cycle."""
