@@ -7,7 +7,40 @@ from trader import reconcile_kis
 from trader.run_context import RunContext
 from trader.kr import recovery_scope_20261104 as recovery_scope
 
-from tests.kr.test_kr_20261123_infinite_daily_owner import db as db_fixture
+import sqlalchemy as sa
+
+
+@pytest.fixture()
+def db_fixture():
+    engine = sa.create_engine("sqlite:///:memory:")
+    with engine.begin() as conn:
+        conn.execute(sa.text("""
+            CREATE TABLE kr_infinite_state (
+                strategy_id TEXT, symbol TEXT, cycle_id TEXT,
+                trading_epoch_id TEXT, status TEXT
+            )
+        """))
+        conn.execute(sa.text("""
+            CREATE TABLE kr_infinite_order_intents (
+                id INTEGER PRIMARY KEY, strategy_id TEXT, symbol TEXT,
+                cycle_id TEXT, side TEXT, broker_order_id TEXT, trade_date DATE,
+                trading_epoch_id TEXT, requested_qty INTEGER,
+                filled_qty INTEGER, status TEXT
+            )
+        """))
+        conn.execute(sa.text("""
+            INSERT INTO kr_infinite_state
+                (strategy_id, symbol, cycle_id, trading_epoch_id, status)
+            VALUES ('KR_INFINITE_V1','122630','cycle-1','current-epoch','ACTIVE')
+        """))
+        conn.execute(sa.text("""
+            INSERT INTO kr_infinite_order_intents (
+                id, strategy_id, symbol, cycle_id, side, broker_order_id,
+                trade_date, trading_epoch_id, requested_qty, filled_qty, status
+            ) VALUES (14,'KR_INFINITE_V1','122630','cycle-1','BUY',
+                      '0000009745','2026-11-23','current-epoch',15,15,'FILLED')
+        """))
+    return engine
 
 
 def _run(monkeypatch, db, *, total="15"):
