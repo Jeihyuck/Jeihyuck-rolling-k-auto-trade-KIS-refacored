@@ -1032,6 +1032,16 @@ def _semantic_action_instance(
         ):
             raise ValueError("US_PORT_GUARD_NATIVE_ACTION_IDENTITY_MISSING")
         return "PORT_GUARD_ACTION:" + guard_key
+    if (
+        side == "SELL" and owner == "US_STANDARD"
+        and action.strip().upper() == "US_LEGACY_SOFT_STOP_FIRST_PARTIAL"
+    ):
+        # A V2 soft-stop first trim is repeatable on a NEW trade date only.
+        # Within one session changing PnL text, requested qty or tick count
+        # must never create extra first-trim economic actions.
+        if trade_date is None:
+            raise ValueError("legacy daily soft stop requires verified trade date")
+        return trade_date.isoformat()
     if side == "BUY" and owner == "TQQQ_INFINITE":
         if trade_date is None:
             raise ValueError("TQQQ Infinite BUY action requires a valid trade date")
