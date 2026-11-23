@@ -438,6 +438,37 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
         ):
             status = "OK_WITH_WARNINGS"
 
+        # Independently report any approved US_STANDARD portfolio giveback
+        # episode. Close never fabricates a filled order or retries UNKNOWN.
+        portfolio_guard_close = {"status": "OFF", "orders_checked": 0}
+        if os.getenv("US_PORTFOLIO_GUARD_ACTIVE", "0") == "1":
+            try:
+                from trader.us.portfolio_profit_guard_store import (
+                    portfolio_guard_close_health,
+                )
+                portfolio_guard_close = portfolio_guard_close_health(
+                    env=env, offline=offline,
+                )
+            except Exception as _guard_close_exc:
+                portfolio_guard_close = {
+                    "status": "UNVERIFIED", "orders_checked": 0,
+                    "manual_reconcile_required": True,
+                }
+                logger.error(
+                    "[US_PORT_GUARD][CLOSE_REPORT_FAIL] type=%s",
+                    type(_guard_close_exc).__name__,
+                )
+            logger.info(
+                "[US_PORT_GUARD][CLOSE] status=%s checked=%s",
+                portfolio_guard_close.get("status"),
+                portfolio_guard_close.get("orders_checked"),
+            )
+            if portfolio_guard_close.get("status") not in {"WATCH", "COMPLETE"}:
+                status = "ERROR"
+                report_consistency = worsen_consistency(
+                    report_consistency, "FAILED",
+                )
+
         # 10. Final 로그
         if status == "OK":
             logger.info("[US_TRADE_CLOSE][OK]")
@@ -476,14 +507,19 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
             "close_integrity_status": (daily_report_result.get("report") or {}).get("close_integrity_status", "UNKNOWN"),
             "position_snapshot_error": position_snapshot_error,
             "broker_recovery_health": broker_recovery_health,
+            "portfolio_guard_close": portfolio_guard_close,
             "broker_recovery_integrity_errors": broker_recovery_integrity_errors,
             "manual_reconcile_required": bool(
                 broker_recovery_integrity_errors or missing_sell_cost_basis
                 or report_failed or pending_count > 0
+                or (portfolio_guard_close.get("status")
+                    not in {"OFF", "WATCH", "COMPLETE"})
             ),
             "reconcile_required": bool(
                 broker_recovery_integrity_errors or missing_sell_cost_basis
                 or report_failed or pending_count > 0
+                or (portfolio_guard_close.get("status")
+                    not in {"OFF", "WATCH", "COMPLETE"})
             ),
         }
     finally:
