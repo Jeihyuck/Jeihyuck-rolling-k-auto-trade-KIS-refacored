@@ -112,8 +112,19 @@ ALTER TABLE public.us_portfolio_guard_policy ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.us_portfolio_guard_state ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.us_portfolio_guard_actions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.us_portfolio_guard_reentry_release ENABLE ROW LEVEL SECURITY;
-REVOKE ALL ON TABLE public.us_portfolio_guard_policy,
-                    public.us_portfolio_guard_state,
-                    public.us_portfolio_guard_actions,
-                    public.us_portfolio_guard_reentry_release
-  FROM anon, authenticated;
+-- Development PostgreSQL containers do not create Supabase API roles.
+-- Revoke only roles which actually exist; RLS still defaults to deny.
+DO $guard_auth_roles$ BEGIN
+ IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='anon') THEN
+   REVOKE ALL ON TABLE public.us_portfolio_guard_policy,
+                       public.us_portfolio_guard_state,
+                       public.us_portfolio_guard_actions,
+                       public.us_portfolio_guard_reentry_release FROM anon;
+ END IF;
+ IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='authenticated') THEN
+   REVOKE ALL ON TABLE public.us_portfolio_guard_policy,
+                       public.us_portfolio_guard_state,
+                       public.us_portfolio_guard_actions,
+                       public.us_portfolio_guard_reentry_release FROM authenticated;
+ END IF;
+END $guard_auth_roles$;
