@@ -67,3 +67,29 @@ def test_original_20_60_day_eligibility_stays_unchanged():
     for row in rows[-20:]:
         row["clos"] = 104.0
     assert _score(rows) is None
+
+
+def test_standalone_momentum_numeric_scale_does_not_override_arbitration_momentum_score():
+    """Consumer contract: score used to prove pass is NOT weighted family rank."""
+    from trader.us.four_family_arbitration import eligible_family_scores
+    basic = {
+        "independent_entry_contract_v1": True,
+        "entry_signal_proof_source": "completed_daily_ohlcv",
+        "pullback_pass": False, "momentum_pass": True,
+        "momentum_score": 0.37, "standalone_momentum_score": 0.37,
+        "breakout_pass": False,
+    }
+    old = eligible_family_scores(dict(basic))
+    new = eligible_family_scores({**basic, "standalone_momentum_score": .94})
+    assert old == new == {"momentum": .37}
+
+
+def test_standalone_proof_must_remain_present_for_arbitration():
+    from trader.us.four_family_arbitration import eligible_family_scores
+    row = {
+        "independent_entry_contract_v1": True,
+        "entry_signal_proof_source": "completed_daily_ohlcv",
+        "momentum_pass": True, "standalone_momentum_score": None,
+        "momentum_score": 0.37,
+    }
+    assert "momentum" not in eligible_family_scores(row)
