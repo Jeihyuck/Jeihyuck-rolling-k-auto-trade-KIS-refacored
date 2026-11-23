@@ -319,6 +319,7 @@ def persist_guard_observation_and_reserve(
             "triggered_at_utc": snapshot_at.isoformat(),
             "reference_exposure_usd": str(reference_exposure),
             "initial_hwm_usd": str(hwm),
+            "triggered_pnl_usd": str(pnl),
             "original_lots": original_lots,
         }
         conn.execute(text("""
@@ -371,8 +372,8 @@ def persist_guard_observation_and_reserve(
     reduced = Decimal("0")
     for cycle, original in original_lots.items():
         before = int(original["initial_native_sell_qty"])
-        actual = native_verified_sold_qty_by_cycle.get(cycle)
-        if actual is None or actual < before:
+        actual = native_verified_sold_qty_by_cycle.get(cycle, 0)
+        if actual < before:
             raise PortfolioGuardUnavailable("PORT_GUARD_SELL_LEDGER_REGRESSED")
         sold_since = actual - before
         if sold_since > int(original["initial_holding_qty"]):
@@ -389,9 +390,27 @@ def persist_guard_observation_and_reserve(
             for cycle, original in original_lots.items()
         },
     )
+    remaining_dollars = max(
+        Decimal("0"),
+        reference_exposure
+        * _decimal(policy["stages"][stage - 1]["cumulative_reduction_fraction"])
+        - reduced,
+    )
     if not target_plans:
+        if remaining_dollars < _decimal(policy["min_order_notional_usd"]):
+            # A signed minimum executable lot defines the only allowed dust
+            # tolerance. Never mistake an unfilled pending order for progress.
+            conn.execute(text("""
+                UPDATE public.us_portfolio_guard_state
+                SET state='COMPLETE',updated_at=now()
+                WHERE policy_id=:policy_id AND policy_version=:policy_version
+                  AND env='practice' AND account_hash=:account
+                  AND trading_epoch_id=:epoch AND portfolio_epoch_id=:portfolio
+            """), scope)
+            return {"state": "COMPLETE", "intents": [],
+                    "reason": "NATIVE_SELL_TARGET_MET_WITH_SIGNED_DUST_TOLERANCE"}
         return {"state": "PARTIAL", "intents": [],
-                "reason": "NO_VERIFIED_ORDERABLE_CANDIDATE_OR_TARGET_COMPLETE"}
+                "reason": "TARGET_NOT_MET_OR_NO_VERIFIED_ORDERABLE_CANDIDATE"}
     inserted = []
     for plan in target_plans:
         action_key = _action_key(
