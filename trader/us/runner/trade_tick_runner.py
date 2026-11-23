@@ -3292,6 +3292,7 @@ def run_trade_tick(
             )
             tp_decision_positions = refresh_tp_source_quotes(
                 current_positions, provider,
+                exclude_symbols=existing_sell_symbols,
             )
         profit_capture_intents = build_profit_capture_intents(
             tp_decision_positions, market_state_overlay, existing_sell_symbols,
