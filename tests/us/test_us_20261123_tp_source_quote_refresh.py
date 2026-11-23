@@ -172,3 +172,14 @@ def test_fresh_source_allows_original_tp1_decision_but_stale_source_does_not():
     assert intents[0]["strategy_owner"] == "US_STANDARD"
     assert intents[0]["meta"]["profit_capture_stage"] == "tp1"
     assert row["resolved_quote_asof"] < refreshed[0]["resolved_quote_asof"]
+
+
+def test_protective_sell_symbols_are_never_refetched_by_tp_path():
+    a, b = _position("DHR"), _position("KO")
+    provider = _SafeProvider()
+    refreshed = refresh_tp_source_quotes(
+        [a, b], provider, max_reads=1, exclude_symbols={"DHR"},
+    )
+    assert [call[0] for call in provider.calls] == ["KO"]
+    assert refreshed[0] is a
+    assert refreshed[1] is not b
