@@ -160,3 +160,48 @@ def test_same_lifecycle_confirmed_path_preserved_without_legacy_bridge(native_pr
     assert _confirmed_soft_stop_partial_fill_for_current_lifecycle(pos) == (
         True, "PERSISTENT_SOFT_STOP_ESCALATION",
     )
+
+
+def test_real_exit_evaluator_chooses_remaining_full_qty_after_first_7(native_proof, monkeypatch):
+    """STOP-01 positive decision: 14 BUY→7 filled→7 remaining, no new KIS."""
+    from datetime import datetime, timezone
+    import trader.us.pb1.us_exit_engine as engine
+    from trader.us.protective_stop_obligation import record_confirmed_stop
+
+    pos = _pos(qty=7)
+    pos.update({"entry_price": 100.0, "max_price": 100.0})
+    recorded = []
+    # This acceptance stops at the *decision boundary*. The separate native
+    # router must still prove holdings / UNKNOWN fences before any POST.
+    monkeypatch.setattr(engine, "_make_exit_intent", lambda **kw: dict(kw))
+    monkeypatch.setattr(
+        "trader.us.protective_stop_obligation.record_confirmed_stop",
+        lambda *args, **kwargs: recorded.append(kwargs) or True,
+    )
+    intent = engine.evaluate_exit(
+        pos, current_price=95.0,
+        now=datetime(2026, 11, 20, 16, 0, tzinfo=timezone.utc),
+    )
+    assert intent is not None
+    assert intent["exit_type"] == "persistent_soft_stop_full_exit"
+    assert intent["qty"] == 7
+    assert len(recorded) == 1
+
+
+def test_not_proven_first_fill_reverts_to_existing_partial_policy(native_proof, monkeypatch):
+    """Missing broker confirmation cannot upgrade to a full persistent exit."""
+    from datetime import datetime, timezone
+    import trader.us.pb1.us_exit_engine as engine
+    pos = _pos(qty=7)
+    pos.update({"entry_price": 100.0, "max_price": 100.0})
+    native_proof["order"]["status"] = "ACK"
+    monkeypatch.setattr(engine, "_make_exit_intent", lambda **kw: dict(kw))
+    monkeypatch.setattr(
+        "trader.us.protective_stop_obligation.record_confirmed_stop",
+        lambda *_a, **_kw: True,
+    )
+    intent = engine.evaluate_exit(
+        pos, current_price=95.0,
+        now=datetime(2026, 11, 20, 16, 0, tzinfo=timezone.utc),
+    )
+    assert not intent or intent.get("exit_type") != "persistent_soft_stop_full_exit"
