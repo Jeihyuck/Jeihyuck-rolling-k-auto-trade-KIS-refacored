@@ -13,6 +13,8 @@ import hmac
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from uuid import uuid4
+from sqlalchemy.engine import make_url
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -34,7 +36,14 @@ CYCLE = "test-ko-cycle"
 def store(monkeypatch):
     if not URL:
         pytest.skip("isolated PostgreSQL URL not configured")
-    engine = create_engine(URL)
+    # Never truncate another test's shared us_orders/us_fills. Each acceptance
+    # receives its own disposable Postgres database, including in the generic
+    # US Harness full-suite job.
+    database_name = "pg_guard_" + uuid4().hex[:12]
+    admin = create_engine(URL, isolation_level="AUTOCOMMIT")
+    with admin.connect() as admin_conn:
+        admin_conn.exec_driver_sql("CREATE DATABASE " + database_name)
+    engine = create_engine(make_url(URL).set(database=database_name))
     with engine.begin() as conn:
         # Full migration is installed in a one-off GitHub CI service database.
         ddl = Path("migrations/0064_us_portfolio_guard_policy_state_actions.sql").read_text()
@@ -121,6 +130,11 @@ def store(monkeypatch):
         })
     yield engine,now
     engine.dispose()
+    with admin.connect() as admin_conn:
+        admin_conn.exec_driver_sql(
+            "DROP DATABASE " + database_name + " WITH (FORCE)"
+        )
+    admin.dispose()
 
 
 def _p(qty, bid):
