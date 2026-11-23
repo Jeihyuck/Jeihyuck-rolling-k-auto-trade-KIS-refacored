@@ -72,6 +72,7 @@ def store(monkeypatch):
                 trading_epoch_id text,
                 portfolio_epoch_id text,
                 position_cycle_id text,
+                account_id text,
                 client_order_key text,
                 qty integer,
                 meta jsonb
@@ -202,12 +203,12 @@ def test_pg_native_post_ack_fill_completion_and_stage2_no_double_sell(store):
         conn.execute(text("""
             INSERT INTO public.us_fills
             (client_order_key,symbol,side,env,trading_epoch_id,
-             portfolio_epoch_id,position_cycle_id,qty,meta)
-            VALUES (:key,'KO','SELL','practice',:epoch,:port,:cycle,2,
+             portfolio_epoch_id,position_cycle_id,account_id,qty,meta)
+            VALUES (:key,'KO','SELL','practice',:epoch,:port,:cycle,:account,2,
                     CAST(:meta AS jsonb))
         """), {
             "key":action["action_key"],"epoch":EPOCH,"port":PORT,
-            "cycle":CYCLE,
+            "cycle":CYCLE, "account":ACCOUNT,
             "meta":json.dumps({
                 "fill_evidence_type":"KIS_ORDER_CUMULATIVE_ACTUAL",
                 "is_synthetic": False,
