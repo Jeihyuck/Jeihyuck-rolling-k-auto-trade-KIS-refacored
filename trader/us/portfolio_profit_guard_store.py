@@ -1110,7 +1110,7 @@ def assert_portfolio_guard_reentry_budget(
             WHERE s.env='practice' AND s.account_hash=:account
               AND s.trading_epoch_id=:epoch AND s.portfolio_epoch_id=:portfolio
               AND s.episode_id IS NOT NULL
-            FOR SHARE OF s
+            FOR UPDATE OF s
         """), {"account": acct, "epoch": epoch, "portfolio": portfolio}).mappings().all()
         if not episodes:
             return
@@ -1193,15 +1193,58 @@ def assert_portfolio_guard_reentry_budget(
         released_budget = _decimal(release_body.get("max_new_buy_notional_usd"))
         if released_budget <= 0:
             raise PortfolioGuardUnavailable("GUARD_REENTRY_BUY_BUDGET_MISSING")
-        already = conn.execute(text("""
-            SELECT COALESCE(SUM(notional_usd),0) AS amount
+        # Serialized by the FOR UPDATE lock on the single guard episode
+        # above. No two concurrent workers can consume the same released
+        # dollars, and no unknown broker outcome is silently freed.
+        key_value = str(intent.get("client_order_key") or "").strip()
+        symbol_value = str(intent.get("symbol") or "").strip().upper()
+        if not key_value or not symbol_value:
+            raise PortfolioGuardUnavailable("GUARD_REENTRY_BUY_IDENTITY_MISSING")
+        prior_intent = conn.execute(text("""
+            SELECT client_order_key,account_id,trading_epoch_id,
+                   portfolio_epoch_id,side,symbol,notional_usd
             FROM public.us_order_intents
-            WHERE account_id=:account AND trading_epoch_id=:epoch
-              AND portfolio_epoch_id=:portfolio
-              AND side='BUY' AND status NOT IN
-                ('CANCELLED','CANCELED','REJECTED','BLOCKED','DRY_RUN')
-              AND created_at>=:release_at
-        """), {"account":acct,"epoch":epoch,"portfolio":portfolio,
-               "release_at":start}).mappings().one()
-        if _decimal(already["amount"]) + _decimal(order_notional_usd) > released_budget:
+            WHERE client_order_key=:key AND side='BUY'
+              AND trading_epoch_id=:epoch AND portfolio_epoch_id=:portfolio
+            LIMIT 2
+        """), {"key":key_value,"epoch":epoch,"portfolio":portfolio}).mappings().all()
+        if len(prior_intent) != 1:
+            raise PortfolioGuardUnavailable("GUARD_REENTRY_DURABLE_BUY_INTENT_MISSING")
+        saved = prior_intent[0]
+        if (
+            str(saved.get("account_id") or "") not in (raw_account, acct)
+            or str(saved.get("symbol") or "").strip().upper() != symbol_value
+            or saved.get("notional_usd") is None
+            or _decimal(saved["notional_usd"]) <= 0
+            or _decimal(saved["notional_usd"]) > _decimal(order_notional_usd)
+        ):
+            raise PortfolioGuardUnavailable("GUARD_REENTRY_BUY_INTENT_SCOPE_OR_VALUE_INVALID")
+        reserved = conn.execute(text("""
+            SELECT COALESCE(SUM(notional_usd),0) AS amount
+            FROM public.us_portfolio_guard_reentry_buy_reservations
+            WHERE policy_id=:policy AND policy_version=:version
+              AND env='practice' AND account_hash=:account
+              AND trading_epoch_id=:epoch AND portfolio_epoch_id=:portfolio
+              AND episode_id=:episode
+        """), {
+            "policy":state["policy_id"],"version":state["policy_version"],
+            "account":acct,"epoch":epoch,"portfolio":portfolio,
+            "episode":state["episode_id"],
+        }).mappings().one()
+        if _decimal(reserved["amount"]) + _decimal(order_notional_usd) > released_budget:
             raise PortfolioGuardUnavailable("GUARD_REENTRY_RISK_BUDGET_EXCEEDED")
+        inserted = conn.execute(text("""
+            INSERT INTO public.us_portfolio_guard_reentry_buy_reservations
+            (policy_id,policy_version,env,account_hash,trading_epoch_id,
+             portfolio_epoch_id,episode_id,client_order_key,notional_usd)
+            VALUES (:policy,:version,'practice',:account,:epoch,
+                    :portfolio,:episode,:key,:amount)
+            ON CONFLICT DO NOTHING
+        """), {
+            "policy":state["policy_id"],"version":state["policy_version"],
+            "account":acct,"epoch":epoch,"portfolio":portfolio,
+            "episode":state["episode_id"],"key":key_value,
+            "amount":_decimal(order_notional_usd),
+        })
+        if inserted.rowcount != 1:
+            raise PortfolioGuardUnavailable("GUARD_REENTRY_BUY_KEY_ALREADY_RESERVED")
