@@ -620,7 +620,27 @@ def evaluate_exit(
             policy=cfg,
             now=now,
         )
-        return _make_exit_intent(policy_cfg=cfg, **kwargs)
+        intent = _make_exit_intent(policy_cfg=cfg, **kwargs)
+        if (
+            intent is not None
+            and position.get("legacy_nine_decision_only_provisional") is True
+            and str(position.get("strategy_owner") or "").upper() == "US_STANDARD"
+        ):
+            # Legacy position BUY policy remains V2 and immutable. Stable
+            # action *families* replace volatile PnL/tick prose only for NEW
+            # claims. Pre-existing dynamic uncertain claims remain fenced
+            # separately at the original account/epoch/cycle boundary.
+            _legacy_stop_actions = {
+                "soft_stop_loss": "US_LEGACY_SOFT_STOP_FIRST_PARTIAL",
+                "persistent_soft_stop_full_exit": "US_LEGACY_PERSISTENT_SOFT_STOP_FINAL",
+                "hard_stop_loss": "US_LEGACY_HARD_STOP_FINAL",
+                "hard_stop_full_exit": "US_LEGACY_HARD_STOP_FINAL",
+            }
+            _action = _legacy_stop_actions.get(str(kwargs.get("exit_type") or ""))
+            if _action:
+                intent["semantic_action"] = _action
+                intent.setdefault("meta", {})["semantic_action"] = _action
+        return intent
 
     symbol = position.get("symbol", "")
     exchange = position.get("exchange", "NASDAQ")
