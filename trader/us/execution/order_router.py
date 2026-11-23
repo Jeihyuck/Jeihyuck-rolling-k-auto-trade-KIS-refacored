@@ -3144,6 +3144,7 @@ def route_order(
                 assert_portfolio_guard_native_pre_http(
                     intent, now=_dt_now.now(_tz_now.utc),
                     actual_qty=qty, actual_limit_price=_Decimal(str(price)),
+                    kis_client=kis_client,
                 )
             except Exception as _guard_exc:
                 logger.error(
