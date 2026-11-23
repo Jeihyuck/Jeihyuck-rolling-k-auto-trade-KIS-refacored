@@ -115,6 +115,25 @@ def verify_portfolio_policy(
         last_giveback, last_target = giveback, reduction
     if body.get("rearm_mode") != "OPERATOR_SIGNED_NEW_EPISODE":
         raise ValueError("PORT_GUARD_REARM_POLICY_UNVERIFIED")
+    # A normal giveback stage is partial risk reduction, NOT a hidden
+    # portfolio-wide liquidation order. A 100% target needs a separate
+    # explicit signed approval in the manifest.
+    if last_target == 1 and body.get("allow_full_liquidation") is not True:
+        raise ValueError("PORT_GUARD_UNAUTHORIZED_FULL_LIQUIDATION")
+    if body.get("selection_method") not in {
+        "NATIVE_UNDERPERFORMER_FIRST", "PROPORTIONAL_EXPOSURE",
+    }:
+        raise ValueError("PORT_GUARD_SELECTION_POLICY_UNVERIFIED")
+    if body.get("reentry_mode") != "SIGNED_RELEASE_AFTER_COOLDOWN":
+        raise ValueError("PORT_GUARD_REENTRY_POLICY_UNVERIFIED")
+    cooldown = _decimal(body.get("reentry_min_cooldown_seconds"))
+    recovery = _decimal(body.get("reentry_min_recovery_fraction"))
+    if not (cooldown >= 0 and 0 < recovery <= 1):
+        raise ValueError("PORT_GUARD_REENTRY_CONSTRAINT_INVALID")
+    min_notional = _decimal(body.get("min_order_notional_usd"))
+    max_notional = _decimal(body.get("max_order_notional_usd"))
+    if not (0 < min_notional <= max_notional):
+        raise ValueError("PORT_GUARD_ORDER_LIMITS_INVALID")
     return body, policy_digest(authorization)
 
 
@@ -244,22 +263,37 @@ def plan_verified_guard_sell(
     positions: list[dict], *, policy: dict, stage_no: int,
     reference_exposure_usd: Decimal, already_reduced_usd: Decimal,
     excluded_symbols: set[str],
+    episode_reference_prices: dict[str, str] | None = None,
 ) -> list[dict]:
-    """Deterministic integer-share plan from FIXED episode exposure.
+    """Approved partial portfolio reduction; NEVER unconditional sell-all.
 
-    No order authority is produced. A durable reservation and canonical
-    broker-submit gate are required before routing this output.
+    Progress is measured in frozen episode-reference dollars. The latest KIS
+    bid is for executable price/quantity only; a falling price cannot be
+    counted as a completed SELL. Missing original references fail closed.
     """
     if stage_no < 1 or stage_no > len(policy["stages"]):
         return []
-    stage = policy["stages"][stage_no - 1]
-    remaining_target = max(
-        Decimal("0"),
-        reference_exposure_usd * _decimal(stage["cumulative_reduction_fraction"])
-        - already_reduced_usd,
+    target_fraction = _decimal(
+        policy["stages"][stage_no - 1]["cumulative_reduction_fraction"]
     )
-    if remaining_target <= 0:
+    if target_fraction >= 1 and policy.get("allow_full_liquidation") is not True:
+        raise ValueError("PORT_GUARD_FULL_LIQUIDATION_NOT_APPROVED")
+    remaining = max(
+        Decimal("0"),
+        reference_exposure_usd * target_fraction - already_reduced_usd,
+    )
+    if remaining <= 0:
         return []
+    method = str(policy.get("selection_method") or "")
+    if method not in {"NATIVE_UNDERPERFORMER_FIRST", "PROPORTIONAL_EXPOSURE"}:
+        raise ValueError("PORT_GUARD_SELECTION_METHOD_NOT_SIGNED")
+    if episode_reference_prices is None:
+        # Only synthetic one-shot unit fixtures may omit the map.
+        # Production planning MUST supply the frozen episode references.
+        episode_reference_prices = {
+            str(p.get("position_cycle_id") or ""): str(p.get("mark_bid_usd"))
+            for p in positions
+        }
     candidates = []
     for p in positions:
         sym = str(p.get("symbol") or "").upper()
@@ -267,24 +301,53 @@ def plan_verified_guard_sell(
             continue
         if not p.get("position_cycle_id") or p.get("unresolved_sell") is True:
             continue
+        cycle = str(p["position_cycle_id"])
+        if cycle not in episode_reference_prices:
+            raise ValueError("PORT_GUARD_EPISODE_REFERENCE_MISSING")
         qty = int(_decimal(p.get("orderable_qty")))
-        price = _decimal(p.get("mark_bid_usd"))
+        bid = _decimal(p.get("mark_bid_usd"))
+        ref_price = _decimal(episode_reference_prices[cycle])
         entry = _decimal(p.get("verified_entry_usd"))
-        if qty > 0 and price > 0 and entry > 0:
-            candidates.append(((price / entry - 1), sym, p, qty, price))
-    candidates.sort(key=lambda row: (row[0], row[1]))
-    plans = []
-    for _, sym, p, available, price in candidates:
-        if remaining_target <= 0:
-            break
-        # Never exceed policy cumulative target or KIS orderable quantity.
-        count = min(available, int(remaining_target / price))
-        if count <= 0:
+        if qty <= 0 or bid <= 0 or ref_price <= 0 or entry <= 0:
             continue
-        plans.append({
-            "symbol": sym, "qty": count, "position_cycle_id": p["position_cycle_id"],
-            "reference_price_usd": str(price),
-            "planned_reduced_usd": str(count * price),
+        candidates.append({
+            "symbol": sym, "position_cycle_id": cycle,
+            "max_qty": qty, "bid": bid, "reference_price": ref_price,
+            "relative_return": bid / entry - 1,
         })
-        remaining_target -= count * price
-    return plans
+    if method == "NATIVE_UNDERPERFORMER_FIRST":
+        candidates.sort(key=lambda item: (item["relative_return"], item["symbol"]))
+    else:
+        candidates.sort(key=lambda item: item["symbol"])
+    min_notional = _decimal(policy["min_order_notional_usd"])
+    max_notional = _decimal(policy["max_order_notional_usd"])
+    output = []
+    total_available = sum(c["max_qty"] * c["reference_price"] for c in candidates)
+    for candidate in candidates:
+        if remaining < min_notional:
+            break
+        if method == "PROPORTIONAL_EXPOSURE" and total_available > 0:
+            weight = (
+                candidate["max_qty"] * candidate["reference_price"] / total_available
+            )
+            allocation = max(Decimal("0"), remaining * weight)
+        else:
+            allocation = remaining
+        ref = candidate["reference_price"]
+        bid = candidate["bid"]
+        qty = min(
+            candidate["max_qty"],
+            int(allocation / ref),  # frozen episode exposure basis
+            int(max_notional / bid),
+        )
+        if qty <= 0 or qty * bid < min_notional:
+            continue
+        output.append({
+            "symbol": candidate["symbol"], "qty": qty,
+            "position_cycle_id": candidate["position_cycle_id"],
+            "reference_price_usd": str(ref),
+            "latest_bid_usd": str(bid),
+            "planned_reduced_usd": str(qty * ref),
+        })
+        remaining -= qty * ref
+    return output
