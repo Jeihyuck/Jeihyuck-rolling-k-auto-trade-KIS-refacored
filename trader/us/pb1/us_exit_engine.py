@@ -298,6 +298,113 @@ def _recover_legacy_soft_stop_execution_lifecycle(
     return upgraded
 
 
+def _verified_legacy_forward_soft_stop_partial(
+    position: dict, soft_exec: dict,
+) -> tuple[bool, str]:
+    """Prove a pre-portfolio-epoch V2 partial fill in its forward SELL cycle.
+
+    A legacy original BUY lifecycle differs intentionally from the verified
+    prospective SELL cycle. Some historical daily risk rows do not contain
+    state.lifecycle, so requiring equality with it makes confirmed partial
+    fills forever ineligible for persistent-stop escalation. This narrowly
+    scoped bridge proves BOTH identities from the original DB/KIS-backed
+    filled order, and does not rewrite the original V2 or stored risk state.
+
+    This is only a decision gate; the router still independently verifies
+    current KIS holding/orderability, reserves quantity and fences UNKNOWN.
+    """
+    if (
+        position.get("legacy_nine_decision_only_provisional") is not True
+        or os.getenv("KIS_ENV", "").lower() != "practice"
+        or os.getenv("WSL_RUN_MARKET", "").upper() != "US"
+        or str(position.get("strategy_owner") or "").upper() != "US_STANDARD"
+    ):
+        return False, "PERSISTENT_SOFT_STOP_LEGACY_BRIDGE_NOT_ELIGIBLE"
+    meta = position.get("meta") if isinstance(position.get("meta"), dict) else {}
+    provenance = position.get("_legacy_nine_db_original_provenance")
+    if not isinstance(provenance, dict):
+        return False, "PERSISTENT_SOFT_STOP_ORIGINAL_PROOF_MISSING"
+    original_cycle = str(provenance.get("original_cycle") or "")
+    if (
+        not original_cycle
+        or str(position.get("position_lifecycle_id") or meta.get("position_lifecycle_id") or "") != original_cycle
+        or not provenance.get("v2_sha")
+    ):
+        return False, "PERSISTENT_SOFT_STOP_ORIGINAL_CYCLE_MISMATCH"
+    if not soft_exec.get("soft_stop_triggered_today") or not soft_exec.get("soft_stop_partial_done"):
+        return False, "PERSISTENT_SOFT_STOP_PARTIAL_FILL_UNCONFIRMED"
+    try:
+        first_qty = int(soft_exec.get("first_soft_stop_filled_qty") or 0)
+        orderable = int(position.get("orderable_qty") if position.get("orderable_qty") is not None
+                        else position.get("qty") or 0)
+    except (TypeError, ValueError, OverflowError):
+        return False, "PERSISTENT_SOFT_STOP_LEGACY_QUANTITY_INVALID"
+    if first_qty <= 0 or orderable <= 0:
+        return False, "PERSISTENT_SOFT_STOP_LEGACY_FILL_OR_ORDERABLE_MISSING"
+    order_no = str(soft_exec.get("order_no") or "")
+    client_key = str(soft_exec.get("client_order_key") or "")
+    forward_cycle = str(soft_exec.get("position_lifecycle_id") or "")
+    risk = position.get("risk_state") or {}
+    trade_date = str(risk.get("trade_date") or "")[:10]
+    if not (order_no and client_key and forward_cycle and trade_date):
+        return False, "PERSISTENT_SOFT_STOP_FORWARD_ORDER_IDENTITY_MISSING"
+    # The current-day original is re-proved for every prospective bridge.
+    # No ticker-only match, migration of historical rows or synthetic scope.
+    try:
+        from trader.us.execution.us_legacy_nine_active_sell import (
+            build_verified_legacy_stop_obligation_position,
+        )
+        from trader.us.db.repos import load_us_order_for_fill
+        scoped = build_verified_legacy_stop_obligation_position(
+            position, trade_date=trade_date,
+        )
+        if (
+            scoped.get("position_cycle_id") != forward_cycle
+            or scoped.get("position_lifecycle_id") != forward_cycle
+            or scoped.get("trading_epoch_id") != provenance.get("epoch")
+            or scoped.get("_legacy_stop_proof_scoped") is not True
+        ):
+            return False, "PERSISTENT_SOFT_STOP_FORWARD_SCOPE_MISMATCH"
+        order = load_us_order_for_fill(
+            order_no=order_no, client_order_key=client_key,
+            symbol=str(position.get("symbol") or "").upper(), trade_date=trade_date,
+        ) or {}
+    except Exception as exc:
+        logger.warning(
+            "[US_EXIT][LEGACY_PERSISTENT_PROOF_UNAVAILABLE] symbol=%s error_type=%s",
+            position.get("symbol"), type(exc).__name__,
+        )
+        return False, "PERSISTENT_SOFT_STOP_LEGACY_PROOF_UNAVAILABLE"
+
+    order_meta = order.get("meta") if isinstance(order.get("meta"), dict) else {}
+    try:
+        filled_qty = int(order.get("qty_filled") or 0)
+    except (TypeError, ValueError, OverflowError):
+        filled_qty = 0
+    from trader.us.execution.kis_us_response_parser import normalize_us_order_no
+    if (
+        str(order.get("side") or "").upper() != "SELL"
+        or str(order.get("status") or "").upper() not in {"FILLED", "RECONCILED", "CANCELLED"}
+        or filled_qty < first_qty
+        or str(order.get("client_order_key") or "") != client_key
+        or normalize_us_order_no(order.get("order_no")) != normalize_us_order_no(order_no)
+        or str(order.get("trading_epoch_id") or "") != str(provenance.get("epoch") or "")
+        or str(order_meta.get("stop_type") or "") != "soft_stop_loss"
+        or str(order_meta.get("strategy_owner") or "").upper() != "US_STANDARD"
+        or str(order_meta.get("source_original_runtime_lifecycle_id") or "") != original_cycle
+        or str(order_meta.get("position_lifecycle_id") or "") != forward_cycle
+        or order_meta.get("forward_management_not_original_buy") is not True
+        or str(order_meta.get("source_original_entry_exit_contract_sha256") or "") != str(provenance.get("v2_sha"))
+    ):
+        return False, "PERSISTENT_SOFT_STOP_LEGACY_FILL_OR_FORWARD_UNVERIFIED"
+    logger.info(
+        "[US_EXIT][PERSISTENT_SOFT_STOP][VERIFIED_LEGACY_FORWARD_PARTIAL] "
+        "symbol=%s first_filled_qty=%d",
+        position.get("symbol"), first_qty,
+    )
+    return True, "PERSISTENT_SOFT_STOP_VERIFIED_LEGACY_FORWARD_PARTIAL"
+
+
 def _confirmed_soft_stop_partial_fill_for_current_lifecycle(position: dict) -> tuple[bool, str]:
     """Require broker-confirmed first soft-stop fill before persistent escalation.
 
@@ -336,6 +443,8 @@ def _confirmed_soft_stop_partial_fill_for_current_lifecycle(position: dict) -> t
         "",
     )
     state_lifecycle = str(lifecycle_state.get("lifecycle_id") or "").strip()
+    if not state_lifecycle and position.get("legacy_nine_decision_only_provisional") is True:
+        return _verified_legacy_forward_soft_stop_partial(position, soft_exec)
     if (
         not current_lifecycle
         or not state_lifecycle
