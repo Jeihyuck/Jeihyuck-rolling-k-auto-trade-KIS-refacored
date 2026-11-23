@@ -738,6 +738,12 @@ def build_authorized_portfolio_guard_intents(
                 "fill_evidence_type": meta.get("fill_evidence_type"),
                 "is_synthetic": meta.get("is_synthetic") or meta.get("synthetic"),
                 "position_cycle_id": str(fill["position_cycle_id"]),
+                # Only broker-proven native charge records may contribute
+                # to net P&L; legacy fill metadata missing these fields
+                # cannot be silently assumed to have zero commission.
+                "commission_usd": meta.get("kis_verified_commission_usd"),
+                "tax_usd": meta.get("kis_verified_tax_usd"),
+                "native_fee_proof": meta.get("kis_native_fee_proof") is True,
             })
         # Original owner BUY/SELL cycle evidence, not order-intent guesses.
         sell_qty_by_cycle: dict[str, int] = {}
@@ -851,6 +857,11 @@ def build_authorized_portfolio_guard_intents(
             quote_ttl_sec=_decimal(policy["quote_ttl_sec"]),
             max_skew_sec=_decimal(policy["max_snapshot_skew_sec"]),
             broker_full_balance_verified=True,
+            # A zero-row cash-event list is NOT proof of no dividend or
+            # corporate-action cash. Until the native KIS broker cash ledger
+            # imports a dated completeness certificate, do not arm a SELL.
+            broker_cash_ledger_complete=False,
+            cash_events=None,
         )
         snapshot_id = hashlib.sha256(canonical({
             "policy_sha256": manifest_digest, "epoch": epoch,
