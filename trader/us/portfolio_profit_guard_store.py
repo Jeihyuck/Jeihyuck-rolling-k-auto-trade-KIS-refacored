@@ -72,6 +72,113 @@ def _action_key(
     return "US_PPG_" + hashlib.sha256(canonical(material)).hexdigest()[:32]
 
 
+def reconcile_guard_native_order_actions(
+    conn, *, policy: dict, account_hash: str, epoch: str, portfolio: str,
+    episode: str,
+) -> dict:
+    """Reconcile guarded actions from original native-filled orders only.
+
+    NEVER infer a CANCEL from the absence of an order, and never convert a
+    nonauthoritative client ACK into a fill. For any unresolved/UNKNOWN state,
+    the previously reserved stage remains fenced.
+    """
+    scope = {
+        "policy_id": policy["policy_id"], "policy_version": policy["policy_version"],
+        "account": account_hash, "epoch": epoch, "portfolio": portfolio,
+        "episode": episode,
+    }
+    records = conn.execute(text("""
+        SELECT a.action_key,a.symbol,a.position_cycle_id,a.target_qty,
+               a.cumulative_verified_fill_qty,a.state,
+               o.status AS order_status,o.qty_filled AS broker_qty_filled,
+               o.order_no,o.meta AS order_meta,o.client_order_key,
+               o.trading_epoch_id,o.portfolio_epoch_id,
+               o.position_cycle_id AS order_cycle,
+               o.account_id AS order_account
+        FROM public.us_portfolio_guard_actions a
+        LEFT JOIN public.us_orders o
+          ON o.client_order_key=a.action_key
+         AND o.side='SELL' AND o.env='practice'
+         AND o.trading_epoch_id=a.trading_epoch_id
+         AND o.portfolio_epoch_id=a.portfolio_epoch_id
+         AND o.position_cycle_id=a.position_cycle_id
+        WHERE a.policy_id=:policy_id AND a.policy_version=:policy_version
+          AND a.env='practice' AND a.account_hash=:account
+          AND a.trading_epoch_id=:epoch AND a.portfolio_epoch_id=:portfolio
+          AND a.episode_id=:episode
+        ORDER BY a.stage_no,a.symbol
+        FOR UPDATE OF a
+    """), scope).mappings().all()
+    changes = 0
+    for row in records:
+        state = str(row["state"])
+        if state == "COMPLETE":
+            continue
+        if row["order_no"] is None:
+            # No KIS row is not proof the broker did not accept the order.
+            # PLANNED is safe only if no canonical claim has yet been made,
+            # checked by the router. Never retry a formerly unknown order.
+            if state != "PLANNED":
+                return {"state": "BLOCKED", "reason": "GUARD_ORDER_IDENTITY_UNVERIFIED"}
+            continue
+        meta = row.get("order_meta") if isinstance(row.get("order_meta"), dict) else {}
+        if (
+            str(row.get("order_account") or "") not in ("", account_hash)
+            or str(row.get("order_cycle") or "") != row["position_cycle_id"]
+            or str(row.get("trading_epoch_id") or "") != epoch
+            or str(row.get("portfolio_epoch_id") or "") != portfolio
+            or str(meta.get("portfolio_guard_action_key") or "") != row["action_key"]
+            or str(row.get("client_order_key") or "") != row["action_key"]
+        ):
+            raise PortfolioGuardUnavailable("PORT_GUARD_NATIVE_ORDER_SCOPE_MISMATCH")
+        status = str(row.get("order_status") or "").upper()
+        try:
+            observed_qty = int(row.get("broker_qty_filled") or 0)
+            target = int(row["target_qty"])
+        except (ValueError, TypeError):
+            raise PortfolioGuardUnavailable("PORT_GUARD_ORDER_FILL_QTY_UNVERIFIED")
+        if observed_qty < 0 or observed_qty > target:
+            raise PortfolioGuardUnavailable("PORT_GUARD_NATIVE_ORDER_OVERFILLED")
+        # Only native ledger fill rows, never synthetic local ACK, can satisfy.
+        actual = conn.execute(text("""
+            SELECT COALESCE(SUM(qty),0) AS qty
+            FROM public.us_fills
+            WHERE symbol=:symbol AND side='SELL' AND env='practice'
+              AND trading_epoch_id=:epoch AND portfolio_epoch_id=:portfolio
+              AND position_cycle_id=:cycle
+              AND client_order_key=:key
+              AND meta->>'fill_evidence_type'='KIS_ORDER_CUMULATIVE_ACTUAL'
+              AND COALESCE((meta->>'is_synthetic')::boolean,false)=false
+              AND COALESCE((meta->>'accounting_active')::boolean,true)=true
+        """), {"symbol":row["symbol"],"epoch":epoch,
+               "portfolio":portfolio,"cycle":row["position_cycle_id"],
+               "key":row["action_key"]}).mappings().one()
+        native_filled = int(actual["qty"] or 0)
+        if native_filled != observed_qty:
+            # Even FILLED broker row is not terminal before Stage4's native
+            # cumulative actual persistence is durable.
+            return {"state": "BLOCKED", "reason": "GUARD_NATIVE_FILL_RECON_PENDING"}
+        if status in ("FILLED", "RECONCILED") and native_filled == target:
+            transition = "COMPLETE"
+        elif status in ("FILLED", "RECONCILED", "PARTIALLY_FILLED") and native_filled > 0:
+            transition = "PARTIAL"
+        elif status in ("OPEN", "ACK", "SUBMITTED", "ACCEPTED") and native_filled == 0:
+            transition = "SUBMITTED"
+        else:
+            transition = "SUBMIT_UNKNOWN"
+        # Never downgrade a previously terminal stage, or erase uncertainty.
+        if state == "SUBMIT_UNKNOWN" and transition != "COMPLETE":
+            return {"state": "BLOCKED", "reason": "GUARD_SUBMIT_UNKNOWN_REQUIRES_BROKER_PROOF"}
+        conn.execute(text("""
+            UPDATE public.us_portfolio_guard_actions
+            SET state=:next,cumulative_verified_fill_qty=:qty,updated_at=now()
+            WHERE action_key=:key AND state=:previous
+        """), {"next":transition,"qty":native_filled,
+               "key":row["action_key"],"previous":state})
+        changes += 1
+    return {"state": "OK", "updated": changes}
+
+
 def persist_guard_observation_and_reserve(
     conn, *, account_hash: str, trading_epoch_id: str,
     portfolio_epoch_id: str, verified_pnl_usd: Decimal,
@@ -212,6 +319,13 @@ def persist_guard_observation_and_reserve(
                   AND env='practice' AND account_hash=:account
                   AND trading_epoch_id=:epoch AND portfolio_epoch_id=:portfolio
             """), {**scope, "stage": stage})
+    observed_actions = reconcile_guard_native_order_actions(
+        conn, policy=policy, account_hash=account_hash,
+        epoch=trading_epoch_id, portfolio=portfolio_epoch_id,
+        episode=current_episode,
+    )
+    if observed_actions.get("state") != "OK":
+        return {"state": "BLOCKED", "intents": [], "reason": observed_actions["reason"]}
     existing_actions = conn.execute(text("""
         SELECT symbol,position_cycle_id,action_key,state,target_qty,
                cumulative_verified_fill_qty,decision_json
