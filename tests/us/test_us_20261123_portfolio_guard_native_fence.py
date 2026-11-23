@@ -13,9 +13,32 @@ from trader.us.portfolio_profit_guard import policy_digest
 from trader.us.portfolio_profit_guard_store import (
     assert_portfolio_guard_native_pre_http, PortfolioGuardUnavailable,
 )
-from tests.us.test_us_20261123_portfolio_profit_guard_policy_math import (
-    _policy, KEY, ACCOUNT, EPOCH, PORT,
-)
+import hashlib
+import hmac
+from trader.us.portfolio_profit_guard import canonical
+
+KEY = "offline-only-HMAC-" + "X" * 50
+ACCOUNT = "f" * 64
+EPOCH = "practice-test-trading-epoch"
+PORT = "practice-test-portfolio-epoch"
+
+def _policy():
+    doc = {
+        "purpose": "US_STANDARD_PORTFOLIO_GIVEBACK_SELL_V1",
+        "mode": "ACTIVE", "env": "practice", "sleeve": "US_STANDARD",
+        "account_hash": ACCOUNT, "trading_epoch_id": EPOCH,
+        "portfolio_epoch_id": PORT, "policy_id": "synthetic-policy",
+        "policy_version": "v1",
+        "effective_at": "2026-11-23T14:00:00+00:00",
+        "expires_at": "2026-11-24T14:00:00+00:00",
+        "accounting_method": "NATIVE_FILLS_PLUS_FRESH_KIS_MARK_V1",
+        "mark_source": "KIS_BID",
+        "activation_profit_usd": "100", "quote_ttl_sec": "5",
+        "max_snapshot_skew_sec": "3", "rearm_mode": "OPERATOR_SIGNED_NEW_EPISODE",
+        "stages": [{"giveback_fraction": "0.25", "cumulative_reduction_fraction": "0.20"}],
+    }
+    doc["hmac_sha256"] = hmac.new(KEY.encode(),canonical(doc),hashlib.sha256).hexdigest()
+    return doc
 
 NOW = datetime(2026, 11, 23, 15, 0, tzinfo=timezone.utc)
 ACTION = "US_PPG_test-native-action"
