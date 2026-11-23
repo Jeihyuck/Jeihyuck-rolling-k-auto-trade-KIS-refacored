@@ -582,6 +582,23 @@ def build_authorized_portfolio_guard_intents(
                 "fill_evidence_type": meta.get("fill_evidence_type"),
                 "is_synthetic": meta.get("is_synthetic") or meta.get("synthetic"),
             })
+        # Profit-ranking cost basis is derived from verified original
+        # native BUY fills, never a mutable position or provider average.
+        # This changes no original BUY and never invents a new cost basis.
+        native_buy_totals: dict[str, tuple[Decimal, Decimal]] = {}
+        for proof in fill_proof:
+            if proof["side"] != "BUY":
+                continue
+            sym = str(proof["symbol"]).upper()
+            qty_filled = _decimal(proof["qty"])
+            price_filled = _decimal(proof["price_usd"])
+            old_qty, old_cost = native_buy_totals.get(
+                sym, (Decimal("0"), Decimal("0")),
+            )
+            native_buy_totals[sym] = (
+                old_qty + qty_filled,
+                old_cost + qty_filled * price_filled,
+            )
         enriched_by_symbol: dict[str, dict] = {}
         native_valuations = []
         all_position_symbols = set()
@@ -617,6 +634,11 @@ def build_authorized_portfolio_guard_intents(
             orderable_qty = position.get("orderable_qty")
             if orderable_qty is None:
                 raise PortfolioGuardUnavailable("PORT_GUARD_KIS_ORDERABLE_MISSING")
+            native_buy_qty, native_buy_cost = native_buy_totals.get(
+                sym, (Decimal("0"), Decimal("0")),
+            )
+            if native_buy_qty <= 0 or native_buy_cost <= 0:
+                raise PortfolioGuardUnavailable("PORT_GUARD_NATIVE_BUY_COST_MISSING")
             latest = {
                 "symbol": sym, "strategy_owner": "US_STANDARD",
                 "account_hash": account_hash, "trading_epoch_id": epoch,
@@ -624,10 +646,7 @@ def build_authorized_portfolio_guard_intents(
                 "mark_bid_usd": str(bid), "mark_source": "KIS_BID",
                 "snapshot_native_kis": True, "quote_asof_utc": source_ts.isoformat(),
                 "position_cycle_id": pos_cycle,
-                "verified_entry_usd": str(
-                    position.get("broker_avg_price") or position.get("avg_cost")
-                    or position.get("entry_price") or ""
-                ),
+                "verified_entry_usd": str(native_buy_cost / native_buy_qty),
             }
             native_valuations.append(latest)
             enriched_by_symbol[sym] = position
