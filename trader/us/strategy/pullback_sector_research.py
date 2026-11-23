@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timezone
 import math
+from zoneinfo import ZoneInfo
 
 
 class SectorResearchEvidenceError(ValueError):
@@ -83,7 +84,7 @@ def point_in_time_sector_strength(*, stock_bars: list[dict],
         last_day = date.fromisoformat(str(expected_completed_date))
     except (TypeError, ValueError) as exc:
         raise SectorResearchEvidenceError("EXPECTED_DATE_UNVERIFIED") from exc
-    if last_day >= decision.date():
+    if last_day >= decision.astimezone(ZoneInfo("America/New_York")).date():
         # PREP research uses only strictly prior ET completed sessions.
         raise SectorResearchEvidenceError("EXPECTED_BAR_NOT_YET_COMPLETED")
     stock = _completed_series(stock_bars, decision_at=decision, expected_completed_date=last_day)
