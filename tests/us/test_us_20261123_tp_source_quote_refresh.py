@@ -123,3 +123,52 @@ def test_no_reader_or_zero_budget_keeps_original():
     row = _position()
     assert refresh_tp_source_quotes([row], object())[0] is row
     assert refresh_tp_source_quotes([row], _SafeProvider(), budget_sec=0)[0] is row
+
+
+def test_fresh_source_allows_original_tp1_decision_but_stale_source_does_not():
+    """Positive TP decision path, not broker-authorized POST."""
+    from decimal import Decimal
+    from datetime import datetime, timezone
+    from unittest.mock import patch
+
+    from trader.us.entry_exit_contract import build_us_entry_exit_contract
+    from trader.us.market_state_overlay import build_profit_capture_intents
+
+    row = _position(quote_age=40)
+    contract = build_us_entry_exit_contract({
+        "symbol": "KO", "strategy_owner": "US_STANDARD",
+        "entry_style_selected": "pb1_pullback",
+        "position_action": "NEW_POSITION_BUY",
+    })
+    row["meta"] = {
+        "entry_exit_contract": contract,
+        "entry_exit_contract_sha256": contract["sha256"],
+        "entry_exit_contract_version": contract["version"],
+        "strategy_owner": "US_STANDARD",
+    }
+    row["position_lifecycle_id"] = "KO:original-v2-cycle"
+    now = datetime.now(timezone.utc)
+    overlay = {"profit_capture_enabled": True}
+
+    def decision(positions):
+        with (
+            patch("trader.us.profit_capture.authoritative_broker_avg",
+                  return_value=(Decimal("100"), {"broker_avg_price_source": "KIS_BROKER"})),
+            patch("trader.us.execution.us_legacy_nine_active_sell.enrich_legacy_nine_v2_decision_position",
+                  side_effect=lambda pos, **_: pos),
+        ):
+            return build_profit_capture_intents(
+                positions, overlay, now=now, trade_date="2026-11-20",
+                profit_capture_state={"KO": {}}, defer_pending_until_claim=True,
+                decision_clock_real_time=True,
+            )
+
+    assert decision([row]) == [], "Known 40s-old quote must block TP decision"
+    refreshed = refresh_tp_source_quotes([row], _SafeProvider())
+    intents = decision(refreshed)
+    assert len(intents) == 1
+    assert intents[0]["symbol"] == "KO"
+    assert intents[0]["side"] == "SELL"
+    assert intents[0]["strategy_owner"] == "US_STANDARD"
+    assert intents[0]["meta"]["profit_capture_stage"] == "tp1"
+    assert row["resolved_quote_asof"] < refreshed[0]["resolved_quote_asof"]
