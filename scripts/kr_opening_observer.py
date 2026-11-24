@@ -244,7 +244,47 @@ def _conflict_repair_anchors(code: str, unresolved: list, observed_at: datetime)
     return [valid[(start + offset) % len(valid)] for offset in range(count)]
 
 
-def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: float = 0.8) -> dict:
+_RECENT_REPAIR_NEXT: dict[str, float] = {}
+
+
+def _recent_gap_anchor(coverage: dict, bars: list[dict], observed_at: datetime) -> str | None:
+    """Target a genuinely unobserved minute in the latest required native window.
+
+    This is a request anchor, not a claim that a missing minute had trades.
+    Never construct a candle or infer a business date from an empty response.
+    """
+    if coverage.get("reason") != "RECENT_MINUTE_GAP":
+        return None
+    stamps = []
+    for bar in bars:
+        try:
+            stamp = datetime.fromisoformat(bar["timestamp"])
+            if stamp.tzinfo is not None:
+                stamp = stamp.astimezone(KST)
+                if stamp.date() == observed_at.date() and dtime(9, 30) <= stamp.time() < dtime(15, 30):
+                    stamps.append(stamp)
+        except (KeyError, ValueError, TypeError):
+            continue
+    latest = sorted(set(stamps))[-3:]
+    if len(latest) < 3:
+        return None
+    expected = [latest[-1] - timedelta(minutes=i) for i in (2, 1, 0)]
+    missing = [stamp for stamp in expected if stamp not in latest and stamp.time() >= dtime(9, 30)]
+    if not missing:
+        return None
+    return (max(missing) + timedelta(minutes=1)).strftime("%H%M%S")
+
+
+def _recent_repair_due(code: str) -> bool:
+    now = time.monotonic()
+    if now < _RECENT_REPAIR_NEXT.get(code, 0.0):
+        return False
+    _RECENT_REPAIR_NEXT[code] = now + 60.0
+    return True
+
+
+def run_once(*, kis, codes: list[str], observed_at: datetime,
+             sleep_between: float = 0.8, refresh_clock=None) -> dict:
     """No order methods are called; all I/O is read-only KIS and local proofs."""
     observed_at = observed_at.astimezone(KST)
     if not dtime(9, 0) <= observed_at.time() <= dtime(15, 5):
@@ -254,7 +294,14 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
     minute_requests, quote_requests, native_request_failures = 0, 0, 0
     symbol_scan_sec: list[float] = []
     symbol_outcomes: dict[str, dict] = {}
+    session_date = observed_at.date()
     for code in codes:
+        # Production batches can span multiple completed minutes. Do not
+        # query every subsequent symbol at the previous batch's clock.
+        if refresh_clock is not None:
+            observed_at = refresh_clock().astimezone(KST)
+            if observed_at.date() != session_date or not dtime(9, 0) <= observed_at.time() <= dtime(15, 5):
+                break
         symbol_started = time.monotonic()
         if str(code).zfill(6) == "122630":
             # Separate owner: never collect KR_INFINITE by PB1 proof route.
@@ -294,6 +341,12 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
             )
             # Prioritize current native data before optional historical repair.
             anchors = [observed_at.strftime("%H%M%S")]
+            recent_anchor = _recent_gap_anchor(
+                opening_coverage, (stored or {}).get("bars") or [], observed_at,
+            )
+            if recent_anchor and recent_anchor not in anchors and _recent_repair_due(code):
+                anchors.append(recent_anchor)
+                logger.info("[KR][OPENING_OBSERVER][RECENT_GAP_REPAIR] code=%s anchor=%s", code, recent_anchor)
             if repair_due:
                 anchors.append("092900")
             # An unresolved native-minute conflict can be >30 bars old.
@@ -653,7 +706,8 @@ def main() -> None:
                 priority["state"], len(priority["hot"]), len(priority["warm"]),
                 len(priority["cold"]), selected, len(codes),
             )
-            result = run_once(kis=kis, codes=selected, observed_at=now)
+            result = run_once(kis=kis, codes=selected, observed_at=now,
+                              refresh_clock=now_kst)
             for code, outcome in result.get("symbol_outcomes", {}).items():
                 tier = next(
                     (name for name in ("hot", "warm", "cold")
