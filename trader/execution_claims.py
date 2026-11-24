@@ -398,6 +398,14 @@ class DurableExecutionClaimRepo:
             observed_qty is not None
             and (prior_filled is None or observed_qty > prior_filled)
         )
+        if str(action_row["action_state"]) == "SUPERSEDED":
+            # A closed-lifecycle cancellation of intent is not a fill.
+            # Replayed rejection/ACK must not reopen it; contradictory late
+            # authoritative economics must be escalated, not silently ignored.
+            if not (authoritative and is_new_fill and observed_qty > 0):
+                return self._snapshot(action_row)
+            superseded = True
+
         if superseded:
             # Keep the immutable Attempt and its fills, not its obsolete state
             # transitions.  An old observation may only change economic truth
