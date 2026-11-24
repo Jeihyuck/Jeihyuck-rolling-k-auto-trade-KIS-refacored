@@ -175,6 +175,18 @@ def _completed_bar_structure(bars: list[dict], now: datetime) -> tuple[str, str,
     return "COVERED", "STRUCTURAL_1M_BARS_AVAILABLE", opening, after_open
 
 
+def _native_window_structure(after_open: list[dict], now: datetime) -> tuple[str, str]:
+    """One structural check shared by collection and the 5+3 evaluator."""
+    stamps = [datetime.fromisoformat(bar["timestamp"]) for bar in after_open[-8:]]
+    if any((right - left).total_seconds() != 60 for left, right in zip(stamps, stamps[1:])):
+        return "UNKNOWN", "POST_OPENING_NATIVE_WINDOW_GAP"
+    if len(stamps) < 8:
+        return "WAIT", "POST_OPENING_NATIVE_WINDOW_PENDING"
+    if not 0 <= (now.astimezone(KST) - stamps[-1]).total_seconds() <= 180:
+        return "UNKNOWN", "COMPLETED_BAR_STALE"
+    return "COVERED", "POST_OPENING_NATIVE_WINDOW_AVAILABLE"
+
+
 def inspect_completed_bar_coverage(*, rows: list[dict], now: datetime,
                                    source_conflicts: list | None = None) -> dict:
     """Read-only structural proof; COVERED never grants BUY authorization."""
@@ -189,17 +201,8 @@ def inspect_completed_bar_coverage(*, rows: list[dict], now: datetime,
     unobserved = [
         f"09:{i:02d}" for i in range(30) if f"09:{i:02d}" not in observed
     ]
-    native_recent = after_open[-8:]
-    recent_native_stamps = [
-        datetime.fromisoformat(bar["timestamp"]) for bar in native_recent
-    ]
-    recent_native_window_ready = bool(
-        len(native_recent) == 8
-        and all((b - a).total_seconds() == 60
-                for a, b in zip(recent_native_stamps,
-                                recent_native_stamps[1:]))
-        and 0 <= (now - recent_native_stamps[-1]).total_seconds() <= 180
-    )
+    native_window_state, native_window_reason = _native_window_structure(after_open, now)
+    recent_native_window_ready = native_window_state == "COVERED"
     # Retain historical opening diagnostics, but expose the independent
     # admissible data path separately. No structural verdict is authority.
     scope = _conflict_scope(bars=bars, conflicts=source_conflicts or [],
@@ -213,6 +216,8 @@ def inspect_completed_bar_coverage(*, rows: list[dict], now: datetime,
         "state": state, "reason": reason,
         "opening_range_ready": opening_ready,
         "native_post_open_window_ready": independent_ready,
+        "native_post_open_window_state": native_window_state,
+        "native_post_open_window_reason": native_window_reason,
         "available_native_paths": [
             *([ "OPENING_RANGE" ] if state == "COVERED" and opening_ready
                and not scope["full_conflicts"] else []),
@@ -258,15 +263,10 @@ def _evaluate_verified_intraday_window(
         "reference_source": "KIS_NATIVE_POST_OPENING_5_PLUS_3",
     }
     window = after_open[-8:]
-    stamps = [datetime.fromisoformat(bar["timestamp"]) for bar in window]
-    if any((right - left).total_seconds() != 60
-           for left, right in zip(stamps, stamps[1:])):
-        return _result("UNKNOWN", "POST_OPENING_NATIVE_WINDOW_GAP", **proof)
-    if len(window) < 8:
-        return _result("WAIT", "POST_OPENING_NATIVE_WINDOW_PENDING", **proof)
+    native_state, native_reason = _native_window_structure(after_open, now)
+    if native_state != "COVERED":
+        return _result(native_state, native_reason, **proof)
     current = window[-1]
-    if (now - stamps[-1]).total_seconds() > 180:
-        return _result("UNKNOWN", "COMPLETED_BAR_STALE", **proof)
 
     earlier, recent = window[:5], window[-3:]
     high = max(bar["high"] for bar in earlier)
