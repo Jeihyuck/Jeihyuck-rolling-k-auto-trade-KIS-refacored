@@ -319,15 +319,11 @@ def run_once(*, kis, codes: list[str], observed_at: datetime,
                 max_age_seconds=None,
             )
             opening_coverage = (
-                inspect_completed_bar_coverage(rows=stored["bars"], now=observed_at)
+                inspect_completed_bar_coverage(rows=stored["bars"], now=observed_at,
+                                               source_conflicts=stored.get("source_conflicts"))
                 if stored else {"opening_count": 0, "opening_valid_minutes": []}
             )
-            valid_opening = opening_coverage.get("opening_valid_minutes") or []
-            opening_ready = (
-                len(valid_opening) >= 25
-                and valid_opening[0] <= "09:03"
-                and valid_opening[-1] >= "09:26"
-            )
+            opening_ready = bool(opening_coverage.get("opening_range_ready"))
             unresolved = list((stored or {}).get("source_conflicts") or [])
             repair_due = (
                 observed_at.time() >= dtime(9, 30)
@@ -444,6 +440,7 @@ def run_once(*, kis, codes: list[str], observed_at: datetime,
                 raise RuntimeError("OPENING_PROOF_PERSISTED_READBACK_FAILED")
             coverage = inspect_completed_bar_coverage(
                 rows=persisted["bars"], now=proof_now,
+                source_conflicts=persisted.get("source_conflicts"),
             )
             # The opening anchor can cover up to the early session; only
             # request the 09:15 repair anchor if that first replay still left
@@ -479,6 +476,7 @@ def run_once(*, kis, codes: list[str], observed_at: datetime,
                             raise RuntimeError("OPENING_REPAIR_READBACK_FAILED")
                         coverage = inspect_completed_bar_coverage(
                             rows=persisted["bars"], now=proof_now,
+                source_conflicts=persisted.get("source_conflicts"),
                         )
                     logger.info(
                         "[KR][OPENING_OBSERVER][REPAIR] code=%s anchor=091500 "
@@ -505,8 +503,15 @@ def run_once(*, kis, codes: list[str], observed_at: datetime,
                     "unverified_buy_blocked=1",
                     code, persisted.get("source_conflicts"),
                 )
-                coverage = {**coverage, "state": "UNKNOWN",
-                            "reason": "CONFLICTING_NATIVE_COMPLETED_BAR"}
+                if not coverage.get("available_native_paths"):
+                    coverage = {**coverage, "state": "UNKNOWN",
+                                "reason": "CONFLICTING_NATIVE_COMPLETED_BAR"}
+            if (coverage["state"] != "COVERED"
+                    and coverage.get("native_post_open_window_ready")):
+                # Structural availability only; owner-specific breakout still
+                # requires the opening reference in the final timing evaluator.
+                coverage = {**coverage, "state": "COVERED",
+                            "reason": "INDEPENDENT_NATIVE_5_PLUS_3_AVAILABLE"}
             if coverage["state"] == "COVERED":
                 coverage_ok += 1
             elif observed_at.time() >= dtime(9, 30):
