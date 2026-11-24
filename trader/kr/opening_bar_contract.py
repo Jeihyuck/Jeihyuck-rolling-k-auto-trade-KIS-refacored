@@ -141,6 +141,13 @@ def clean_completed_bars(rows: list[dict], now: datetime) -> list[dict]:
 
 
 
+def opening_range_ready(opening: list[dict]) -> bool:
+    """Legacy opening-reference quality criterion, not a universal BUY gate."""
+    return bool(len(opening) >= 25
+                and datetime.fromisoformat(opening[0]["timestamp"]).time() <= dtime(9, 3)
+                and datetime.fromisoformat(opening[-1]["timestamp"]).time() >= dtime(9, 26))
+
+
 def _completed_bar_structure(bars: list[dict], now: datetime) -> tuple[str, str, list[dict], list[dict]]:
     """One shared structural contract for observer health and BUY evaluator.
 
@@ -153,9 +160,7 @@ def _completed_bar_structure(bars: list[dict], now: datetime) -> tuple[str, str,
                   datetime.fromisoformat(bar["timestamp"]).time() >= dtime(9, 30)]
     if now.time() < dtime(9, 30):
         return "WAIT", "OPENING_OBSERVATION", opening, after_open
-    if (len(opening) < 25
-            or datetime.fromisoformat(opening[0]["timestamp"]).time() > dtime(9, 3)
-            or datetime.fromisoformat(opening[-1]["timestamp"]).time() < dtime(9, 26)):
+    if not opening_range_ready(opening):
         return "UNKNOWN", "OPENING_BARS_MISSING_OR_INCOMPLETE", opening, after_open
     if not bars:
         return "UNKNOWN", "NO_CURRENT_BAR", opening, after_open
@@ -170,7 +175,8 @@ def _completed_bar_structure(bars: list[dict], now: datetime) -> tuple[str, str,
     return "COVERED", "STRUCTURAL_1M_BARS_AVAILABLE", opening, after_open
 
 
-def inspect_completed_bar_coverage(*, rows: list[dict], now: datetime) -> dict:
+def inspect_completed_bar_coverage(*, rows: list[dict], now: datetime,
+                                   source_conflicts: list | None = None) -> dict:
     """Read-only structural proof; COVERED never grants BUY authorization."""
     now = now.astimezone(KST)
     bars = clean_completed_bars(rows, now)
@@ -194,9 +200,26 @@ def inspect_completed_bar_coverage(*, rows: list[dict], now: datetime) -> dict:
                                 recent_native_stamps[1:]))
         and 0 <= (now - recent_native_stamps[-1]).total_seconds() <= 180
     )
+    # Retain historical opening diagnostics, but expose the independent
+    # admissible data path separately. No structural verdict is authority.
+    scope = _conflict_scope(bars=bars, conflicts=source_conflicts or [],
+                            now=now, family="PULLBACK")
+    independent_ready = bool(recent_native_window_ready
+                             and scope["independent_window_ready"]
+                             and not scope["invalid"])
+    opening_ready = bool(opening_range_ready(opening)
+                         and not scope["opening_conflicts"] and not scope["invalid"])
     return {
         "state": state, "reason": reason,
-        "native_post_open_window_ready": recent_native_window_ready,
+        "opening_range_ready": opening_ready,
+        "native_post_open_window_ready": independent_ready,
+        "available_native_paths": [
+            *([ "OPENING_RANGE" ] if state == "COVERED" and opening_ready
+               and not scope["full_conflicts"] else []),
+            *([ "POST_OPENING_5_PLUS_3" ] if independent_ready else []),
+        ],
+        "source_conflicts": list(source_conflicts or []),
+        "window_conflicts": scope["window_conflicts"],
         "bars": len(bars), "opening_count": len(opening),
         # Unobserved does NOT prove a broker data gap: some minutes may have
         # no genuine trades. Never synthesize their OHLC or volume.
