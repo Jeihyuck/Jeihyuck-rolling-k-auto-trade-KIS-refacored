@@ -58,6 +58,25 @@ def source(symbol, monkeypatch):
         "pre_order_holding_qty":0,"cumulative_filled_qty":6,
         "fill_evidence_type":"KIS_ORDER_CUMULATIVE_ACTUAL","is_synthetic":False,
     }
+    from trader.us.entry_timing.opportunity import _decision, _submission_binding
+    # Reproduce the actual 11/23 final V2 timing envelope. Its original
+    # content and canonical submission binding are independently hashed.
+    scoped_intent = {
+        "symbol":symbol,"side":"BUY","strategy_owner":"US_STANDARD",
+        "position_action":"NEW_POSITION_BUY","client_order_key":"original-"+symbol,
+        "position_lifecycle_id":cycle,"position_cycle_id":cycle,"env":"practice",
+        "broker_account_hash":HASH,"trading_epoch_id":"epoch",
+        "portfolio_epoch_id":"portfolio","submit_attempt_id":"attempt-"+symbol,
+    }
+    timing = {
+        **_decision("READY","fixture",style=reason,facts={"reversal":None},
+                    price=100.0,max_entry_price=101.0),
+        "mode":"ENFORCE","decision_epoch":1795449600.0,"max_age_sec":120,
+        "submission_binding_version":2,
+    }
+    timing["submission_binding_sha256"] = _submission_binding(scoped_intent,timing)
+    meta.update(submit_attempt_id=scoped_intent["submit_attempt_id"],
+                us_entry_opportunity_v1=timing)
     row = {
         "symbol":symbol,"trading_epoch_id":"epoch","account_id":HASH,
         "portfolio_epoch_id":"portfolio","position_cycle_id":cycle,
@@ -112,7 +131,7 @@ def test_original_placeholder_to_scoped_sell_audit(symbol, family, monkeypatch):
 
 @pytest.mark.parametrize("fault", ["intent_contract","fill_contract","foreign_cycle",
                                    "entry_copy","entry_hash","wrong_action","wrong_timing",
-                                   "duplicate_source","different_account"])
+                                   "duplicate_source","different_account","all_timing_copies_tampered"])
 def test_no_false_bridge_even_when_exit_audit_is_optional(fault, monkeypatch):
     entry, contract, row, identity = source("MDT",monkeypatch)
     rows = [row]
@@ -130,6 +149,9 @@ def test_no_false_bridge_even_when_exit_audit_is_optional(fault, monkeypatch):
         row["intent_meta"]["position_action"] = "ADD_TO_EXISTING_BUY"
     elif fault == "wrong_timing":
         row["intent_meta"]["us_entry_opportunity_v1"] = {"submission_binding_version":1}
+    elif fault == "all_timing_copies_tampered":
+        for field in ("intent_meta","order_meta","fill_meta"):
+            row[field]["us_entry_opportunity_v1"]["submission_binding_sha256"] = "a"*64
     elif fault == "duplicate_source":
         rows += [deepcopy(row)]
     elif fault == "different_account":
