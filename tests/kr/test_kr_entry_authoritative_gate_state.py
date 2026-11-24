@@ -91,6 +91,11 @@ def _install_native_minute_enforce_test_proof(monkeypatch) -> None:
     installed in production code. Dedicated opening-bar tests verify
     native-source freshness and fail-closed behavior separately.
     """
+    # Only this in-memory DB + FakeKis unit test exercises the submit path.
+    # The workflow-level NO_TRADE guard remains enabled for every other test.
+    monkeypatch.setenv("NO_TRADE", "0")
+    monkeypatch.setattr("trader.pb1_engine.now_kst",
+                        lambda: datetime(2026, 8, 6, 10, 0, tzinfo=ZoneInfo("Asia/Seoul")))
     monkeypatch.setenv("KR_PB1_ENTRY_TIMING_MODE", "ENFORCE")
     monkeypatch.setenv("KR_PB1_ENTRY_TIMING_APPROVED", "1")
 
@@ -142,7 +147,7 @@ def test_entry_pullback_candidates_do_not_hard_block(monkeypatch) -> None:
         assert "SIZING_NOT_PASSED" not in reasons
 
         status = engine._place_entry(cf)
-        assert status["api_submitted"] == 1
+        assert status["api_submitted"] == 1, status
 
 
 def test_hard_block_diagnostic_contains_gate_state_fields(caplog, monkeypatch) -> None:
