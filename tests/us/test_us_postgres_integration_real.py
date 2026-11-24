@@ -2897,11 +2897,35 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
             ON us_position_risk_state(trading_epoch_id, trade_date, symbol)
         """))
         conn.execute(text("""
-            INSERT INTO us_position_risk_state(trading_epoch_id,trade_date,symbol,state)
-            VALUES (:epoch,'2026-11-10','AMGN',CAST(:state AS jsonb))
-            ON CONFLICT(trading_epoch_id,trade_date,symbol)
-            DO UPDATE SET state=EXCLUDED.state
-        """), {"epoch": epoch, "state": json.dumps({"lifecycle": first_lifecycle})})
+            DELETE FROM us_position_risk_state
+            WHERE trading_epoch_id=:epoch AND trade_date='2026-11-10' AND symbol='AMGN'
+        """), {"epoch": epoch})
+
+    # Build the actual risk lifecycle from the persisted native fill chain,
+    # without pre-seeding a lifecycle or fabricating a raw-account fill.
+    from trader.us.position_lifecycle_state import (
+        reconcile_us_position_lifecycles, update_us_position_high_watermark,
+    )
+    from trader import account_state
+    monkeypatch.setenv("WSL_RUN_MARKET", "US")
+    monkeypatch.setattr(account_state, "get_account_key", lambda **kw: account)
+    monkeypatch.setattr(account_state, "resolve_env_name", lambda *a, **kw: "practice")
+    initial = [p for p in repos.load_positions("2026-11-10") if p["symbol"] == "AMGN"]
+    assert len(initial) == 1
+    assert initial[0]["account_id"] == broker_hash
+    first_now = datetime.fromisoformat("2026-11-10T20:00:00+00:00")
+    initialized = reconcile_us_position_lifecycles(
+        positions=initial, trade_date="2026-11-10", now=first_now,
+        authoritative=True, env="practice", managed_owners={"US_STANDARD"},
+    )["AMGN"]
+    assert initialized["lifecycle_id"] == cycle
+    assert initialized["opened_at_source"] == "confirmed_buy_fill"
+    assert initialized["entry_policy"]["entry_exit_contract_sha256"] == contract["sha256"]
+    first_lifecycle = update_us_position_high_watermark(
+        symbol="AMGN", trade_date="2026-11-10", lifecycle_id=cycle,
+        current_price=470.0, entry_price=461.8, now=first_now, position=initial[0],
+    )
+    assert first_lifecycle["high_watermark"] == 470.0
 
     assert repos.save_position_snapshot(
         [{"symbol": "AMGN", "exchange": "NASDAQ", "qty": 6,
