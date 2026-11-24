@@ -3259,6 +3259,26 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
         "2026-11-13", ["AMGN"], {"AMGN": cycle},
     )["AMGN"]
     assert pending_tp2["tp2_done"] is False
+    # Corrupted replay metadata cannot replace the durable original receipt,
+    # even when the incoming KIS order/cumulative quantity otherwise matches.
+    bad_fill = repos.mark_order_filled_by_reconcile(
+        order_no="CI-AMGN-TP2-SELL",
+        client_order_key=tp2_intent["client_order_key"],
+        symbol="AMGN", side="SELL", filled_qty=tp2_qty, requested_qty=tp2_qty,
+        cumulative_filled_qty=tp2_qty, avg_price_usd=490.0,
+        trade_date="2026-11-13", evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        source="fills_by_order_no",
+        meta={**meta, "profit_capture_stage":"tp2",
+              "source_entry_contract_sha256":"foreign-contract"},
+    )
+    assert bad_fill["status"] == "FILL_ORIGINAL_CONTRACT_CONFLICT", bad_fill
+    with pg_engine.connect() as conn:
+        rejected = conn.execute(text("""
+            SELECT qty_filled,status,meta FROM us_orders
+            WHERE order_no='CI-AMGN-TP2-SELL'
+        """)).mappings().one()
+        assert rejected["qty_filled"] == 0 and rejected["status"] == "ACK"
+        assert rejected["meta"]["us_original_buy_sst_v1"] == receipt
     tp2_fill = repos.mark_order_filled_by_reconcile(
         order_no="CI-AMGN-TP2-SELL",
         client_order_key=tp2_intent["client_order_key"],
@@ -3306,6 +3326,7 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
     assert persisted["fill_qty"] == tp2_qty
     assert persisted["order_meta"]["source_entry_contract_sha256"] == contract["sha256"]
     assert persisted["order_meta"]["us_original_buy_sst_v1"] == receipt
+    assert persisted["fill_meta"]["us_original_buy_sst_v1"] == receipt
     assert persisted["fill_meta"]["position_lifecycle_id"] == cycle
     # Latest zero must fence the old original even while history is intact.
     with pg_engine.begin() as conn:
