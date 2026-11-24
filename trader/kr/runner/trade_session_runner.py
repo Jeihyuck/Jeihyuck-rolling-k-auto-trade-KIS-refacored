@@ -657,6 +657,12 @@ def normalize_kr_session_completion(
         return "BLOCKED_RECONCILE", (
             pb1_exit_reason_s or "historical_recovery_unverified"
         ), 0, 1
+    if pb1_status_u == "RETRYABLE_MARKET_DATA_ERROR" and pb1_exit_reason_s == "KR_ENTRY_TIMING_DATA_UNVERIFIED":
+        return "RETRYABLE_MARKET_DATA_ERROR", pb1_exit_reason_s, 0, 1
+    if pb1_status_u == "OK_NO_TRADE" and pb1_exit_reason_s == "KR_ENTRY_TIMING_POLICY_WAIT":
+        # This is a successful evaluation, not a completed trading session.
+        # Preserve the next scheduled evaluation without reporting build failure.
+        return "OK_NO_TRADE", pb1_exit_reason_s, 0, 1
     policy_block_reasons = {
         "BUYABLE_EXISTING_HOLDING_KIS",
         "BUYABLE_TODAY_BUY_EXISTS",

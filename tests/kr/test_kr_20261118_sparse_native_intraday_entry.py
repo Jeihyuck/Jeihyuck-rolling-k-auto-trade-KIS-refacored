@@ -255,3 +255,40 @@ def test_partial_momentum_breakout_requires_true_opening_high():
     assert decision["state"] == "UNKNOWN"
     assert decision["reason"] == "OPENING_RANGE_HIGH_UNVERIFIED_FOR_MOMENTUM_BREAKOUT"
     assert decision["opening_range_complete"] is False
+
+
+@pytest.mark.parametrize("conflict_minute,style,expected", [
+    (5, "ENTRY_PULLBACK", "READY_SHADOW"),
+    (34, "ENTRY_PULLBACK", "UNKNOWN"),
+    (5, "ENTRY_BREAKOUT", "UNKNOWN"),
+])
+def test_conflict_scope_does_not_consume_quarantined_dependency(
+    monkeypatch, tmp_path, conflict_minute, style, expected,
+):
+    from trader.kr import opening_bar_contract as op
+    monkeypatch.setattr(op, "_evidence_file", lambda *a, **k: tmp_path / "proof.json")
+    rows = sparse_opening_and_native_rebound()
+    op.save_opening_proof(env="practice", account_scope="scope", code="093320",
+                          now=NOW, raw_bars=rows, vwap=None, vwap_source="UNKNOWN")
+    selected = next(r for r in rows if r["time"] == (
+        BASE + timedelta(minutes=conflict_minute)).strftime("%H%M%S"))
+    changed = {**selected, "volume": selected["volume"] + 1}
+    op.save_opening_proof(env="practice", account_scope="scope", code="093320",
+                          now=NOW, raw_bars=[changed], vwap=None, vwap_source="UNKNOWN")
+    stored = op.load_opening_proof(env="practice", account_scope="scope", code="093320", now=NOW)
+    assert stored["source_conflicts"]
+    verdict = op.evaluate_proof_for_candidate(
+        env="practice", account_scope="scope", code="093320", now=NOW,
+        style=style, setup_ok=True, trigger_ok=True, pivot=102, order_price=103.5)
+    assert verdict["state"] == expected
+    assert verdict["source_conflicts"] == stored["source_conflicts"]
+    assert verdict["not_order_authorization"] is True
+    health = op.inspect_completed_bar_coverage(
+        rows=stored["bars"], now=NOW, source_conflicts=stored["source_conflicts"])
+    assert health["native_post_open_window_ready"] is (conflict_minute != 34)
+    if expected == "READY_SHADOW":
+        assert verdict["conflict_scope"] == "INDEPENDENT_5_PLUS_3"
+        assert verdict["reference_source"] == "KIS_NATIVE_POST_OPENING_5_PLUS_3"
+        assert "opening_high" not in verdict
+    else:
+        assert verdict["reason"] == "CONFLICTING_NATIVE_COMPLETED_BAR"

@@ -141,6 +141,13 @@ def clean_completed_bars(rows: list[dict], now: datetime) -> list[dict]:
 
 
 
+def opening_range_ready(opening: list[dict]) -> bool:
+    """Legacy opening-reference quality criterion, not a universal BUY gate."""
+    return bool(len(opening) >= 25
+                and datetime.fromisoformat(opening[0]["timestamp"]).time() <= dtime(9, 3)
+                and datetime.fromisoformat(opening[-1]["timestamp"]).time() >= dtime(9, 26))
+
+
 def _completed_bar_structure(bars: list[dict], now: datetime) -> tuple[str, str, list[dict], list[dict]]:
     """One shared structural contract for observer health and BUY evaluator.
 
@@ -153,9 +160,7 @@ def _completed_bar_structure(bars: list[dict], now: datetime) -> tuple[str, str,
                   datetime.fromisoformat(bar["timestamp"]).time() >= dtime(9, 30)]
     if now.time() < dtime(9, 30):
         return "WAIT", "OPENING_OBSERVATION", opening, after_open
-    if (len(opening) < 25
-            or datetime.fromisoformat(opening[0]["timestamp"]).time() > dtime(9, 3)
-            or datetime.fromisoformat(opening[-1]["timestamp"]).time() < dtime(9, 26)):
+    if not opening_range_ready(opening):
         return "UNKNOWN", "OPENING_BARS_MISSING_OR_INCOMPLETE", opening, after_open
     if not bars:
         return "UNKNOWN", "NO_CURRENT_BAR", opening, after_open
@@ -170,7 +175,20 @@ def _completed_bar_structure(bars: list[dict], now: datetime) -> tuple[str, str,
     return "COVERED", "STRUCTURAL_1M_BARS_AVAILABLE", opening, after_open
 
 
-def inspect_completed_bar_coverage(*, rows: list[dict], now: datetime) -> dict:
+def _native_window_structure(after_open: list[dict], now: datetime) -> tuple[str, str]:
+    """One structural check shared by collection and the 5+3 evaluator."""
+    stamps = [datetime.fromisoformat(bar["timestamp"]) for bar in after_open[-8:]]
+    if any((right - left).total_seconds() != 60 for left, right in zip(stamps, stamps[1:])):
+        return "UNKNOWN", "POST_OPENING_NATIVE_WINDOW_GAP"
+    if len(stamps) < 8:
+        return "WAIT", "POST_OPENING_NATIVE_WINDOW_PENDING"
+    if not 0 <= (now.astimezone(KST) - stamps[-1]).total_seconds() <= 180:
+        return "UNKNOWN", "COMPLETED_BAR_STALE"
+    return "COVERED", "POST_OPENING_NATIVE_WINDOW_AVAILABLE"
+
+
+def inspect_completed_bar_coverage(*, rows: list[dict], now: datetime,
+                                   source_conflicts: list | None = None) -> dict:
     """Read-only structural proof; COVERED never grants BUY authorization."""
     now = now.astimezone(KST)
     bars = clean_completed_bars(rows, now)
@@ -183,20 +201,40 @@ def inspect_completed_bar_coverage(*, rows: list[dict], now: datetime) -> dict:
     unobserved = [
         f"09:{i:02d}" for i in range(30) if f"09:{i:02d}" not in observed
     ]
-    native_recent = after_open[-8:]
-    recent_native_stamps = [
-        datetime.fromisoformat(bar["timestamp"]) for bar in native_recent
-    ]
-    recent_native_window_ready = bool(
-        len(native_recent) == 8
-        and all((b - a).total_seconds() == 60
-                for a, b in zip(recent_native_stamps,
-                                recent_native_stamps[1:]))
-        and 0 <= (now - recent_native_stamps[-1]).total_seconds() <= 180
-    )
+    native_window_state, native_window_reason = _native_window_structure(after_open, now)
+    recent_native_window_ready = native_window_state == "COVERED"
+    # Retain historical opening diagnostics, but expose the independent
+    # admissible data path separately. No structural verdict is authority.
+    scope = _conflict_scope(bars=bars, conflicts=source_conflicts or [],
+                            now=now, family="PULLBACK")
+    independent_ready = bool(recent_native_window_ready
+                             and scope["independent_window_ready"]
+                             and not scope["invalid"])
+    opening_ready = bool(opening_range_ready(opening)
+                         and not scope["opening_conflicts"] and not scope["invalid"])
+    required_recent = 4 if active_entry_policy(os.getenv("KIS_ENV", "practice")) == "US_ALIGNED_V2" else 3
+    if state == "COVERED" and required_recent == 4:
+        recent = after_open[-4:]
+        if len(recent) < 4:
+            state, reason = "WAIT", "POST_OPENING_CONFIRMATION_PENDING"
+        elif any((datetime.fromisoformat(b["timestamp"]) -
+                  datetime.fromisoformat(a["timestamp"])).total_seconds() != 60
+                 for a, b in zip(recent, recent[1:])):
+            state, reason = "UNKNOWN", "RECENT_MINUTE_GAP"
     return {
+        "required_recent_minutes": required_recent,
         "state": state, "reason": reason,
-        "native_post_open_window_ready": recent_native_window_ready,
+        "opening_range_ready": opening_ready,
+        "native_post_open_window_ready": independent_ready,
+        "native_post_open_window_state": native_window_state,
+        "native_post_open_window_reason": native_window_reason,
+        "available_native_paths": [
+            *([ "OPENING_RANGE" ] if state == "COVERED" and opening_ready
+               and not scope["full_conflicts"] else []),
+            *([ "POST_OPENING_5_PLUS_3" ] if independent_ready else []),
+        ],
+        "source_conflicts": list(source_conflicts or []),
+        "window_conflicts": scope["window_conflicts"],
         "bars": len(bars), "opening_count": len(opening),
         # Unobserved does NOT prove a broker data gap: some minutes may have
         # no genuine trades. Never synthesize their OHLC or volume.
@@ -235,15 +273,10 @@ def _evaluate_verified_intraday_window(
         "reference_source": "KIS_NATIVE_POST_OPENING_5_PLUS_3",
     }
     window = after_open[-8:]
-    stamps = [datetime.fromisoformat(bar["timestamp"]) for bar in window]
-    if any((right - left).total_seconds() != 60
-           for left, right in zip(stamps, stamps[1:])):
-        return _result("UNKNOWN", "POST_OPENING_NATIVE_WINDOW_GAP", **proof)
-    if len(window) < 8:
-        return _result("WAIT", "POST_OPENING_NATIVE_WINDOW_PENDING", **proof)
+    native_state, native_reason = _native_window_structure(after_open, now)
+    if native_state != "COVERED":
+        return _result(native_state, native_reason, **proof)
     current = window[-1]
-    if (now - stamps[-1]).total_seconds() > 180:
-        return _result("UNKNOWN", "COMPLETED_BAR_STALE", **proof)
 
     earlier, recent = window[:5], window[-3:]
     high = max(bar["high"] for bar in earlier)
@@ -434,6 +467,27 @@ def _evidence_file(env: str, account_scope: str, code: str, now: datetime) -> Pa
                         digest, now.date().isoformat(), f"{str(code).zfill(6)}.json")
 
 
+class OpeningProofLockTimeout(TimeoutError):
+    """The read-only evidence writer could not acquire its per-symbol lock."""
+
+
+def _acquire_opening_proof_lock(lock_file, *, timeout_seconds: float = 2.0) -> None:
+    """Never let an evidence-writer lock stall a collector indefinitely."""
+    import fcntl
+    import time
+
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise OpeningProofLockTimeout("OPENING_PROOF_LOCK_TIMEOUT") from exc
+            time.sleep(min(0.05, remaining))
+
+
 def save_opening_proof(*, env: str, account_scope: str, code: str,
                        now: datetime, raw_bars: list[dict], vwap: float | None,
                        vwap_source: str) -> dict:
@@ -474,7 +528,7 @@ def save_opening_proof(*, env: str, account_scope: str, code: str,
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_suffix(".lock")
     with lock_path.open("a+b") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        _acquire_opening_proof_lock(lock_file)
         try:
             previous = load_opening_proof(
                 env=env, account_scope=account_scope, code=code, now=now,
@@ -644,6 +698,92 @@ def load_opening_proof(*, env: str, account_scope: str, code: str, now: datetime
         return None
 
 
+def _conflict_scope(*, bars: list[dict], conflicts: list, now: datetime, family: str) -> dict:
+    """Use the actual dependency window; never remove quarantined source rows.
+
+    Opening references depend on every observed opening minute. Pullback uses
+    the last eight post-open bars; momentum/breakout use the last three.
+    An independent 5+3 path may not consume ANY quarantined window minute.
+    """
+    opening = [b for b in bars if datetime.fromisoformat(b["timestamp"]).time() < dtime(9, 30)]
+    post = [b for b in bars if datetime.fromisoformat(b["timestamp"]).time() >= dtime(9, 30)]
+    keys = {b["timestamp"] for b in bars}
+    invalid = False
+    normalized = set()
+    for raw in conflicts:
+        try:
+            stamp = datetime.fromisoformat(raw)
+            if stamp.tzinfo is None:
+                raise ValueError("naive conflict")
+            key = stamp.astimezone(KST).isoformat()
+            if key not in keys:
+                raise ValueError("unmatched conflict")
+            normalized.add(key)
+        except (TypeError, ValueError, OverflowError):
+            invalid = True
+    open_keys = {b["timestamp"] for b in opening}
+    full_recent_keys = {b["timestamp"] for b in post[-(8 if family == "PULLBACK" else 3):]}
+    window = post[-8:]
+    window_keys = {b["timestamp"] for b in window}
+    stamps = [datetime.fromisoformat(b["timestamp"]) for b in window]
+    independent = (len(stamps) == 8
+                   and all((b - a).total_seconds() == 60 for a, b in zip(stamps, stamps[1:]))
+                   and 0 <= (now.astimezone(KST) - stamps[-1]).total_seconds() <= 180
+                   and not (normalized & window_keys))
+    return {"invalid": invalid, "opening_conflicts": sorted(normalized & open_keys),
+            "full_conflicts": sorted(normalized & (open_keys | full_recent_keys)),
+            "window_conflicts": sorted(normalized & window_keys),
+            "independent_window_ready": independent,
+            "opening": opening, "post": post}
+
+
+def active_entry_policy(env: str) -> str:
+    """Explicit WSL profile selects V2; legacy remains a reversible ENFORCE policy."""
+    if str(env).lower() != "practice":
+        return "LEGACY_V1"
+    return str(os.getenv("KR_PB1_ENTRY_OPPORTUNITY_POLICY", "LEGACY_V1")).strip().upper()
+
+
+def _evaluate_us_aligned_reclaim(*, payload, now, family, setup_ok, trigger_ok, order_price):
+    from trader.kr.entry_opportunity_v2 import evaluate_reclaim
+    if not setup_ok:
+        return _result("INVALID", "ORIGINAL_SETUP_FAILED")
+    now = now.astimezone(KST)
+    if not dtime(9, 30) <= now.time() <= dtime(15, 5):
+        return _result("WAIT", "OUTSIDE_ENTRY_WINDOW")
+    bars = clean_completed_bars(payload["bars"], now)
+    conflicts = payload.get("source_conflicts") or []
+    scope = _conflict_scope(bars=bars, conflicts=conflicts, now=now, family=family)
+    if scope["invalid"]:
+        return _result("UNKNOWN", "CONFLICTING_NATIVE_COMPLETED_BAR")
+    opening, post = scope["opening"], scope["post"]
+    # V2 reads a longer 15-minute trough; include every operand in conflict
+    # scope even if V1 would have ignored that historical conflict.
+    conflict_keys = {datetime.fromisoformat(raw).astimezone(KST).isoformat()
+                     for raw in conflicts}
+    recent_keys = {b["timestamp"] for b in post[-15:]}
+    full_ok = opening_range_ready(opening) and not (
+        scope["opening_conflicts"] or conflict_keys & recent_keys)
+    if full_ok:
+        independent = False
+    elif scope["independent_window_ready"]:
+        independent = True
+    else:
+        if conflicts and (scope["opening_conflicts"] or conflict_keys & recent_keys):
+            return _result("UNKNOWN", "CONFLICTING_NATIVE_COMPLETED_BAR",
+                           source_conflicts=list(conflicts))
+        state, reason = _native_window_structure(post, now)
+        return _result(state if state != "COVERED" else "UNKNOWN", reason,
+                       opening_count=len(opening))
+    return evaluate_reclaim(
+        family=family, opening=opening, post=post, now=now,
+        order_price=order_price, independent=independent,
+        vwap=payload.get("vwap"),
+        vwap_verified=payload.get("vwap_source") == "KIS_NATIVE_WEIGHTED_AVG",
+        trigger_ok=trigger_ok,
+    )
+
+
 def evaluate_proof_for_candidate(*, env: str, account_scope: str, code: str,
                                  now: datetime, style: str, setup_ok: bool,
                                  trigger_ok: bool, pivot: float | None,
@@ -653,9 +793,52 @@ def evaluate_proof_for_candidate(*, env: str, account_scope: str, code: str,
     )
     if not payload:
         return _result("UNKNOWN", "NO_FRESH_VERIFIED_KIS_MINUTE_BAR_PROOF")
-    if payload.get("source_conflicts"):
-        return _result("UNKNOWN", "CONFLICTING_NATIVE_COMPLETED_BAR",
-                       source_conflicts=list(payload["source_conflicts"]))
+    family = STYLES.get(str(style or "").strip().upper())
+    policy = active_entry_policy(env)
+    if policy not in {"LEGACY_V1", "US_ALIGNED_V2"}:
+        return _result("UNKNOWN", "ENTRY_OPPORTUNITY_POLICY_INVALID")
+    if policy == "US_ALIGNED_V2" and family in {"PULLBACK", "MOMENTUM"}:
+        # An owner-confirmed momentum breakout remains on its separate V1
+        # opening/pivot contract, not an easier reclaim substitution.
+        result = _evaluate_us_aligned_reclaim(
+            payload=payload, now=now, family=family, setup_ok=setup_ok,
+            trigger_ok=trigger_ok, order_price=order_price,
+        )
+        if result.get("reason") != "MOMENTUM_BREAKOUT_REQUIRES_OWNER_PATH":
+            return result
+    conflicts = payload.get("source_conflicts") or []
+    if conflicts:
+        family = STYLES.get(str(style or "").strip().upper())
+        bars = clean_completed_bars(payload["bars"], now)
+        scope = _conflict_scope(bars=bars, conflicts=conflicts, now=now, family=family or "")
+        diagnostic = {"source_conflicts": list(conflicts),
+                      "relevant_source_conflicts": scope["full_conflicts"],
+                      "native_window_conflicts": scope["window_conflicts"]}
+        if scope["invalid"] or not family:
+            return _result("UNKNOWN", "CONFLICTING_NATIVE_COMPLETED_BAR", **diagnostic)
+        structure, _, _, _ = _completed_bar_structure(bars, now)
+        if structure == "COVERED" and not scope["full_conflicts"]:
+            # Historical conflict outside every operand of this full proof.
+            verdict = evaluate_price_aware_entry(
+                style=style, rows=payload["bars"], now=now, vwap=payload["vwap"],
+                vwap_verified=payload["vwap_source"] == "KIS_NATIVE_WEIGHTED_AVG",
+                pivot=pivot, trigger_ok=trigger_ok, setup_ok=setup_ok,
+                order_price=order_price,
+            )
+            return {**verdict, **diagnostic, "conflict_scope": "OUTSIDE_FULL_DEPENDENCIES"}
+        if (family in {"PULLBACK", "MOMENTUM"} and scope["independent_window_ready"]
+                and setup_ok and dtime(9, 30) <= now.astimezone(KST).time() <= dtime(15, 5)):
+            # Do not use an opening high/volume contaminated by a conflict.
+            # The existing independent evaluator consumes only the clean
+            # latest eight bars, never an invented opening range.
+            verdict = _evaluate_verified_intraday_window(
+                family=family, opening=scope["opening"], after_open=scope["post"],
+                now=now.astimezone(KST), vwap=payload["vwap"],
+                vwap_verified=payload["vwap_source"] == "KIS_NATIVE_WEIGHTED_AVG",
+                pivot=pivot, trigger_ok=trigger_ok, order_price=order_price,
+            )
+            return {**verdict, **diagnostic, "conflict_scope": "INDEPENDENT_5_PLUS_3"}
+        return _result("UNKNOWN", "CONFLICTING_NATIVE_COMPLETED_BAR", **diagnostic)
     return evaluate_price_aware_entry(
         style=style, rows=payload["bars"], now=now,
         vwap=payload["vwap"],
