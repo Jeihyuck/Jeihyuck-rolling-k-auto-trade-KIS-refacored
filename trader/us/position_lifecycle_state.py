@@ -712,10 +712,24 @@ def reconcile_us_position_lifecycles(
     return out
 
 
-def update_us_position_high_watermark(*, symbol: str, trade_date: str, lifecycle_id: str, current_price: float, entry_price: float, now: datetime) -> dict:
+def update_us_position_high_watermark(*, symbol: str, trade_date: str, lifecycle_id: str, current_price: float, entry_price: float, now: datetime, position: dict | None = None) -> dict:
     symbol = _sym(symbol)
     latest = load_latest_us_position_risk_state(symbol, trade_date)
     lifecycle = dict(((latest.get("state") or {}).get("lifecycle") or {}))
+    # Native US exit evaluation must update only the already-bound open
+    # lifecycle. A symbol-only row (including a legacy V2 provisional
+    # decision row) cannot authorize creating or re-keying risk history.
+    if position is not None and os.getenv("WSL_RUN_MARKET", "").upper() == "US":
+        identity = _position_identity(position, env=None)
+        if (
+            _sym(position.get("symbol")) != symbol
+            or identity.get("position_lifecycle_id") != lifecycle_id
+            or identity.get("position_cycle_id") != lifecycle_id
+            or not _identity_is_current(identity)
+            or not _lifecycle_matches_identity(lifecycle, identity)
+            or lifecycle.get("is_open") is not True
+        ):
+            raise ValueError("US_HIGH_WATERMARK_ORIGINAL_SCOPE_UNVERIFIED")
     now_iso = _iso(now)
     same = lifecycle.get("lifecycle_id") == lifecycle_id
     previous = _f(lifecycle.get("high_watermark")) if same else 0.0
