@@ -587,6 +587,38 @@ def reconcile_us_position_lifecycles(
         if not lifecycle or lifecycle.get("is_open") is False:
             original_proof = pos.get("_verified_original_buy_fill")
             candidate_fills = list(fills or [])
+            native_standard = (
+                os.getenv("WSL_RUN_MARKET", "").upper() == "US"
+                and identity["strategy_owner"] == "US_STANDARD"
+            )
+            if native_standard:
+                # A canonical position already has its BUY-time cycle.
+                # Do not manufacture a new ID from today's balance/price if
+                # the risk leaf has not been created (or was lost). Resolve
+                # the actual signed original BUY through the same source
+                # query used by the authoritative snapshot writer.
+                from trader.us.original_buy_lineage import load_verified_us_original_buy_scope
+                original_proof = (
+                    load_verified_us_original_buy_scope(
+                        symbol=symbol, trade_date=trade_date, qty=qty, identity=identity,
+                    )
+                    if authoritative and lifecycle.get("is_open") is not False else None
+                )
+                if not original_proof or any(
+                    str(original_proof.get(k) or "") != identity.get(k)
+                    for k in ("env", "account_id", "trading_epoch_id", "strategy_owner",
+                              "portfolio_epoch_id", "position_cycle_id", "position_lifecycle_id")
+                ):
+                    pos["lifecycle_identity_status"] = "ORIGINAL_BUY_SCOPE_UNVERIFIED"
+                    logger.error(
+                        "[US_POSITION][LIFECYCLE][ORIGINAL_BUY_REQUIRED] "
+                        "symbol=%s action=NO_SYNTHETIC_CYCLE", symbol,
+                    )
+                    continue
+                # Only the independently matched native fill can initialize
+                # the canonical open state; unrelated same-symbol fills are
+                # not candidates for this creation.
+                candidate_fills = []
             if isinstance(original_proof, dict):
                 # Original broker-positive evidence already independently
                 # matched intent/order/account/cycle; no synthetic fill.
@@ -604,6 +636,13 @@ def reconcile_us_position_lifecycles(
                 or fill_meta.get("position_cycle_id")
                 or ""
             ).strip()
+            if native_standard and (
+                not confirmed_opened_at
+                or fill_lifecycle_id != identity.get("position_lifecycle_id")
+            ):
+                pos["lifecycle_identity_status"] = "ORIGINAL_BUY_SCOPE_UNVERIFIED"
+                logger.error("[US_POSITION][LIFECYCLE][ORIGINAL_BUY_FILL_REJECTED] symbol=%s", symbol)
+                continue
             opened_at = confirmed_opened_at or now_iso
             opened_at_source = "confirmed_buy_fill" if confirmed_opened_at else "first_authoritative_position_observation"
             lifecycle_id = _new_lifecycle_id(
