@@ -2727,6 +2727,19 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
             ON CONFLICT(trading_epoch_id) DO UPDATE SET
                 account_id=EXCLUDED.account_id,status='ACTIVE'
         """), {"epoch": epoch, "account": account})
+        # The isolated fixture mirrors the portfolio identity columns consumed
+        # by the production scope binder, not a monkeypatched authorization.
+        conn.execute(text("""
+            CREATE TABLE portfolio_epochs(
+                portfolio_epoch_id TEXT PRIMARY KEY, trading_epoch_id TEXT NOT NULL,
+                env TEXT NOT NULL, account_id TEXT NOT NULL, status TEXT NOT NULL,
+                sid INTEGER NOT NULL, mode INTEGER NOT NULL, strategy TEXT NOT NULL
+            )
+        """))
+        conn.execute(text("""
+            INSERT INTO portfolio_epochs VALUES
+                (:portfolio,:epoch,'practice',:account,'ACTIVE',0,0,'US_STANDARD')
+        """), {"portfolio":portfolio,"epoch":epoch,"account":account})
         conn.execute(text("""
             INSERT INTO us_order_intents
                 (trade_date,client_order_key,symbol,exchange,side,qty,
@@ -2741,10 +2754,10 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
             INSERT INTO us_orders
                 (trade_date,client_order_key,symbol,exchange,side,
                  qty_requested,qty_filled,order_no,status,trading_epoch_id,
-                 account_id,portfolio_epoch_id,position_cycle_id,meta)
+                 account_id,portfolio_epoch_id,position_cycle_id,meta,dry_run)
             VALUES ('2026-11-10',:key,'AMGN','NASDAQ','BUY',6,0,
                     :order_no,'ACK',:epoch,:account,:portfolio,:cycle,
-                    CAST(:meta AS jsonb))
+                    CAST(:meta AS jsonb),FALSE)
         """), {"key": key, "order_no": order_no, "epoch": epoch,
                "account": broker_hash, "portfolio": portfolio,
                "cycle": cycle, "meta": json.dumps(meta)})
@@ -3142,7 +3155,9 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
                         lambda _conn=None, **_kw: epoch)
     monkeypatch.setattr(repos, "_us_state_epoch_id",
                         lambda _conn=None, **_kw: epoch)
-    monkeypatch.setenv("WSL_RUN_MARKET", "")
+    # Exercise production WSL identity gates rather than disabling them in
+    # the offline broker-boundary replay. No native KIS client is constructed.
+    monkeypatch.setenv("WSL_RUN_MARKET", "US")
     monkeypatch.setenv("US_ACCOUNT_RESERVATION_MODE", "OFF")
     monkeypatch.setenv("US_ATOMIC_CLAIM_OUTBOX_ENABLED", "0")
     monkeypatch.setattr(order_router, "resolve_dry_run_for_us_order", lambda: False)
@@ -3205,6 +3220,32 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
     tp2_intent.setdefault("orderable_qty", 4)
     tp2_intent.setdefault("sellable_qty", 4)
     tp2_intent.setdefault("available_qty", 4)
+    # Independently verify the exact historical BUY quantity (six) even
+    # though the currently held quantity is only four after TP1.
+    from trader.us.execution.recovery_identity import (
+        USRecoveryScope, bind_existing_standard_order_buy_source,
+    )
+    scope = USRecoveryScope("practice", broker_hash, epoch, portfolio, cycle, "US_STANDARD")
+    with pg_engine.connect() as conn:
+        receipt = bind_existing_standard_order_buy_source(
+            tp2_intent, conn=conn, scope=scope, raw_account=account,
+        )
+        assert receipt["source_buy_client_order_key"] == key
+        assert receipt["source_entry_contract_sha256"] == contract["sha256"]
+        assert receipt["position_cycle_id"] == cycle
+        for field in ("source_entry_contract_sha256", "source_entry_contract_version"):
+            wrong = {**tp2_intent, "meta": dict(tp2_intent["meta"])}
+            wrong["meta"][field] = "foreign-contract"
+            with pytest.raises(RuntimeError, match="US_SST_ORIGINAL_CONTRACT_CONFLICT"):
+                bind_existing_standard_order_buy_source(
+                    wrong, conn=conn, scope=scope, raw_account=account,
+                )
+        with pytest.raises(ValueError, match="US_SST_HOLDING_SCOPE_CONFLICT"):
+            bind_existing_standard_order_buy_source(
+                tp2_intent, conn=conn, raw_account=account,
+                scope=USRecoveryScope("practice", broker_hash, epoch, portfolio,
+                                      "foreign-cycle", "US_STANDARD"),
+            )
     routed_tp2 = route_exit_orders_immediately(
         [tp2_intent], buy_daily_notional=0, position_count=1,
         effective_budget=10000, signal_only=False, kis_order_allowed=True,
@@ -3264,7 +3305,22 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
         """)).mappings().one()
     assert persisted["fill_qty"] == tp2_qty
     assert persisted["order_meta"]["source_entry_contract_sha256"] == contract["sha256"]
+    assert persisted["order_meta"]["us_original_buy_sst_v1"] == receipt
     assert persisted["fill_meta"]["position_lifecycle_id"] == cycle
+    # Latest zero must fence the old original even while history is intact.
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO us_positions(as_of,symbol,exchange,qty,trading_epoch_id,
+                                     account_id,portfolio_epoch_id,position_cycle_id,meta)
+            VALUES ('2026-11-14','AMGN','NASDAQ',0,:epoch,:account,:portfolio,:cycle,
+                    CAST(:meta AS jsonb))
+        """), {"epoch":epoch,"account":broker_hash,"portfolio":portfolio,
+               "cycle":cycle,"meta":json.dumps(carried["meta"])})
+        with pytest.raises(ValueError, match="US_SST_OPEN_HOLDING_UNVERIFIED"):
+            bind_existing_standard_order_buy_source(
+                {**tp2_intent, "trade_date":"2026-11-14"},
+                conn=conn, scope=scope, raw_account=account,
+            )
 
 
 def test_pg_original_signed_buy_contract_survives_raw_snapshot_upsert(pg_engine, monkeypatch):
