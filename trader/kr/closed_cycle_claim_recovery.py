@@ -73,6 +73,7 @@ def prove_closed_rejected_sell(*, claim, position, orders, fills, attempts,
     if not attempts or not orders or not fills:
         return None
     rejected_keys = set()
+    last_rejected_at = None
     for attempt in attempts:
         key = attempt.get("client_order_key")
         if (attempt.get("action_key") != claim.get("action_key")
@@ -81,7 +82,19 @@ def prove_closed_rejected_sell(*, claim, position, orders, fills, attempts,
                 or _qty(attempt.get("cumulative_filled_qty")) != 0
                 or not key or key in rejected_keys):
             return None
+        at = attempt.get("created_at")
+        if not isinstance(at, datetime):
+            return None
+        # SQLite offline fixtures can lose UTC tzinfo on round trip.
+        at = at if at.tzinfo else at.replace(tzinfo=timezone.utc)
+        last_rejected_at = max(last_rejected_at, at) if last_rejected_at else at
         rejected_keys.add(key)
+    closed_at = position.get("closed_ts")
+    if not isinstance(closed_at, datetime):
+        return None
+    closed_at = closed_at if closed_at.tzinfo else closed_at.replace(tzinfo=timezone.utc)
+    if closed_at < last_rejected_at:
+        return None
     order_by_id = {}
     verified_rejections = set()
     for order in orders:
@@ -111,7 +124,7 @@ def prove_closed_rejected_sell(*, claim, position, orders, fills, attempts,
             return None
     if rejected_keys != verified_rejections:
         return None
-    bought = sold = 0
+    bought = sold = later_sold = 0
     seen_fills = set()
     filled_orders = set()
     for fill in fills:
@@ -124,11 +137,17 @@ def prove_closed_rejected_sell(*, claim, position, orders, fills, attempts,
         broker_id = str(fill.get("broker_fill_id") or "")
         odno = str(fill.get("kis_odno") or "")
         day = str(raw.get("ord_dt") or "")
+        fill_at = fill.get("filled_at")
+        if not isinstance(fill_at, datetime):
+            return None
+        fill_at = fill_at if fill_at.tzinfo else fill_at.replace(tzinfo=timezone.utc)
         if (not same_scope(fill) or not order or order.get("status") != "FILLED"
                 or side not in {"BUY", "SELL"} or order.get("side") != side
                 or not qty or _qty(order.get("qty")) != qty or not odno
                 or str(order.get("kis_odno")) != odno or str(raw.get("odno")) != odno
                 or str(raw.get("pdno")) != code or len(day) != 8 or not day.isdigit()
+                or fill_at.astimezone(KST).strftime("%Y%m%d") != day
+                or fill_at > closed_at or _qty(raw.get("ord_qty")) != qty
                 or raw.get("sll_buy_dvsn_cd") != ("01" if side == "SELL" else "02")
                 or _qty(raw.get("tot_ccld_qty")) != qty or _qty(raw.get("rmn_qty")) != 0
                 or meta.get("evidence_kind") != "KIS_ORDER_CUMULATIVE_EXECUTION"
@@ -141,11 +160,14 @@ def prove_closed_rejected_sell(*, claim, position, orders, fills, attempts,
             bought += qty
         else:
             sold += qty
-    if (not bought or bought != sold or
+            if fill_at >= last_rejected_at:
+                later_sold += qty
+    if (not bought or bought != sold or later_sold < claim["target_qty"] or
             filled_orders != {oid for oid, row in order_by_id.items() if row.get("status") == "FILLED"}):
         return None
     return {"code": code, "position_cycle_id": cycle, "portfolio_epoch_id": portfolio,
-            "buy_qty": bought, "sell_qty": sold, "broker_fill_ids": sorted(seen_fills),
+            "buy_qty": bought, "sell_qty": sold, "later_sell_qty": later_sold,
+            "broker_fill_ids": sorted(seen_fills),
             "rejected_attempt_ids": [str(a["attempt_id"]) for a in attempts],
             "reason": "CLOSED_CYCLE_BY_OTHER_NATIVE_FILLS"}
 
