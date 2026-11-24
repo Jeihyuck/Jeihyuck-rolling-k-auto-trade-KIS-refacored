@@ -6611,9 +6611,16 @@ def mark_order_filled_by_reconcile(
         cumulative = max(previous, min(observed_cumulative, requested))
         remaining = max(0, requested - cumulative)
         status = "ACK" if cumulative <= 0 else "PARTIALLY_FILLED" if remaining else "FILLED"
-        order_meta = {**_parse_json_meta(order.get("meta")), **(meta or {}),
-                      "remaining_qty": remaining, "fill_evidence_type": evidence,
-                      "is_synthetic": synthetic}
+        from trader.us.position_contract_provenance import merge_original_order_contract_metadata
+        try:
+            preserved_meta = merge_original_order_contract_metadata(
+                _parse_json_meta(order.get("meta")), meta or {},
+            )
+        except ValueError as exc:
+            return {"status": "FILL_ORIGINAL_CONTRACT_CONFLICT", "reason": str(exc),
+                    "retry_order": False, "entry_fence": True, "requires_reconcile": True}
+        order_meta = {**preserved_meta, "remaining_qty": remaining,
+                      "fill_evidence_type": evidence, "is_synthetic": synthetic}
         promotion = {"superseded": 0, "conflict": 0}
         if not synthetic:
             promotion = _supersede_synthetic_fills_for_actual(trade_date=td, order_no=on, client_order_key=cok or order.get("client_order_key") or "", cumulative=observed_cumulative)
@@ -6771,9 +6778,16 @@ def mark_order_filled_by_reconcile(
                     "field": immutable_key, "retry_order": False,
                     "entry_fence": True,
                 })
+        from trader.us.position_contract_provenance import merge_original_order_contract_metadata
+        try:
+            preserved_meta = merge_original_order_contract_metadata(source_meta, incoming_meta)
+        except ValueError as exc:
+            raise FillAccountingInvariantError({
+                "status": "FILL_ORIGINAL_CONTRACT_CONFLICT", "reason": str(exc),
+                "retry_order": False, "entry_fence": True, "requires_reconcile": True,
+            }) from exc
         merged = {
-            **source_meta,
-            **incoming_meta,
+            **preserved_meta,
             "remaining_qty": remaining,
             "fill_evidence_type": evidence,
             "is_synthetic": synthetic,
