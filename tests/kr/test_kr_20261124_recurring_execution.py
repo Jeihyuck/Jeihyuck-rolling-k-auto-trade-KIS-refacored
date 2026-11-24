@@ -43,3 +43,49 @@ def test_conflict_repair_rotates_all_valid_native_minutes(monkeypatch):
     windows = [observer._conflict_repair_anchors("093320", stamps, now) for _ in range(3)]
     assert all(len(window) <= 2 for window in windows)
     assert set().union(*map(set, windows)) == {"091300", "091400", "091500", "091600", "091700"}
+
+
+def _timing_skip(state, reason):
+    return {"terminal_event": "FINAL_SKIP", "skipped": 1,
+            "skipped_reason": "KR_ENTRY_TIMING_NOT_READY_OR_PRICE_TOO_HIGH",
+            "timing_state": state, "timing_reason": reason}
+
+
+def test_zero_submit_mixed_timing_wait_and_data_error_is_retryable_not_build_failure():
+    from trader.pb1_engine import _classify_kr_timing_zero_submit
+    from trader.kr.runner.trade_session_runner import normalize_kr_session_completion
+    results = [_timing_skip("WAIT", "PULLBACK_SUPPORT_REBOUND_NOT_CONFIRMED"),
+               _timing_skip("UNKNOWN", "RECENT_MINUTE_GAP"),
+               _timing_skip("WAIT", "ORDER_PRICE_MOVED_FROM_CONFIRMED_BAR")]
+    decision = _classify_kr_timing_zero_submit({"results": results}, expected_count=3)
+    assert decision == ("RETRYABLE_MARKET_DATA_ERROR", "KR_ENTRY_TIMING_DATA_UNVERIFIED")
+    assert normalize_kr_session_completion(
+        status="OK", summary_reason="PB1_SESSION_DONE", marker={"completed": 1},
+        pb1_status=decision[0], pb1_exit_reason=decision[1],
+    ) == (*decision, 0, 1)
+
+
+def test_all_timing_wait_is_successful_evaluation_not_session_completion():
+    from trader.pb1_engine import _classify_kr_timing_zero_submit
+    from trader.kr.runner.trade_session_runner import normalize_kr_session_completion
+    results = [_timing_skip("WAIT", "PULLBACK_SUPPORT_REBOUND_NOT_CONFIRMED"),
+               _timing_skip("READY_SHADOW", "ORDER_PRICE_ABOVE_CONFIRMED_CAP")]
+    decision = _classify_kr_timing_zero_submit({"results": results}, expected_count=2)
+    assert decision == ("OK_NO_TRADE", "KR_ENTRY_TIMING_POLICY_WAIT")
+    assert normalize_kr_session_completion(
+        status="OK", summary_reason="PB1_SESSION_DONE", marker={"completed": 1},
+        pb1_status=decision[0], pb1_exit_reason=decision[1],
+    ) == (*decision, 0, 1)
+
+
+@pytest.mark.parametrize("change", [
+    {"failed": 1}, {"attempted": 1}, {"api_submitted": 1},
+    {"results": []}, {"results": [_timing_skip("READY_SHADOW", "READY")]},
+    {"results": [{"terminal_event": "ORDER_SUBMIT_UNRESOLVED", "skipped": 1}]},
+    {"results": [{"terminal_event": "FINAL_SKIP", "skipped": 1, "skipped_reason": "ENTRY_PLAN_INVALID"}]},
+])
+def test_timing_classifier_does_not_hide_actual_or_unaccounted_failures(change):
+    from trader.pb1_engine import _classify_kr_timing_zero_submit
+    result = {"results": [_timing_skip("WAIT", "PULLBACK_SUPPORT_REBOUND_NOT_CONFIRMED")]}
+    result.update(change)
+    assert _classify_kr_timing_zero_submit(result, expected_count=1) is None
