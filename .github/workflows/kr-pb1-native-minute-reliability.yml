@@ -27,6 +27,10 @@ on:
       - "scripts/wsl/kr-entry-timing-activation.sh"
       - "tests/kr/test_kr_pb1_minute_*.py"
       - "tests/kr/test_kr_20261124_recurring_execution.py"
+      - "tests/kr/test_kr_20261124_closed_cycle_claim_recovery.py"
+      - "trader/kr/closed_cycle_claim_recovery.py"
+      - "trader/execution_claims.py"
+      - "trader/kr/runtime_integrity_20260928.py"
       - "tests/kr/test_kr_pb1_kis_observer_budget.py"
       - ".github/workflows/kr-pb1-native-minute-reliability.yml"
   workflow_dispatch:
@@ -83,4 +87,5 @@ jobs:
             tests/kr/test_kr_runtime_integrity_p0_20260922.py \
             tests/kr/test_kr_20261029_price_aware_opening.py \
             tests/kr/test_kr_20261110_timing_activation_cjenm.py \
-            tests/kr/test_kr_20261124_recurring_execution.py
+            tests/kr/test_kr_20261124_recurring_execution.py \
+            tests/kr/test_kr_20261124_closed_cycle_claim_recovery.py
