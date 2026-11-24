@@ -253,7 +253,12 @@ def _recent_gap_anchor(coverage: dict, bars: list[dict], observed_at: datetime) 
     This is a request anchor, not a claim that a missing minute had trades.
     Never construct a candle or infer a business date from an empty response.
     """
-    if coverage.get("reason") != "RECENT_MINUTE_GAP":
+    if coverage.get("reason") == "RECENT_MINUTE_GAP":
+        window_size = 3
+    elif (not coverage.get("opening_range_ready")
+          and coverage.get("native_post_open_window_reason") == "POST_OPENING_NATIVE_WINDOW_GAP"):
+        window_size = 8
+    else:
         return None
     stamps = []
     for bar in bars:
@@ -265,10 +270,11 @@ def _recent_gap_anchor(coverage: dict, bars: list[dict], observed_at: datetime) 
                     stamps.append(stamp)
         except (KeyError, ValueError, TypeError):
             continue
-    latest = sorted(set(stamps))[-3:]
-    if len(latest) < 3:
+    latest = sorted(set(stamps))[-window_size:]
+    if len(latest) < (3 if window_size == 3 else 2):
         return None
-    expected = [latest[-1] - timedelta(minutes=i) for i in (2, 1, 0)]
+    expected = [latest[-1] - timedelta(minutes=i)
+                for i in range(window_size - 1, -1, -1)]
     missing = [stamp for stamp in expected if stamp not in latest and stamp.time() >= dtime(9, 30)]
     if not missing:
         return None
