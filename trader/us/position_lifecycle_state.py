@@ -181,6 +181,8 @@ def _lifecycle_matches_identity(lifecycle: dict, identity: dict[str, str]) -> bo
 
 
 def _identity_is_current(identity: dict[str, str]) -> bool:
+    if identity.get("account_id") == "CONFLICTING_POSITION_ACCOUNT_SCOPE":
+        return False
     if not all(identity.get(key) for key in (
         "env", "account_id", "trading_epoch_id", "strategy_owner",
     )):
