@@ -205,6 +205,45 @@ def _repair_opening_due(code: str) -> bool:
     return True
 
 
+# Conflict revalidation has its own bounded cadence: three independent reads
+# spaced >=60s must not inherit the opening-range 15-minute backoff.
+_CONFLICT_REPAIR_NEXT: dict[str, float] = {}
+_CONFLICT_REPAIR_CURSOR: dict[str, int] = {}
+
+
+def _repair_conflict_due(code: str) -> bool:
+    now = time.monotonic()
+    if now < _CONFLICT_REPAIR_NEXT.get(code, 0.0):
+        return False
+    _CONFLICT_REPAIR_NEXT[code] = now + 60.0
+    return True
+
+
+def _conflict_repair_anchors(code: str, unresolved: list, observed_at: datetime) -> list[str]:
+    """Rotate a bounded pair of exact historical anchors; never starve later conflicts."""
+    valid = []
+    for minute in unresolved:
+        try:
+            stamp = datetime.fromisoformat(str(minute))
+            if stamp.tzinfo is None:
+                continue
+            stamp = stamp.astimezone(KST)
+        except (ValueError, TypeError, OverflowError):
+            continue
+        if (stamp.date() != observed_at.date()
+                or not dtime(9, 0) <= stamp.time() < dtime(15, 30)
+                or stamp >= observed_at.replace(second=0, microsecond=0)):
+            continue
+        valid.append((stamp + timedelta(minutes=1)).strftime("%H%M%S"))
+    valid = sorted(set(valid))
+    if not valid:
+        return []
+    start = _CONFLICT_REPAIR_CURSOR.get(code, 0) % len(valid)
+    count = min(2, len(valid))
+    _CONFLICT_REPAIR_CURSOR[code] = (start + count) % len(valid)
+    return [valid[(start + offset) % len(valid)] for offset in range(count)]
+
+
 def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: float = 0.8) -> dict:
     """No order methods are called; all I/O is read-only KIS and local proofs."""
     observed_at = observed_at.astimezone(KST)
@@ -245,39 +284,28 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
             unresolved = list((stored or {}).get("source_conflicts") or [])
             repair_due = (
                 observed_at.time() >= dtime(9, 30)
-                and (not (opening_ready or opening_coverage.get(
-                    "native_post_open_window_ready", False)) or bool(unresolved))
+                and not (opening_ready or opening_coverage.get(
+                    "native_post_open_window_ready", False))
                 and _repair_opening_due(code)
             )
-            anchors = (
-                ["092900", observed_at.strftime("%H%M%S")]
-                if repair_due else [observed_at.strftime("%H%M%S")]
+            conflict_due = (
+                observed_at.time() >= dtime(9, 30)
+                and bool(unresolved) and _repair_conflict_due(code)
             )
+            # Prioritize current native data before optional historical repair.
+            anchors = [observed_at.strftime("%H%M%S")]
+            if repair_due:
+                anchors.append("092900")
             # An unresolved native-minute conflict can be >30 bars old.
             # Current-window reads no longer contain it: target the exact
             # conflict timestamp in an authenticated KIS historical window.
             # The original value and conflict quarantine remain intact until
             # the normal multi-read proof resolves it. Maximum two targeted
             # reads per repair cycle to preserve the observer-only KIS budget.
-            if repair_due:
-                extra_conflict_anchors: list[str] = []
-                for conflict_minute in unresolved:
-                    try:
-                        conflict_at = datetime.fromisoformat(str(conflict_minute)).astimezone(KST)
-                    except (ValueError, TypeError, OverflowError):
-                        continue
-                    if (conflict_at.date() != observed_at.date()
-                            or not dtime(9, 0) <= conflict_at.time() < dtime(15, 30)
-                            or conflict_at >= observed_at.replace(second=0, microsecond=0)):
-                        continue
-                    # KIS time-itemchart returns a backward-looking window.
-                    next_completed = conflict_at + timedelta(minutes=1)
-                    extra_conflict_anchors.append(next_completed.strftime("%H%M%S"))
-                    if len(extra_conflict_anchors) >= 2:
-                        break
-                anchors.extend(extra_conflict_anchors)
+            if conflict_due:
+                anchors.extend(_conflict_repair_anchors(code, unresolved, observed_at))
             anchors = list(dict.fromkeys(anchors))
-            if repair_due:
+            if repair_due or conflict_due:
                 logger.info(
                     "[KR][OPENING_OBSERVER][REPAIR_REQUEST] code=%s "
                     "opening_count=%s anchors=%s bounded_backoff=1",
