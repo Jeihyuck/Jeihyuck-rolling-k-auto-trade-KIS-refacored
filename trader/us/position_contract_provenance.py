@@ -47,3 +47,45 @@ def restore_null_elided_policy(derived: dict, original: dict) -> dict | None:
 
 def carry_entry_policy(derived: dict, original: dict) -> dict:
     return restore_null_elided_policy(derived, original) or deepcopy(derived)
+
+
+def merge_original_order_contract_metadata(source: dict, incoming: dict) -> dict:
+    """Preserve original execution-order BUY attribution across fill replay.
+
+    KIS observations supply quantities, prices and execution status, never a
+    replacement strategy contract. Null or absent derivative copies cannot
+    erase durable original values. Explicit competing original evidence is
+    a reconciliation conflict, not permission to re-sign or adopt it.
+    """
+    result = {**source, **incoming}
+    immutable = (
+        "entry_exit_contract", "entry_exit_contract_sha256",
+        "entry_exit_contract_version", "parent_entry_contract_sha256",
+        "source_entry_contract_sha256", "source_entry_contract_version",
+        "us_original_buy_sst_v1",
+    )
+    for field in immutable:
+        original = source.get(field)
+        observed = incoming.get(field)
+        if original not in (None, ""):
+            if observed not in (None, "", original):
+                # Broker/journal serialization may elide null leaves. This
+                # is not a changed signed payload if exactly provable.
+                if not (field == "entry_exit_contract"
+                        and isinstance(original, dict)
+                        and isinstance(observed, dict)
+                        and _without_nulls(original) == observed):
+                    raise ValueError("FILL_ORIGINAL_CONTRACT_CONFLICT:" + field)
+            result[field] = deepcopy(original)
+        elif field == "us_original_buy_sst_v1" and observed not in (None, ""):
+            # A fill observer cannot manufacture the pre-submit receipt.
+            raise ValueError("FILL_ORIGINAL_CONTRACT_CONFLICT:" + field)
+    receipt = source.get("us_original_buy_sst_v1")
+    if receipt is not None:
+        if (not isinstance(receipt, dict)
+                or not receipt.get("source_entry_contract_sha256")
+                or receipt["source_entry_contract_sha256"] != result.get("source_entry_contract_sha256")
+                or receipt.get("position_cycle_id") != result.get("position_cycle_id")
+                or receipt.get("portfolio_epoch_id") != result.get("portfolio_epoch_id")):
+            raise ValueError("FILL_ORIGINAL_CONTRACT_CONFLICT:receipt")
+    return result
