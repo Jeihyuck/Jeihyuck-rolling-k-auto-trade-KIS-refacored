@@ -1062,6 +1062,24 @@ def test_legacy_original_high_watermark_survives_empty_current_day(scenario, mon
     assert not result.get("position_cycle_id")
     assert client.order_days_requested == []
 
+    # After the initial recovery, a later peak in the same verified original
+    # must survive subsequent ticks; archived history is not the mutable HWM.
+    monkeypatch.setattr(lifecycle, "load_latest_us_position_risk_state",
+                        lambda *a, **kw: {"trade_date": "2026-11-11",
+                                         "state": {"lifecycle": dict(writes[-1])}})
+    new_high = lifecycle.update_us_position_high_watermark(
+        symbol=SYMBOL, trade_date="2026-11-11", lifecycle_id=OLD_CYCLE,
+        current_price=130.0, entry_price=100.0, now=now, position=pos,
+    )
+    assert new_high["high_watermark"] == 130.0 and len(writes) == 2
+    carried = lifecycle.update_us_position_high_watermark(
+        symbol=SYMBOL, trade_date="2026-11-11", lifecycle_id=OLD_CYCLE,
+        current_price=128.0, entry_price=100.0, now=now, position=pos,
+    )
+    assert carried["high_watermark"] == 130.0
+    assert carried["high_watermark_at"] == new_high["high_watermark_at"]
+    assert len(writes) == 2
+
     # An asserted original flag cannot substitute for matching native net fills.
     pos["qty"] = 3
     pos["legacy_nine_decision_only_provisional"] = True
@@ -1070,4 +1088,4 @@ def test_legacy_original_high_watermark_survives_empty_current_day(scenario, mon
             symbol=SYMBOL, trade_date="2026-11-11", lifecycle_id=OLD_CYCLE,
             current_price=999.0, entry_price=100.0, now=now, position=pos,
         )
-    assert len(writes) == 1
+    assert len(writes) == 2
