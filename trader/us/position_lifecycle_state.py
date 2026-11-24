@@ -571,6 +571,25 @@ def reconcile_us_position_lifecycles(
         # Resolve latest lifecycle after binding authoritative identity.
         latest = load_latest_us_position_risk_state(symbol, trade_date)
         lifecycle = dict(((latest.get("state") or {}).get("lifecycle") or {}))
+        if (not lifecycle and identity.get("portfolio_epoch_id")
+                and identity.get("position_lifecycle_id")
+                and os.getenv("WSL_RUN_MARKET", "").upper() == "US"):
+            # Today's soft-stop counters can be persisted before the
+            # lifecycle leaf is carried. An empty leaf is not a new cycle.
+            # Use only the newest nonempty leaf in the same epoch; never
+            # search past a closed or conflicting lifecycle to revive an old one.
+            for candidate in risk_candidates_by_symbol.get(symbol, []):
+                if str(candidate.get("trading_epoch_id") or "") != identity["trading_epoch_id"]:
+                    continue
+                previous = ((candidate.get("state") or {}).get("lifecycle") or {})
+                if not previous:
+                    continue
+                if (previous.get("is_open") is True
+                        and previous.get("account_id") == identity["account_id"]
+                        and _lifecycle_matches_identity(previous, identity)):
+                    latest = candidate
+                    lifecycle = dict(previous)
+                break
         # A persisted same-day lifecycle can be reused only with an exact
         # owner/account/epoch/lifecycle match. A prior-day row must still be
         # carried into today's row; a stale tick may never overwrite newer
