@@ -7206,18 +7206,20 @@ def load_us_positions_by_symbols(
             with engine.begin() as conn:
                 epoch_id = _active_us_epoch(conn)
                 sql = """
-                        SELECT DISTINCT ON (symbol)
-                            *
-                        FROM us_positions
-                        WHERE symbol = ANY(:syms)
-                          AND as_of <= :td
-                          AND qty > 0
+                        SELECT * FROM (
+                            SELECT DISTINCT ON (symbol) *
+                            FROM us_positions
+                            WHERE symbol = ANY(:syms)
+                              AND as_of <= :td
                 """
                 params = {"syms": list(symbols), "td": td}
                 if epoch_id:
                     sql += " AND trading_epoch_id=:epoch_id"
                     params["epoch_id"] = epoch_id
-                sql += " ORDER BY symbol, as_of DESC"
+                # A later authoritative zero is the end of this holding.
+                # Filter positive quantity AFTER selecting the newest row;
+                # otherwise a closed position can become an ADD parent again.
+                sql += " ORDER BY symbol, as_of DESC, created_at DESC, id DESC) latest WHERE qty > 0"
                 raw = conn.execute(text(sql), params)
                 rows = [dict(r._mapping) for r in raw]
         except Exception as exc:
