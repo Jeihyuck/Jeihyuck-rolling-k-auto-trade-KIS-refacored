@@ -756,14 +756,51 @@ def update_us_position_high_watermark(*, symbol: str, trade_date: str, lifecycle
     latest = load_latest_us_position_risk_state(symbol, trade_date)
     lifecycle = dict(((latest.get("state") or {}).get("lifecycle") or {}))
     # Native US exit evaluation must update only the already-bound open
-    # lifecycle. A symbol-only row (including a legacy V2 provisional
-    # decision row) cannot authorize creating or re-keying risk history.
+    # lifecycle. Legacy V2 retains its original historical risk lifecycle;
+    # its separate prospective SELL scope must never replace the BUY history.
     if position is not None and os.getenv("WSL_RUN_MARKET", "").upper() == "US":
         identity = _position_identity(position, env=None)
-        if (
-            _sym(position.get("symbol")) != symbol
-            or identity.get("position_lifecycle_id") != lifecycle_id
-            or identity.get("position_cycle_id") != lifecycle_id
+        if (_sym(position.get("symbol")) != symbol
+                or identity.get("position_lifecycle_id") != lifecycle_id):
+            raise ValueError("US_HIGH_WATERMARK_ORIGINAL_SCOPE_UNVERIFIED")
+        if not identity.get("portfolio_epoch_id"):
+            from trader.us.execution.us_legacy_nine_active_sell import (
+                enrich_legacy_nine_v2_decision_position,
+            )
+            # The caller's provisional flag is NOT sufficient proof.
+            # Re-prove original BUY, native net fills and exact historical
+            # runtime scope through the existing read-only legacy bridge.
+            proven = enrich_legacy_nine_v2_decision_position(position, trade_date=trade_date)
+            original = proven.get("_verified_legacy_runtime_lifecycle") or {}
+            proven_identity = _position_identity(proven, env=None)
+            if (
+                proven is position
+                or proven.get("legacy_nine_decision_only_provisional") is not True
+                or not _identity_is_current(proven_identity)
+                or original.get("lifecycle_id") != lifecycle_id
+                or original.get("is_open") is not True
+                or original.get("portfolio_epoch_id")
+                or original.get("position_cycle_id")
+                or any(str(original.get(k) or "") != proven_identity.get(k)
+                       for k in ("account_id", "env", "trading_epoch_id", "strategy_owner"))
+                or (lifecycle and (
+                    lifecycle.get("lifecycle_id") != lifecycle_id
+                    or lifecycle.get("is_open") is not True
+                    or any(str(lifecycle.get(k) or "") != str(original.get(k) or "")
+                           for k in ("account_id", "env", "trading_epoch_id", "strategy_owner",
+                                     "portfolio_epoch_id", "position_cycle_id"))
+                ))
+                or _f(original.get("high_watermark")) <= 0
+                or not original.get("high_watermark_at")
+            ):
+                raise ValueError("US_HIGH_WATERMARK_LEGACY_ORIGINAL_UNVERIFIED")
+            # Keep original opening date and recorded peak/time. Never
+            # manufacture a canonical portfolio/cycle for a legacy risk row.
+            lifecycle = dict(original)
+            if _f(((latest.get("state") or {}).get("lifecycle") or {}).get("high_watermark")) > _f(lifecycle.get("high_watermark")):
+                raise ValueError("US_HIGH_WATERMARK_LEGACY_SOURCE_STALE")
+        elif (
+            identity.get("position_cycle_id") != lifecycle_id
             or not _identity_is_current(identity)
             or not _lifecycle_matches_identity(lifecycle, identity)
             or lifecycle.get("is_open") is not True
@@ -781,6 +818,7 @@ def update_us_position_high_watermark(*, symbol: str, trade_date: str, lifecycle
         same
         and new_high == previous
         and str(latest.get("trade_date") or "") == str(trade_date)
+        and ((latest.get("state") or {}).get("lifecycle") or {}).get("lifecycle_id") == lifecycle_id
         and lifecycle.get("high_watermark_source") == "us_position_risk_state"
         and lifecycle.get("high_watermark_at")
         and lifecycle.get("is_open") is True
