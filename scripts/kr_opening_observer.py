@@ -254,7 +254,7 @@ def _recent_gap_anchor(coverage: dict, bars: list[dict], observed_at: datetime) 
     Never construct a candle or infer a business date from an empty response.
     """
     if coverage.get("reason") == "RECENT_MINUTE_GAP":
-        window_size = 3
+        window_size = 4 if coverage.get("required_recent_minutes") == 4 else 3
     elif (not coverage.get("opening_range_ready")
           and coverage.get("native_post_open_window_reason") == "POST_OPENING_NATIVE_WINDOW_GAP"):
         window_size = 8
@@ -271,7 +271,7 @@ def _recent_gap_anchor(coverage: dict, bars: list[dict], observed_at: datetime) 
         except (KeyError, ValueError, TypeError):
             continue
     latest = sorted(set(stamps))[-window_size:]
-    if len(latest) < (3 if window_size == 3 else 2):
+    if len(latest) < (window_size if window_size in (3, 4) else 2):
         return None
     expected = [latest[-1] - timedelta(minutes=i)
                 for i in range(window_size - 1, -1, -1)]
