@@ -89,3 +89,12 @@ def test_timing_classifier_does_not_hide_actual_or_unaccounted_failures(change):
     result = {"results": [_timing_skip("WAIT", "PULLBACK_SUPPORT_REBOUND_NOT_CONFIRMED")]}
     result.update(change)
     assert _classify_kr_timing_zero_submit(result, expected_count=1) is None
+
+
+def test_recent_gap_repair_targets_missing_minute_without_synthetic_bar():
+    now = datetime(2026, 11, 24, 10, 35, tzinfo=contract.KST)
+    bars = [{"timestamp": f"2026-11-24T10:{minute:02d}:00+09:00"}
+            for minute in (30, 32, 34)]
+    assert observer._recent_gap_anchor({"reason": "RECENT_MINUTE_GAP"}, bars, now) == "103400"
+    assert observer._recent_gap_anchor({"reason": "COMPLETED_BAR_STALE"}, bars, now) is None
+    assert observer._recent_gap_anchor({"reason": "RECENT_MINUTE_GAP"}, bars[:2], now) is None
