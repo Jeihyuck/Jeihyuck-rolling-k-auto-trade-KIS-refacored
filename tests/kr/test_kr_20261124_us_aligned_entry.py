@@ -189,3 +189,32 @@ def test_v2_profile_is_active_not_shadow():
     env["KR_PB1_ENTRY_OPPORTUNITY_POLICY"] = "LEGACY_V1"
     output = subprocess.check_output(["bash", "-c", cmd], env=env, text=True)
     assert output.endswith("LEGACY_V1 ENFORCE 1")
+
+
+def test_realistic_kr_tick_grid_shallow_rebound_ready(monkeypatch):
+    # Native 50-won ticks on a 25,000-won stock. Equal lows,
+    # no previous high breakout and only 0.8% observed pullback.
+    start = NOW.replace(hour=9, minute=0)
+    opening = [bar(start+timedelta(minutes=i), 25050, 25000, 25200, 10000)
+               for i in range(30)]
+    post = [bar(NOW-timedelta(minutes=15-i), 25000, 25000, 25150, 100)
+            for i in range(11)]
+    post += [bar(NOW-timedelta(minutes=4), 25000, 25000, 25150, 100),
+             bar(NOW-timedelta(minutes=3), 25000, 25000, 25150, 100),
+             bar(NOW-timedelta(minutes=2), 25050, 25000, 25150, 80),
+             bar(NOW-timedelta(minutes=1), 25100, 25050, 25150, 80)]
+    # 1.5 R:R cannot be met at 25,100 with target 25,200. The price
+    # guard must reject this, even though the new rebound criteria pass.
+    blocked = evaluate(opening, post, order_price=25100)
+    assert blocked["reason"] == "PULLBACK_NO_ROOM_VS_STOP"
+    assert .005 <= blocked["intraday_pullback_depth"] < .01
+    # Rebound at 25,100 with stop 25,050 and target 25,200 -> 2R.
+    post[-3] = dict(post[-3], low=25050, open=25050, close=25050)
+    post[-2] = dict(post[-2], low=25050, open=25100, close=25100)
+    post[-1] = dict(post[-1], low=25050, open=25150, close=25150)
+    result = evaluate(opening, post, order_price=25100)
+    assert result["state"] == "READY_SHADOW", result
+    assert result["max_entry_price"] == 25100
+    assert result["risk_reward_reference"] == 2
+    assert result["higher_lows"] is True
+    assert result["intraday_pullback_depth"] < .01
