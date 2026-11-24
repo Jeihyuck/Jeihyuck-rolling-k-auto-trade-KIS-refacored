@@ -434,6 +434,27 @@ def _evidence_file(env: str, account_scope: str, code: str, now: datetime) -> Pa
                         digest, now.date().isoformat(), f"{str(code).zfill(6)}.json")
 
 
+class OpeningProofLockTimeout(TimeoutError):
+    """The read-only evidence writer could not acquire its per-symbol lock."""
+
+
+def _acquire_opening_proof_lock(lock_file, *, timeout_seconds: float = 2.0) -> None:
+    """Never let an evidence-writer lock stall a collector indefinitely."""
+    import fcntl
+    import time
+
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise OpeningProofLockTimeout("OPENING_PROOF_LOCK_TIMEOUT") from exc
+            time.sleep(min(0.05, remaining))
+
+
 def save_opening_proof(*, env: str, account_scope: str, code: str,
                        now: datetime, raw_bars: list[dict], vwap: float | None,
                        vwap_source: str) -> dict:
@@ -474,7 +495,7 @@ def save_opening_proof(*, env: str, account_scope: str, code: str,
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_suffix(".lock")
     with lock_path.open("a+b") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        _acquire_opening_proof_lock(lock_file)
         try:
             previous = load_opening_proof(
                 env=env, account_scope=account_scope, code=code, now=now,
