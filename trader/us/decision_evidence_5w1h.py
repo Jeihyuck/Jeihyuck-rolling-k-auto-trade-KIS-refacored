@@ -93,6 +93,7 @@ def verify_decision_evidence(record: dict) -> bool:
 def verified_original_buy_decision_binding(
     *, symbol: str, cycle: str, contract: dict, intent_meta: dict,
     order_meta: dict, fill_meta: dict, original_order_key: str,
+    account_hash: str, trading_epoch_id: str, portfolio_epoch_id: str,
 ) -> dict | None:
     """Audit-only bridge after exact native first-BUY lineage was proven.
 
@@ -102,7 +103,8 @@ def verified_original_buy_decision_binding(
     Never re-sign the original signal or accept a ticker-only match.
     """
     from trader.us.entry_exit_contract import verify_us_entry_exit_contract
-    if not cycle or not original_order_key or not verify_us_entry_exit_contract(contract):
+    if (not all((cycle, original_order_key, account_hash, trading_epoch_id, portfolio_epoch_id))
+            or not verify_us_entry_exit_contract(contract)):
         return None
     provenance = contract.get("entry_provenance") or {}
     entry = provenance.get("entry_decision_evidence_5w1h")
@@ -122,6 +124,8 @@ def verified_original_buy_decision_binding(
                 or meta.get("entry_exit_contract_sha256") != contract["sha256"]
                 or meta.get("position_lifecycle_id") != cycle
                 or meta.get("position_cycle_id") != cycle
+                or meta.get("portfolio_epoch_id") != portfolio_epoch_id
+                or meta.get("broker_account_hash") != account_hash
                 or meta.get("strategy_owner") != "US_STANDARD"):
             return None
     if source_scope != cycle:
@@ -135,14 +139,28 @@ def verified_original_buy_decision_binding(
         # across all three original records. It is additional provenance,
         # not a replacement for the exact native BUY chain.
         timing = intent_meta.get("us_entry_opportunity_v1")
-        if timing is not None and (
-            not isinstance(timing, dict)
-            or timing.get("submission_binding_version") != 2
-            or not timing.get("submission_binding_sha256")
-            or order_meta.get("us_entry_opportunity_v1") != timing
-            or fill_meta.get("us_entry_opportunity_v1") != timing
-        ):
-            return None
+        if timing is not None:
+            from trader.us.entry_timing.opportunity import _verify_timing_signal_and_binding
+            attempt = intent_meta.get("submit_attempt_id")
+            scoped_intent = {
+                "symbol": symbol, "side": "BUY", "strategy_owner": "US_STANDARD",
+                "position_action": "NEW_POSITION_BUY",
+                "client_order_key": original_order_key,
+                "position_lifecycle_id": cycle, "position_cycle_id": cycle,
+                "env": "practice", "broker_account_hash": account_hash,
+                "trading_epoch_id": trading_epoch_id,
+                "portfolio_epoch_id": portfolio_epoch_id,
+                "submit_attempt_id": attempt,
+            }
+            if (not isinstance(timing, dict)
+                    or timing.get("submission_binding_version") != 2
+                    or not attempt
+                    or any(m.get("submit_attempt_id") != attempt
+                           for m in (order_meta, fill_meta))
+                    or order_meta.get("us_entry_opportunity_v1") != timing
+                    or fill_meta.get("us_entry_opportunity_v1") != timing
+                    or not _verify_timing_signal_and_binding(scoped_intent, timing)):
+                return None
     return {
         "source_buy_client_order_key": original_order_key,
         "source_entry_contract_sha256": contract["sha256"],
