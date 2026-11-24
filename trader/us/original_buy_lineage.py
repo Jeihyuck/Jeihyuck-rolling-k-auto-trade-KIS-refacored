@@ -34,7 +34,7 @@ def _exact_positive_shares(raw: Any) -> int | None:
     return number if number is not None and number > 0 else None
 
 def select_verified_us_original_buy_scope(
-    rows: list[dict], *, symbol: str, qty: int, identity: dict[str, str],
+    rows: list[dict], *, symbol: str, qty: int | None, identity: dict[str, str],
 ) -> dict | None:
     """Return the only proven complete first BUY or fail closed.
 
@@ -50,7 +50,14 @@ def select_verified_us_original_buy_scope(
     # A bool, float, or decimal-looking string is not a broker-proven share count.
     # Do not allow an integer cast at this execution/provenance boundary.
     exact_qty = _exact_positive_shares(qty)
-    if env != "practice" or not account or not epoch or exact_qty is None:
+    # Historical original proof does not compare the original filled quantity
+    # with today's remaining shares. Only a completely scoped caller may use
+    # this mode. Current first-BUY balance adoption still requires exact qty.
+    historical = qty is None and all(identity.get(k) for k in (
+        "portfolio_epoch_id", "position_cycle_id", "position_lifecycle_id",
+        "strategy_owner",
+    ))
+    if env != "practice" or not account or not epoch or (exact_qty is None and not historical):
         return None
     expected_hash = hashlib.sha256(account.encode("utf-8")).hexdigest()
     eligible: list[dict] = []
@@ -81,15 +88,22 @@ def select_verified_us_original_buy_scope(
             and not (identity.get("strategy_owner")
                      and str(identity["strategy_owner"]).upper() != owner)
             and portfolio and cycle
+            and all(not identity.get(k) or str(identity[k]) == expected
+                    for k, expected in (("portfolio_epoch_id", portfolio),
+                                        ("position_cycle_id", cycle),
+                                        ("position_lifecycle_id", cycle)))
             and row.get("order_no") and row.get("client_order_key")
             and row.get("filled_at") is not None
             and pre_order_qty == 0
-            and requested == intended and 0 < filled == cumulative == exact_qty <= requested
+            and requested == intended and 0 < filled == cumulative <= requested
+            and (historical or filled == exact_qty)
             and order_filled == filled
             and (
                 (order_status == "FILLED" and filled == requested)
                 or (order_status == "PARTIALLY_FILLED" and filled < requested)
+                or (historical and order_status == "CANCELLED" and filled < requested)
             )
+            and fill_meta.get("is_synthetic") is not True
             and str(fill_meta.get("fill_evidence_type") or "") == "KIS_ORDER_CUMULATIVE_ACTUAL"
             and isinstance(contract, dict) and verify_us_entry_exit_contract(contract)
             and all(str(meta.get("broker_account_hash") or "") == expected_hash
@@ -130,7 +144,7 @@ def select_verified_us_original_buy_scope(
 
 
 def load_verified_us_original_buy_scope(
-    *, symbol: str, trade_date: str, qty: int, identity: dict[str, str],
+    *, symbol: str, trade_date: str, qty: int | None, identity: dict[str, str],
     conn: Any = None,
 ) -> dict | None:
     """Read-only exact original BUY lookup, optionally within a snapshot transaction."""
@@ -178,11 +192,20 @@ def load_verified_us_original_buy_scope(
                    AND f.portfolio_epoch_id=o.portfolio_epoch_id
                    AND f.position_cycle_id=o.position_cycle_id
                  WHERE o.trade_date=:td AND o.symbol=:symbol
-                   AND o.side='BUY' AND o.status IN ('FILLED','PARTIALLY_FILLED')
+                   AND o.side='BUY'
+                   AND (o.status IN ('FILLED','PARTIALLY_FILLED')
+                        OR (:historical AND o.status='CANCELLED'))
                    AND o.trading_epoch_id=:epoch
+                   AND (NOT :historical OR (
+                       o.account_id=:account_hash AND o.portfolio_epoch_id=:portfolio
+                       AND o.position_cycle_id=:cycle AND o.dry_run IS FALSE
+                   ))
                  LIMIT 51
             """), {"td": trade_date, "symbol": symbol,
-                 "epoch": active_epoch}).mappings().all()
+                 "epoch": active_epoch, "historical": qty is None,
+                 "account_hash": hashlib.sha256(str(identity["account_id"]).encode()).hexdigest(),
+                 "portfolio": str(identity.get("portfolio_epoch_id") or ""),
+                 "cycle": str(identity.get("position_cycle_id") or "")}).mappings().all()
         # An exhausted bounded scan is not evidence of a globally unique BUY.
         # Reject instead of selecting one order from a truncated 50-row sample.
         if len(rows) >= 51:
@@ -667,3 +690,83 @@ def verified_carried_us_snapshot_identity(
         "lineage_verified_partial_sell_shares": sold_shares,
         "lineage_verified_net_add_shares": added_shares,
     }
+
+
+def prove_open_standard_buy_source(
+    *, conn: Any, symbol: str, trade_date: str, identity: dict[str, str],
+) -> dict:
+    """Canonical current holding -> original native BUY proof, read-only.
+
+    The latest snapshot (including zero holdings) is a boundary; never
+    search backwards past a closed, unscoped, or conflicting position.
+    A matching signed original and open risk leaf are both required. This
+    function does not authorize an order or substitute for fresh KIS qty.
+    """
+    from sqlalchemy import text
+    from trader.us.entry_exit_contract import verify_us_entry_exit_contract
+
+    required = ("env", "account_id", "trading_epoch_id", "portfolio_epoch_id",
+                "position_cycle_id", "position_lifecycle_id", "strategy_owner")
+    if (not all(identity.get(k) for k in required)
+            or identity["env"] != "practice"
+            or identity["strategy_owner"] != "US_STANDARD"
+            or symbol == "TQQQ"
+            or identity["position_cycle_id"] != identity["position_lifecycle_id"]):
+        raise ValueError("US_SST_SCOPE_UNVERIFIED")
+    epoch, portfolio, cycle = (identity[k] for k in (
+        "trading_epoch_id", "portfolio_epoch_id", "position_cycle_id"))
+    account = identity["account_id"]
+    broker_hash = hashlib.sha256(account.encode()).hexdigest()
+    params = {"epoch": epoch, "symbol": symbol, "td": trade_date}
+    rows = conn.execute(text("""
+        SELECT as_of, qty, account_id, portfolio_epoch_id, position_cycle_id, meta
+        FROM us_positions
+        WHERE trading_epoch_id=:epoch AND symbol=:symbol AND as_of<=:td
+        ORDER BY as_of DESC, created_at DESC LIMIT 2
+    """), params).mappings().all()
+    if (not rows or _exact_positive_shares(rows[0].get("qty")) is None
+            or (len(rows) > 1 and rows[1]["as_of"] == rows[0]["as_of"])):
+        raise ValueError("US_SST_OPEN_HOLDING_UNVERIFIED")
+    row = rows[0]
+    meta = row.get("meta") or {}
+    expected = {"portfolio_epoch_id": portfolio, "position_cycle_id": cycle}
+    if (str(row.get("account_id") or "") != broker_hash
+            or str(meta.get("account_id") or "") != account
+            or str(meta.get("broker_account_hash") or "") != broker_hash
+            or str(meta.get("strategy_owner") or "") != "US_STANDARD"
+            or str(meta.get("position_lifecycle_id") or "") != cycle
+            or any(str(row.get(k) or "") != v or str(meta.get(k) or "") != v
+                   for k, v in expected.items())):
+        raise ValueError("US_SST_HOLDING_SCOPE_CONFLICT")
+    contract = meta.get("entry_exit_contract")
+    if (not verify_us_entry_exit_contract(contract)
+            or meta.get("entry_exit_contract_sha256") != contract["sha256"]):
+        raise ValueError("US_SST_HOLDING_CONTRACT_UNVERIFIED")
+    life_row = conn.execute(text("""
+        SELECT state->'lifecycle' AS lifecycle
+        FROM us_position_risk_state
+        WHERE trading_epoch_id=:epoch AND symbol=:symbol AND trade_date<=:td
+          AND jsonb_typeof(state->'lifecycle')='object'
+          AND state->'lifecycle'<>'{}'::jsonb
+        ORDER BY trade_date DESC, updated_at DESC LIMIT 1
+    """), params).mappings().first()
+    life = (life_row or {}).get("lifecycle") or {}
+    if (life.get("is_open") is not True or life.get("lifecycle_id") != cycle
+            or any(str(life.get(k) or "") != identity[k] for k in required
+                   if k != "position_lifecycle_id")
+            or not life.get("opened_trade_date")):
+        raise ValueError("US_SST_OPEN_LIFECYCLE_UNVERIFIED")
+    policy = life.get("entry_policy") or {}
+    if (policy.get("entry_exit_contract_sha256") != contract["sha256"]
+            or not verify_us_entry_exit_contract(policy.get("entry_exit_contract"))
+            or policy["entry_exit_contract"] != contract):
+        raise ValueError("US_SST_LIFECYCLE_CONTRACT_CONFLICT")
+    proof = load_verified_us_original_buy_scope(
+        symbol=symbol, trade_date=str(life["opened_trade_date"]), qty=None,
+        identity=identity, conn=conn,
+    )
+    if not proof or proof["meta"]["entry_exit_contract"] != contract:
+        raise ValueError("US_SST_ORIGINAL_NATIVE_BUY_UNVERIFIED")
+    return {"contract": contract, "position_cycle_id": cycle,
+            "portfolio_epoch_id": portfolio, "original_buy_trade_date": str(life["opened_trade_date"]),
+            "source_order_key": proof["client_order_key"]}
