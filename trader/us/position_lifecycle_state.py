@@ -105,6 +105,30 @@ def _position_identity(pos: dict, *, env: str | None) -> dict[str, str]:
 
     resolved_env = value("env", "trading_env") or str(env or "").strip().lower()
     account_id = value("account_id", "account_key")
+    # Scoped position rows store the broker SHA256 in the SQL account_id
+    # column, while lifecycle state and trading_epochs use the raw account
+    # key. Only normalize an explicit, cryptographically matching pair.
+    # Never replace a conflicting account with the current runtime account.
+    row_account = str(pos.get("account_id") or "").strip()
+    raw_account = str(meta.get("account_id") or "").strip()
+    if row_account and raw_account and row_account != raw_account:
+        expected_hash = hashlib.sha256(raw_account.encode("utf-8")).hexdigest()
+        asserted_hashes = [
+            str(source.get("broker_account_hash") or "").strip()
+            for source in (pos, meta)
+            if source.get("broker_account_hash") not in (None, "")
+        ]
+        if (row_account == expected_hash and asserted_hashes
+                and all(h == expected_hash for h in asserted_hashes)):
+            account_id = raw_account
+        else:
+            # Return a nonempty invalid identity so the normal current-account
+            # guard rejects it; do not let missing-account fallback adopt it.
+            account_id = "CONFLICTING_POSITION_ACCOUNT_SCOPE"
+            logger.error(
+                "[US_POSITION][LIFECYCLE][ACCOUNT_SCOPE_CONFLICT] symbol=%s",
+                _sym(pos.get("symbol")),
+            )
     if not account_id:
         try:
             from trader.account_state import get_account_key
@@ -167,12 +191,19 @@ def _identity_is_current(identity: dict[str, str]) -> bool:
 
         if _get_engine_or_none() is None:
             return True
-        return bool(
-            resolve_env_name() == identity["env"]
-            and get_account_key(env=identity["env"]) == identity["account_id"]
-            and str(_active_us_epoch() or "") == identity["trading_epoch_id"]
-        )
-    except Exception:
+        if resolve_env_name() != identity["env"]:
+            logger.error("[US_POSITION][LIFECYCLE][CURRENT_SCOPE_REJECTED] field=env")
+            return False
+        if get_account_key(env=identity["env"]) != identity["account_id"]:
+            logger.error("[US_POSITION][LIFECYCLE][CURRENT_SCOPE_REJECTED] field=account_id")
+            return False
+        if str(_active_us_epoch() or "") != identity["trading_epoch_id"]:
+            logger.error("[US_POSITION][LIFECYCLE][CURRENT_SCOPE_REJECTED] field=trading_epoch_id")
+            return False
+        return True
+    except Exception as exc:
+        logger.error("[US_POSITION][LIFECYCLE][CURRENT_SCOPE_UNAVAILABLE] error_type=%s",
+                     type(exc).__name__)
         return False
 
 
