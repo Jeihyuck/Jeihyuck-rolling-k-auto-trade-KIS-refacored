@@ -138,3 +138,54 @@ def test_authenticated_quote_and_final_limit():
     ]:
         assert validate_live_quote(**{**kw,"quote":{**quote,**update}})["state"] == state
     assert validate_live_quote(**{**kw,"order_price":result["max_entry_price"]+50})["state"] == "WAIT"
+
+
+def test_active_engine_rejects_stale_quote_and_market_order(monkeypatch):
+    from types import SimpleNamespace
+    import trader.pb1_engine as pb1
+    opening, post = fixture()
+    opening = [dict(b, high=10200) for b in opening]
+    proof = evaluate(opening, post)
+    monkeypatch.setenv("KR_PB1_ENTRY_TIMING_MODE", "ENFORCE")
+    monkeypatch.setenv("KR_PB1_ENTRY_TIMING_APPROVED", "1")
+    monkeypatch.setattr(pb1, "now_kst", lambda: NOW)
+    monkeypatch.setattr(pb1, "evaluate_proof_for_candidate", lambda **kw: proof)
+    engine = pb1.PB1Engine.__new__(pb1.PB1Engine)
+    engine.env = "practice"
+    engine._now_kst = NOW
+    quote = dict(source="KIS_REST_INQUIRE_PRICE",
+                 source_identity="AUTHENTICATED_REST_REQUEST_BOUND",
+                 requested_symbol="093320", market="KR", received_at=NOW.timestamp()-16,
+                 last=10020, ask=10050, bid=10050)
+    engine.kis = SimpleNamespace(get_price_snapshot=lambda *a, **kw: quote)
+    cf = SimpleNamespace(code="093320", setup_ok=True,
+                         features={"entry_style_selected":"ENTRY_PULLBACK",
+                                   "setup_ok":True, "order_price_source":"ask"})
+    decision = engine._resolve_entry_pre_submit(
+        cf=cf, stage="PB1-AM", order_price=10050, order_type="LIMIT")
+    assert not decision.ok
+    assert decision.context["timing_reason"] == "V2_NATIVE_QUOTE_STALE"
+    assert cf.features["entry_timing_evidence"]["entry_policy"] == "US_ALIGNED_V2"
+    quote["received_at"] = NOW.timestamp()-1
+    decision = engine._resolve_entry_pre_submit(
+        cf=cf, stage="PB1-AM", order_price=10050, order_type="MARKET")
+    assert not decision.ok
+    assert decision.reason_codes == ["KR_ENTRY_TIMING_PRICE_CAP_UNENFORCEABLE_ORDER_TYPE"]
+
+
+def test_v2_profile_is_active_not_shadow():
+    import os
+    import subprocess
+    env = {**os.environ, "STRATEGY_ENV":"practice", "KIS_ENV":"practice"}
+    for key in ("KR_PB1_ENTRY_OPPORTUNITY_POLICY", "KR_PB1_ENTRY_TIMING_MODE",
+                "KR_PB1_ENTRY_TIMING_APPROVED"):
+        env.pop(key, None)
+    cmd = ('source scripts/wsl/kr-entry-timing-activation.sh; '
+           'kr_pb1_entry_timing_defaults; '
+           'printf "%s %s %s" "$KR_PB1_ENTRY_OPPORTUNITY_POLICY" '
+           '"$KR_PB1_ENTRY_TIMING_MODE" "$KR_PB1_ENTRY_TIMING_APPROVED"')
+    output = subprocess.check_output(["bash", "-c", cmd], env=env, text=True)
+    assert output.endswith("US_ALIGNED_V2 ENFORCE 1")
+    env["KR_PB1_ENTRY_OPPORTUNITY_POLICY"] = "LEGACY_V1"
+    output = subprocess.check_output(["bash", "-c", cmd], env=env, text=True)
+    assert output.endswith("LEGACY_V1 ENFORCE 1")
