@@ -98,3 +98,20 @@ def test_recent_gap_repair_targets_missing_minute_without_synthetic_bar():
     assert observer._recent_gap_anchor({"reason": "RECENT_MINUTE_GAP"}, bars, now) == "103400"
     assert observer._recent_gap_anchor({"reason": "COMPLETED_BAR_STALE"}, bars, now) is None
     assert observer._recent_gap_anchor({"reason": "RECENT_MINUTE_GAP"}, bars[:2], now) is None
+
+
+@pytest.mark.parametrize("status,reason", [
+    ("OK_NO_TRADE", "KR_ENTRY_TIMING_POLICY_WAIT"),
+    ("RETRYABLE_MARKET_DATA_ERROR", "KR_ENTRY_TIMING_DATA_UNVERIFIED"),
+])
+def test_inner_pb1_timing_marker_never_completes_session(status, reason):
+    from trader import pb1_runner
+    normalized = pb1_runner.normalize_session_result(
+        status=status, reason=reason, order_candidates=3, api_submitted=0, skipped=3)
+    assert normalized.status == status
+    assert normalized.completed == 0 and normalized.retryable == 1
+    marker = pb1_runner._compute_session_marker_payload(
+        status=status, exit_reason=reason, exit_code=0, entry_status="DONE", sell_orders_ack=1)
+    assert marker["status"] == "PARTIAL_SUCCESS_RETRYABLE"
+    assert marker["sell_completed"] and not marker["completed"] and marker["retryable"]
+    assert not pb1_runner.should_skip_duplicate_from_marker(marker, session="afternoon")
