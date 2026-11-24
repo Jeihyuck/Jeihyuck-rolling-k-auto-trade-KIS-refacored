@@ -4046,7 +4046,10 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
                 # The fake broker may have received the economic order; this
                 # transport error MUST NOT authorize a second native POST.
                 raise TimeoutError("synthetic_unknown_ack_after_post")
-            return {"ok": True, "order_no": "CI-BUY-EIGHT"}
+            return {"ok": True, "order_no": (
+                "CI-BUY-EIGHT-REENTRY" if sum(p[0] == "BUY" for p in self.posts) > 1
+                else "CI-BUY-EIGHT"
+            )}
 
         def place_us_sell_order(self, sym, exchange, qty, price):
             assert sym == symbol and exchange == "NASDAQ"
@@ -4523,6 +4526,9 @@ engine.dispose()
     assert sell_row["order_meta"]["source_entry_contract_sha256"] == signed["sha256"]
     assert (sell_row["order_cycle"],sell_row["fill_cycle"]) == (cycle,cycle)
     assert sell_row["fill_meta"]["source_entry_contract_sha256"] == signed["sha256"]
+    assert sell_row["order_meta"]["us_original_buy_sst_v1"] == sell_row["fill_meta"]["us_original_buy_sst_v1"]
+    assert sell_row["order_meta"]["us_original_buy_sst_v1"]["source_buy_client_order_key"] == "ci-eight-original-buy"
+    assert sell_row["order_meta"]["us_original_buy_sst_v1"]["position_cycle_id"] == cycle
     if paper_profile:
         with engine.connect() as conn:
             original_count = conn.execute(text("""
@@ -4549,6 +4555,115 @@ engine.dispose()
             assert conn.execute(text("""
                 SELECT count(*) FROM us_fills WHERE order_no='CI-SELL-EIGHT'
             """)).scalar_one() == original_count
+
+
+    if (not paper_profile and selected_style == "ENTRY_PULLBACK"
+            and contract_mode == "V3_ACTIVE_PRACTICE"):
+        # Full original lifecycle, not just a SELL ACK. Hard-stop all shares,
+        # authoritative flat observation, then a genuine next-day BUY using
+        # the production router and a new deterministic cycle.
+        from trader.us.position_lifecycle_state import reconcile_us_position_lifecycles
+        from trader.us.execution.recovery_identity import (
+            USRecoveryScope, bind_existing_standard_order_buy_source,
+        )
+        assert actual_sell_qty == 6
+        broker.qty = 0
+        assert repos.save_position_snapshot(
+            [], trade_date="2026-11-11", balance_fetch_status="OK",
+            balance_parse_status="OK", authoritative_positions=True,
+            preserve_previous_positions=False,
+        ) == 0
+        closed = reconcile_us_position_lifecycles(
+            positions=[], trade_date="2026-11-11", now=datetime.now(timezone.utc),
+            authoritative=True, env="practice", managed_owners={"US_STANDARD"},
+        )[symbol]
+        assert closed["is_open"] is False and closed["lifecycle_id"] == cycle
+        assert not repos.load_us_positions_by_symbols([symbol], as_of="2026-11-11")
+        old_scope = USRecoveryScope("practice", account_hash, epoch, portfolio,
+                                   cycle, "US_STANDARD")
+        with engine.connect() as conn:
+            with pytest.raises(ValueError, match="US_SST_OPEN_HOLDING_UNVERIFIED"):
+                bind_existing_standard_order_buy_source(
+                    {**sell, "trade_date":"2026-11-12"},
+                    conn=conn, scope=old_scope, raw_account=raw_account,
+                )
+        next_cycle = hashlib.sha256("|".join((
+            account_hash, epoch, portfolio, "US_STANDARD", symbol,
+            "2026-11-12", "NEW_POSITION_BUY",
+        )).encode("utf-8")).hexdigest()[:32]
+        assert next_cycle != cycle
+        # No old BUY metadata, previous action, contract or receipt may
+        # leak into the new order. The router signs its own new BUY.
+        new_buy = {
+            **{k: original_intent[k] for k in (
+                "symbol", "exchange", "side", "qty", "limit_price", "notional_usd",
+                "strategy_owner", "sleeve_id", "strategy", "strategy_name",
+                "strategy_version", "entry_style_selected", "position_action",
+                "entry_reason", "book", "horizon", "theme_cluster",
+                "classification_source", "position_state",
+            )},
+            "trade_date":"2026-11-12", "client_order_key":"ci-eight-reentry",
+            "meta": {
+                "entry_style_selected":selected_style,
+                "theme_cluster":"OTHER", "classification_source":"CI_FINAL30_OFFLINE",
+                "position_state":"NEW", "position_action":"NEW_POSITION_BUY",
+            },
+        }
+        order_router._capture_native_buy_baseline(new_buy, broker, None)
+        reentry = route_order(
+            new_buy, kis_client=broker, allowed_symbols={symbol},
+            current_position_symbols=set(), total_portfolio_usd=20000,
+            available_cash_usd=10000,
+            now=datetime(2026,11,12,16,tzinfo=timezone.utc),
+        )
+        assert reentry["status"] == "ACK", reentry
+        assert broker.posts[-1] == ("BUY", symbol, 6)
+        with engine.connect() as conn:
+            new_order = conn.execute(text("""
+                SELECT meta,position_cycle_id FROM us_orders
+                WHERE order_no='CI-BUY-EIGHT-REENTRY'
+            """)).mappings().one()
+        assert new_order["position_cycle_id"] == next_cycle
+        assert verify_us_entry_exit_contract(new_order["meta"]["entry_exit_contract"])
+        new_fill = repos.mark_order_filled_by_reconcile(
+            order_no="CI-BUY-EIGHT-REENTRY",client_order_key="ci-eight-reentry",
+            symbol=symbol,side="BUY",filled_qty=6,requested_qty=6,
+            cumulative_filled_qty=6,avg_price_usd=10.0,trade_date="2026-11-12",
+            evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",source="fills_by_order_no",
+            meta={**new_order["meta"],"cumulative_filled_qty":6},
+        )
+        assert new_fill["status"] == "OK", new_fill
+        broker.qty = 6
+        assert repos.save_position_snapshot(
+            [{"symbol":symbol,"exchange":"NASDAQ","qty":6,"avg_cost":10.0,
+              "current_px":10.0,"balance_source":"kis_balance_authoritative","meta":{}}],
+            trade_date="2026-11-12",balance_fetch_status="OK",
+            balance_parse_status="OK",authoritative_positions=True,
+            preserve_previous_positions=False,
+        ) == 1
+        reopened = reconcile_us_position_lifecycles(
+            positions=repos.load_positions("2026-11-12"),
+            trade_date="2026-11-12",now=datetime.now(timezone.utc),
+            authoritative=True,env="practice",managed_owners={"US_STANDARD"},
+        )[symbol]
+        assert reopened["is_open"] is True
+        assert reopened["lifecycle_id"] == next_cycle
+        assert reopened["opened_trade_date"] == "2026-11-12"
+        assert reopened["high_watermark"] == 10.0
+        with engine.connect() as conn:
+            with pytest.raises(ValueError,match="US_SST_HOLDING_SCOPE_CONFLICT"):
+                bind_existing_standard_order_buy_source(
+                    {**sell,"trade_date":"2026-11-12"},
+                    conn=conn,scope=old_scope,raw_account=raw_account,
+                )
+            new_scope = USRecoveryScope("practice",account_hash,epoch,portfolio,
+                                        next_cycle,"US_STANDARD")
+            new_receipt = bind_existing_standard_order_buy_source(
+                {"symbol":symbol,"trade_date":"2026-11-12","side":"SELL","meta":{}},
+                conn=conn,scope=new_scope,raw_account=raw_account,
+            )
+            assert new_receipt["source_buy_client_order_key"] == "ci-eight-reentry"
+            assert new_receipt["position_cycle_id"] == next_cycle
 
 
 def test_pg_authoritative_balance_survives_optional_lineage_query_exception(
