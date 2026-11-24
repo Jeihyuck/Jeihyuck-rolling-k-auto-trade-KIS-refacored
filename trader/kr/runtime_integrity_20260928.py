@@ -401,7 +401,20 @@ def _build_hard_timeout_runner(timeout_error_cls: type[BaseException]) -> Callab
                 # watchdog that is currently being handled.
                 signal.setitimer(signal.ITIMER_REAL, 0)
                 last_stage = str(os.getenv("PB1_LAST_STAGE") or "unknown")
-                _finalize_tracked_tick_run_on_timeout(last_stage=last_stage)
+                # The finalization itself used to run after disarming the
+                # watchdog. Give this best-effort DB write its OWN deadline.
+                # Never mark any order/fill/claim successful to close a run.
+                signal.setitimer(signal.ITIMER_REAL, 5.0)
+                try:
+                    _finalize_tracked_tick_run_on_timeout(last_stage=last_stage)
+                except _HardTickAbort:
+                    logger.error(
+                        "[KR_P0][TICK_TIMEOUT_RUN_FINALIZE_DEADLINE] run_id=%s "
+                        "last_stage=%s action=RETAIN_DURABLE_ORDER_FENCES",
+                        getattr(_TICK_RUN_STATE, "run_id", None), last_stage,
+                    )
+                finally:
+                    signal.setitimer(signal.ITIMER_REAL, 0)
                 # Translate only after the entire tick stack has unwound past all
                 # broad ``except Exception`` fail-soft handlers.  The existing
                 # outer PB1 loop can then keep its TickTimeoutError recovery path.
