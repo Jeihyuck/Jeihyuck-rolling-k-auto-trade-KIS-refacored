@@ -30,7 +30,9 @@ def evaluate_reclaim(*, family, opening, post, now, order_price, independent,
     facts = {
         "version": "kr_opening_bar_opportunity_v2",
         "entry_policy": POLICY, "family": family,
-        "opening_count": len(opening), "opening_range_complete": not independent,
+        "opening_count": len(opening),
+        "opening_range_complete": not independent and len(opening) == 30,
+        "opening_reference_available": not independent,
         "reference_source": ("KIS_NATIVE_POST_OPENING_5_PLUS_3" if independent
                              else "KIS_NATIVE_OPENING_AND_RECENT_15"),
         "not_order_authorization": True,
@@ -118,3 +120,79 @@ def evaluate_reclaim(*, family, opening, post, now, order_price, independent,
         return result("WAIT", "ORDER_PRICE_ABOVE_CONFIRMED_CAP")
     return result("READY_SHADOW", "US_ALIGNED_RECLAIM_CONFIRMED",
                   max_entry_price=cap)
+
+
+def validate_live_quote(*, code, timing, quote, now, order_price, allow_passive=False):
+    """Fresh authenticated quote guard for an already READY V2 LIMIT.
+
+    A passive LIMIT is allowed only on the pre-existing no-ask fallback path.
+    This is not an invented bid/ask, an upward repricing, or order authority.
+    """
+    def positive(value):
+        try:
+            value = float(value)
+            return value if math.isfinite(value) and value > 0 else None
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def verdict(state, reason, **facts):
+        return {"state": state, "reason": reason, **facts}
+
+    if timing.get("state") != "READY_SHADOW" or timing.get("entry_policy") != POLICY:
+        return verdict("UNKNOWN", "V2_TIMING_PROOF_UNAVAILABLE")
+    if not isinstance(quote, dict) or now.tzinfo is None:
+        return verdict("UNKNOWN", "V2_NATIVE_QUOTE_UNAVAILABLE")
+    source = str(quote.get("source") or "").upper()
+    identity = {
+        "KIS_REST_INQUIRE_PRICE": "AUTHENTICATED_REST_REQUEST_BOUND",
+        "KIS_WEBSOCKET": "KIS_WS_PARSED_SYMBOL",
+    }.get(source)
+    symbols = [str(quote.get(key) or "").removeprefix("A")
+               for key in ("requested_symbol", "symbol") if quote.get(key)]
+    expected = str(code).removeprefix("A").zfill(6)
+    if (not identity or quote.get("source_identity") != identity
+            or str(quote.get("market") or "").upper() != "KR"
+            or not symbols or any(not s.isascii() or not s.isdigit()
+                                  or s.zfill(6) != expected for s in symbols)):
+        return verdict("UNKNOWN", "V2_NATIVE_QUOTE_IDENTITY_UNVERIFIED")
+    receipt = positive(quote.get("received_at"))
+    if receipt is None:
+        return verdict("UNKNOWN", "V2_NATIVE_QUOTE_STALE")
+    age = now.timestamp()-receipt
+    quote_day = str(quote.get("stck_bsop_date") or "").replace("-", "")
+    if not 0 <= age <= 15 or quote.get("stale") or (
+            quote_day and quote_day != now.strftime("%Y%m%d")):
+        return verdict("UNKNOWN", "V2_NATIVE_QUOTE_STALE", quote_age_sec=age)
+    try:
+        bar_age = (now-datetime.fromisoformat(timing["latest_bar_ts"])).total_seconds()
+    except (ValueError, TypeError, KeyError):
+        return verdict("UNKNOWN", "COMPLETED_BAR_STALE")
+    if not 0 <= bar_age <= 180:
+        return verdict("UNKNOWN", "COMPLETED_BAR_STALE")
+    last = positive(quote.get("last") or quote.get("prpr") or quote.get("stck_prpr"))
+    close = positive(timing.get("reference_price"))
+    cap = positive(timing.get("max_entry_price"))
+    price = positive(order_price)
+    if None in (last, close, cap, price):
+        return verdict("UNKNOWN", "V2_NATIVE_PRICE_UNVERIFIED")
+    facts = dict(quote_age_sec=age, quote_source=source, quote_last=last,
+                 latest_bar_age_sec=bar_age)
+    if abs(last/close-1) > MAX_DEVIATION:
+        return verdict("WAIT", "ORDER_PRICE_MOVED_FROM_CONFIRMED_BAR", **facts)
+    if price > cap:
+        return verdict("WAIT", "ORDER_PRICE_ABOVE_CONFIRMED_CAP", **facts)
+    ask, bid = positive(quote.get("ask")), positive(quote.get("bid"))
+    facts.update(quote_ask=ask, quote_bid=bid)
+    if ask is None or bid is None:
+        if not allow_passive:
+            return verdict("UNKNOWN", "V2_EXECUTABLE_BID_ASK_UNVERIFIED", **facts)
+        return verdict("READY", "V2_AUTHENTICATED_PASSIVE_LIMIT", **facts)
+    if ask < bid:
+        return verdict("UNKNOWN", "V2_EXECUTABLE_BID_ASK_UNVERIFIED", **facts)
+    spread = (ask-bid)/((ask+bid)/2)
+    facts["spread_pct"] = spread*100
+    if spread > 0.003:
+        return verdict("WAIT", "V2_SPREAD_EXCEEDS_LIMIT", **facts)
+    if ask > price:
+        return verdict("WAIT", "V2_ASK_ABOVE_PLANNED_LIMIT", **facts)
+    return verdict("READY", "V2_EXECUTABLE_LIMIT_CONFIRMED", **facts)
