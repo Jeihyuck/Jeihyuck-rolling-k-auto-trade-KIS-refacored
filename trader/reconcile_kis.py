@@ -3851,6 +3851,27 @@ def reconcile_kis(
             recovery_scope = resolve_kr_recovery_scope(
                 engine=engine, env=env, kis=kis,
             )
+            # Historical maintenance only. Current-only trading ticks must
+            # never scan closed lifecycles or issue extra broker calls.
+            if (historical_recovery and env == "practice"
+                    and strategy == "pb1_pullback_close"
+                    and fresh_balance_proven and not holdings_error
+                    and not unresolved_broker_activity
+                    and reconcile_result.get("ok") is True):
+                try:
+                    from trader.kr.closed_cycle_claim_recovery import retire_closed_pb1_rejected_claims
+                    retired = retire_closed_pb1_rejected_claims(
+                        engine=engine, scope=recovery_scope,
+                        holdings_rows=holdings_rows, now=now_kst(),
+                    )
+                    reconcile_result["closed_cycle_claims_superseded"] = retired
+                except Exception as retirement_error:
+                    logger.exception(
+                        "[KR_RECONCILE][CLOSED_CYCLE_CLAIM_RECOVERY_FAIL] "
+                        "type=%s action=RETAIN_ORIGINAL_CLAIM",
+                        type(retirement_error).__name__,
+                    )
+                    reconcile_result["closed_cycle_claim_recovery_error"] = type(retirement_error).__name__
             execution_claim_health = _execution_claim_health(
                 orders_repo, market="KR", env=env,
                 account_id=hashlib.sha256(
