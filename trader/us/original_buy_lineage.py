@@ -118,7 +118,22 @@ def select_verified_us_original_buy_scope(
                     for meta in (intent_meta, order_meta, fill_meta))
         ):
             continue
+        # Diagnostic provenance is independent of order eligibility. It is
+        # derived only after the original native BUY chain above is verified.
+        decision_binding = None
+        if historical:
+            try:
+                from trader.us.decision_evidence_5w1h import verified_original_buy_decision_binding
+                decision_binding = verified_original_buy_decision_binding(
+                    symbol=symbol, cycle=cycle, contract=contract,
+                    intent_meta=intent_meta, order_meta=order_meta, fill_meta=fill_meta,
+                    original_order_key=str(row["client_order_key"]),
+                )
+            except Exception as exc:
+                logger.warning("[US_SST][DECISION_BINDING_UNAVAILABLE] symbol=%s type=%s",
+                               symbol, type(exc).__name__)
         eligible.append({
+            **({"original_buy_decision_binding": decision_binding} if decision_binding else {}),
             "symbol": symbol, "side": "BUY", "qty": filled,
             "trading_epoch_id": epoch,
             "portfolio_epoch_id": portfolio,
@@ -769,4 +784,5 @@ def prove_open_standard_buy_source(
         raise ValueError("US_SST_ORIGINAL_NATIVE_BUY_UNVERIFIED")
     return {"contract": contract, "position_cycle_id": cycle,
             "portfolio_epoch_id": portfolio, "original_buy_trade_date": str(life["opened_trade_date"]),
-            "source_order_key": proof["client_order_key"]}
+            "source_order_key": proof["client_order_key"],
+            "original_buy_decision_binding": proof.get("original_buy_decision_binding")}
