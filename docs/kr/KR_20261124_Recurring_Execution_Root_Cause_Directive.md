@@ -1,0 +1,34 @@
+# KR 2026-11-24 반복 장애 근본 해결 지시서 (P0 / Draft)
+Base dual-agent: 66106538db2cdcda516eac867a821132587a6a18. 활성 trading epoch 09772c87-27ab-412d-b1c7-0a4a55196462, KR portfolio f9fb141f-68a4-4c92-aa5b-20f9016b2b1a. 이전 epoch 제외. PR #361/#367/#370/#378/#393의 실제 diff와 운영 경로를 비교할 것. 기존 지시를 대체하되 투자 철학을 변경하지 않는다.
+
+## 0. 증거 및 완료 상태
+11/24 11:54 KST DB: KODEX 122630 39주, 2,116,462원, 전용 owner KR_INFINITE, ACTIVE, 전일 15주 SATISFIED. 오늘 orders/fills/infinite intents 0. 10:36:21 reconcile EXACT_ACTIVE_CYCLE_PARITY, current_only_fresh_broker_proven=true, unresolved_broker_activity=false, historical_unresolved_claims=1. PB1 16 OK_NO_TRADE, 35 RETRYABLE_ORDER_BUILD_ERROR, 1 STARTED. 10:36:40 guard heartbeat, 10:36:45 tick STARTED (8de03d43-03ef-40b7-9c56-86a3765e5d63), 10:36:59 reconcile_today; 이후 11:54까지 tick 기록 없음. 원인 미확정: 운영 로그/프로세스 증거 필요.
+35 tick의 ORDER_SKIP 105건: WAIT/정책 후보 77건(반등 46, 가격 괴리 21, 구조적 risk 6, 장초 확인 4), 데이터 문제 28건(충돌 11, stale 9, gap 8). 종목별 데이터 오류 251970 8, 093320 18, 192820 2. 10:35:54 093320 UNKNOWN RECENT_MINUTE_GAP opening_count=27. 실제 매수 조건 미충족을 데이터 오류와 혼동하지 말 것.
+현재 Draft 구현: opening proof flock 획득 timeout, 독립 60s conflict repair cadence, 대상 순환 및 단위 테스트. 미실행 테스트/미검증 운영. 나머지 아래 P0 작업 미완; 이 PR을 머지하지 말 것.
+
+## 1. P0-1 tick 생존성, 보호 SELL 독립
+- 마지막 tick 및 AM session guard의 운영 WSL stdout/stderr, task exit code, process tree, stack dump, KIS 요청 시작/종료, DB wait/lock, observer 상태 및 scheduler 운영 시간표를 대조. 마지막 기록이 reconcile_today라는 이유로 DB 원인이나 flock 원인 확정 금지. 정상 스케줄 종료 여부도 확인. 10:36 정지 재현 fixture 확보.
+- 실제 runner -> PB1 -> reconcile -> market data -> submit -> finalize 경로의 blocking call inventory 작성. 각 호출에 monotonic deadline, bounded connect/read/DB lock/statement/file-lock timeouts 적용. 제한 없는 retry/sleep 제거. 180초 기존 submit boundary 유지. 종료 기록과 heartbeat를 별도 bounded 경로로 기록; DB 장애 시 durable local journal, 복구 후 replay.
+- read-only observer 수집/복구와 BUY 계산 및 보호 SELL 분리. 주문 실행 프로세스 강제 종료 또는 lease takeover 전 SUBMIT_UNKNOWN/active attempt/remote broker evidence를 확인하고 재실행 시 duplicate 금지. deadline 이후 API 호출 금지. DB 실패를 empty orders/no holding 으로 fail-open 금지. 단일 owner/fencing/중복방지 유지.
+- 장애를 주입해 다음 tick 또는 안전한 재기동이 보장되는지 검증. 정상 무매매 tick도 종료/heartbeat 기록. 목표: 기존 180s 경계 내 tick 종료 또는 명시적 안전 중단; 정상 tick 대비 지연 측정, 보호 SELL이 신규 BUY 후보 1분봉/과거 대사를 기다리지 않아야 함. 임의 스케줄 변경 금지.
+
+## 2. P0-2 canonical native 1m evidence
+파일: trader/kr/opening_bar_contract.py, scripts/kr_opening_observer.py, 실제 KIS adapter, shortlist producer, submit boundary.
+- 현재 _completed_bar_structure에는 len(opening)<25, 09:03/09:26 범위 조건이 남아 있음. evaluate_price_aware_entry의 5+3 경로는 OPENING_BARS_MISSING_OR_INCOMPLETE인 경우에만 호출. 25개 수집은 보편 매수 필수 조건이 아니어야 함. 개장 완전 경로/독립 최신 5+3 경로의 정확한 의존 자료를 명시하고 단일 evaluator가 observer와 broker-bound gate에 동일한 verdict/evidence ID 제공. opening 전체 의존 신호에는 완전한 원본 증거가 필요한 정책 보존. opening high를 로컬 high라고 속이지 말 것. 5+3은 실제 연속 완료 봉 8개와 원래 style별 가격/거래량/위험 조건 충족시만 사용. 기존 0.4% 및 가격 cap, VWAP, 원래 trigger/risk/position sizing 유지. 경로 비교 replay로 전략 변경과 구분.
+- HOT 3~5 / WARM 5, 실제 orderable shortlist publish/consume TTL 및 세대 확인. Final30 전체 순회 의존 제거, 최신 완료 봉 first, historical repair 분리. 093320 실제 원본 응답/HTTP receipt/거래일/시각/페이지 경계로 누락 8, stale 9, conflict 1 재현. 거래 없는 분과 실제 수집 누락 분리, no-trade proof 없으면 UNKNOWN; synthetic OHLCV/전일/미완료 봉 금지.
+- source_conflicts는 현재 종목 전체에 대한 하드 veto. 충돌 봉에 대해 exact anchor native fetch, receipt uniqueness, 동일 응답 3회 재사용 금지, 최소 60초 간격/120초 span 보존. 본 Draft가 복구 주기를 독립화했으나 근본 해결 아님: current data deadline, globally bounded rate limiter, 충돌 fair queue 및 backoff/observability 검증. relevant dependency set과 conflict set의 교집합 검증, 충돌이 어떤 경로에도 필요 없음을 증명한 독립 경로만 사용 가능; 필요한 봉 충돌은 계속 fail-closed. audit/quarantine 삭제 금지. 충돌 원인(완료 시각 정의, 중복 페이지, broker revision, HTTP 캐시)별로 처리. 데이터 저장은 원자적이며 proof timestamp와 latest native minute timestamp/receipt freshness 분리.
+- 정상 완료 봉의 latest freshness <= 기존 180초; HOT p95 목표 90초 이내 및 1분봉 수집 p95/최대/요청 수 측정. 원본이 정상인 replay에서 세 장애를 재현 후 복구할 것. 원본 부실이면 UNKNOWN 유지; 복구 성공률과 정상 정책 WAIT 비율 구분. 매수 건수 증가 자체가 합격 조건 아님.
+
+## 3. P0-3 final decision to submit result contract
+trader/pb1_engine.py zero-API summary (latest commit diff near 21718), trader/kr/runner/trade_session_runner.py normalize_kr_session_completion.
+현재 #393은 not entry_allowed 대사 fence를 BLOCKED_RECONCILE/OK_NO_TRADE로 분리했지만 entry_allowed=true 이고 최종 timing skip이면 ORDER_CANDIDATE_BUT_ZERO_API_SUBMIT 반복. runner policy_block_reasons에는 timing typed state 부재.
+- 후보별 stage/owner/timing state/reason/authorization/intent ID/claim/attempt/API outcome 구조화. WAIT/INVALID(전략) -> 정상 tick no-trade, UNKNOWN(data) -> retryable market data, reconcile fence -> BLOCKED_RECONCILE, 실제 plan build failure -> build error, API reject/unknown -> broker lifecycle 상태. 진입 후보와 broker-bound ready 후보 별도 집계. mixed WAIT+UNKNOWN은 tick degraded + per-symbol 결과, 보호 SELL 및 정상 READY 후보는 영향 없어야 함.
+- HARD_FAIL_ON_CANDIDATE_WITHOUT_API_SUBMIT은 최종 승인/유효한 주문 계획 및 남은 deadline이 있는데 실행 경로가 누락된 실제 실패만 적용. 단순 상태 이름 변경으로 완료하지 말 것. tick 완료와 session 완료 구분; WAIT로 정상 종료한 tick 때문에 다음 AM tick/PM을 막지 말 것. 105건 재현 후 35개 false build failure 제거, genuine build error 주입 시 기존 차단 유지. 실제 native READY -> intent -> durable claim -> broker mock submit -> fill -> reconcile positive integration test; broker API 실제 호출 금지.
+
+## 4. P0-4 SST 매수→매도 계약 및 미해결 Runner Final
+활성 epoch에서 PB1 현재 보유 0; 11/19 PB1 SELL:KR_TAKE_PROFIT_RUNNER_FINAL:KR_US_RUNNER_FINAL RETRYABLE remaining 8. 당시 lifecycle_id, position_cycle_id, portfolio_epoch_id, action/attempt, KIS 원본 주문/누적 체결, 이후 전량 매도 및 현재 zero holding을 정확히 연결. 잔고 0만으로 임의 SATISFIED 처리 금지. 다른 종목/epoch와 수량 상계 금지. 실제 완료 체결 증명이 있다면 기존 lifecycle transition으로 정리; 다른 매도 계약에 의해 이미 청산됐다면 명시적 superseded/closed evidence (실제 코드 상태 모델 확인 후 구현); 미확인 상태 유지 및 알림. 신규 BUY를 근거 없이 전역 차단하거나 남은 수량을 무조건 신규 SELL 하지 말 것.
+원본 BUY ID/owner/epoch/account/cycle/계약 hash 보존, 부분체결 후 잔량은 동일 계약의 새로운 attempt, terminal cancel proof와 broker cumulative fill 확인; TP1/2/3/runner/soft/hard stop/보호 매도 기존 ACTIVE 정책 회귀. 기존 -3/-6 등 정책 변경 금지. KODEX 전용 owner는 PB1 규칙 제외, 11/23 15주 원본 매칭 및 cross-owner fail-closed 회귀. 이번 PR은 DB 변경/실거래/스케줄 변경 금지, 별도 승인 없이는 머지 금지.
+
+## 5. merge gate (all mandatory)
+- HEAD pin, 기존 PR diff 및 코드 경로 매핑, 운영 장애 원인 증거, failing-before/passing-after 테스트 각각 제시. 단위 테스트뿐 아니라 실제 production entrypoint + mocked broker/DB/clock 통합 replay. 105 skips + 10:36 tick hang + 8-share claim + KODEX 15-share owner fixture. raw 자료 부재 시 fixture를 재구성했다는 사실 명시, 운영 원인 확인을 완료로 위장 금지.
+- 테스트 로그, git SHA, 파일/함수, p50/p95/max duration, KIS call counts, duplicate/order_unknown evidence, DB lifecycle assertions 제출. 기존 안전 suite 실행; 테스트 실패/누락/P0 미해결이면 Draft 유지. 현재 추가 테스트 미실행. 신규 운영 evidence를 별도 검증하기 전까지 완전 해결 주장 금지.
