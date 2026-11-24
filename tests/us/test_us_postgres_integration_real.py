@@ -2965,6 +2965,16 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
     assert held[0]["account_id"] == broker_hash
     assert held[0]["meta"]["account_id"] == account
     next_now = datetime.fromisoformat("2026-11-11T16:00:00+00:00")
+    # Soft-stop counters may be written before the next-day lifecycle.
+    # The current row must not hide the exact original risk leaf.
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO us_position_risk_state
+                (trading_epoch_id,trade_date,symbol,soft_stop_breach_count,state)
+            VALUES (:epoch,'2026-11-11','AMGN',1,'{}'::jsonb)
+            ON CONFLICT(trading_epoch_id,trade_date,symbol)
+            DO UPDATE SET soft_stop_breach_count=1,state='{}'::jsonb
+        """), {"epoch": epoch})
     next_lifecycle = reconcile_us_position_lifecycles(
         positions=held, trade_date="2026-11-11", now=next_now,
         authoritative=False, env="practice", managed_owners={"US_STANDARD"},
