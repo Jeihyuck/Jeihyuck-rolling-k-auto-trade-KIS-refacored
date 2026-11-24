@@ -128,6 +128,8 @@ def select_verified_us_original_buy_scope(
                     symbol=symbol, cycle=cycle, contract=contract,
                     intent_meta=intent_meta, order_meta=order_meta, fill_meta=fill_meta,
                     original_order_key=str(row["client_order_key"]),
+                    account_hash=expected_hash, trading_epoch_id=epoch,
+                    portfolio_epoch_id=portfolio,
                 )
             except Exception as exc:
                 logger.warning("[US_SST][DECISION_BINDING_UNAVAILABLE] symbol=%s type=%s",
