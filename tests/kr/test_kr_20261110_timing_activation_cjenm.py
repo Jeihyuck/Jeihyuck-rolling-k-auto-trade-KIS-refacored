@@ -369,7 +369,8 @@ def test_native_kis_api_envelope_to_observer_to_ready_proof_contract(tmp_path, m
         kis=client, codes=["035760"], observed_at=observed,
         sleep_between=0,
     )
-    assert called == ["092900", "093451"]
+    # Latest native evidence must be collected before optional historical repair.
+    assert called == ["093451", "092900"]
     assert summary["completed"] == 1, summary
     assert summary["unknown"] == 0, summary
     decision = op.evaluate_proof_for_candidate(
