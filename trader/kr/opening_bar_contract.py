@@ -212,7 +212,17 @@ def inspect_completed_bar_coverage(*, rows: list[dict], now: datetime,
                              and not scope["invalid"])
     opening_ready = bool(opening_range_ready(opening)
                          and not scope["opening_conflicts"] and not scope["invalid"])
+    required_recent = 4 if active_entry_policy(os.getenv("KIS_ENV", "practice")) == "US_ALIGNED_V2" else 3
+    if state == "COVERED" and required_recent == 4:
+        recent = after_open[-4:]
+        if len(recent) < 4:
+            state, reason = "WAIT", "POST_OPENING_CONFIRMATION_PENDING"
+        elif any((datetime.fromisoformat(b["timestamp"]) -
+                  datetime.fromisoformat(a["timestamp"])).total_seconds() != 60
+                 for a, b in zip(recent, recent[1:])):
+            state, reason = "UNKNOWN", "RECENT_MINUTE_GAP"
     return {
+        "required_recent_minutes": required_recent,
         "state": state, "reason": reason,
         "opening_range_ready": opening_ready,
         "native_post_open_window_ready": independent_ready,
