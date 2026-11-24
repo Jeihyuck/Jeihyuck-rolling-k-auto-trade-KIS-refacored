@@ -2998,6 +2998,22 @@ def _compute_session_marker_payload(
 ) -> dict[str, Any]:
     status_u = str(status or "UNKNOWN").upper()
     exit_reason_u = str(exit_reason or "").upper()
+    timing_retry = (
+        (status_u == "RETRYABLE_MARKET_DATA_ERROR" and exit_reason_u == "KR_ENTRY_TIMING_DATA_UNVERIFIED")
+        or (status_u == "OK_NO_TRADE" and exit_reason_u == "KR_ENTRY_TIMING_POLICY_WAIT")
+    )
+    if timing_retry and not fatal_error and int(exit_code) == 0:
+        return {
+            "status": "PARTIAL_SUCCESS_RETRYABLE" if int(sell_orders_ack or 0) > 0 else status_u,
+            "exit_reason": str(exit_reason),
+            "completed": False,
+            "retryable": True,
+            "sell_orders_ack": int(sell_orders_ack or 0),
+            "sell_completed": bool(int(sell_orders_ack or 0) > 0),
+            "entry_status": str(entry_status or "UNKNOWN").upper(),
+            "entry_abort_reason": entry_abort_reason,
+            "entry_completed": False,
+        }
     if status_u == "RETRYABLE_ORDER_BUILD_ERROR" or exit_reason_u in {"ENTRY_PLAN_INVALID_BEFORE_API_SUBMIT", "ALL_CANDIDATES_SKIPPED_BEFORE_API_SUBMIT", "RETRYABLE_ORDER_BUILD_ERROR"}:
         return {
             "status": "RETRYABLE_ORDER_BUILD_ERROR",
@@ -3054,6 +3070,16 @@ def normalize_session_result(
     status_u = str(status or "UNKNOWN").upper()
     reason_u = str(reason or "").upper()
     skip_reason_set = {str(r or "").upper() for r in (skip_reasons or [])}
+    if (
+        int(api_submitted or 0) == 0 and (
+            (status_u == "RETRYABLE_MARKET_DATA_ERROR" and reason_u == "KR_ENTRY_TIMING_DATA_UNVERIFIED")
+            or (status_u == "OK_NO_TRADE" and reason_u == "KR_ENTRY_TIMING_POLICY_WAIT")
+        )
+    ):
+        return NormalizedSessionResult(
+            status=status_u, reason=str(reason), completed=0, retryable=1,
+            exit_reason=str(reason),
+        )
     policy_block_reasons = {
         "BUYABLE_EXISTING_HOLDING_KIS",
         "BUYABLE_TODAY_BUY_EXISTS",
@@ -3119,6 +3145,7 @@ PM_RETRYABLE_NO_TRADE_REASONS = {
     "NO_FINAL_SETUPS",
     "NO_FINAL_SETUPS_AFTER_STYLE_GATE",
     "NO_BRIDGE_CANDIDATES",
+    "KR_ENTRY_TIMING_POLICY_WAIT",
 }
 
 
