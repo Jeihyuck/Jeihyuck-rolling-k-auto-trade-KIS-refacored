@@ -80,6 +80,34 @@ def merge_original_order_contract_metadata(source: dict, incoming: dict) -> dict
         elif field == "us_original_buy_sst_v1" and observed not in (None, ""):
             # A fill observer cannot manufacture the pre-submit receipt.
             raise ValueError("FILL_ORIGINAL_CONTRACT_CONFLICT:" + field)
+    # Reporting metadata is not economic execution evidence. Keep the
+    # submitted order's original audit fields, flag conflicting observations,
+    # and never let a diagnostic mismatch strand an otherwise real KIS fill.
+    audit_fields = (
+        "source_entry_reason", "source_entry_decision_sha256",
+        "us_original_buy_decision_binding_v1", "exit_decision_evidence_5w1h",
+        "exit_decision_evidence_status",
+    )
+    conflicts = []
+    if source.get("us_original_buy_decision_binding_v1") is not None:
+        for field in audit_fields:
+            if field not in source:
+                result.pop(field, None)
+                continue
+            original = source[field]
+            if incoming.get(field) not in (None, "", original):
+                conflicts.append(field)
+            result[field] = deepcopy(original)
+    elif incoming.get("us_original_buy_decision_binding_v1") is not None:
+        # A fill observer cannot manufacture a pre-submit decision binding.
+        for field in audit_fields:
+            if field in source:
+                result[field] = deepcopy(source[field])
+            else:
+                result.pop(field, None)
+        conflicts.append("us_original_buy_decision_binding_v1")
+    if conflicts:
+        result["original_buy_decision_replay_conflicts"] = sorted(conflicts)
     receipt = source.get("us_original_buy_sst_v1")
     if receipt is not None:
         if (not isinstance(receipt, dict)
