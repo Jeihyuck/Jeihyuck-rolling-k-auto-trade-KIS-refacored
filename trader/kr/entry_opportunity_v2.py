@@ -183,8 +183,10 @@ def validate_live_quote(*, code, timing, quote, now, order_price, allow_passive=
         return verdict("WAIT", "ORDER_PRICE_ABOVE_CONFIRMED_CAP", **facts)
     ask, bid = positive(quote.get("ask")), positive(quote.get("bid"))
     facts.update(quote_ask=ask, quote_bid=bid)
+    if ask is not None and ask > price:
+        return verdict("WAIT", "V2_ASK_ABOVE_PLANNED_LIMIT", **facts)
     if ask is None or bid is None:
-        if not allow_passive:
+        if not allow_passive or ask is not None:
             return verdict("UNKNOWN", "V2_EXECUTABLE_BID_ASK_UNVERIFIED", **facts)
         return verdict("READY", "V2_AUTHENTICATED_PASSIVE_LIMIT", **facts)
     if ask < bid:
@@ -193,6 +195,4 @@ def validate_live_quote(*, code, timing, quote, now, order_price, allow_passive=
     facts["spread_pct"] = spread*100
     if spread > 0.003:
         return verdict("WAIT", "V2_SPREAD_EXCEEDS_LIMIT", **facts)
-    if ask > price:
-        return verdict("WAIT", "V2_ASK_ABOVE_PLANNED_LIMIT", **facts)
     return verdict("READY", "V2_EXECUTABLE_LIMIT_CONFIRMED", **facts)
