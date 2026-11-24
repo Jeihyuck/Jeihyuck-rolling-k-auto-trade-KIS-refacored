@@ -1,0 +1,32 @@
+name: KR US-aligned Entry Opportunity
+on:
+  pull_request:
+    branches: [dual-agent, fix/kr-20261124-recurring-execution-root-causes]
+  workflow_dispatch:
+jobs:
+  opportunity-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      STRATEGY_ENV: practice
+      KIS_ENV: practice
+      MARKET: KR
+      REGION: KR
+      PB1_MARKET_SCOPE: KRX
+      ALLOW_REAL_ORDER: "0"
+      DISABLE_LIVE_TRADING: "1"
+      NO_TRADE: "1"
+      PYTHONPATH: "."
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: |
+          python -m pip install -r requirements.txt
+          python -m pip install pytest pytest-mock
+      - run: |
+          python -m py_compile trader/kr/entry_opportunity_v2.py trader/kr/opening_bar_contract.py trader/kr/entry_timing_price.py trader/pb1_engine.py scripts/kr_opening_observer.py
+          bash -n scripts/wsl/kr-entry-timing-activation.sh
+      - run: |
+          python -m pytest -q tests/kr/test_kr_20261124_us_aligned_entry.py tests/kr/test_kr_20261124_recurring_execution.py tests/kr/test_kr_20261124_closed_cycle_claim_recovery.py tests/kr/test_kr_20261118_sparse_native_intraday_entry.py tests/kr/test_kr_20261110_timing_activation_cjenm.py tests/kr/test_kr_20261113_timing_market_price_cap.py tests/kr/test_kr_20261116_integrated_recovery.py tests/kr/test_kr_pb1_minute_native_conflicts.py tests/kr/test_kr_pb1_minute_priority_queue.py tests/kr/test_kr_pb1_kis_observer_budget.py tests/kr/test_kr_entry_authoritative_gate_state.py tests/test_kr_order_price_guardrails.py
