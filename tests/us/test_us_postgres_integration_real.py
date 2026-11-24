@@ -2924,6 +2924,50 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
     assert tomorrow["meta"]["lineage_identity_status"] == "VERIFIED_CURRENT_EPOCH_CONTINUITY"
     assert tomorrow["meta"]["entry_exit_contract_sha256"] == contract["sha256"]
 
+    # Regression 2026-11-23: a verified native BUY and snapshot can both
+    # be durable, yet the restarted DB consumer formerly compared its
+    # SHA256 SQL account column to the raw lifecycle account. Exercise
+    # the real SELECT and reconcile path, not an injected position dict.
+    from trader.us.position_lifecycle_state import (
+        reconcile_us_position_lifecycles, update_us_position_high_watermark,
+    )
+    from trader import account_state
+    monkeypatch.setenv("WSL_RUN_MARKET", "US")
+    monkeypatch.setattr(account_state, "get_account_key", lambda **kw: account)
+    monkeypatch.setattr(account_state, "resolve_env_name", lambda *a, **kw: "practice")
+    restarted = repos.load_positions("2026-11-11")
+    held = [p for p in restarted if p["symbol"] == "AMGN"]
+    assert len(held) == 1
+    assert held[0]["account_id"] == broker_hash
+    assert held[0]["meta"]["account_id"] == account
+    next_now = datetime.fromisoformat("2026-11-11T16:00:00+00:00")
+    next_lifecycle = reconcile_us_position_lifecycles(
+        positions=held, trade_date="2026-11-11", now=next_now,
+        authoritative=False, env="practice", managed_owners={"US_STANDARD"},
+    )["AMGN"]
+    assert held[0]["lifecycle_identity_status"] == "IDENTIFIED"
+    assert next_lifecycle["lifecycle_id"] == cycle
+    assert next_lifecycle["opened_trade_date"] == "2026-11-10"
+    assert next_lifecycle["high_watermark"] == 470.0
+    assert next_lifecycle["entry_policy"]["entry_exit_contract_sha256"] == contract["sha256"]
+    high = update_us_position_high_watermark(
+        symbol="AMGN", trade_date="2026-11-11", lifecycle_id=cycle,
+        current_price=471.0, entry_price=461.8, now=next_now, position=held[0],
+    )
+    assert high["high_watermark"] == 471.0
+    assert high["lifecycle_id"] == cycle
+    assert high["account_id"] == account
+    # A mismatched caller must not overwrite that durable original cycle.
+    wrong = {**held[0], "account_id": "f" * 64}
+    with pytest.raises(ValueError, match="US_HIGH_WATERMARK_ORIGINAL_SCOPE_UNVERIFIED"):
+        update_us_position_high_watermark(
+            symbol="AMGN", trade_date="2026-11-11", lifecycle_id=cycle,
+            current_price=999.0, entry_price=461.8, now=next_now, position=wrong,
+        )
+    durable = repos.load_latest_us_position_risk_state("AMGN", "2026-11-11")
+    assert durable["state"]["lifecycle"]["high_watermark"] == 471.0
+    monkeypatch.delenv("WSL_RUN_MARKET", raising=False)
+
     # An actual PostgreSQL / repo-reconciled partial SELL in the SAME scoped
     # cycle must not orphan the original BUY V2/V3 on the next KIS balance day.
     # This is an offline native-evidence fixture; never a real KIS HTTP call.
