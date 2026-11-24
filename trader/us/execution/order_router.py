@@ -1677,7 +1677,9 @@ def route_order(
         try:
             from trader.account_state import get_account_key
             from trader.us.db.repos import _active_us_epoch, _get_engine_or_none
-            from trader.us.execution.recovery_identity import bind_original_us_order_scope
+            from trader.us.execution.recovery_identity import (
+                bind_original_us_order_scope, bind_existing_standard_order_buy_source,
+            )
             _identity_engine = _get_engine_or_none()
             if _identity_engine is None:
                 raise RuntimeError("US_SCOPE_DATABASE_UNAVAILABLE")
@@ -1729,11 +1731,19 @@ def route_order(
                         raise RuntimeError(
                             "US_LEGACY_AUTO_SELL_UNVERIFIED:" + _legacy_reason
                         )
-                bind_original_us_order_scope(
+                _bound_original_scope = bind_original_us_order_scope(
                     intent, conn=_identity_conn, env=_env,
                     account_key=_raw_account_key,
                     trading_epoch_id=str(_epoch or ""),
                 )
+                if (
+                    (side == "SELL" and _legacy_nine_auto_sell_proof is None)
+                    or (side == "BUY" and is_existing_position_buy)
+                ):
+                    bind_existing_standard_order_buy_source(
+                        intent, conn=_identity_conn, scope=_bound_original_scope,
+                        raw_account=_raw_account_key,
+                    )
             meta = intent["meta"]
             if meta.get("legacy_nine_tp_pending_deferred") is True:
                 # Durable TP stage still belongs to the archived original
@@ -2508,6 +2518,19 @@ def route_order(
             if _preclaim_engine is None:
                 raise RuntimeError("US_CLAIM_SCOPE_DB_UNAVAILABLE")
             with _preclaim_engine.begin() as _preclaim_conn:
+                if (
+                    (side == "SELL" and _legacy_nine_auto_sell_proof is None)
+                    or (side == "BUY" and is_existing_position_buy)
+                ):
+                    # Same receipt and immutable source immediately before
+                    # the claim boundary, not just a caller-supplied cycle.
+                    from trader.us.execution.recovery_identity import (
+                        bind_existing_standard_order_buy_source,
+                    )
+                    bind_existing_standard_order_buy_source(
+                        intent, conn=_preclaim_conn, scope=_us_claim_scope,
+                        raw_account=_raw_account_key,
+                    )
                 # A prior unknown one-share legacy stop under a fluctuating
                 # PnL action key is not a new order entitlement. This checks
                 # the same native-verified account/epoch/cycle *before* the
