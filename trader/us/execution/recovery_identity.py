@@ -245,6 +245,29 @@ def bind_existing_standard_order_buy_source(
                 us_original_buy_sst_v1=receipt)
     intent.update(source_entry_contract_sha256=contract["sha256"],
                   source_entry_contract_version=contract["version"], meta=meta)
+    if side == "SELL":
+        # The original BUY proof above is the common authority for every
+        # canonical exit family. Decision attribution is audit-only: a
+        # missing legacy audit or diagnostic error never changes SELL policy.
+        binding = proof.get("original_buy_decision_binding")
+        if binding:
+            try:
+                import os
+                from datetime import datetime, timezone
+                from trader.us.decision_evidence_5w1h import attach_original_buy_bound_sell_audit
+                status = attach_original_buy_bound_sell_audit(
+                    intent, contract=contract, binding=binding,
+                    decision_at=str(meta.get("decision_ts_et") or meta.get("decision_at")
+                                    or datetime.now(timezone.utc).isoformat()),
+                    code_sha=str(os.getenv("US_PINNED_CODE_SHA") or os.getenv("GITHUB_SHA") or "UNKNOWN"),
+                )
+                meta["exit_decision_evidence_status"] = (
+                    "VERIFIED" if status == "ALREADY_VERIFIED" else status
+                )
+            except Exception:
+                meta["exit_decision_evidence_status"] = "AUDIT_UNAVAILABLE"
+        elif (contract.get("entry_provenance") or {}).get("entry_decision_evidence_5w1h"):
+            meta["exit_decision_evidence_status"] = "ORIGINAL_DECISION_BINDING_UNVERIFIED"
     return receipt
 
 
