@@ -665,6 +665,45 @@ def load_opening_proof(*, env: str, account_scope: str, code: str, now: datetime
         return None
 
 
+def _conflict_scope(*, bars: list[dict], conflicts: list, now: datetime, family: str) -> dict:
+    """Use the actual dependency window; never remove quarantined source rows.
+
+    Opening references depend on every observed opening minute. Pullback uses
+    the last eight post-open bars; momentum/breakout use the last three.
+    An independent 5+3 path may not consume ANY quarantined window minute.
+    """
+    opening = [b for b in bars if datetime.fromisoformat(b["timestamp"]).time() < dtime(9, 30)]
+    post = [b for b in bars if datetime.fromisoformat(b["timestamp"]).time() >= dtime(9, 30)]
+    keys = {b["timestamp"] for b in bars}
+    invalid = False
+    normalized = set()
+    for raw in conflicts:
+        try:
+            stamp = datetime.fromisoformat(raw)
+            if stamp.tzinfo is None:
+                raise ValueError("naive conflict")
+            key = stamp.astimezone(KST).isoformat()
+            if key not in keys:
+                raise ValueError("unmatched conflict")
+            normalized.add(key)
+        except (TypeError, ValueError, OverflowError):
+            invalid = True
+    open_keys = {b["timestamp"] for b in opening}
+    full_recent_keys = {b["timestamp"] for b in post[-(8 if family == "PULLBACK" else 3):]}
+    window = post[-8:]
+    window_keys = {b["timestamp"] for b in window}
+    stamps = [datetime.fromisoformat(b["timestamp"]) for b in window]
+    independent = (len(stamps) == 8
+                   and all((b - a).total_seconds() == 60 for a, b in zip(stamps, stamps[1:]))
+                   and 0 <= (now.astimezone(KST) - stamps[-1]).total_seconds() <= 180
+                   and not (normalized & window_keys))
+    return {"invalid": invalid, "opening_conflicts": sorted(normalized & open_keys),
+            "full_conflicts": sorted(normalized & (open_keys | full_recent_keys)),
+            "window_conflicts": sorted(normalized & window_keys),
+            "independent_window_ready": independent,
+            "opening": opening, "post": post}
+
+
 def evaluate_proof_for_candidate(*, env: str, account_scope: str, code: str,
                                  now: datetime, style: str, setup_ok: bool,
                                  trigger_ok: bool, pivot: float | None,
@@ -674,9 +713,39 @@ def evaluate_proof_for_candidate(*, env: str, account_scope: str, code: str,
     )
     if not payload:
         return _result("UNKNOWN", "NO_FRESH_VERIFIED_KIS_MINUTE_BAR_PROOF")
-    if payload.get("source_conflicts"):
-        return _result("UNKNOWN", "CONFLICTING_NATIVE_COMPLETED_BAR",
-                       source_conflicts=list(payload["source_conflicts"]))
+    conflicts = payload.get("source_conflicts") or []
+    if conflicts:
+        family = STYLES.get(str(style or "").strip().upper())
+        bars = clean_completed_bars(payload["bars"], now)
+        scope = _conflict_scope(bars=bars, conflicts=conflicts, now=now, family=family or "")
+        diagnostic = {"source_conflicts": list(conflicts),
+                      "relevant_source_conflicts": scope["full_conflicts"],
+                      "native_window_conflicts": scope["window_conflicts"]}
+        if scope["invalid"] or not family:
+            return _result("UNKNOWN", "CONFLICTING_NATIVE_COMPLETED_BAR", **diagnostic)
+        structure, _, _, _ = _completed_bar_structure(bars, now)
+        if structure == "COVERED" and not scope["full_conflicts"]:
+            # Historical conflict outside every operand of this full proof.
+            verdict = evaluate_price_aware_entry(
+                style=style, rows=payload["bars"], now=now, vwap=payload["vwap"],
+                vwap_verified=payload["vwap_source"] == "KIS_NATIVE_WEIGHTED_AVG",
+                pivot=pivot, trigger_ok=trigger_ok, setup_ok=setup_ok,
+                order_price=order_price,
+            )
+            return {**verdict, **diagnostic, "conflict_scope": "OUTSIDE_FULL_DEPENDENCIES"}
+        if (family in {"PULLBACK", "MOMENTUM"} and scope["independent_window_ready"]
+                and setup_ok and dtime(9, 30) <= now.astimezone(KST).time() <= dtime(15, 5)):
+            # Do not use an opening high/volume contaminated by a conflict.
+            # The existing independent evaluator consumes only the clean
+            # latest eight bars, never an invented opening range.
+            verdict = _evaluate_verified_intraday_window(
+                family=family, opening=scope["opening"], after_open=scope["post"],
+                now=now.astimezone(KST), vwap=payload["vwap"],
+                vwap_verified=payload["vwap_source"] == "KIS_NATIVE_WEIGHTED_AVG",
+                pivot=pivot, trigger_ok=trigger_ok, order_price=order_price,
+            )
+            return {**verdict, **diagnostic, "conflict_scope": "INDEPENDENT_5_PLUS_3"}
+        return _result("UNKNOWN", "CONFLICTING_NATIVE_COMPLETED_BAR", **diagnostic)
     return evaluate_price_aware_entry(
         style=style, rows=payload["bars"], now=now,
         vwap=payload["vwap"],
