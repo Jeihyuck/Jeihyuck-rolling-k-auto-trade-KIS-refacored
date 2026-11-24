@@ -105,6 +105,30 @@ def _position_identity(pos: dict, *, env: str | None) -> dict[str, str]:
 
     resolved_env = value("env", "trading_env") or str(env or "").strip().lower()
     account_id = value("account_id", "account_key")
+    # Scoped position rows store the broker SHA256 in the SQL account_id
+    # column, while lifecycle state and trading_epochs use the raw account
+    # key. Only normalize an explicit, cryptographically matching pair.
+    # Never replace a conflicting account with the current runtime account.
+    row_account = str(pos.get("account_id") or "").strip()
+    raw_account = str(meta.get("account_id") or "").strip()
+    if row_account and raw_account and row_account != raw_account:
+        expected_hash = hashlib.sha256(raw_account.encode("utf-8")).hexdigest()
+        asserted_hashes = [
+            str(source.get("broker_account_hash") or "").strip()
+            for source in (pos, meta)
+            if source.get("broker_account_hash") not in (None, "")
+        ]
+        if (row_account == expected_hash and asserted_hashes
+                and all(h == expected_hash for h in asserted_hashes)):
+            account_id = raw_account
+        else:
+            # Return a nonempty invalid identity so the normal current-account
+            # guard rejects it; do not let missing-account fallback adopt it.
+            account_id = "CONFLICTING_POSITION_ACCOUNT_SCOPE"
+            logger.error(
+                "[US_POSITION][LIFECYCLE][ACCOUNT_SCOPE_CONFLICT] symbol=%s",
+                _sym(pos.get("symbol")),
+            )
     if not account_id:
         try:
             from trader.account_state import get_account_key
@@ -157,6 +181,8 @@ def _lifecycle_matches_identity(lifecycle: dict, identity: dict[str, str]) -> bo
 
 
 def _identity_is_current(identity: dict[str, str]) -> bool:
+    if identity.get("account_id") == "CONFLICTING_POSITION_ACCOUNT_SCOPE":
+        return False
     if not all(identity.get(key) for key in (
         "env", "account_id", "trading_epoch_id", "strategy_owner",
     )):
@@ -167,12 +193,19 @@ def _identity_is_current(identity: dict[str, str]) -> bool:
 
         if _get_engine_or_none() is None:
             return True
-        return bool(
-            resolve_env_name() == identity["env"]
-            and get_account_key(env=identity["env"]) == identity["account_id"]
-            and str(_active_us_epoch() or "") == identity["trading_epoch_id"]
-        )
-    except Exception:
+        if resolve_env_name() != identity["env"]:
+            logger.error("[US_POSITION][LIFECYCLE][CURRENT_SCOPE_REJECTED] field=env")
+            return False
+        if get_account_key(env=identity["env"]) != identity["account_id"]:
+            logger.error("[US_POSITION][LIFECYCLE][CURRENT_SCOPE_REJECTED] field=account_id")
+            return False
+        if str(_active_us_epoch() or "") != identity["trading_epoch_id"]:
+            logger.error("[US_POSITION][LIFECYCLE][CURRENT_SCOPE_REJECTED] field=trading_epoch_id")
+            return False
+        return True
+    except Exception as exc:
+        logger.error("[US_POSITION][LIFECYCLE][CURRENT_SCOPE_UNAVAILABLE] error_type=%s",
+                     type(exc).__name__)
         return False
 
 
@@ -538,6 +571,25 @@ def reconcile_us_position_lifecycles(
         # Resolve latest lifecycle after binding authoritative identity.
         latest = load_latest_us_position_risk_state(symbol, trade_date)
         lifecycle = dict(((latest.get("state") or {}).get("lifecycle") or {}))
+        if (not lifecycle and identity.get("portfolio_epoch_id")
+                and identity.get("position_lifecycle_id")
+                and os.getenv("WSL_RUN_MARKET", "").upper() == "US"):
+            # Today's soft-stop counters can be persisted before the
+            # lifecycle leaf is carried. An empty leaf is not a new cycle.
+            # Use only the newest nonempty leaf in the same epoch; never
+            # search past a closed or conflicting lifecycle to revive an old one.
+            for candidate in risk_candidates_by_symbol.get(symbol, []):
+                if str(candidate.get("trading_epoch_id") or "") != identity["trading_epoch_id"]:
+                    continue
+                previous = ((candidate.get("state") or {}).get("lifecycle") or {})
+                if not previous:
+                    continue
+                if (previous.get("is_open") is True
+                        and previous.get("account_id") == identity["account_id"]
+                        and _lifecycle_matches_identity(previous, identity)):
+                    latest = candidate
+                    lifecycle = dict(previous)
+                break
         # A persisted same-day lifecycle can be reused only with an exact
         # owner/account/epoch/lifecycle match. A prior-day row must still be
         # carried into today's row; a stale tick may never overwrite newer
@@ -554,6 +606,38 @@ def reconcile_us_position_lifecycles(
         if not lifecycle or lifecycle.get("is_open") is False:
             original_proof = pos.get("_verified_original_buy_fill")
             candidate_fills = list(fills or [])
+            native_standard = (
+                os.getenv("WSL_RUN_MARKET", "").upper() == "US"
+                and identity["strategy_owner"] == "US_STANDARD"
+            )
+            if native_standard:
+                # A canonical position already has its BUY-time cycle.
+                # Do not manufacture a new ID from today's balance/price if
+                # the risk leaf has not been created (or was lost). Resolve
+                # the actual signed original BUY through the same source
+                # query used by the authoritative snapshot writer.
+                from trader.us.original_buy_lineage import load_verified_us_original_buy_scope
+                original_proof = (
+                    load_verified_us_original_buy_scope(
+                        symbol=symbol, trade_date=trade_date, qty=qty, identity=identity,
+                    )
+                    if authoritative and lifecycle.get("is_open") is not False else None
+                )
+                if not original_proof or any(
+                    str(original_proof.get(k) or "") != identity.get(k)
+                    for k in ("env", "account_id", "trading_epoch_id", "strategy_owner",
+                              "portfolio_epoch_id", "position_cycle_id", "position_lifecycle_id")
+                ):
+                    pos["lifecycle_identity_status"] = "ORIGINAL_BUY_SCOPE_UNVERIFIED"
+                    logger.error(
+                        "[US_POSITION][LIFECYCLE][ORIGINAL_BUY_REQUIRED] "
+                        "symbol=%s action=NO_SYNTHETIC_CYCLE", symbol,
+                    )
+                    continue
+                # Only the independently matched native fill can initialize
+                # the canonical open state; unrelated same-symbol fills are
+                # not candidates for this creation.
+                candidate_fills = []
             if isinstance(original_proof, dict):
                 # Original broker-positive evidence already independently
                 # matched intent/order/account/cycle; no synthetic fill.
@@ -571,6 +655,13 @@ def reconcile_us_position_lifecycles(
                 or fill_meta.get("position_cycle_id")
                 or ""
             ).strip()
+            if native_standard and (
+                not confirmed_opened_at
+                or fill_lifecycle_id != identity.get("position_lifecycle_id")
+            ):
+                pos["lifecycle_identity_status"] = "ORIGINAL_BUY_SCOPE_UNVERIFIED"
+                logger.error("[US_POSITION][LIFECYCLE][ORIGINAL_BUY_FILL_REJECTED] symbol=%s", symbol)
+                continue
             opened_at = confirmed_opened_at or now_iso
             opened_at_source = "confirmed_buy_fill" if confirmed_opened_at else "first_authoritative_position_observation"
             lifecycle_id = _new_lifecycle_id(
@@ -679,10 +770,75 @@ def reconcile_us_position_lifecycles(
     return out
 
 
-def update_us_position_high_watermark(*, symbol: str, trade_date: str, lifecycle_id: str, current_price: float, entry_price: float, now: datetime) -> dict:
+def update_us_position_high_watermark(*, symbol: str, trade_date: str, lifecycle_id: str, current_price: float, entry_price: float, now: datetime, position: dict | None = None) -> dict:
     symbol = _sym(symbol)
     latest = load_latest_us_position_risk_state(symbol, trade_date)
     lifecycle = dict(((latest.get("state") or {}).get("lifecycle") or {}))
+    # Native US exit evaluation must update only the already-bound open
+    # lifecycle. Legacy V2 retains its original historical risk lifecycle;
+    # its separate prospective SELL scope must never replace the BUY history.
+    if position is not None and os.getenv("WSL_RUN_MARKET", "").upper() == "US":
+        identity = _position_identity(position, env=None)
+        if (_sym(position.get("symbol")) != symbol
+                or identity.get("position_lifecycle_id") != lifecycle_id):
+            raise ValueError("US_HIGH_WATERMARK_ORIGINAL_SCOPE_UNVERIFIED")
+        if not identity.get("portfolio_epoch_id"):
+            from trader.us.execution.us_legacy_nine_active_sell import (
+                enrich_legacy_nine_v2_decision_position,
+            )
+            # The caller's provisional flag is NOT sufficient proof.
+            # Re-prove original BUY, native net fills and exact historical
+            # runtime scope through the existing read-only legacy bridge.
+            proven = enrich_legacy_nine_v2_decision_position(position, trade_date=trade_date)
+            original = proven.get("_verified_legacy_runtime_lifecycle") or {}
+            proven_identity = _position_identity(proven, env=None)
+            if (
+                proven is position
+                or proven.get("legacy_nine_decision_only_provisional") is not True
+                or not _identity_is_current(proven_identity)
+                or original.get("lifecycle_id") != lifecycle_id
+                or original.get("is_open") is not True
+                or original.get("portfolio_epoch_id")
+                or original.get("position_cycle_id")
+                or any(str(original.get(k) or "") != proven_identity.get(k)
+                       for k in ("account_id", "env", "trading_epoch_id", "strategy_owner"))
+                or (lifecycle and (
+                    lifecycle.get("lifecycle_id") != lifecycle_id
+                    or lifecycle.get("is_open") is not True
+                    or any(str(lifecycle.get(k) or "") != str(original.get(k) or "")
+                           for k in ("account_id", "env", "trading_epoch_id", "strategy_owner",
+                                     "portfolio_epoch_id", "position_cycle_id"))
+                ))
+                or _f(original.get("high_watermark")) <= 0
+                or not original.get("high_watermark_at")
+            ):
+                raise ValueError("US_HIGH_WATERMARK_LEGACY_ORIGINAL_UNVERIFIED")
+            # Keep original opening date and recorded peak/time. Never
+            # manufacture a canonical portfolio/cycle for a legacy risk row.
+            current_leaf = dict(lifecycle)
+            lifecycle = dict(original)
+            # A verified later risk leaf can have a higher peak than the
+            # archived BUY-time history. Preserve the peak/timestamp pair
+            # from the exact same original scope instead of fencing every
+            # tick after the first new high.
+            if current_leaf:
+                original_sha = (original.get("entry_policy") or {}).get("entry_exit_contract_sha256")
+                current_sha = (current_leaf.get("entry_policy") or {}).get("entry_exit_contract_sha256")
+                if current_sha != original_sha:
+                    raise ValueError("US_HIGH_WATERMARK_LEGACY_CONTRACT_CONFLICT")
+                if _f(current_leaf.get("high_watermark")) >= _f(original.get("high_watermark")):
+                    if (not current_leaf.get("high_watermark_at")
+                            or current_leaf.get("high_watermark_source") != "us_position_risk_state"):
+                        raise ValueError("US_HIGH_WATERMARK_LEGACY_PEAK_PROOF_MISSING")
+                    for field in ("high_watermark", "high_watermark_at", "high_watermark_source"):
+                        lifecycle[field] = current_leaf[field]
+        elif (
+            identity.get("position_cycle_id") != lifecycle_id
+            or not _identity_is_current(identity)
+            or not _lifecycle_matches_identity(lifecycle, identity)
+            or lifecycle.get("is_open") is not True
+        ):
+            raise ValueError("US_HIGH_WATERMARK_ORIGINAL_SCOPE_UNVERIFIED")
     now_iso = _iso(now)
     same = lifecycle.get("lifecycle_id") == lifecycle_id
     previous = _f(lifecycle.get("high_watermark")) if same else 0.0
@@ -695,6 +851,7 @@ def update_us_position_high_watermark(*, symbol: str, trade_date: str, lifecycle
         same
         and new_high == previous
         and str(latest.get("trade_date") or "") == str(trade_date)
+        and ((latest.get("state") or {}).get("lifecycle") or {}).get("lifecycle_id") == lifecycle_id
         and lifecycle.get("high_watermark_source") == "us_position_risk_state"
         and lifecycle.get("high_watermark_at")
         and lifecycle.get("is_open") is True

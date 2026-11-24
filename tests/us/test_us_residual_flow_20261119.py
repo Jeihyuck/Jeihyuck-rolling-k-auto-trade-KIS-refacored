@@ -126,13 +126,22 @@ def test_completed_daily_io_before_after_same_production_path(monkeypatch, capsy
     monkeypatch.setattr(repo, "get_latest_us_daily_date", lambda **kw: pytest.fail("duplicate latest-date query"))
     provider = USDataProvider(offline=True)
     symbols = ["SPY", "QQQ", "SMH", "RSP", "IWM", "XLK"]
-    # Old production implementation used 3 DB reads for EACH evaluation;
-    # represent its duplicate audit + MAX(date) reads with identical IO cost.
+    # Compare equivalent end-to-end work, not DB-only latency against
+    # DB + calendar + audit + normalization + defensive copies. The old
+    # path had three reads per evaluation; replay its two redundant reads
+    # with identical controlled I/O and run the actual uncached production
+    # evaluator for the remaining read. Both paths return normalized bars.
     started = time.perf_counter()
     before = []
     for repeat in range(2):
         for sym in symbols:
-            before.append(load(symbol=sym)); load(symbol=sym); load(symbol=sym)
+            load(symbol=sym); load(symbol=sym)
+            result = provider.get_completed_daily_prices_result(
+                sym, "NYSE", trade_date="2026-11-18", required_bars=260,
+                allow_http_sync=False,
+            )
+            assert result["quality"] == "OK"
+            before.append(result)
     before_sec = time.perf_counter() - started
     before_calls = len(calls); calls.clear()
     provider.bind_tick_context(TickExecutionContext("2026-11-18", "am", "run", 1, "tick1"))
@@ -141,15 +150,19 @@ def test_completed_daily_io_before_after_same_production_path(monkeypatch, capsy
         for sym in symbols:
             result = provider.get_completed_daily_prices_result(sym, "NYSE", trade_date="2026-11-18", required_bars=260, allow_http_sync=False)
             assert result["quality"] == "OK"
-            after.append(result["rows"])
+            after.append(result)
     after_sec = time.perf_counter() - started
     assert len(calls) == 6 and before_calls == 36
-    assert len(before) == len(after) == 12 and all(len(x) == 260 for x in after)
+    assert len(before) == len(after) == 12
+    assert all(len(x["rows"]) == 260 for x in after)
+    assert before == after  # same bars AND quality/provenance metadata
     assert after_sec < before_sec
     print({"before_db_reads": before_calls, "after_db_reads": len(calls),
            "before_ms": round(before_sec*1000, 2), "after_ms": round(after_sec*1000, 2)})
     # Mutable callers cannot corrupt a shared cached snapshot.
-    after[0].clear()
+    after[0]["rows"][0]["close"] = -999.0
+    assert provider.get_completed_daily_prices_result("SPY", "NYSE", trade_date="2026-11-18", required_bars=260, allow_http_sync=False)["rows"][0]["close"] == 100.0
+    after[0]["rows"].clear()
     assert len(provider.get_completed_daily_prices_result("SPY", "NYSE", trade_date="2026-11-18", required_bars=260, allow_http_sync=False)["rows"]) == 260
     provider.bind_tick_context(TickExecutionContext("2026-11-18", "am", "run", 1, "tick2"))
     provider.get_completed_daily_prices_result("SPY", "NYSE", trade_date="2026-11-18", required_bars=260, allow_http_sync=False)

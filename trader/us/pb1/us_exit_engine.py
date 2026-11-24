@@ -1632,6 +1632,7 @@ def prepare_exit_position_snapshots(
                         high_state = update_us_position_high_watermark(
                             symbol=symbol, trade_date=_trade_date_from_key(resolve_us_trade_date_key(now)), lifecycle_id=str(lifecycle_id),
                             current_price=current_price, entry_price=entry_price_for_state, now=now or datetime.now(),
+                            position=pos,
                         )
                         pos["high_watermark"] = high_state.get("high_watermark")
                         pos["max_price"] = high_state.get("high_watermark")

@@ -190,6 +190,87 @@ def bind_original_us_order_scope(
     return scope
 
 
+def bind_existing_standard_order_buy_source(
+    intent: dict, *, conn, scope: USRecoveryScope, raw_account: str,
+) -> dict:
+    """Revalidate canonical ADD/SELL against the open original native BUY.
+
+    The original contract remains distinct from an approved forward
+    management or stop-policy revision. This read-only proof is not a
+    strategy signal, a broker balance, or permission to submit an order.
+    """
+    from trader.us.original_buy_lineage import prove_open_standard_buy_source
+
+    if scope.strategy_owner != "US_STANDARD":
+        raise USRecoveryIdentityError("US_SST_OWNER_SCOPE_UNVERIFIED")
+    if hashlib.sha256(raw_account.encode()).hexdigest() != scope.account_id:
+        raise USRecoveryIdentityError("US_SST_ACCOUNT_SCOPE_UNVERIFIED")
+    identity = {**scope.as_dict(), "account_id": raw_account,
+                "position_lifecycle_id": scope.position_cycle_id}
+    proof = prove_open_standard_buy_source(
+        conn=conn, symbol=str(intent.get("symbol") or "").strip().upper(),
+        trade_date=str(intent.get("trade_date") or ""), identity=identity,
+    )
+    contract = proof["contract"]
+    meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+    side = str(intent.get("side") or "").upper()
+    for field, expected in (
+        ("source_entry_contract_sha256", contract["sha256"]),
+        ("source_entry_contract_version", contract["version"]),
+    ):
+        for source in (intent, meta):
+            if source.get(field) not in (None, "", expected):
+                raise USRecoveryIdentityError("US_SST_ORIGINAL_CONTRACT_CONFLICT")
+    if side == "BUY":
+        # Existing ADD policy already rejects mixed lots. The independently
+        # loaded original must also match the parent the producer selected.
+        if (meta.get("entry_exit_contract") != contract
+                or meta.get("parent_entry_contract_sha256") != contract["sha256"]):
+            raise USRecoveryIdentityError("US_SST_ADD_PARENT_CONTRACT_CONFLICT")
+    elif side != "SELL":
+        raise USRecoveryIdentityError("US_SST_SIDE_UNVERIFIED")
+    # Missing diagnostic copies (e.g. defense trim) may be attached from
+    # proof; a conflicting caller is never rewritten to appear legitimate.
+    receipt = {
+        "source_buy_trade_date": proof["original_buy_trade_date"],
+        "source_buy_client_order_key": proof["source_order_key"],
+        "source_entry_contract_sha256": contract["sha256"],
+        "position_cycle_id": scope.position_cycle_id,
+        "portfolio_epoch_id": scope.portfolio_epoch_id,
+    }
+    if meta.get("us_original_buy_sst_v1") not in (None, receipt):
+        raise USRecoveryIdentityError("US_SST_ORIGINAL_RECEIPT_CONFLICT")
+    meta.update(source_entry_contract_sha256=contract["sha256"],
+                source_entry_contract_version=contract["version"],
+                us_original_buy_sst_v1=receipt)
+    intent.update(source_entry_contract_sha256=contract["sha256"],
+                  source_entry_contract_version=contract["version"], meta=meta)
+    if side == "SELL":
+        # The original BUY proof above is the common authority for every
+        # canonical exit family. Decision attribution is audit-only: a
+        # missing legacy audit or diagnostic error never changes SELL policy.
+        binding = proof.get("original_buy_decision_binding")
+        if binding:
+            try:
+                import os
+                from datetime import datetime, timezone
+                from trader.us.decision_evidence_5w1h import attach_original_buy_bound_sell_audit
+                status = attach_original_buy_bound_sell_audit(
+                    intent, contract=contract, binding=binding,
+                    decision_at=str(meta.get("decision_ts_et") or meta.get("decision_at")
+                                    or datetime.now(timezone.utc).isoformat()),
+                    code_sha=str(os.getenv("US_PINNED_CODE_SHA") or os.getenv("GITHUB_SHA") or "UNKNOWN"),
+                )
+                meta["exit_decision_evidence_status"] = (
+                    "VERIFIED" if status == "ALREADY_VERIFIED" else status
+                )
+            except Exception:
+                meta["exit_decision_evidence_status"] = "AUDIT_UNAVAILABLE"
+        elif (contract.get("entry_provenance") or {}).get("entry_decision_evidence_5w1h"):
+            meta["exit_decision_evidence_status"] = "ORIGINAL_DECISION_BINDING_UNVERIFIED"
+    return receipt
+
+
 def assert_recovery_scope(original: dict, current: dict, *,
                           original_meta: dict | None = None,
                           current_meta: dict | None = None) -> None:
