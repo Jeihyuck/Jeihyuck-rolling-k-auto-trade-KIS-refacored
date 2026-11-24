@@ -151,3 +151,15 @@ def test_timeout_finalization_has_separate_deadline_and_does_not_swallow_timeout
     with pytest.raises(TickTimeoutError, match="tick_hard_timeout"):
         runtime._build_hard_timeout_runner(TickTimeoutError)(timeout_sec=1, call=timeout)
     assert timers == [1.0, 0, 5.0, 0, 0]
+
+
+def test_independent_native_window_gap_is_repaired_without_opening_count_gate():
+    now = datetime(2026, 11, 24, 10, 35, tzinfo=contract.KST)
+    raw = [{"date":"20261124","time":f"10{minute:02d}00",
+            "open":100,"high":101,"low":99,"close":100,"volume":100}
+           for minute in (26,27,28,29,30,32,33,34)]
+    coverage = contract.inspect_completed_bar_coverage(rows=raw, now=now)
+    assert coverage["opening_range_ready"] is False
+    assert coverage["native_post_open_window_reason"] == "POST_OPENING_NATIVE_WINDOW_GAP"
+    bars = contract.clean_completed_bars(raw, now)
+    assert observer._recent_gap_anchor(coverage, bars, now) == "103200"
