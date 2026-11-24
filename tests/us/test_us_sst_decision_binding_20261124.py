@@ -26,6 +26,7 @@ SELL_FAMILIES = ["soft_stop_loss","hard_stop_loss","persistent_soft_stop_full_ex
 
 
 def source(symbol, monkeypatch):
+    monkeypatch.setenv("KIS_ENV","practice")
     monkeypatch.setenv("US_SWING_EXIT_MODE","V3_ACTIVE_PRACTICE")
     monkeypatch.setenv("US_SWING_V3_DEPLOY_APPROVED","1")
     reason = "ENTRY_MOMENTUM" if symbol == "LLY" else "ENTRY_PULLBACK"
@@ -40,10 +41,12 @@ def source(symbol, monkeypatch):
     contract = build_us_entry_exit_contract({
         "symbol":symbol,"strategy_owner":"US_STANDARD",
         "entry_reason":reason,"entry_style_selected":reason,
+        "position_action":"NEW_POSITION_BUY","book":"SWING_BOOK","horizon":"SWING_CARRY",
         "meta":{"entry_decision_evidence_5w1h":entry,
                 "entry_decision_evidence_sha256":entry["sha256"]},
     })
     assert verify_us_entry_exit_contract(contract)
+    assert contract['version'] == 'us_entry_exit_contract_v3'
     cycle = "actual-cycle-"+symbol
     meta = {
         "entry_exit_contract":contract,"entry_exit_contract_sha256":contract["sha256"],
