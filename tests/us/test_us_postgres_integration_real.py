@@ -2694,12 +2694,27 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
     cycle = "cycle-ci-amgn"
     key = "original-buy-amgn-ci"
     order_no = "0000039784"
+    from trader.us.decision_evidence_5w1h import (
+        build_decision_evidence, verify_decision_evidence, verify_exit_entry_link,
+    )
+    original_5w1h = build_decision_evidence(
+        decision_id="ci-original-buy-5w1h",side="BUY",strategy_owner="US_STANDARD",
+        symbol="AMGN",decision_at="2026-11-10T16:00:00Z",policy_version="v2",
+        code_sha="ci-original",position_lifecycle_id="ENTRY:US_STANDARD:AMGN",
+        decision_reason="CI_BUY",facts={"pullback_pct":0.06,"reversal":None},
+        thresholds={},market_context={"regime":"NORMAL"},sizing={"qty":6},
+    )
     contract = build_us_entry_exit_contract({
         "symbol": "AMGN", "strategy_owner": "US_STANDARD",
         "position_action": "NEW_POSITION_BUY", "book": "SWING_BOOK",
         "horizon": "SWING_CARRY", "entry_reason": "CI_BUY",
+        "meta":{"entry_decision_evidence_5w1h":original_5w1h,
+                "entry_decision_evidence_sha256":original_5w1h["sha256"]},
     })
     meta = {
+        "position_action":"NEW_POSITION_BUY",
+        "entry_decision_evidence_5w1h":original_5w1h,
+        "entry_decision_evidence_sha256":original_5w1h["sha256"],
         "env": "practice", "strategy_owner": "US_STANDARD", "sleeve_id": "US_STANDARD",
         "broker_account_hash": broker_hash, "trading_epoch_id": epoch,
         "portfolio_epoch_id": portfolio, "position_cycle_id": cycle,
@@ -3328,6 +3343,24 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
     assert persisted["order_meta"]["us_original_buy_sst_v1"] == receipt
     assert persisted["fill_meta"]["us_original_buy_sst_v1"] == receipt
     assert persisted["fill_meta"]["position_lifecycle_id"] == cycle
+    # Independently re-read the original native BUY (not the SELL's copy)
+    # and verify durable 5W1H linkage through the actual PG router + fill.
+    from trader.us.original_buy_lineage import prove_open_standard_buy_source
+    with pg_engine.connect() as conn:
+        original_audit = prove_open_standard_buy_source(
+            conn=conn,symbol="AMGN",trade_date="2026-11-13",
+            identity={**scope.as_dict(),"account_id":account,"position_lifecycle_id":cycle},
+        )
+    binding = original_audit["original_buy_decision_binding"]
+    assert binding["source_entry_lifecycle_id"] == "ENTRY:US_STANDARD:AMGN"
+    assert binding["position_cycle_id"] == cycle
+    for durable_meta in (persisted["order_meta"],persisted["fill_meta"]):
+        assert durable_meta["source_entry_reason"] == "CI_BUY"
+        assert durable_meta["source_entry_decision_sha256"] == original_5w1h["sha256"]
+        assert durable_meta["us_original_buy_decision_binding_v1"] == binding
+        assert verify_exit_entry_link(durable_meta["exit_decision_evidence_5w1h"],
+                                      original_5w1h,original_buy_binding=binding)
+    assert verify_decision_evidence(original_5w1h)
     # Latest zero must fence the old original even while history is intact.
     with pg_engine.begin() as conn:
         conn.execute(text("""
