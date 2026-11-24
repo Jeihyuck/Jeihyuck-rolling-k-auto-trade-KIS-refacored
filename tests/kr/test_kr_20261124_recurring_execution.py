@@ -115,3 +115,39 @@ def test_inner_pb1_timing_marker_never_completes_session(status, reason):
     assert marker["status"] == "PARTIAL_SUCCESS_RETRYABLE"
     assert marker["sell_completed"] and not marker["completed"] and marker["retryable"]
     assert not pb1_runner.should_skip_duplicate_from_marker(marker, session="afternoon")
+
+
+def test_priority_manifest_lock_contention_returns_without_blocking_tick(monkeypatch, tmp_path):
+    from trader.kr import entry_priority_queue as priority
+    codes = [str(i).zfill(6) for i in range(1, 31)]
+    monkeypatch.setattr(priority, "_prep_snapshot", lambda *a, **k: {
+        "codes": codes, "contract_hash": "contract", "final30_digest": "digest"})
+    monkeypatch.setattr(priority, "_current_sha", lambda: "a"*40)
+    monkeypatch.setattr(priority, "manifest_path", lambda *a: tmp_path / "priority.json")
+    def bounded_failure(lock, *, timeout_seconds):
+        assert timeout_seconds == 2.0
+        raise contract.OpeningProofLockTimeout("contended")
+    monkeypatch.setattr(priority, "_acquire_opening_proof_lock", bounded_failure)
+    result = priority.publish_pb1_priority(
+        date="2026-11-24", account_scope="offline", eligible_codes=codes[:3],
+        now=datetime(2026, 11, 24, 10, 35, tzinfo=contract.KST))
+    assert result["state"] == "PRIORITY_LOCK_TIMEOUT"
+    assert not (tmp_path / "priority.json").exists()
+
+
+def test_timeout_finalization_has_separate_deadline_and_does_not_swallow_timeout(monkeypatch):
+    import signal
+    from trader.kr import runtime_integrity_20260928 as runtime
+    class TickTimeoutError(TimeoutError):
+        pass
+    timers = []
+    monkeypatch.setattr(signal, "setitimer", lambda which, seconds: timers.append(seconds))
+    def timeout():
+        raise runtime._HardTickAbort("tick_hard_timeout")
+    def blocked_finalize(**kwargs):
+        assert timers[-1] == 5.0
+        raise runtime._HardTickAbort("finalize deadline")
+    monkeypatch.setattr(runtime, "_finalize_tracked_tick_run_on_timeout", blocked_finalize)
+    with pytest.raises(TickTimeoutError, match="tick_hard_timeout"):
+        runtime._build_hard_timeout_runner(TickTimeoutError)(timeout_sec=1, call=timeout)
+    assert timers == [1.0, 0, 5.0, 0, 0]
