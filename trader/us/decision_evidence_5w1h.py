@@ -186,9 +186,16 @@ def attach_original_buy_bound_sell_audit(
             or not binding.get("source_buy_client_order_key")):
         return "LIFECYCLE_MISMATCH"
     prior = meta.get("exit_decision_evidence_5w1h")
-    if (isinstance(prior, dict) and verify_exit_entry_link(
-            prior, entry, original_buy_binding=binding)
+    if (isinstance(prior, dict) and prior.get("original_buy_binding") == binding
+            and verify_exit_entry_link(prior, entry, original_buy_binding=binding)
             and prior["what"]["decision_id"] == "US_STANDARD:SELL:" + str(intent.get("client_order_key") or "")):
+        meta.update(exit_decision_evidence_status="VERIFIED",
+                    source_entry_decision_sha256=entry["sha256"],
+                    source_entry_reason=provenance.get("entry_reason"),
+                    us_original_buy_decision_binding_v1=dict(binding))
+        intent.update(exit_decision_id=prior["what"]["decision_id"],
+                      source_entry_decision_sha256=entry["sha256"],
+                      source_entry_reason=provenance.get("entry_reason"))
         return "ALREADY_VERIFIED"
     ev = build_exit_evidence_from_entry(
         entry_evidence=entry,
