@@ -481,6 +481,12 @@ class DurableExecutionClaimRepo:
             action_state = "UNCERTAIN" if active_attempt_id else (
                 "SATISFIED" if remaining == 0 else "UNCERTAIN"
             )
+        if str(action_row["action_state"]) == "SUPERSEDED":
+            # A new authoritative fill after economic closure contradicts
+            # the prior closure proof, even if it exactly matches the target.
+            action_state = "UNCERTAIN"
+            active_attempt_id = action_row["active_attempt_id"]
+            self._record_conflict(conn, key)
         if overfilled:
             action_state = "UNCERTAIN"
             active_attempt_id = action_row["active_attempt_id"]
