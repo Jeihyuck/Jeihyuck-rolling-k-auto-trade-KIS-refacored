@@ -212,7 +212,17 @@ def inspect_completed_bar_coverage(*, rows: list[dict], now: datetime,
                              and not scope["invalid"])
     opening_ready = bool(opening_range_ready(opening)
                          and not scope["opening_conflicts"] and not scope["invalid"])
+    required_recent = 4 if active_entry_policy(os.getenv("KIS_ENV", "practice")) == "US_ALIGNED_V2" else 3
+    if state == "COVERED" and required_recent == 4:
+        recent = after_open[-4:]
+        if len(recent) < 4:
+            state, reason = "WAIT", "POST_OPENING_CONFIRMATION_PENDING"
+        elif any((datetime.fromisoformat(b["timestamp"]) -
+                  datetime.fromisoformat(a["timestamp"])).total_seconds() != 60
+                 for a, b in zip(recent, recent[1:])):
+            state, reason = "UNKNOWN", "RECENT_MINUTE_GAP"
     return {
+        "required_recent_minutes": required_recent,
         "state": state, "reason": reason,
         "opening_range_ready": opening_ready,
         "native_post_open_window_ready": independent_ready,
@@ -727,6 +737,53 @@ def _conflict_scope(*, bars: list[dict], conflicts: list, now: datetime, family:
             "opening": opening, "post": post}
 
 
+def active_entry_policy(env: str) -> str:
+    """Explicit WSL profile selects V2; legacy remains a reversible ENFORCE policy."""
+    if str(env).lower() != "practice":
+        return "LEGACY_V1"
+    return str(os.getenv("KR_PB1_ENTRY_OPPORTUNITY_POLICY", "LEGACY_V1")).strip().upper()
+
+
+def _evaluate_us_aligned_reclaim(*, payload, now, family, setup_ok, trigger_ok, order_price):
+    from trader.kr.entry_opportunity_v2 import evaluate_reclaim
+    if not setup_ok:
+        return _result("INVALID", "ORIGINAL_SETUP_FAILED")
+    now = now.astimezone(KST)
+    if not dtime(9, 30) <= now.time() <= dtime(15, 5):
+        return _result("WAIT", "OUTSIDE_ENTRY_WINDOW")
+    bars = clean_completed_bars(payload["bars"], now)
+    conflicts = payload.get("source_conflicts") or []
+    scope = _conflict_scope(bars=bars, conflicts=conflicts, now=now, family=family)
+    if scope["invalid"]:
+        return _result("UNKNOWN", "CONFLICTING_NATIVE_COMPLETED_BAR")
+    opening, post = scope["opening"], scope["post"]
+    # V2 reads a longer 15-minute trough; include every operand in conflict
+    # scope even if V1 would have ignored that historical conflict.
+    conflict_keys = {datetime.fromisoformat(raw).astimezone(KST).isoformat()
+                     for raw in conflicts}
+    recent_keys = {b["timestamp"] for b in post[-15:]}
+    full_ok = opening_range_ready(opening) and not (
+        scope["opening_conflicts"] or conflict_keys & recent_keys)
+    if full_ok:
+        independent = False
+    elif scope["independent_window_ready"]:
+        independent = True
+    else:
+        if conflicts and (scope["opening_conflicts"] or conflict_keys & recent_keys):
+            return _result("UNKNOWN", "CONFLICTING_NATIVE_COMPLETED_BAR",
+                           source_conflicts=list(conflicts))
+        state, reason = _native_window_structure(post, now)
+        return _result(state if state != "COVERED" else "UNKNOWN", reason,
+                       opening_count=len(opening))
+    return evaluate_reclaim(
+        family=family, opening=opening, post=post, now=now,
+        order_price=order_price, independent=independent,
+        vwap=payload.get("vwap"),
+        vwap_verified=payload.get("vwap_source") == "KIS_NATIVE_WEIGHTED_AVG",
+        trigger_ok=trigger_ok,
+    )
+
+
 def evaluate_proof_for_candidate(*, env: str, account_scope: str, code: str,
                                  now: datetime, style: str, setup_ok: bool,
                                  trigger_ok: bool, pivot: float | None,
@@ -736,6 +793,19 @@ def evaluate_proof_for_candidate(*, env: str, account_scope: str, code: str,
     )
     if not payload:
         return _result("UNKNOWN", "NO_FRESH_VERIFIED_KIS_MINUTE_BAR_PROOF")
+    family = STYLES.get(str(style or "").strip().upper())
+    policy = active_entry_policy(env)
+    if policy not in {"LEGACY_V1", "US_ALIGNED_V2"}:
+        return _result("UNKNOWN", "ENTRY_OPPORTUNITY_POLICY_INVALID")
+    if policy == "US_ALIGNED_V2" and family in {"PULLBACK", "MOMENTUM"}:
+        # An owner-confirmed momentum breakout remains on its separate V1
+        # opening/pivot contract, not an easier reclaim substitution.
+        result = _evaluate_us_aligned_reclaim(
+            payload=payload, now=now, family=family, setup_ok=setup_ok,
+            trigger_ok=trigger_ok, order_price=order_price,
+        )
+        if result.get("reason") != "MOMENTUM_BREAKOUT_REQUIRES_OWNER_PATH":
+            return result
     conflicts = payload.get("source_conflicts") or []
     if conflicts:
         family = STYLES.get(str(style or "").strip().upper())

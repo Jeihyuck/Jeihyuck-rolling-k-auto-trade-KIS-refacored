@@ -5957,6 +5957,25 @@ class PB1Engine:
                 pivot=(cf.features or {}).get("pivot"),
                 order_price=float(order_price or 0.0),
             )
+            if (_timing.get("entry_policy") == "US_ALIGNED_V2"
+                    and _timing.get("state") == "READY_SHADOW"):
+                from trader.kr.entry_opportunity_v2 import validate_live_quote
+                # Read the broker wrapper's fresh WS/REST cache instead of
+                # reusing the potentially old whole-tick planning snapshot.
+                # Existing KIS request budgets and timeout fences still apply.
+                try:
+                    _quote_api = getattr(self, "kis", None) or getattr(self, "kis_api", None)
+                    _live_quote = _quote_api.get_price_snapshot(str(cf.code).zfill(6), market="J") if _quote_api else {}
+                except Exception:
+                    _live_quote = {}
+                _quote_check = validate_live_quote(
+                    code=cf.code, timing=_timing, quote=_live_quote,
+                    now=now_kst(), order_price=order_price,
+                    allow_passive=(cf.features or {}).get("order_price_source") == "timing_bounded_prpr_limit",
+                )
+                _timing = {**_timing, "live_quote_validation": _quote_check}
+                if _quote_check["state"] != "READY":
+                    _timing.update(state=_quote_check["state"], reason=_quote_check["reason"])
             # Preserve the actual pre-submit timing verdict in the existing
             # candidate evaluation/ORDER_SKIP payload for later read-only audits.
             # This does not authorize trades or alter owner strategy thresholds.
@@ -5972,6 +5991,19 @@ class PB1Engine:
                     # Persist source-native candle values for a reproducible
                     # 0.5% slippage vs symmetric 0.4% gate investigation.
                     # These observations do NOT relax or authorize BUY.
+                    "entry_policy": _timing.get("entry_policy", "LEGACY_V1"),
+                    "reference_source": _timing.get("reference_source"),
+                    "recent_closes": _timing.get("recent_closes"),
+                    "recent_lows": _timing.get("recent_lows"),
+                    "prior_2m_volume": _timing.get("prior_2m_volume"),
+                    "recent_2m_volume": _timing.get("recent_2m_volume"),
+                    "volume_reference": _timing.get("volume_reference"),
+                    "intraday_pullback_depth": _timing.get("intraday_pullback_depth"),
+                    "risk_reward_reference": _timing.get("risk_reward_reference"),
+                    "structural_stop_reference": _timing.get("structural_stop_reference"),
+                    "structural_target_reference": _timing.get("structural_target_reference"),
+                    "stop_distance_pct": _timing.get("stop_distance_pct"),
+                    "live_quote_validation": _timing.get("live_quote_validation"),
                     "reference_price": _timing.get("reference_price"),
                     "opening_count": _timing.get("opening_count"),
                     "opening_high": _timing.get("opening_high"),
@@ -7555,6 +7587,7 @@ class PB1Engine:
                 "trade_horizon": _classify_trade_horizon(dict(cf.features)),
                 "initial_stop_price": cf.features.get("stop_price") or cf.features.get("initial_stop"),
                 "entry_reason_source": "candidate_features",
+                "entry_timing_evidence": cf.features.get("entry_timing_evidence") or {},
                 "setup_snapshot_missing_fields": missing_reference_fields,
             }
         )
@@ -11445,7 +11478,7 @@ class PB1Engine:
                 logger.info(
                     "[KR][ENTRY][TIMING_BOUNDED_PRICE] code=%s original=%.0f "
                     "bounded=%.0f method=%s ref=%.0f quote_age_sec=%s "
-                    "max_price=%s cap_0p4_unchanged=1",
+                    "max_price=%s bounded_by_verified_policy=1",
                     cf.code, _old, _bounded,
                     _price_proof.get("reason"), _price_proof.get("reference_price"),
                     _price_proof.get("quote_age_sec"), _price_proof.get("price_ceiling"),
