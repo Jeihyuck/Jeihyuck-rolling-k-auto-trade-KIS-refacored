@@ -815,9 +815,23 @@ def update_us_position_high_watermark(*, symbol: str, trade_date: str, lifecycle
                 raise ValueError("US_HIGH_WATERMARK_LEGACY_ORIGINAL_UNVERIFIED")
             # Keep original opening date and recorded peak/time. Never
             # manufacture a canonical portfolio/cycle for a legacy risk row.
+            current_leaf = dict(lifecycle)
             lifecycle = dict(original)
-            if _f(((latest.get("state") or {}).get("lifecycle") or {}).get("high_watermark")) > _f(lifecycle.get("high_watermark")):
-                raise ValueError("US_HIGH_WATERMARK_LEGACY_SOURCE_STALE")
+            # A verified later risk leaf can have a higher peak than the
+            # archived BUY-time history. Preserve the peak/timestamp pair
+            # from the exact same original scope instead of fencing every
+            # tick after the first new high.
+            if current_leaf:
+                original_sha = (original.get("entry_policy") or {}).get("entry_exit_contract_sha256")
+                current_sha = (current_leaf.get("entry_policy") or {}).get("entry_exit_contract_sha256")
+                if current_sha != original_sha:
+                    raise ValueError("US_HIGH_WATERMARK_LEGACY_CONTRACT_CONFLICT")
+                if _f(current_leaf.get("high_watermark")) >= _f(original.get("high_watermark")):
+                    if (not current_leaf.get("high_watermark_at")
+                            or current_leaf.get("high_watermark_source") != "us_position_risk_state"):
+                        raise ValueError("US_HIGH_WATERMARK_LEGACY_PEAK_PROOF_MISSING")
+                    for field in ("high_watermark", "high_watermark_at", "high_watermark_source"):
+                        lifecycle[field] = current_leaf[field]
         elif (
             identity.get("position_cycle_id") != lifecycle_id
             or not _identity_is_current(identity)
