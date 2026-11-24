@@ -205,7 +205,92 @@ def _repair_opening_due(code: str) -> bool:
     return True
 
 
-def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: float = 0.8) -> dict:
+# Conflict revalidation has its own bounded cadence: three independent reads
+# spaced >=60s must not inherit the opening-range 15-minute backoff.
+_CONFLICT_REPAIR_NEXT: dict[str, float] = {}
+_CONFLICT_REPAIR_CURSOR: dict[str, int] = {}
+
+
+def _repair_conflict_due(code: str) -> bool:
+    now = time.monotonic()
+    if now < _CONFLICT_REPAIR_NEXT.get(code, 0.0):
+        return False
+    _CONFLICT_REPAIR_NEXT[code] = now + 60.0
+    return True
+
+
+def _conflict_repair_anchors(code: str, unresolved: list, observed_at: datetime) -> list[str]:
+    """Rotate a bounded pair of exact historical anchors; never starve later conflicts."""
+    valid = []
+    for minute in unresolved:
+        try:
+            stamp = datetime.fromisoformat(str(minute))
+            if stamp.tzinfo is None:
+                continue
+            stamp = stamp.astimezone(KST)
+        except (ValueError, TypeError, OverflowError):
+            continue
+        if (stamp.date() != observed_at.date()
+                or not dtime(9, 0) <= stamp.time() < dtime(15, 30)
+                or stamp >= observed_at.replace(second=0, microsecond=0)):
+            continue
+        valid.append((stamp + timedelta(minutes=1)).strftime("%H%M%S"))
+    valid = sorted(set(valid))
+    if not valid:
+        return []
+    start = _CONFLICT_REPAIR_CURSOR.get(code, 0) % len(valid)
+    count = min(2, len(valid))
+    _CONFLICT_REPAIR_CURSOR[code] = (start + count) % len(valid)
+    return [valid[(start + offset) % len(valid)] for offset in range(count)]
+
+
+_RECENT_REPAIR_NEXT: dict[str, float] = {}
+
+
+def _recent_gap_anchor(coverage: dict, bars: list[dict], observed_at: datetime) -> str | None:
+    """Target a genuinely unobserved minute in the latest required native window.
+
+    This is a request anchor, not a claim that a missing minute had trades.
+    Never construct a candle or infer a business date from an empty response.
+    """
+    if coverage.get("reason") == "RECENT_MINUTE_GAP":
+        window_size = 3
+    elif (not coverage.get("opening_range_ready")
+          and coverage.get("native_post_open_window_reason") == "POST_OPENING_NATIVE_WINDOW_GAP"):
+        window_size = 8
+    else:
+        return None
+    stamps = []
+    for bar in bars:
+        try:
+            stamp = datetime.fromisoformat(bar["timestamp"])
+            if stamp.tzinfo is not None:
+                stamp = stamp.astimezone(KST)
+                if stamp.date() == observed_at.date() and dtime(9, 30) <= stamp.time() < dtime(15, 30):
+                    stamps.append(stamp)
+        except (KeyError, ValueError, TypeError):
+            continue
+    latest = sorted(set(stamps))[-window_size:]
+    if len(latest) < (3 if window_size == 3 else 2):
+        return None
+    expected = [latest[-1] - timedelta(minutes=i)
+                for i in range(window_size - 1, -1, -1)]
+    missing = [stamp for stamp in expected if stamp not in latest and stamp.time() >= dtime(9, 30)]
+    if not missing:
+        return None
+    return (max(missing) + timedelta(minutes=1)).strftime("%H%M%S")
+
+
+def _recent_repair_due(code: str) -> bool:
+    now = time.monotonic()
+    if now < _RECENT_REPAIR_NEXT.get(code, 0.0):
+        return False
+    _RECENT_REPAIR_NEXT[code] = now + 60.0
+    return True
+
+
+def run_once(*, kis, codes: list[str], observed_at: datetime,
+             sleep_between: float = 0.8, refresh_clock=None) -> dict:
     """No order methods are called; all I/O is read-only KIS and local proofs."""
     observed_at = observed_at.astimezone(KST)
     if not dtime(9, 0) <= observed_at.time() <= dtime(15, 5):
@@ -215,7 +300,14 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
     minute_requests, quote_requests, native_request_failures = 0, 0, 0
     symbol_scan_sec: list[float] = []
     symbol_outcomes: dict[str, dict] = {}
+    session_date = observed_at.date()
     for code in codes:
+        # Production batches can span multiple completed minutes. Do not
+        # query every subsequent symbol at the previous batch's clock.
+        if refresh_clock is not None:
+            observed_at = refresh_clock().astimezone(KST)
+            if observed_at.date() != session_date or not dtime(9, 0) <= observed_at.time() <= dtime(15, 5):
+                break
         symbol_started = time.monotonic()
         if str(code).zfill(6) == "122630":
             # Separate owner: never collect KR_INFINITE by PB1 proof route.
@@ -233,51 +325,42 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
                 max_age_seconds=None,
             )
             opening_coverage = (
-                inspect_completed_bar_coverage(rows=stored["bars"], now=observed_at)
+                inspect_completed_bar_coverage(rows=stored["bars"], now=observed_at,
+                                               source_conflicts=stored.get("source_conflicts"))
                 if stored else {"opening_count": 0, "opening_valid_minutes": []}
             )
-            valid_opening = opening_coverage.get("opening_valid_minutes") or []
-            opening_ready = (
-                len(valid_opening) >= 25
-                and valid_opening[0] <= "09:03"
-                and valid_opening[-1] >= "09:26"
-            )
+            opening_ready = bool(opening_coverage.get("opening_range_ready"))
             unresolved = list((stored or {}).get("source_conflicts") or [])
             repair_due = (
                 observed_at.time() >= dtime(9, 30)
-                and (not (opening_ready or opening_coverage.get(
-                    "native_post_open_window_ready", False)) or bool(unresolved))
+                and not (opening_ready or opening_coverage.get(
+                    "native_post_open_window_ready", False))
                 and _repair_opening_due(code)
             )
-            anchors = (
-                ["092900", observed_at.strftime("%H%M%S")]
-                if repair_due else [observed_at.strftime("%H%M%S")]
+            conflict_due = (
+                observed_at.time() >= dtime(9, 30)
+                and bool(unresolved) and _repair_conflict_due(code)
             )
+            # Prioritize current native data before optional historical repair.
+            anchors = [observed_at.strftime("%H%M%S")]
+            recent_anchor = _recent_gap_anchor(
+                opening_coverage, (stored or {}).get("bars") or [], observed_at,
+            )
+            if recent_anchor and recent_anchor not in anchors and _recent_repair_due(code):
+                anchors.append(recent_anchor)
+                logger.info("[KR][OPENING_OBSERVER][RECENT_GAP_REPAIR] code=%s anchor=%s", code, recent_anchor)
+            if repair_due:
+                anchors.append("092900")
             # An unresolved native-minute conflict can be >30 bars old.
             # Current-window reads no longer contain it: target the exact
             # conflict timestamp in an authenticated KIS historical window.
             # The original value and conflict quarantine remain intact until
             # the normal multi-read proof resolves it. Maximum two targeted
             # reads per repair cycle to preserve the observer-only KIS budget.
-            if repair_due:
-                extra_conflict_anchors: list[str] = []
-                for conflict_minute in unresolved:
-                    try:
-                        conflict_at = datetime.fromisoformat(str(conflict_minute)).astimezone(KST)
-                    except (ValueError, TypeError, OverflowError):
-                        continue
-                    if (conflict_at.date() != observed_at.date()
-                            or not dtime(9, 0) <= conflict_at.time() < dtime(15, 30)
-                            or conflict_at >= observed_at.replace(second=0, microsecond=0)):
-                        continue
-                    # KIS time-itemchart returns a backward-looking window.
-                    next_completed = conflict_at + timedelta(minutes=1)
-                    extra_conflict_anchors.append(next_completed.strftime("%H%M%S"))
-                    if len(extra_conflict_anchors) >= 2:
-                        break
-                anchors.extend(extra_conflict_anchors)
+            if conflict_due:
+                anchors.extend(_conflict_repair_anchors(code, unresolved, observed_at))
             anchors = list(dict.fromkeys(anchors))
-            if repair_due:
+            if repair_due or conflict_due:
                 logger.info(
                     "[KR][OPENING_OBSERVER][REPAIR_REQUEST] code=%s "
                     "opening_count=%s anchors=%s bounded_backoff=1",
@@ -363,6 +446,7 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
                 raise RuntimeError("OPENING_PROOF_PERSISTED_READBACK_FAILED")
             coverage = inspect_completed_bar_coverage(
                 rows=persisted["bars"], now=proof_now,
+                source_conflicts=persisted.get("source_conflicts"),
             )
             # The opening anchor can cover up to the early session; only
             # request the 09:15 repair anchor if that first replay still left
@@ -398,6 +482,7 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
                             raise RuntimeError("OPENING_REPAIR_READBACK_FAILED")
                         coverage = inspect_completed_bar_coverage(
                             rows=persisted["bars"], now=proof_now,
+                source_conflicts=persisted.get("source_conflicts"),
                         )
                     logger.info(
                         "[KR][OPENING_OBSERVER][REPAIR] code=%s anchor=091500 "
@@ -424,8 +509,15 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
                     "unverified_buy_blocked=1",
                     code, persisted.get("source_conflicts"),
                 )
-                coverage = {**coverage, "state": "UNKNOWN",
-                            "reason": "CONFLICTING_NATIVE_COMPLETED_BAR"}
+                if not coverage.get("available_native_paths"):
+                    coverage = {**coverage, "state": "UNKNOWN",
+                                "reason": "CONFLICTING_NATIVE_COMPLETED_BAR"}
+            if (coverage["state"] != "COVERED"
+                    and coverage.get("native_post_open_window_ready")):
+                # Structural availability only; owner-specific breakout still
+                # requires the opening reference in the final timing evaluator.
+                coverage = {**coverage, "state": "COVERED",
+                            "reason": "INDEPENDENT_NATIVE_5_PLUS_3_AVAILABLE"}
             if coverage["state"] == "COVERED":
                 coverage_ok += 1
             elif observed_at.time() >= dtime(9, 30):
@@ -625,7 +717,8 @@ def main() -> None:
                 priority["state"], len(priority["hot"]), len(priority["warm"]),
                 len(priority["cold"]), selected, len(codes),
             )
-            result = run_once(kis=kis, codes=selected, observed_at=now)
+            result = run_once(kis=kis, codes=selected, observed_at=now,
+                              refresh_clock=now_kst)
             for code, outcome in result.get("symbol_outcomes", {}).items():
                 tier = next(
                     (name for name in ("hot", "warm", "cold")

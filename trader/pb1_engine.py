@@ -1595,6 +1595,38 @@ def _finalize_kr_order_candidates(
     return finalized, meta
 
 
+def _classify_kr_timing_zero_submit(submit_result, *, expected_count):
+    """Classify only fully accounted, explicitly denied timing-gate outcomes.
+
+    Missing results, genuine failures, unknown broker outcomes and mixed
+    unrelated blockers remain in the original conservative error path.
+    """
+    results = submit_result.get("results") or []
+    if (expected_count <= 0 or len(results) != expected_count
+            or any(int(submit_result.get(k, 0) or 0) for k in
+                   ("api_submitted", "attempted", "accepted", "filled", "rejected", "failed"))):
+        return None
+    data_blocked = False
+    for result in results:
+        if (result.get("terminal_event") != "FINAL_SKIP"
+                or int(result.get("skipped", 0) or 0) != 1
+                or result.get("skipped_reason") != "KR_ENTRY_TIMING_NOT_READY_OR_PRICE_TOO_HIGH"):
+            return None
+        state = result.get("timing_state")
+        reason = result.get("timing_reason")
+        if not reason or state not in {"WAIT", "INVALID", "UNKNOWN", "READY_SHADOW"}:
+            return None
+        if state == "READY_SHADOW":
+            # Only an explicit price-cap denial is a normal policy wait.
+            if reason != "ORDER_PRICE_ABOVE_CONFIRMED_CAP":
+                return None
+        if state == "UNKNOWN":
+            data_blocked = True
+    if data_blocked:
+        return "RETRYABLE_MARKET_DATA_ERROR", "KR_ENTRY_TIMING_DATA_UNVERIFIED"
+    return "OK_NO_TRADE", "KR_ENTRY_TIMING_POLICY_WAIT"
+
+
 def _submit_finalized_order_candidates(
     candidates: list["CandidateFeature"], *, submitter: Any,
     pre_submit_gate: Any | None = None,
@@ -5992,7 +6024,13 @@ class PB1Engine:
                         reason_codes=["KR_ENTRY_TIMING_NOT_READY_OR_PRICE_TOO_HIGH"],
                         blocking_stage="pre_submit_timing",
                         context={"code": cf.code, "timing_state": _timing.get("state"),
-                                 "timing_reason": _timing.get("reason")},
+                                 "timing_reason": (
+                                     "ORDER_PRICE_ABOVE_CONFIRMED_CAP"
+                                     if (_timing.get("state") == "READY_SHADOW"
+                                         and _max_price is not None
+                                         and float(order_price or 0) > float(_max_price))
+                                     else _timing.get("reason")
+                                 )},
                     )
         gate_snapshot = getattr(self, "_buyable_gate_context", {}).get(str(cf.code or "").zfill(6), {}) if hasattr(self, "_buyable_gate_context") else {}
         existing_order = None
@@ -11445,6 +11483,9 @@ class PB1Engine:
             )
             status["skipped"] = 1
             status["skipped_reason"] = final_reason
+            if pre_submit.blocking_stage == "pre_submit_timing":
+                status["timing_state"] = pre_submit.context.get("timing_state")
+                status["timing_reason"] = pre_submit.context.get("timing_reason")
             status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
             status["terminal_event"] = "FINAL_SKIP"
             return status
@@ -12707,6 +12748,9 @@ class PB1Engine:
             )
             status["skipped"] = 1
             status["skipped_reason"] = final_reason
+            if pre_submit.blocking_stage == "pre_submit_timing":
+                status["timing_state"] = pre_submit.context.get("timing_state")
+                status["timing_reason"] = pre_submit.context.get("timing_reason")
             status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
             status["terminal_event"] = "FINAL_SKIP"
             return status
@@ -21730,6 +21774,13 @@ class PB1Engine:
                             "order_candidates=%s api_submitted=0 reason=%s",
                             len(orderable_candidates), final_notes,
                         )
+                    elif (not plan_skip_reasons and
+                          (timing_outcome := _classify_kr_timing_zero_submit(
+                              submit_result, expected_count=len(orderable_candidates)
+                          )) is not None):
+                        final_status, final_notes = timing_outcome
+                        logger.info("[KR][ORDER_ZERO_API][TIMING] status=%s reason=%s",
+                                    final_status, final_notes)
                     elif top_policy_blocker and not plan_skip_reasons:
                         final_status = "OK_NO_TRADE"
                         final_notes = top_policy_blocker

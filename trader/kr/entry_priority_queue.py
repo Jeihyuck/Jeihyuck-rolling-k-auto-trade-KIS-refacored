@@ -14,7 +14,7 @@ import os
 import subprocess
 import tempfile
 
-from trader.kr.opening_bar_contract import KST
+from trader.kr.opening_bar_contract import KST, OpeningProofLockTimeout, _acquire_opening_proof_lock
 from trader.runtime_paths import repo_root
 
 VERSION = "kr_pb1_minute_priority_v1"
@@ -219,7 +219,10 @@ def publish_pb1_priority(*, date: str, account_scope: str,
     import fcntl
     lock_path = path.with_suffix(".lock")
     with lock_path.open("a+b") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            _acquire_opening_proof_lock(lock, timeout_seconds=2.0)
+        except OpeningProofLockTimeout:
+            return {"state": "PRIORITY_LOCK_TIMEOUT", "hot": [], "warm": []}
         tmp = None
         try:
             with tempfile.NamedTemporaryFile(
