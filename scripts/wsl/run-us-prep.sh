@@ -144,15 +144,26 @@ if [[ "$prep_rc" == 0 ]]; then
 import sys
 from pathlib import Path
 trade_date = sys.argv[1]
-from trader.us.prep_effective import check_effective_prep_sources
+from trader.us.prep_effective import check_effective_prep_sources, clear_recovered_us_prep_preflight_marker
+from trader.us.path_contract import load_us_prep_contract
 result = check_effective_prep_sources(trade_date)
 print('[US_PREP][POST_COMPLETE_CONTRACT_CHECK]', result)
 if not result['ok']:
     raise SystemExit(1)
 marker = Path("runtime/health") / f"us-prep-missing-{trade_date}.json"
 if marker.exists():
-    marker.unlink()
-    print(f"[US_PREP][CLEAR_STALE_EXIT_ONLY] trade_date={trade_date} marker={marker}")
+    contract = load_us_prep_contract(trade_date) or {}
+    revision = str(contract.get("run_revision") or contract.get("git_commit_sha") or "")
+    if contract.get("entry_can_proceed") not in (1, True, "1", "true", "True"):
+        print("[US_PREP][PREFLIGHT_MARKER_RETAINED] reason=entry_not_authorized")
+    else:
+        ok, reason = clear_recovered_us_prep_preflight_marker(
+            trade_date=trade_date, expected_run_id=str(result.get("run_id") or ""),
+            current_revision=revision,
+        )
+        print(f"[US_PREP][CLEAR_STALE_EXIT_ONLY] trade_date={trade_date} ok={ok} reason={reason}")
+        if not ok:
+            raise SystemExit(1)
 raise SystemExit(0)
 PY
   cleanup_rc=$?

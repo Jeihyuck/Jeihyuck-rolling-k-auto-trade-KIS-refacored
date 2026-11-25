@@ -1361,6 +1361,18 @@ class USDataProvider:
             # Re-raise original exception if not temporary or no DB fallback
             raise
 
+    def get_account_summary_observation(self) -> dict:
+        """Separate reporting-only KIS account observation from holdings truth."""
+        from trader.us.account_summary import parse_practice_present_balance
+        if self._offline:
+            return {"status": "UNAVAILABLE", "reason": "offline"}
+        try:
+            raw = self._get_client().get_us_present_balance()
+            return parse_practice_present_balance(raw)
+        except Exception as exc:
+            logger.warning("[US_ACCOUNT_SUMMARY][UNAVAILABLE] type=%s", type(exc).__name__)
+            return {"status": "UNAVAILABLE", "reason": type(exc).__name__}
+
     def get_balance(self, force_refresh: bool = False) -> dict:
         """잔고 조회."""
         ctx = self._tick_context

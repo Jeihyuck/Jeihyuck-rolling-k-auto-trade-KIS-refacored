@@ -226,6 +226,21 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
             position_snapshot_error = str(exc)
             logger.error("[US_TRADE_CLOSE][ERROR] save_position_snapshot failed: %s", exc)
 
+        # Independent reporting observation. Never make a delayed practice
+        # summary part of the SELL/BUY gate or replace native positions.
+        account_summary = {"status": "UNAVAILABLE", "reason": "offline_or_replay"}
+        if not offline and not force_now and env == "practice":
+            try:
+                reader = getattr(provider, "get_account_summary_observation", None)
+                if callable(reader):
+                    observed = reader()
+                    if isinstance(observed, dict):
+                        account_summary = observed
+            except Exception as exc:
+                account_summary = {"status": "UNAVAILABLE", "reason": type(exc).__name__}
+        logger.info("[US_ACCOUNT_SUMMARY][CLOSE] status=%s reason=%s",
+                    account_summary.get("status"), account_summary.get("reason", ""))
+
         # 5. Reconcile log DB 저장
         try:
             save_reconcile_log({
@@ -239,6 +254,7 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
                     "total_pvs_semantics": reconcile_result.get("total_pvs_semantics", "holdings_market_value_usd"),
                     "total_pvs_source": reconcile_result.get("total_pvs_source", "unknown"),
                     "account_equity_source": reconcile_result.get("account_equity_source", "unknown"),
+                    "account_summary_observation": account_summary,
                 },
             }, trade_date=trade_date)
             logger.info("[US_RECONCILE_LOG][SAVE]")
@@ -332,6 +348,8 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
                 if isinstance(candidate_positions, list):
                     direct_positions = candidate_positions
                     direct_balance = balance
+            if isinstance(direct_balance, dict):
+                direct_balance = {**direct_balance, "account_summary_observation": account_summary}
             daily_report_result = run_daily_report(
                 env=env, session="close", trade_date=trade_date, offline=offline,
                 final_balance=direct_balance, final_positions=direct_positions, kis_fills=fills,
@@ -502,6 +520,7 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
             "ack_reconcile_status": ack_reconcile_status,
             "ack_reconcile_result": ack_reconcile_result,
             "balance": balance,
+            "account_summary_observation": account_summary,
             "close_entry_enabled": close_entry_enabled,
             "order_final_classification": close_order_classification.get("orders", []),
             "order_final_classification_counts": close_order_classification.get("counts", {}),
