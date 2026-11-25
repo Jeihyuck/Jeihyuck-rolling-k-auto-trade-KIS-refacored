@@ -453,6 +453,7 @@ def _evidence_from_db(conn, *, symbol: str, trade_date: str,
     return {
         "symbol":symbol,"exchange":str(pos.get("exchange") or "").upper(),
         "holding":holding,"original_cycle":original_cycle,
+        "original_runtime_lifecycle": dict(history),
         "source_buy_day":opened,"source_buy_order":str(buy["order_no"]),
         "source_buy_qty":buy_qty, "v2_sha":digest,
         "original_v2_contract":contract,
@@ -835,6 +836,10 @@ def enrich_legacy_nine_v2_decision_position(
         out["strategy_owner"]="US_STANDARD"
         out["trading_epoch_id"]=epoch
         out["account_id"]=raw_account
+        # This bridge has independently verified the active practice account.
+        # Expose its environment to the HWM identity check without creating
+        # a canonical portfolio or changing any historical DB row.
+        out["env"]="practice"
         out["lifecycle_identity_status"]="VERIFIED_LEGACY_ORIGINAL"
         meta_out["position_lifecycle_id"]=old_life
         meta_out["entry_exit_contract"]=source_contract
@@ -844,6 +849,9 @@ def enrich_legacy_nine_v2_decision_position(
                 meta_out[f"{stage}_done"]=True
         out["meta"]=meta_out
         out["legacy_nine_decision_only_provisional"]=True
+        # Derived risk state, not SELL permission: expose only the historical
+        # original already independently verified against the BUY/fill chain.
+        out["_verified_legacy_runtime_lifecycle"]=dict(evidence["original_runtime_lifecycle"])
         out["_legacy_nine_db_original_provenance"]={
             "symbol":symbol,"epoch":epoch,
             "account_hash":hashlib.sha256(raw_account.encode()).hexdigest(),

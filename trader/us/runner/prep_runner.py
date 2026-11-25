@@ -365,7 +365,7 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
     daily_sync_summary = {"sync_target_count": 0, "sync_ok_count": 0, "sync_failed_count": 0, "sync_failed_symbols": [], "price_data_failed_symbols": [], "exchange_resolution_failed_symbols": [], "open_position_sync_failed_symbols": [], "benchmark_sync_failed_symbols": []}
     try:
         from trader.us.db.repos import load_latest_open_us_position_lifecycles, load_positions
-        from trader.us.symbols import resolve_exchange
+        from trader.us.symbols import resolve_quote_exchange
         benchmark_symbols = {"SPY", "QQQ", "QQQM", "SMH", "SOXX", "DIA", "IWM", "RSP", "XLK", "XLI", "XLF", "XLV", "XLP", "XLU", "XLE"}
         sync_symbols = {str(s.get("symbol") or "").upper() for s in dynamic_universe_result.get("symbols", [])}
         sync_symbols |= benchmark_symbols
@@ -404,9 +404,9 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
                 continue
             try:
                 if hasattr(provider, "get_completed_daily_prices_result"):
-                    result = provider.get_completed_daily_prices_result(sym, resolve_exchange(sym), trade_date=trade_date, required_bars=int(os.getenv("US_DAILY_REQUIRED_BARS", "260")), allow_http_sync=True)
+                    result = provider.get_completed_daily_prices_result(sym, resolve_quote_exchange(sym), trade_date=trade_date, required_bars=int(os.getenv("US_DAILY_REQUIRED_BARS", "260")), allow_http_sync=True)
                 else:
-                    rows = provider.get_completed_daily_prices(sym, resolve_exchange(sym), trade_date=trade_date, required_bars=int(os.getenv("US_DAILY_REQUIRED_BARS", "260")), allow_http_sync=True)
+                    rows = provider.get_completed_daily_prices(sym, resolve_quote_exchange(sym), trade_date=trade_date, required_bars=int(os.getenv("US_DAILY_REQUIRED_BARS", "260")), allow_http_sync=True)
                     result = {"quality": "OK" if rows else "INSUFFICIENT_HISTORY", "valid_bar_count": len(rows or []), "db_latest": None, "expected_latest": None}
                 if result.get("quality") == "OK":
                     sync_ok.append(sym)

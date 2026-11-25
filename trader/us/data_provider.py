@@ -1220,9 +1220,13 @@ class USDataProvider:
         max_pages = int(os.getenv("US_DAILY_BACKFILL_MAX_PAGES", "6") or 6)
         client = None if self._offline else self._get_client()
 
+        http_attempts = 0
+
         def _fetch_history(*, as_of: str, need: int, stop_at: str | None, direction: str) -> list[dict]:
+            nonlocal http_attempts
             if self._offline:
                 return _make_stub_daily(symbol, max(required + 5, need + 5))
+            http_attempts += 1
             if hasattr(client, "get_us_daily_price_history"):
                 self.stats["daily_http_call_count"] += 1
                 return client.get_us_daily_price_history(symbol, exchange, as_of_date=as_of, required_bars=need, stop_at_date=stop_at, max_pages=max_pages)
@@ -1261,7 +1265,7 @@ class USDataProvider:
         duplicate_count = int(audit.get("duplicate_count") or 0)
         quality = "OK" if len(rows) >= required and audit_last_date == expected_latest and invalid_close_count == 0 and duplicate_count == 0 else ("STALE" if audit_last_date != expected_latest else "INSUFFICIENT_HISTORY")
         logger.info("[US_OHLCV][VERIFY] symbol=%s quality=%s valid_bar_count=%d latest=%s expected=%s invalid_close_count=%s duplicate_count=%s", symbol, quality, len(rows), db_latest, expected_latest, audit.get("invalid_close_count"), audit.get("duplicate_count"))
-        return {"rows": normalize_daily_rows(symbol, rows), "quality": quality, "valid_bar_count": len(rows), "db_latest": db_latest.isoformat() if db_latest else None, "expected_latest": expected_latest.isoformat(), "invalid_close_count": invalid_close_count, "duplicate_count": duplicate_count, "http_sync_attempted": total_fetched > 0, "http_sync_succeeded": total_fetched == 0 or total_upserted > 0}
+        return {"rows": normalize_daily_rows(symbol, rows), "quality": quality, "valid_bar_count": len(rows), "db_latest": db_latest.isoformat() if db_latest else None, "expected_latest": expected_latest.isoformat(), "invalid_close_count": invalid_close_count, "duplicate_count": duplicate_count, "http_sync_attempted": http_attempts > 0, "http_sync_succeeded": http_attempts > 0 and quality == "OK", "http_sync_call_count": http_attempts, "http_rows_fetched": total_fetched if http_attempts else 0, "rows_upserted": total_upserted}
 
     def get_completed_daily_prices(
         self,
@@ -1362,9 +1366,13 @@ class USDataProvider:
         ctx = self._tick_context
         if ctx is not None:
             ctx.count("balance_logical_calls")
-            if ctx.balance_snapshot_at is not None and ctx.balance_snapshot:
+            if not force_refresh and ctx.balance_snapshot_at is not None and ctx.balance_snapshot:
                 ctx.count("balance_cache_hits")
                 return ctx.balance_snapshot
+            if force_refresh:
+                # A failed explicit refresh must not resurrect an older cached balance.
+                ctx.balance_snapshot = {}
+                ctx.balance_snapshot_at = None
         started = __import__("time").monotonic()
         if self._offline:
             return {
@@ -1388,7 +1396,9 @@ class USDataProvider:
                 ctx.count("balance_http_calls")
             raw = self._get_client().get_us_balance(force_refresh=force_refresh)
             result = normalize_us_balance(raw)
-            if ctx is not None and result.get("balance_complete", True):
+            if (ctx is not None and result.get("balance_complete", True)
+                    and result.get("balance_authoritative", True)
+                    and result.get("balance_parse_status") == "OK"):
                 ctx.balance_snapshot = result
                 ctx.balance_snapshot_at = __import__("time").monotonic()
             return result

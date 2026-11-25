@@ -2694,12 +2694,27 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
     cycle = "cycle-ci-amgn"
     key = "original-buy-amgn-ci"
     order_no = "0000039784"
+    from trader.us.decision_evidence_5w1h import (
+        build_decision_evidence, verify_decision_evidence, verify_exit_entry_link,
+    )
+    original_5w1h = build_decision_evidence(
+        decision_id="ci-original-buy-5w1h",side="BUY",strategy_owner="US_STANDARD",
+        symbol="AMGN",decision_at="2026-11-10T16:00:00Z",policy_version="v2",
+        code_sha="ci-original",position_lifecycle_id="ENTRY:US_STANDARD:AMGN",
+        decision_reason="CI_BUY",facts={"pullback_pct":0.06,"reversal":None},
+        thresholds={},market_context={"regime":"NORMAL"},sizing={"qty":6},
+    )
     contract = build_us_entry_exit_contract({
         "symbol": "AMGN", "strategy_owner": "US_STANDARD",
         "position_action": "NEW_POSITION_BUY", "book": "SWING_BOOK",
         "horizon": "SWING_CARRY", "entry_reason": "CI_BUY",
+        "meta":{"entry_decision_evidence_5w1h":original_5w1h,
+                "entry_decision_evidence_sha256":original_5w1h["sha256"]},
     })
     meta = {
+        "position_action":"NEW_POSITION_BUY",
+        "entry_decision_evidence_5w1h":original_5w1h,
+        "entry_decision_evidence_sha256":original_5w1h["sha256"],
         "env": "practice", "strategy_owner": "US_STANDARD", "sleeve_id": "US_STANDARD",
         "broker_account_hash": broker_hash, "trading_epoch_id": epoch,
         "portfolio_epoch_id": portfolio, "position_cycle_id": cycle,
@@ -2727,6 +2742,19 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
             ON CONFLICT(trading_epoch_id) DO UPDATE SET
                 account_id=EXCLUDED.account_id,status='ACTIVE'
         """), {"epoch": epoch, "account": account})
+        # The isolated fixture mirrors the portfolio identity columns consumed
+        # by the production scope binder, not a monkeypatched authorization.
+        conn.execute(text("""
+            CREATE TABLE portfolio_epochs(
+                portfolio_epoch_id TEXT PRIMARY KEY, trading_epoch_id TEXT NOT NULL,
+                env TEXT NOT NULL, account_id TEXT NOT NULL, status TEXT NOT NULL,
+                sid INTEGER NOT NULL, mode INTEGER NOT NULL, strategy TEXT NOT NULL
+            )
+        """))
+        conn.execute(text("""
+            INSERT INTO portfolio_epochs VALUES
+                (:portfolio,:epoch,'practice',:account,'ACTIVE',0,0,'US_STANDARD')
+        """), {"portfolio":portfolio,"epoch":epoch,"account":account})
         conn.execute(text("""
             INSERT INTO us_order_intents
                 (trade_date,client_order_key,symbol,exchange,side,qty,
@@ -2741,10 +2769,10 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
             INSERT INTO us_orders
                 (trade_date,client_order_key,symbol,exchange,side,
                  qty_requested,qty_filled,order_no,status,trading_epoch_id,
-                 account_id,portfolio_epoch_id,position_cycle_id,meta)
+                 account_id,portfolio_epoch_id,position_cycle_id,meta,dry_run)
             VALUES ('2026-11-10',:key,'AMGN','NASDAQ','BUY',6,0,
                     :order_no,'ACK',:epoch,:account,:portfolio,:cycle,
-                    CAST(:meta AS jsonb))
+                    CAST(:meta AS jsonb),FALSE)
         """), {"key": key, "order_no": order_no, "epoch": epoch,
                "account": broker_hash, "portfolio": portfolio,
                "cycle": cycle, "meta": json.dumps(meta)})
@@ -2897,16 +2925,41 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
             ON us_position_risk_state(trading_epoch_id, trade_date, symbol)
         """))
         conn.execute(text("""
-            INSERT INTO us_position_risk_state(trading_epoch_id,trade_date,symbol,state)
-            VALUES (:epoch,'2026-11-10','AMGN',CAST(:state AS jsonb))
-            ON CONFLICT(trading_epoch_id,trade_date,symbol)
-            DO UPDATE SET state=EXCLUDED.state
-        """), {"epoch": epoch, "state": json.dumps({"lifecycle": first_lifecycle})})
+            DELETE FROM us_position_risk_state
+            WHERE trading_epoch_id=:epoch AND trade_date='2026-11-10' AND symbol='AMGN'
+        """), {"epoch": epoch})
 
+    # Build the actual risk lifecycle from the persisted native fill chain,
+    # without pre-seeding a lifecycle or fabricating a raw-account fill.
+    from trader.us.position_lifecycle_state import (
+        reconcile_us_position_lifecycles, update_us_position_high_watermark,
+    )
+    from trader import account_state
+    monkeypatch.setenv("WSL_RUN_MARKET", "US")
+    monkeypatch.setattr(account_state, "get_account_key", lambda **kw: account)
+    monkeypatch.setattr(account_state, "resolve_env_name", lambda *a, **kw: "practice")
+    initial = [p for p in repos.load_positions("2026-11-10") if p["symbol"] == "AMGN"]
+    assert len(initial) == 1
+    assert initial[0]["account_id"] == broker_hash
+    first_now = datetime.fromisoformat("2026-11-10T20:00:00+00:00")
+    initialized = reconcile_us_position_lifecycles(
+        positions=initial, trade_date="2026-11-10", now=first_now,
+        authoritative=True, env="practice", managed_owners={"US_STANDARD"},
+    )["AMGN"]
+    assert initialized["lifecycle_id"] == cycle
+    assert initialized["opened_at_source"] == "confirmed_buy_fill"
+    assert initialized["entry_policy"]["entry_exit_contract_sha256"] == contract["sha256"]
+    first_lifecycle = update_us_position_high_watermark(
+        symbol="AMGN", trade_date="2026-11-10", lifecycle_id=cycle,
+        current_price=470.0, entry_price=461.8, now=first_now, position=initial[0],
+    )
+    assert first_lifecycle["high_watermark"] == 470.0
+
+    runtime_position = {"symbol": "AMGN", "exchange": "NASDAQ", "qty": 6,
+                        "avg_cost": 461.8, "current_px": 469.0,
+                        "balance_source": "kis_balance_authoritative", "meta": {}}
     assert repos.save_position_snapshot(
-        [{"symbol": "AMGN", "exchange": "NASDAQ", "qty": 6,
-          "avg_cost": 461.8, "current_px": 469.0,
-          "balance_source": "kis_balance_authoritative", "meta": {}}],
+        [runtime_position],
         trade_date="2026-11-11",
         balance_fetch_status="OK", balance_parse_status="OK",
         authoritative_positions=True, preserve_previous_positions=False,
@@ -2923,6 +2976,66 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
     assert tomorrow["meta"]["position_lifecycle_id"] == cycle
     assert tomorrow["meta"]["lineage_identity_status"] == "VERIFIED_CURRENT_EPOCH_CONTINUITY"
     assert tomorrow["meta"]["entry_exit_contract_sha256"] == contract["sha256"]
+    # The live runner consumes the original broker dict, not a separate SELECT.
+    assert runtime_position["position_lifecycle_id"] == cycle
+    assert runtime_position["strategy_owner"] == "US_STANDARD"
+    assert runtime_position["meta"]["entry_exit_contract_sha256"] == contract["sha256"]
+    assert runtime_position["qty"] == 6
+    assert runtime_position["current_px"] == 469.0
+
+    # Regression 2026-11-23: a verified native BUY and snapshot can both
+    # be durable, yet the restarted DB consumer formerly compared its
+    # SHA256 SQL account column to the raw lifecycle account. Exercise
+    # the real SELECT and reconcile path, not an injected position dict.
+    from trader.us.position_lifecycle_state import (
+        reconcile_us_position_lifecycles, update_us_position_high_watermark,
+    )
+    from trader import account_state
+    monkeypatch.setenv("WSL_RUN_MARKET", "US")
+    monkeypatch.setattr(account_state, "get_account_key", lambda **kw: account)
+    monkeypatch.setattr(account_state, "resolve_env_name", lambda *a, **kw: "practice")
+    restarted = repos.load_positions("2026-11-11")
+    held = [p for p in restarted if p["symbol"] == "AMGN"]
+    assert len(held) == 1
+    assert held[0]["account_id"] == broker_hash
+    assert held[0]["meta"]["account_id"] == account
+    next_now = datetime.fromisoformat("2026-11-11T16:00:00+00:00")
+    # Soft-stop counters may be written before the next-day lifecycle.
+    # The current row must not hide the exact original risk leaf.
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO us_position_risk_state
+                (trading_epoch_id,trade_date,symbol,soft_stop_breach_count,state)
+            VALUES (:epoch,'2026-11-11','AMGN',1,'{}'::jsonb)
+            ON CONFLICT(trading_epoch_id,trade_date,symbol)
+            DO UPDATE SET soft_stop_breach_count=1,state='{}'::jsonb
+        """), {"epoch": epoch})
+    next_lifecycle = reconcile_us_position_lifecycles(
+        positions=held, trade_date="2026-11-11", now=next_now,
+        authoritative=False, env="practice", managed_owners={"US_STANDARD"},
+    )["AMGN"]
+    assert held[0]["lifecycle_identity_status"] == "IDENTIFIED"
+    assert next_lifecycle["lifecycle_id"] == cycle
+    assert next_lifecycle["opened_trade_date"] == "2026-11-10"
+    assert next_lifecycle["high_watermark"] == 470.0
+    assert next_lifecycle["entry_policy"]["entry_exit_contract_sha256"] == contract["sha256"]
+    high = update_us_position_high_watermark(
+        symbol="AMGN", trade_date="2026-11-11", lifecycle_id=cycle,
+        current_price=471.0, entry_price=461.8, now=next_now, position=held[0],
+    )
+    assert high["high_watermark"] == 471.0
+    assert high["lifecycle_id"] == cycle
+    assert high["account_id"] == account
+    # A mismatched caller must not overwrite that durable original cycle.
+    wrong = {**held[0], "account_id": "f" * 64}
+    with pytest.raises(ValueError, match="US_HIGH_WATERMARK_ORIGINAL_SCOPE_UNVERIFIED"):
+        update_us_position_high_watermark(
+            symbol="AMGN", trade_date="2026-11-11", lifecycle_id=cycle,
+            current_price=999.0, entry_price=461.8, now=next_now, position=wrong,
+        )
+    durable = repos.load_latest_us_position_risk_state("AMGN", "2026-11-11")
+    assert durable["state"]["lifecycle"]["high_watermark"] == 471.0
+    monkeypatch.delenv("WSL_RUN_MARKET", raising=False)
 
     # An actual PostgreSQL / repo-reconciled partial SELL in the SAME scoped
     # cycle must not orphan the original BUY V2/V3 on the next KIS balance day.
@@ -3064,7 +3177,9 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
                         lambda _conn=None, **_kw: epoch)
     monkeypatch.setattr(repos, "_us_state_epoch_id",
                         lambda _conn=None, **_kw: epoch)
-    monkeypatch.setenv("WSL_RUN_MARKET", "")
+    # Exercise production WSL identity gates rather than disabling them in
+    # the offline broker-boundary replay. No native KIS client is constructed.
+    monkeypatch.setenv("WSL_RUN_MARKET", "US")
     monkeypatch.setenv("US_ACCOUNT_RESERVATION_MODE", "OFF")
     monkeypatch.setenv("US_ATOMIC_CLAIM_OUTBOX_ENABLED", "0")
     monkeypatch.setattr(order_router, "resolve_dry_run_for_us_order", lambda: False)
@@ -3127,6 +3242,32 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
     tp2_intent.setdefault("orderable_qty", 4)
     tp2_intent.setdefault("sellable_qty", 4)
     tp2_intent.setdefault("available_qty", 4)
+    # Independently verify the exact historical BUY quantity (six) even
+    # though the currently held quantity is only four after TP1.
+    from trader.us.execution.recovery_identity import (
+        USRecoveryScope, bind_existing_standard_order_buy_source,
+    )
+    scope = USRecoveryScope("practice", broker_hash, epoch, portfolio, cycle, "US_STANDARD")
+    with pg_engine.connect() as conn:
+        receipt = bind_existing_standard_order_buy_source(
+            tp2_intent, conn=conn, scope=scope, raw_account=account,
+        )
+        assert receipt["source_buy_client_order_key"] == key
+        assert receipt["source_entry_contract_sha256"] == contract["sha256"]
+        assert receipt["position_cycle_id"] == cycle
+        for field in ("source_entry_contract_sha256", "source_entry_contract_version"):
+            wrong = {**tp2_intent, "meta": dict(tp2_intent["meta"])}
+            wrong["meta"][field] = "foreign-contract"
+            with pytest.raises(RuntimeError, match="US_SST_ORIGINAL_CONTRACT_CONFLICT"):
+                bind_existing_standard_order_buy_source(
+                    wrong, conn=conn, scope=scope, raw_account=account,
+                )
+        with pytest.raises(ValueError, match="US_SST_HOLDING_SCOPE_CONFLICT"):
+            bind_existing_standard_order_buy_source(
+                tp2_intent, conn=conn, raw_account=account,
+                scope=USRecoveryScope("practice", broker_hash, epoch, portfolio,
+                                      "foreign-cycle", "US_STANDARD"),
+            )
     routed_tp2 = route_exit_orders_immediately(
         [tp2_intent], buy_daily_notional=0, position_count=1,
         effective_budget=10000, signal_only=False, kis_order_allowed=True,
@@ -3140,6 +3281,26 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
         "2026-11-13", ["AMGN"], {"AMGN": cycle},
     )["AMGN"]
     assert pending_tp2["tp2_done"] is False
+    # Corrupted replay metadata cannot replace the durable original receipt,
+    # even when the incoming KIS order/cumulative quantity otherwise matches.
+    bad_fill = repos.mark_order_filled_by_reconcile(
+        order_no="CI-AMGN-TP2-SELL",
+        client_order_key=tp2_intent["client_order_key"],
+        symbol="AMGN", side="SELL", filled_qty=tp2_qty, requested_qty=tp2_qty,
+        cumulative_filled_qty=tp2_qty, avg_price_usd=490.0,
+        trade_date="2026-11-13", evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        source="fills_by_order_no",
+        meta={**meta, "profit_capture_stage":"tp2",
+              "source_entry_contract_sha256":"foreign-contract"},
+    )
+    assert bad_fill["status"] == "FILL_ORIGINAL_CONTRACT_CONFLICT", bad_fill
+    with pg_engine.connect() as conn:
+        rejected = conn.execute(text("""
+            SELECT qty_filled,status,meta FROM us_orders
+            WHERE order_no='CI-AMGN-TP2-SELL'
+        """)).mappings().one()
+        assert rejected["qty_filled"] == 0 and rejected["status"] == "ACK"
+        assert rejected["meta"]["us_original_buy_sst_v1"] == receipt
     tp2_fill = repos.mark_order_filled_by_reconcile(
         order_no="CI-AMGN-TP2-SELL",
         client_order_key=tp2_intent["client_order_key"],
@@ -3186,7 +3347,41 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
         """)).mappings().one()
     assert persisted["fill_qty"] == tp2_qty
     assert persisted["order_meta"]["source_entry_contract_sha256"] == contract["sha256"]
+    assert persisted["order_meta"]["us_original_buy_sst_v1"] == receipt
+    assert persisted["fill_meta"]["us_original_buy_sst_v1"] == receipt
     assert persisted["fill_meta"]["position_lifecycle_id"] == cycle
+    # Independently re-read the original native BUY (not the SELL's copy)
+    # and verify durable 5W1H linkage through the actual PG router + fill.
+    from trader.us.original_buy_lineage import prove_open_standard_buy_source
+    with pg_engine.connect() as conn:
+        original_audit = prove_open_standard_buy_source(
+            conn=conn,symbol="AMGN",trade_date="2026-11-13",
+            identity={**scope.as_dict(),"account_id":account,"position_lifecycle_id":cycle},
+        )
+    binding = original_audit["original_buy_decision_binding"]
+    assert binding["source_entry_lifecycle_id"] == "ENTRY:US_STANDARD:AMGN"
+    assert binding["position_cycle_id"] == cycle
+    for durable_meta in (persisted["order_meta"],persisted["fill_meta"]):
+        assert durable_meta["source_entry_reason"] == "CI_BUY"
+        assert durable_meta["source_entry_decision_sha256"] == original_5w1h["sha256"]
+        assert durable_meta["us_original_buy_decision_binding_v1"] == binding
+        assert verify_exit_entry_link(durable_meta["exit_decision_evidence_5w1h"],
+                                      original_5w1h,original_buy_binding=binding)
+    assert verify_decision_evidence(original_5w1h)
+    # Latest zero must fence the old original even while history is intact.
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO us_positions(as_of,symbol,exchange,qty,trading_epoch_id,
+                                     account_id,portfolio_epoch_id,position_cycle_id,meta)
+            VALUES ('2026-11-14','AMGN','NASDAQ',0,:epoch,:account,:portfolio,:cycle,
+                    CAST(:meta AS jsonb))
+        """), {"epoch":epoch,"account":broker_hash,"portfolio":portfolio,
+               "cycle":cycle,"meta":json.dumps(carried["meta"])})
+        with pytest.raises(ValueError, match="US_SST_OPEN_HOLDING_UNVERIFIED"):
+            bind_existing_standard_order_buy_source(
+                {**tp2_intent, "trade_date":"2026-11-14"},
+                conn=conn, scope=scope, raw_account=account,
+            )
 
 
 def test_pg_original_signed_buy_contract_survives_raw_snapshot_upsert(pg_engine, monkeypatch):
@@ -3891,7 +4086,10 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
                 # The fake broker may have received the economic order; this
                 # transport error MUST NOT authorize a second native POST.
                 raise TimeoutError("synthetic_unknown_ack_after_post")
-            return {"ok": True, "order_no": "CI-BUY-EIGHT"}
+            return {"ok": True, "order_no": (
+                "CI-BUY-EIGHT-REENTRY" if sum(p[0] == "BUY" for p in self.posts) > 1
+                else "CI-BUY-EIGHT"
+            )}
 
         def place_us_sell_order(self, sym, exchange, qty, price):
             assert sym == symbol and exchange == "NASDAQ"
@@ -4368,6 +4566,9 @@ engine.dispose()
     assert sell_row["order_meta"]["source_entry_contract_sha256"] == signed["sha256"]
     assert (sell_row["order_cycle"],sell_row["fill_cycle"]) == (cycle,cycle)
     assert sell_row["fill_meta"]["source_entry_contract_sha256"] == signed["sha256"]
+    assert sell_row["order_meta"]["us_original_buy_sst_v1"] == sell_row["fill_meta"]["us_original_buy_sst_v1"]
+    assert sell_row["order_meta"]["us_original_buy_sst_v1"]["source_buy_client_order_key"] == "ci-eight-original-buy"
+    assert sell_row["order_meta"]["us_original_buy_sst_v1"]["position_cycle_id"] == cycle
     if paper_profile:
         with engine.connect() as conn:
             original_count = conn.execute(text("""
@@ -4394,6 +4595,115 @@ engine.dispose()
             assert conn.execute(text("""
                 SELECT count(*) FROM us_fills WHERE order_no='CI-SELL-EIGHT'
             """)).scalar_one() == original_count
+
+
+    if (not paper_profile and selected_style == "ENTRY_PULLBACK"
+            and contract_mode == "V3_ACTIVE_PRACTICE"):
+        # Full original lifecycle, not just a SELL ACK. Hard-stop all shares,
+        # authoritative flat observation, then a genuine next-day BUY using
+        # the production router and a new deterministic cycle.
+        from trader.us.position_lifecycle_state import reconcile_us_position_lifecycles
+        from trader.us.execution.recovery_identity import (
+            USRecoveryScope, bind_existing_standard_order_buy_source,
+        )
+        assert actual_sell_qty == 6
+        broker.qty = 0
+        assert repos.save_position_snapshot(
+            [], trade_date="2026-11-11", balance_fetch_status="OK",
+            balance_parse_status="OK", authoritative_positions=True,
+            preserve_previous_positions=False,
+        ) == 0
+        closed = reconcile_us_position_lifecycles(
+            positions=[], trade_date="2026-11-11", now=datetime.now(timezone.utc),
+            authoritative=True, env="practice", managed_owners={"US_STANDARD"},
+        )[symbol]
+        assert closed["is_open"] is False and closed["lifecycle_id"] == cycle
+        assert not repos.load_us_positions_by_symbols([symbol], as_of="2026-11-11")
+        old_scope = USRecoveryScope("practice", account_hash, epoch, portfolio,
+                                   cycle, "US_STANDARD")
+        with engine.connect() as conn:
+            with pytest.raises(ValueError, match="US_SST_OPEN_HOLDING_UNVERIFIED"):
+                bind_existing_standard_order_buy_source(
+                    {**sell, "trade_date":"2026-11-12"},
+                    conn=conn, scope=old_scope, raw_account=raw_account,
+                )
+        next_cycle = hashlib.sha256("|".join((
+            account_hash, epoch, portfolio, "US_STANDARD", symbol,
+            "2026-11-12", "NEW_POSITION_BUY",
+        )).encode("utf-8")).hexdigest()[:32]
+        assert next_cycle != cycle
+        # No old BUY metadata, previous action, contract or receipt may
+        # leak into the new order. The router signs its own new BUY.
+        new_buy = {
+            **{k: original_intent[k] for k in (
+                "symbol", "exchange", "side", "qty", "limit_price", "notional_usd",
+                "strategy_owner", "sleeve_id", "strategy", "strategy_name",
+                "strategy_version", "entry_style_selected", "position_action",
+                "entry_reason", "book", "horizon", "theme_cluster",
+                "classification_source", "position_state",
+            )},
+            "trade_date":"2026-11-12", "client_order_key":"ci-eight-reentry",
+            "meta": {
+                "entry_style_selected":selected_style,
+                "theme_cluster":"OTHER", "classification_source":"CI_FINAL30_OFFLINE",
+                "position_state":"NEW", "position_action":"NEW_POSITION_BUY",
+            },
+        }
+        order_router._capture_native_buy_baseline(new_buy, broker, None)
+        reentry = route_order(
+            new_buy, kis_client=broker, allowed_symbols={symbol},
+            current_position_symbols=set(), total_portfolio_usd=20000,
+            available_cash_usd=10000,
+            now=datetime(2026,11,12,16,tzinfo=timezone.utc),
+        )
+        assert reentry["status"] == "ACK", reentry
+        assert broker.posts[-1] == ("BUY", symbol, 6)
+        with engine.connect() as conn:
+            new_order = conn.execute(text("""
+                SELECT meta,position_cycle_id FROM us_orders
+                WHERE order_no='CI-BUY-EIGHT-REENTRY'
+            """)).mappings().one()
+        assert new_order["position_cycle_id"] == next_cycle
+        assert verify_us_entry_exit_contract(new_order["meta"]["entry_exit_contract"])
+        new_fill = repos.mark_order_filled_by_reconcile(
+            order_no="CI-BUY-EIGHT-REENTRY",client_order_key="ci-eight-reentry",
+            symbol=symbol,side="BUY",filled_qty=6,requested_qty=6,
+            cumulative_filled_qty=6,avg_price_usd=10.0,trade_date="2026-11-12",
+            evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",source="fills_by_order_no",
+            meta={**new_order["meta"],"cumulative_filled_qty":6},
+        )
+        assert new_fill["status"] == "OK", new_fill
+        broker.qty = 6
+        assert repos.save_position_snapshot(
+            [{"symbol":symbol,"exchange":"NASDAQ","qty":6,"avg_cost":10.0,
+              "current_px":10.0,"balance_source":"kis_balance_authoritative","meta":{}}],
+            trade_date="2026-11-12",balance_fetch_status="OK",
+            balance_parse_status="OK",authoritative_positions=True,
+            preserve_previous_positions=False,
+        ) == 1
+        reopened = reconcile_us_position_lifecycles(
+            positions=repos.load_positions("2026-11-12"),
+            trade_date="2026-11-12",now=datetime.now(timezone.utc),
+            authoritative=True,env="practice",managed_owners={"US_STANDARD"},
+        )[symbol]
+        assert reopened["is_open"] is True
+        assert reopened["lifecycle_id"] == next_cycle
+        assert reopened["opened_trade_date"] == "2026-11-12"
+        assert reopened["high_watermark"] == 10.0
+        with engine.connect() as conn:
+            with pytest.raises(ValueError,match="US_SST_HOLDING_SCOPE_CONFLICT"):
+                bind_existing_standard_order_buy_source(
+                    {**sell,"trade_date":"2026-11-12"},
+                    conn=conn,scope=old_scope,raw_account=raw_account,
+                )
+            new_scope = USRecoveryScope("practice",account_hash,epoch,portfolio,
+                                        next_cycle,"US_STANDARD")
+            new_receipt = bind_existing_standard_order_buy_source(
+                {"symbol":symbol,"trade_date":"2026-11-12","side":"SELL","meta":{}},
+                conn=conn,scope=new_scope,raw_account=raw_account,
+            )
+            assert new_receipt["source_buy_client_order_key"] == "ci-eight-reentry"
+            assert new_receipt["position_cycle_id"] == next_cycle
 
 
 def test_pg_authoritative_balance_survives_optional_lineage_query_exception(

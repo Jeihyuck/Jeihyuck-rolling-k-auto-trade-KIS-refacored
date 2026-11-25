@@ -250,7 +250,12 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
         balance_fetch_ok = False
         try:
             balance = provider.get_balance()
-            balance_fetch_ok = isinstance(balance, dict) and str(balance.get("balance_parse_status", "OK")) == "OK"
+            balance_fetch_ok = (
+                isinstance(balance, dict)
+                and str(balance.get("balance_parse_status", "OK")) == "OK"
+                and balance.get("balance_complete") is not False
+                and balance.get("balance_authoritative") is not False
+            )
         except Exception as exc:
             logger.warning("[US_TRADE_CLOSE][WARN] balance fetch failed: %s", exc)
 
@@ -382,7 +387,7 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
         final_balance_unresolved = not offline and (
             reconcile_status == "TEMP_ERROR"
             or str(reconcile_result.get("balance_fetch_status") or "").upper()
-            in {"FAILED", "ERROR", "TEMP_ERROR"}
+            in {"FAILED", "ERROR", "TEMP_ERROR", "INCOMPLETE"}
         )
         if final_balance_unresolved:
             report_consistency = worsen_consistency(report_consistency, "FAILED")

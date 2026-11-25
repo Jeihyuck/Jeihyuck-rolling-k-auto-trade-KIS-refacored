@@ -1018,3 +1018,74 @@ def test_legacy_scoped_hard_stop_debt_replays_with_exact_active_epoch(scenario, 
         pending=[{**debt, "trading_epoch_id": "retired-epoch"}], now=now,
     ) == []
     assert built == []
+
+
+def test_legacy_original_high_watermark_survives_empty_current_day(scenario, monkeypatch):
+    from contextlib import contextmanager
+    from datetime import datetime, timezone
+    from trader import account_state
+    from trader.us import position_lifecycle_state as lifecycle
+    from trader.us.db import repos
+
+    db, client, _ = scenario
+    db.history["lifecycle"].update({
+        "high_watermark": 125.0,
+        "high_watermark_at": "2026-11-04T16:00:00+00:00",
+        "high_watermark_source": "us_position_risk_state",
+    })
+    class Engine:
+        @contextmanager
+        def connect(self):
+            yield db
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: Engine())
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda *a, **kw: EPOCH)
+    monkeypatch.setattr(account_state, "resolve_env_name", lambda: "practice")
+    writes = []
+    monkeypatch.setattr(lifecycle, "load_latest_us_position_risk_state",
+                        lambda *a, **kw: {"trade_date": "2026-11-11", "state": {}})
+    monkeypatch.setattr(lifecycle, "_save_lifecycle",
+                        lambda sym, day, data: writes.append(dict(data)) or dict(data))
+    pos = {"symbol": SYMBOL, "qty": 4, "strategy_owner": "US_STANDARD",
+           "position_lifecycle_id": OLD_CYCLE, "account_id": RAW_ACCOUNT,
+           "env": "practice", "trading_epoch_id": EPOCH}
+    now = datetime(2026, 11, 11, 16, tzinfo=timezone.utc)
+    result = lifecycle.update_us_position_high_watermark(
+        symbol=SYMBOL, trade_date="2026-11-11", lifecycle_id=OLD_CYCLE,
+        current_price=120.0, entry_price=100.0, now=now, position=pos,
+    )
+    assert len(writes) == 1
+    assert result["high_watermark"] == 125.0
+    assert result["high_watermark_at"] == "2026-11-04T16:00:00+00:00"
+    assert result["opened_trade_date"] == "2026-10-27"
+    assert result["lifecycle_id"] == OLD_CYCLE
+    assert not result.get("portfolio_epoch_id")
+    assert not result.get("position_cycle_id")
+    assert client.order_days_requested == []
+
+    # After the initial recovery, a later peak in the same verified original
+    # must survive subsequent ticks; archived history is not the mutable HWM.
+    monkeypatch.setattr(lifecycle, "load_latest_us_position_risk_state",
+                        lambda *a, **kw: {"trade_date": "2026-11-11",
+                                         "state": {"lifecycle": dict(writes[-1])}})
+    new_high = lifecycle.update_us_position_high_watermark(
+        symbol=SYMBOL, trade_date="2026-11-11", lifecycle_id=OLD_CYCLE,
+        current_price=130.0, entry_price=100.0, now=now, position=pos,
+    )
+    assert new_high["high_watermark"] == 130.0 and len(writes) == 2
+    carried = lifecycle.update_us_position_high_watermark(
+        symbol=SYMBOL, trade_date="2026-11-11", lifecycle_id=OLD_CYCLE,
+        current_price=128.0, entry_price=100.0, now=now, position=pos,
+    )
+    assert carried["high_watermark"] == 130.0
+    assert carried["high_watermark_at"] == new_high["high_watermark_at"]
+    assert len(writes) == 2
+
+    # An asserted original flag cannot substitute for matching native net fills.
+    pos["qty"] = 3
+    pos["legacy_nine_decision_only_provisional"] = True
+    with pytest.raises(ValueError, match="US_HIGH_WATERMARK_LEGACY_ORIGINAL_UNVERIFIED"):
+        lifecycle.update_us_position_high_watermark(
+            symbol=SYMBOL, trade_date="2026-11-11", lifecycle_id=OLD_CYCLE,
+            current_price=999.0, entry_price=100.0, now=now, position=pos,
+        )
+    assert len(writes) == 2

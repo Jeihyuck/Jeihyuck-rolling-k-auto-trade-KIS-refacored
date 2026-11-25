@@ -27,6 +27,12 @@ kr_pb1_entry_timing_defaults() {
         ;;
     esac
     export KR_PB1_ENTRY_TIMING_APPROVED="${KR_PB1_ENTRY_TIMING_APPROVED:-1}"
+    # V2 is active for the approved practice AM/PM profile, not shadow.
+    export KR_PB1_ENTRY_OPPORTUNITY_POLICY="${KR_PB1_ENTRY_OPPORTUNITY_POLICY:-US_ALIGNED_V2}"
+    case "$KR_PB1_ENTRY_OPPORTUNITY_POLICY" in
+      US_ALIGNED_V2|LEGACY_V1) ;;
+      *) export KR_PB1_ENTRY_TIMING_APPROVED=0 ;;
+    esac
     # The old quote-only parallel SHADOW must not mask the mandatory
     # completed KIS 1m ENFORCE gate or be mistaken for live BUY authorization.
     export KR_PB1_ENTRY_TIMING_SHADOW_ENABLED=0
@@ -39,13 +45,14 @@ kr_pb1_entry_timing_defaults() {
     # practice-scoped. Real order logic never waits on the read-only collector.
     export KR_PB1_KIS_OBSERVER_BUDGET_ENABLED="${KR_PB1_KIS_OBSERVER_BUDGET_ENABLED:-1}"
   else
+    export KR_PB1_ENTRY_OPPORTUNITY_POLICY=LEGACY_V1
     export KR_PB1_ENTRY_TIMING_MODE="${KR_PB1_ENTRY_TIMING_MODE:-SHADOW}"
     export KR_PB1_ENTRY_TIMING_APPROVED="${KR_PB1_ENTRY_TIMING_APPROVED:-0}"
     export KR_PB1_ENTRY_TIMING_SHADOW_ENABLED="${KR_PB1_ENTRY_TIMING_SHADOW_ENABLED:-0}"
     export KR_PB1_OPENING_OBSERVER_ENABLED=0
     export KR_PB1_KIS_OBSERVER_BUDGET_ENABLED=0
   fi
-  echo "[KR][ENTRY_TIMING][EFFECTIVE_CONFIG] strategy_env=${STRATEGY_ENV:-unknown} kis_env=${KIS_ENV:-unknown} mode=$KR_PB1_ENTRY_TIMING_MODE approved=$KR_PB1_ENTRY_TIMING_APPROVED legacy_quote_shadow=DISABLED opening_observer=$KR_PB1_OPENING_OBSERVER_ENABLED interval_sec=${KR_PB1_OPENING_OBSERVER_INTERVAL_SEC:-n/a}"
+  echo "[KR][ENTRY_TIMING][EFFECTIVE_CONFIG] strategy_env=${STRATEGY_ENV:-unknown} kis_env=${KIS_ENV:-unknown} mode=$KR_PB1_ENTRY_TIMING_MODE approved=$KR_PB1_ENTRY_TIMING_APPROVED policy=$KR_PB1_ENTRY_OPPORTUNITY_POLICY legacy_quote_shadow=DISABLED opening_observer=$KR_PB1_OPENING_OBSERVER_ENABLED interval_sec=${KR_PB1_OPENING_OBSERVER_INTERVAL_SEC:-n/a}"
   if [[ "${STRATEGY_ENV:-}" == "practice" && "${KIS_ENV:-}" == "practice" ]] &&
      { [[ "$KR_PB1_ENTRY_TIMING_MODE" != "ENFORCE" ]] ||
        [[ "$KR_PB1_ENTRY_TIMING_APPROVED" != "1" ]] ||

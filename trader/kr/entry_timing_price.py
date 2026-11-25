@@ -92,8 +92,14 @@ def resolve_bounded_prpr_limit(
     last = _pos(quote.get("last") or quote.get("prpr") or quote.get("stck_prpr"))
     if last is None:
         return block("QUOTE_LAST_UNVERIFIED")
-    lower = reference * (1 - MAX_ORDER_PRICE_DEVIATION)
-    upper = min(reference * (1 + MAX_ORDER_PRICE_DEVIATION), strategy_cap, original)
+    # Only the V2 evaluator's actual proof can select the new bound.
+    # Never widen a legacy or breakout proof by reading an environment flag.
+    deviation = MAX_ORDER_PRICE_DEVIATION
+    if timing.get("entry_policy") == "US_ALIGNED_V2":
+        from trader.kr.entry_opportunity_v2 import MAX_DEVIATION
+        deviation = MAX_DEVIATION
+    lower = reference * (1 - deviation)
+    upper = min(reference * (1 + deviation), strategy_cap, original)
     # A materially different last trade means that source quote and completed
     # minute proof do not represent the same acceptable trading region.
     if not lower <= last <= upper:
@@ -145,7 +151,7 @@ def maybe_bound_pb1_prpr_fallback(
     import os
     from trader.account_state import get_account_key
     from trader.kr.opening_bar_contract import (
-        evaluate_proof_for_candidate, load_opening_proof,
+        evaluate_proof_for_candidate, load_opening_proof, active_entry_policy,
     )
     features = getattr(cf, "features", None)
     if not isinstance(features, dict):
@@ -173,7 +179,10 @@ def maybe_bound_pb1_prpr_fallback(
     close = _pos(bars[-1].get("close")) if bars else None
     if close is None:
         return {"state": "BLOCK", "reason": "NATIVE_MINUTE_PROOF_UNAVAILABLE"}
-    if reference_price / close <= 1 + MAX_ORDER_PRICE_DEVIATION:
+    # V2 may need to reduce synthetic slippage even inside the 1% region
+    # because the signed risk/reward ceiling can be lower than that price.
+    if (active_entry_policy("practice") != "US_ALIGNED_V2"
+            and reference_price / close <= 1 + MAX_ORDER_PRICE_DEVIATION):
         return {"state": "NOT_APPLICABLE"}
     style = str(
         features.get("entry_style_selected")
@@ -196,6 +205,8 @@ def maybe_bound_pb1_prpr_fallback(
         quote = engine._get_price_snapshot_cached(symbol, market="J")
     except Exception:
         return {"state": "BLOCK", "reason": "QUOTE_FETCH_UNAVAILABLE"}
+    if active_entry_policy("practice") == "US_ALIGNED_V2" and reference_price <= float(timing.get("max_entry_price") or 0):
+        return {"state": "NOT_APPLICABLE"}
     return resolve_bounded_prpr_limit(
         code=symbol, original_price=reference_price,
         timing=timing,

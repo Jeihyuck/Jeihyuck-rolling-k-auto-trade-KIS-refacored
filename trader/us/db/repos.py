@@ -5731,10 +5731,12 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
             })
         return len(positions)
     count = 0
+    verified_runtime_updates = []
     try:
         with engine.begin() as conn:
             trading_epoch_id = _active_us_epoch(conn)
             for p in positions:
+                runtime_position = p
                 # Proactively bind a NEW US_STANDARD BUY from the original,
                 # uniquely matching KIS fill/order/intent *before* writing
                 # the first authoritative broker balance snapshot. Never
@@ -5983,6 +5985,14 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                             str(stored.get("persisted_lifecycle") or "") != verified_identity["position_lifecycle_id"],
                         )):
                             raise RuntimeError("US_SNAPSHOT_IDENTITY_READBACK_MISMATCH")
+                if verified_identity:
+                    # The proof is currently attached to a local copy only.
+                    # Carry it to the SAME broker observation after commit;
+                    # downstream risk code must see the identical BUY scope.
+                    verified_runtime_updates.append((runtime_position, {
+                        **verified_identity, "trading_epoch_id": trading_epoch_id,
+                        "meta": dict(meta_to_store),
+                    }))
                 count += 1
             if stale_close_requested:
                 params = {"td": td, "symbols": symbols, "source": close_source}
@@ -5998,6 +6008,10 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                     params["trading_epoch_id"] = trading_epoch_id
                 sql += " AND NOT (UPPER(symbol) = ANY(CAST(:symbols AS text[])))"
                 conn.execute(text(sql), params)
+        # No mutation on rollback or conflicting RETURNING proof. Quantity,
+        # price and orderability stay on the authoritative broker observation.
+        for runtime_position, verified_context in verified_runtime_updates:
+            runtime_position.update(verified_context)
     except Exception as exc:
         logger.error("[US_POSITIONS][SNAPSHOT][ERROR] %s", exc)
         if authoritative_positions:
@@ -6611,9 +6625,16 @@ def mark_order_filled_by_reconcile(
         cumulative = max(previous, min(observed_cumulative, requested))
         remaining = max(0, requested - cumulative)
         status = "ACK" if cumulative <= 0 else "PARTIALLY_FILLED" if remaining else "FILLED"
-        order_meta = {**_parse_json_meta(order.get("meta")), **(meta or {}),
-                      "remaining_qty": remaining, "fill_evidence_type": evidence,
-                      "is_synthetic": synthetic}
+        from trader.us.position_contract_provenance import merge_original_order_contract_metadata
+        try:
+            preserved_meta = merge_original_order_contract_metadata(
+                _parse_json_meta(order.get("meta")), meta or {},
+            )
+        except ValueError as exc:
+            return {"status": "FILL_ORIGINAL_CONTRACT_CONFLICT", "reason": str(exc),
+                    "retry_order": False, "entry_fence": True, "requires_reconcile": True}
+        order_meta = {**preserved_meta, "remaining_qty": remaining,
+                      "fill_evidence_type": evidence, "is_synthetic": synthetic}
         promotion = {"superseded": 0, "conflict": 0}
         if not synthetic:
             promotion = _supersede_synthetic_fills_for_actual(trade_date=td, order_no=on, client_order_key=cok or order.get("client_order_key") or "", cumulative=observed_cumulative)
@@ -6771,9 +6792,16 @@ def mark_order_filled_by_reconcile(
                     "field": immutable_key, "retry_order": False,
                     "entry_fence": True,
                 })
+        from trader.us.position_contract_provenance import merge_original_order_contract_metadata
+        try:
+            preserved_meta = merge_original_order_contract_metadata(source_meta, incoming_meta)
+        except ValueError as exc:
+            raise FillAccountingInvariantError({
+                "status": "FILL_ORIGINAL_CONTRACT_CONFLICT", "reason": str(exc),
+                "retry_order": False, "entry_fence": True, "requires_reconcile": True,
+            }) from exc
         merged = {
-            **source_meta,
-            **incoming_meta,
+            **preserved_meta,
             "remaining_qty": remaining,
             "fill_evidence_type": evidence,
             "is_synthetic": synthetic,
@@ -7206,18 +7234,20 @@ def load_us_positions_by_symbols(
             with engine.begin() as conn:
                 epoch_id = _active_us_epoch(conn)
                 sql = """
-                        SELECT DISTINCT ON (symbol)
-                            *
-                        FROM us_positions
-                        WHERE symbol = ANY(:syms)
-                          AND as_of <= :td
-                          AND qty > 0
+                        SELECT * FROM (
+                            SELECT DISTINCT ON (symbol) *
+                            FROM us_positions
+                            WHERE symbol = ANY(:syms)
+                              AND as_of <= :td
                 """
                 params = {"syms": list(symbols), "td": td}
                 if epoch_id:
                     sql += " AND trading_epoch_id=:epoch_id"
                     params["epoch_id"] = epoch_id
-                sql += " ORDER BY symbol, as_of DESC"
+                # A later authoritative zero is the end of this holding.
+                # Filter positive quantity AFTER selecting the newest row;
+                # otherwise a closed position can become an ADD parent again.
+                sql += " ORDER BY symbol, as_of DESC, created_at DESC, id DESC) latest WHERE qty > 0"
                 raw = conn.execute(text(sql), params)
                 rows = [dict(r._mapping) for r in raw]
         except Exception as exc:

@@ -86,7 +86,7 @@ def test_sparse_opening_native_18_bars_repaired_only_from_genuine_kis(setup_read
     )
     summary = proof.inspect_completed_bar_coverage(rows=persisted["bars"], now=now)
     assert result["completed"] == 1
-    assert [a for _, a in calls] == ["092900", "093600", "091500"]
+    assert [a for _, a in calls] == ["093600", "092900", "091500"]
     assert summary["opening_count"] == 30
     assert summary["state"] == "COVERED"
     assert not persisted["source_conflicts"]
