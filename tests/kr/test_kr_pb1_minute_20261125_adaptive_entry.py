@@ -280,3 +280,30 @@ def test_independent_watchdog_ignores_old_success_and_detects_stale_exact_run(tm
     current["status"]="OK"
     write()
     assert inspect(**kw)["state"] == "TERMINAL"
+
+
+def test_kr_daily_preload_only_queries_ttl_misses(monkeypatch):
+    from trader import pb1_engine as pb1
+    from trader import cache_ttl
+    from trader.db import engine as db
+    cache = cache_ttl.TTLCache()
+    monkeypatch.setattr(cache_ttl, "daily_cache", cache)
+    cached = object()
+    cache.set(("daily","251970",60), cached, 1800)
+    calls = []
+    marker = object()
+    monkeypatch.setattr(db, "make_engine", lambda: marker)
+    def bulk(engine, codes, start, end):
+        assert engine is marker
+        calls.append(list(codes))
+        return {}
+    monkeypatch.setattr(pb1, "load_price_daily_bulk", bulk)
+    engine = pb1.PB1Engine.__new__(pb1.PB1Engine)
+    engine._kr_pb1_batch_preload_ohlcv(["251970"],days=60)
+    assert calls == []
+    engine._kr_pb1_batch_preload_ohlcv(["251970","012750"],days=60)
+    assert calls == [["012750"]]
+    assert cache.get(("daily","251970",60)) is cached
+    cache.cache[("daily","251970",60)] = (cached, 0)
+    engine._kr_pb1_batch_preload_ohlcv(["251970"],days=60)
+    assert calls[-1] == ["251970"]
