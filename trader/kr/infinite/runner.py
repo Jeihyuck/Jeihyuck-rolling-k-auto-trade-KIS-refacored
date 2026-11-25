@@ -261,6 +261,7 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
             minutes_since_open=minutes_since_open,
         )
         retry_key = None
+        preview = None
         if allow_entry and position.qty > 0 and state is not None:
             sleeve_remaining = max(
                 0.0, float(state.allocated_capital_krw) - float(state.filled_notional),
@@ -312,7 +313,13 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
                         "unit_cap=%.0f action=REEVALUATE_OWNER_POLICY",
                         config.symbol, cash, sleeve_remaining, preview_cash,
                     )
-        decision = evaluate(orderable_cash=cash, **decision_args)
+        # An owner WAIT/BLOCK/SELL preview already proved that no BUY cash
+        # inquiry is necessary. Re-evaluating it with the synthetic zero cash
+        # would replace DUPLICATE_INTENT with INSUFFICIENT_STRATEGY_CAPITAL.
+        # A preview BUY still requires the authenticated actual cash evaluation.
+        decision = (preview if preview is not None and
+                    preview.action not in {Action.BUY, Action.RECOVERY}
+                    else evaluate(orderable_cash=cash, **decision_args))
         if decision.metadata and state is not None:
             durable = {key: value for key, value in decision.metadata.items()
                        if key not in {"profit_stage", "desired_profit_stage", "tp1_sold_qty", "remaining_qty"}}
