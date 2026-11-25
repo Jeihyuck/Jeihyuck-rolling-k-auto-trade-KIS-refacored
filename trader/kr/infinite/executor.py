@@ -266,6 +266,26 @@ class KISExecutor:
         )
         return None
 
+    def verify_no_same_day_symbol_order(self, symbol: str, day: date) -> bool:
+        """Conservative pre-hashkey retry evidence; no empty-on-error fallback.
+
+        Any native row for the symbol (including a cancelled or filled row)
+        blocks this narrow retry path. A missing symbol in any returned row
+        also prevents proving absence. No other order method is called.
+        """
+        if self.kis_env != "practice" or symbol != "122630":
+            return False
+        raw = self._original_daily_ccld_pages(day)
+        if (not isinstance(raw, dict) or raw.get("rt_cd") != "0"
+                or not raw.get("_kr_inf_ccld_verified_pages")
+                or not isinstance(raw.get("output1"), list)):
+            return False
+        for item in raw["output1"]:
+            code = str(item.get("pdno") or item.get("code") or "").strip().removeprefix("A")
+            if len(code) != 6 or not code.isascii() or not code.isdigit() or code == symbol:
+                return False
+        return True
+
     def order_state(self, intent: OrderIntent, trade_date: date) -> BrokerOrderState:
         # Reconcile against the order's original trading day, not the current
         # session day. Domestic day orders do not migrate to a later trade date;
