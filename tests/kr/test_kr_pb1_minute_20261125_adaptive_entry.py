@@ -388,3 +388,44 @@ def test_pure_daily_feature_cache_preserves_changed_frame_and_returns_copy(monke
     frame.loc[1, "close"] = 102
     assert engine._compute_kr_daily_features_cached("251970", frame, min_candles=2) == {"close":102.}
     assert calls == [2, 2]
+
+
+def test_closed_infinite_legacy_mirror_uses_exact_owner_economic_proof():
+    from datetime import datetime, timezone, date
+    from scripts.kr_close_settlement_audit import audit_sell_settlement
+    order_id = "mirror-order"
+    odno = "0000008799"
+    key = f"practice:pb1_pullback_close:20261027:122630:SELL:{odno}"
+    row = dict(source_order_id=order_id, source_client_order_key=key,
+               pdno="122630", odno=odno, ord_dt="20261027", sll_buy_dvsn_cd="01",
+               cncl_yn="N", ord_qty="5", tot_ccld_qty="5", rmn_qty="0",
+               tot_ccld_amt="358230", avg_prvs="71646", rjct_qty="0", cncl_cfrm_qty="0")
+    order = dict(code="122630", order_id=order_id, side="SELL", status="FILLED",
+                 qty=5, kis_odno=odno, broker_order_id=odno, client_order_key=key,
+                 position_cycle_id=None, created_at=datetime(2026,10,27,0,17,tzinfo=timezone.utc),
+                 response_json=row)
+    proof = dict(strategy_id="KR_INFINITE_V1", strategy_owner="KR_INFINITE",
+                 cycle_id="old-cycle", trade_date=date(2026,10,27), side="SELL_PARTIAL",
+                 status="FILLED", broker_order_id=odno, requested_qty=5, filled_qty=5,
+                 filled_notional_krw="358230", action="SELL:TP1",
+                 action_state="SATISFIED", target_qty=5, cumulative_filled_qty=5,
+                 remaining_target_qty=0, claim_conflicts=0, active_attempt_id=None,
+                 attempt_state="FILLED", authoritative=True, attempt_requested_qty=5,
+                 attempt_filled_qty=5, account_bound=True, attempt_bound=True)
+    def report(o=order, proofs=None, fills=None):
+        return audit_sell_settlement(orders=[o], fills=fills or [], positions=[],
+            trade_date=date(2026,11,25), infinite_owner_settlements=[proof] if proofs is None else proofs)
+    result = report()
+    assert result["gap_count"] == 0
+    assert result["stored_infinite_owner_sells_verified"] == 1
+    assert result["stored_infinite_owner_evidence"][0]["fresh_kis_query"] is False
+    for patch in ({"account_bound":False}, {"attempt_bound":False}, {"authoritative":False},
+                  {"action_state":"UNCERTAIN"}, {"active_attempt_id":"live"},
+                  {"claim_conflicts":1}, {"filled_notional_krw":"358231"}, {"filled_qty":4},
+                  {"trade_date":date(2026,11,27)}):
+        assert report(proofs=[{**proof, **patch}])["gap_count"] == 1
+    assert report(proofs=[proof, proof])["gap_count"] == 1
+    assert report(proofs=[])["gap_count"] == 1
+    assert report(o={**order,"response_json":{**row,"tot_ccld_qty":"0"}})["gap_count"] == 1
+    assert report(o={**order,"position_cycle_id":"pb1-owned"})["gap_count"] == 1
+    assert report(fills=[{"order_id":order_id,"side":"SELL","qty":5,"price":0}])["gap_count"] == 1
