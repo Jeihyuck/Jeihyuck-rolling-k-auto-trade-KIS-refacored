@@ -122,10 +122,45 @@ def _propagate_position_lifecycle(intent: dict | None, position: dict) -> dict |
         ),
         None,
     )
+    meta = dict(intent.get("meta")) if isinstance(intent.get("meta"), dict) else {}
+    # Preserve the canonical holding scope through BOTH exit books. A signed
+    # lifecycle alone is insufficient: without its portfolio/cycle the order
+    # router mistakes a new scoped holding for an unscoped historical BUY.
+    # This is data handoff only. The order router still independently proves
+    # the original native BUY, active account/epoch and durable scope.
+    scope_fields = ("position_cycle_id", "portfolio_epoch_id",
+                    "trading_epoch_id", "broker_account_hash", "env",
+                    "strategy_owner")
+    scope = {}
+    for field in scope_fields:
+        values = {
+            str(source[field]).strip()
+            for source in (position, position_meta, intent, meta)
+            if source.get(field) not in (None, "") and str(source[field]).strip()
+        }
+        if len(values) > 1:
+            logger.error("[US_EXIT_ROUTER][SCOPE_CONFLICT] symbol=%s field=%s",
+                         position.get("symbol"), field)
+            return None
+        if values:
+            scope[field] = next(iter(values))
+    if scope.get("position_cycle_id") and lifecycle_id and scope["position_cycle_id"] != lifecycle_id:
+        logger.error("[US_EXIT_ROUTER][SCOPE_CONFLICT] symbol=%s field=position_lifecycle_id",
+                     position.get("symbol"))
+        return None
     if lifecycle_id:
-        intent["position_lifecycle_id"] = str(lifecycle_id)
-        meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
-        intent["meta"] = {**meta, "position_lifecycle_id": str(lifecycle_id)}
+        for source in (position, position_meta, intent, meta):
+            supplied = str(source.get("position_lifecycle_id") or "").strip()
+            if supplied and supplied != lifecycle_id:
+                logger.error("[US_EXIT_ROUTER][SCOPE_CONFLICT] symbol=%s field=position_lifecycle_id",
+                             position.get("symbol"))
+                return None
+        scope["position_lifecycle_id"] = str(lifecycle_id)
+    # No missing scope is invented. Unscoped historical positions retain the
+    # existing forward-only proof path; canonical positions keep original IDs.
+    intent.update(scope)
+    meta.update(scope)
+    intent["meta"] = meta
     return intent
 
 

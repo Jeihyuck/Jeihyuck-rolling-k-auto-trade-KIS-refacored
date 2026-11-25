@@ -1811,6 +1811,13 @@ def run_daily_report(
         if canonical and invested <= 0:
             report["report_consistency"] = worsen_consistency(report.get("report_consistency", "OK"), "REPORT_INCONSISTENT_POSITION_VALUE")
             report["errors"].append("REPORT_INCONSISTENT_POSITION_VALUE")
+    if isinstance(final_balance, dict) and isinstance(final_balance.get("account_summary_observation"), dict):
+        observation = final_balance["account_summary_observation"]
+        report["account_summary_observation"] = observation
+        if observation.get("status") != "OBSERVED_REPORT_ONLY":
+            report["warnings"].append("ACCOUNT_PRESENT_BALANCE_UNAVAILABLE")
+        # This is not validated USD NAV or an epoch cash-flow ledger. Do not
+        # overwrite authoritative trading equity or infer USD cash from KRW.
     if kis_fills is not None:
         actual = [f for f in kis_fills if not _fill_is_synthetic(f)]
         report["kis_fill_execution_count"] = len(actual)

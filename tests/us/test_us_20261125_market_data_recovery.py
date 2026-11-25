@@ -1,0 +1,125 @@
+"""11/25 incident regression: quote venue, empty HTTP, and recovery reason."""
+import pytest
+from trader.us.symbols import resolve_exchange, resolve_quote_exchange, resolve_quote_exchange_code, resolve_order_exchange
+from trader.us.prep_effective import benchmark_recovery_required
+from trader.us.data_provider import USDataProvider
+from trader.us.db.price_daily_repo import reset_us_daily_memory
+
+@pytest.mark.parametrize("symbol", "SPY DIA IWM RSP XLE XLF XLI XLK XLP XLU XLV".split())
+def test_etf_quote_route_separate_from_order(symbol):
+    assert resolve_exchange(symbol) == "NYSE"
+    assert resolve_quote_exchange(symbol) == "AMEX"
+    assert resolve_quote_exchange_code(symbol) == "AMS"
+    assert resolve_order_exchange(symbol) == "NYSE"
+
+@pytest.mark.parametrize("symbol", "QQQ SMH QQQM SOXX TQQQ".split())
+def test_nasdaq_quote_route_unchanged(symbol):
+    assert resolve_quote_exchange_code(symbol) == "NAS"
+    assert resolve_order_exchange(symbol) == "NASDAQ"
+
+def test_khc_20260914_listing_transfer_uses_nyse_not_nasdaq():
+    from trader.us.symbols import resolve_order_exchange_code
+    from trader.us.execution.kis_us_client import KisUSClient
+    assert resolve_exchange("KHC") == "NYSE"
+    assert resolve_quote_exchange("KHC") == "NYSE"
+    assert resolve_quote_exchange_code("KHC") == "NYS"
+    assert resolve_order_exchange("KHC") == "NYSE"
+    assert resolve_order_exchange_code("KHC") == "NYSE"
+    # Verify the actual client daily API request, not only the mapping.
+    client = KisUSClient(env="practice", offline=True)
+    client._offline = False
+    client._build_headers = lambda tr_id: {}
+    calls = []
+    def get(path, headers, params):
+        calls.append((path, dict(params)))
+        return {"output2": [{"xymd": "20261124", "clos": "25.0"}]}
+    client._get = get
+    rows = client.get_us_daily_price("KHC", resolve_quote_exchange("KHC"),
+                                    count=5, as_of_date="20261124")
+    assert rows == [{"xymd": "20261124", "clos": "25.0"}]
+    assert len(calls) == 1
+    assert calls[0][1]["EXCD"] == "NYS"
+    assert calls[0][1]["SYMB"] == "KHC"
+    assert calls[0][1]["BYMD"] == "20261124"
+
+
+def test_empty_http_is_attempted_but_failed():
+    reset_us_daily_memory()
+    class EmptyClient:
+        def get_us_daily_price_history(self, *args, **kwargs):
+            return []
+    p = USDataProvider(offline=True)
+    p._client = EmptyClient()
+    p._offline = False
+    result = p.get_completed_daily_prices_result("SPY", "AMEX", trade_date="2026-11-24", required_bars=260, allow_http_sync=True)
+    assert result["quality"] == "STALE"
+    assert result["http_sync_attempted"] is True
+    assert result["http_sync_succeeded"] is False
+    assert result["http_sync_call_count"] == 1
+
+def test_benchmark_recovery_does_not_override_risk_off():
+    assert benchmark_recovery_required({"recoverable_contract": True, "benchmark_daily_failed": True})
+    assert not benchmark_recovery_required({"recoverable_contract": True, "trade_block_reason": "RISK_OFF"})
+    assert not benchmark_recovery_required({"benchmark_daily_failed": True})
+
+
+def test_entry_revision_requires_artifact_db_and_manifest(monkeypatch, tmp_path):
+    from trader.us.prep_effective import entry_revision_proof
+    from trader.us.run_manifest import pin_run_revision
+    date = "2026-11-24"
+    revision = "a" * 40
+    monkeypatch.setenv("US_RUN_MANIFEST_DIR", str(tmp_path))
+    data = {key: 1 for key in ("entry_can_proceed", "exit_can_proceed", "trade_can_proceed",
+                                "final30_trade_ready", "contract_ok", "allow_new_buy")}
+    data.update(contract_version="us_sector_rotation_v3",
+                market_regime_version="us_leading_regime_v1", run_revision=revision)
+    prep = {"status": "OK", "result": data}
+    artifact = {"entry_can_proceed": 1, "run_revision": revision}
+    assert not entry_revision_proof(date, artifact, prep)[0]
+    pin_run_revision(date, revision)
+    assert entry_revision_proof(date, artifact, prep)[0]
+    assert not entry_revision_proof(date, {**artifact, "run_revision": "b" * 40}, prep)[0]
+    assert not entry_revision_proof(date, {**artifact, "entry_can_proceed": 0}, prep)[0]
+    assert entry_revision_proof(date, {"entry_can_proceed": 0}, {"result": {"entry_can_proceed": 0}})[0]
+
+
+def test_tp_refresh_replaces_first_price_alias(monkeypatch):
+    import time
+    from trader.us.execution.tp_signal_quote_refresh import refresh_tp_source_quotes
+    from trader.us.market_state_overlay import _price
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("US_SHARED_KIS_LIMITER_ENABLED", "1")
+    class Provider:
+        def get_isolated_exit_quote(self, *args, **kwargs):
+            return {"last": 100, "_quote_asof_epoch": time.time(),
+                    "_quote_source": "KIS_LIVE", "_quote_quality": "FRESH"}
+    old = {"symbol": "ABBV", "strategy_owner": "US_STANDARD", "qty": 10,
+           "last_price": 110, "resolved_quote_asof": time.time()-60}
+    fresh = refresh_tp_source_quotes([old], Provider())[0]
+    assert _price(fresh) == 100
+    assert _price(old) == 110
+
+
+
+def test_forward_sync_uses_completed_date_and_never_writes_incomplete_trade_day():
+    from datetime import date, timedelta
+    from trader.us.db.price_daily_repo import upsert_us_daily_bars, load_recent_us_daily_bars
+    reset_us_daily_memory()
+    def bar(day, price=100):
+        return {"date": day.isoformat(), "open": price, "high": price, "low": price,
+                "close": price, "volume": 100}
+    previous = date(2026, 11, 20)
+    upsert_us_daily_bars(symbol="SPY", bars=[bar(previous-timedelta(days=i)) for i in range(260)], source="TEST")
+    class Client:
+        def get_us_daily_price_history(self, symbol, exchange, **kw):
+            assert symbol == "SPY" and exchange == "AMEX"
+            assert kw["as_of_date"] == "20261123"
+            return [bar(date(2026,11,23)), bar(date(2026,11,24),999)]
+    provider = USDataProvider(offline=True)
+    provider._client = Client()
+    provider._offline = False
+    result = provider.get_completed_daily_prices_result("SPY","AMEX",trade_date="2026-11-24",
+                                                        required_bars=260,allow_http_sync=True)
+    assert result["quality"] == "OK" and result["db_latest"] == "2026-11-23"
+    rows = load_recent_us_daily_bars(symbol="SPY", before_date="2026-11-25", limit=260)
+    assert all(str(row["date"]) != "2026-11-24" for row in rows)

@@ -510,7 +510,7 @@ def verified_legacy_snapshot_context(conn, *, position: dict, trade_date: str,
             return None
     management = _json(contract.get("management"))
     return {
-        "strategy_owner": "US_STANDARD", "account_id": account,
+        "strategy_owner": "US_STANDARD", "account_id": account, "env": "practice",
         "trading_epoch_id": active_epoch,
         "position_lifecycle_id": evidence["original_cycle"],
         "entry_exit_contract": contract, "entry_exit_contract_sha256": evidence["v2_sha"],
@@ -836,6 +836,10 @@ def enrich_legacy_nine_v2_decision_position(
         out["strategy_owner"]="US_STANDARD"
         out["trading_epoch_id"]=epoch
         out["account_id"]=raw_account
+        # This bridge has independently verified the active practice account.
+        # Expose its environment to the HWM identity check without creating
+        # a canonical portfolio or changing any historical DB row.
+        out["env"]="practice"
         out["lifecycle_identity_status"]="VERIFIED_LEGACY_ORIGINAL"
         meta_out["position_lifecycle_id"]=old_life
         meta_out["entry_exit_contract"]=source_contract

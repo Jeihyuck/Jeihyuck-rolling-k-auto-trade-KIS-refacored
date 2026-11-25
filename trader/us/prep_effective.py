@@ -186,13 +186,20 @@ def clear_recovered_us_prep_preflight_marker(
         return False, "preflight_marker_not_auto_recoverable"
     if not expected_run_id or not current_revision or current_revision == "unknown":
         return False, "preflight_recovery_identity_missing"
-    if verify_run_revision(trade_date, current_revision).get("ok") is not True:
+    try:
+        if verify_run_revision(trade_date, current_revision).get("ok") is not True:
+            return False, "preflight_recovery_revision_unverified"
+    except (OSError, ValueError, TypeError, AttributeError):
         return False, "preflight_recovery_revision_unverified"
     # This is the same source checker invoked by the canonical WSL preflight.
     # It verifies actual artifact + DB completed run + scored locked watchlist.
     proof = check_effective_prep_sources(trade_date)
     if proof.get("ok") is not True or str(proof.get("run_id") or "") != expected_run_id:
         return False, "preflight_recovery_artifact_db_run_unverified"
+    if proof.get("entry_authorized") is not True:
+        return False, "preflight_recovery_entry_not_authorized"
+    if proof.get("entry_revision") != current_revision:
+        return False, "preflight_recovery_entry_revision_mismatch"
     try:
         current = path.stat()
         if (current.st_ino, current.st_mtime_ns, current.st_size) != (
@@ -243,6 +250,36 @@ def is_effective_prep_contract(
     return True
 
 
+def entry_revision_proof(trade_date: str, contract: dict, prep: dict) -> tuple[bool, str]:
+    """A BUY-ready artifact must agree with DB completion and the actual pin."""
+    import re
+    from trader.us.run_manifest import verify_run_revision
+
+    data = prep.get("result") if isinstance(prep.get("result"), dict) else {}
+    yes = (1, True, "1", "true", "True")
+    artifact_entry = contract.get("entry_can_proceed") in yes
+    db_entry = data.get("entry_can_proceed") in yes
+    if not artifact_entry and not db_entry:
+        return True, "exit_only_no_entry_revision_required"
+    if not artifact_entry or not db_entry:
+        return False, "entry_permission_mismatch"
+    allowed, reason = db_prep_entry_permission(prep.get("status"), data)
+    if not allowed:
+        return False, reason
+    artifact_rev = str(contract.get("run_revision") or contract.get("git_commit_sha") or "")
+    db_rev = str(data.get("run_revision") or data.get("git_commit_sha") or "")
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", artifact_rev) or artifact_rev != db_rev:
+        return False, "artifact_db_revision_mismatch"
+    try:
+        verdict = verify_run_revision(trade_date, artifact_rev)
+        manifest = verdict.get("manifest") or {}
+        if verdict.get("ok") is not True or str(manifest.get("trade_date") or "") != trade_date:
+            return False, "run_manifest_revision_unverified"
+    except (ValueError, OSError, TypeError, AttributeError):
+        return False, "run_manifest_revision_unverified"
+    return True, "entry_revision_verified"
+
+
 def check_effective_prep_sources(trade_date: str, *, min_rows: int = 10) -> dict[str, Any]:
     """One read-only artifact/DB/provenance verdict for all WSL PREP gates.
 
@@ -272,7 +309,24 @@ def check_effective_prep_sources(trade_date: str, *, min_rows: int = 10) -> dict
         and provenance.get("ok") is True
         and locked_rows_match_prep_run(prep, locked_rows)
     )
-    return {**result, "ok": bool(ok), "reason": "ok" if ok else "db_live_contract_invalid",
+    revision_ok, revision_reason = entry_revision_proof(trade_date, contract, prep) if ok else (False, "db_live_contract_invalid")
+    ok = ok and revision_ok
+    entry_authorized = bool(ok and revision_reason == "entry_revision_verified")
+    return {**result, "ok": bool(ok), "reason": "ok" if ok else revision_reason,
+            "entry_authorized": entry_authorized,
+            "entry_revision": str(contract.get("run_revision") or contract.get("git_commit_sha") or "") if entry_authorized else None,
+            "benchmark_recovery_required": benchmark_recovery_required(contract),
             "run_id": run_id if ok else None,
             "status": contract.get("status"), "artifact_count": len(artifact_rows),
             "locked_count": len(locked_rows), "provenance_ok": provenance.get("ok") is True}
+
+
+def benchmark_recovery_required(contract: dict[str, Any]) -> bool:
+    """Recover a data failure, not a valid strategy/risk-off BUY prohibition."""
+    return (
+        contract.get("recoverable_contract") is True
+        and (
+            contract.get("benchmark_daily_failed") is True
+            or contract.get("trade_block_reason") == "BENCHMARK_DAILY_DATA_UNAVAILABLE"
+        )
+    )

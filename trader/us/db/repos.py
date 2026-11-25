@@ -3115,7 +3115,13 @@ def save_us_position_lifecycle_atomic(symbol: str, trade_date: str, lifecycle: d
                 dict(combined.get("entry_policy") or {}),
                 dict(data.get("entry_policy") or {}),
             )
-            combined["high_watermark"] = max(high, float(prior.get("high_watermark") or 0))
+            prior_high = float(prior.get("high_watermark") or 0)
+            combined["high_watermark"] = max(high, prior_high)
+            # A delayed writer must never attach its lower price's timestamp
+            # or provenance to the already-persisted higher peak.
+            if prior_high > high or (prior_high == high and prior.get("high_watermark_at")):
+                for field in ("high_watermark_at", "high_watermark_source"):
+                    combined[field] = prior.get(field)
             if prior.get("is_open") is False:
                 combined["is_open"] = False
         state["lifecycle"] = combined
@@ -3207,6 +3213,29 @@ def save_us_position_lifecycle_atomic(symbol: str, trade_date: str, lifecycle: d
                                      ELSE 0 END,
                                 CAST(:high AS numeric)
                              ) END,
+                        -- Peak price, time and source form one proof.
+                        'high_watermark_at',
+                        CASE WHEN us_position_risk_state.state->'lifecycle'->>'lifecycle_id' = :life_id
+                              AND ((CASE WHEN COALESCE(us_position_risk_state.state->'lifecycle'->>'high_watermark','') ~ '^[0-9]+([.][0-9]+)?$'
+                                       THEN (us_position_risk_state.state->'lifecycle'->>'high_watermark')::numeric
+                                       ELSE 0 END) > CAST(:high AS numeric)
+                                   OR ((CASE WHEN COALESCE(us_position_risk_state.state->'lifecycle'->>'high_watermark','') ~ '^[0-9]+([.][0-9]+)?$'
+                                       THEN (us_position_risk_state.state->'lifecycle'->>'high_watermark')::numeric
+                                       ELSE 0 END) = CAST(:high AS numeric)
+                                       AND NULLIF(us_position_risk_state.state->'lifecycle'->>'high_watermark_at','') IS NOT NULL))
+                             THEN us_position_risk_state.state->'lifecycle'->'high_watermark_at'
+                             ELSE CAST(:data AS jsonb)->'high_watermark_at' END,
+                        'high_watermark_source',
+                        CASE WHEN us_position_risk_state.state->'lifecycle'->>'lifecycle_id' = :life_id
+                              AND ((CASE WHEN COALESCE(us_position_risk_state.state->'lifecycle'->>'high_watermark','') ~ '^[0-9]+([.][0-9]+)?$'
+                                       THEN (us_position_risk_state.state->'lifecycle'->>'high_watermark')::numeric
+                                       ELSE 0 END) > CAST(:high AS numeric)
+                                   OR ((CASE WHEN COALESCE(us_position_risk_state.state->'lifecycle'->>'high_watermark','') ~ '^[0-9]+([.][0-9]+)?$'
+                                       THEN (us_position_risk_state.state->'lifecycle'->>'high_watermark')::numeric
+                                       ELSE 0 END) = CAST(:high AS numeric)
+                                       AND NULLIF(us_position_risk_state.state->'lifecycle'->>'high_watermark_at','') IS NOT NULL))
+                             THEN us_position_risk_state.state->'lifecycle'->'high_watermark_source'
+                             ELSE CAST(:data AS jsonb)->'high_watermark_source' END,
                         'is_open',
                         CASE WHEN us_position_risk_state.state->'lifecycle'
                                             ->>'lifecycle_id' IS DISTINCT FROM :life_id
@@ -5731,10 +5760,12 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
             })
         return len(positions)
     count = 0
+    verified_runtime_updates = []
     try:
         with engine.begin() as conn:
             trading_epoch_id = _active_us_epoch(conn)
             for p in positions:
+                runtime_position = p
                 # Proactively bind a NEW US_STANDARD BUY from the original,
                 # uniquely matching KIS fill/order/intent *before* writing
                 # the first authoritative broker balance snapshot. Never
@@ -5772,6 +5803,7 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                                 )
                     except Exception as exc:
                         verified_identity = None
+                        verified_legacy_identity = None
                         logger.warning(
                             "[US_POSITIONS][ORIGINAL_SCOPE][UNAVAILABLE] symbol=%s error=%s "
                             "action=SAVE_UNVERIFIED_BALANCE_ONLY",
@@ -5963,6 +5995,37 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                                   meta->>'strategy_owner' AS persisted_owner,
                                   meta->>'position_lifecycle_id' AS persisted_lifecycle
                     """
+                if verified_legacy_identity:
+                    # The historical BUY has no canonical portfolio scope.
+                    # Keep authoritative quantity updates independent, but never
+                    # replace another cycle's contract or publish mismatched
+                    # legacy proof into the in-memory SELL decision.
+                    sql = """
+                        INSERT INTO us_positions
+                          (as_of, symbol, exchange, qty, avg_cost, current_px,
+                           unrealized_pnl_usd, trading_epoch_id, meta)
+                        VALUES (:as_of, :symbol, :exchange, :qty, :avg_cost, :current_px,
+                                :unrealized_pnl_usd, :trading_epoch_id, CAST(:meta AS jsonb))
+                        ON CONFLICT (trading_epoch_id, as_of, symbol, exchange)
+                        DO UPDATE SET qty=EXCLUDED.qty, avg_cost=EXCLUDED.avg_cost,
+                            current_px=EXCLUDED.current_px, unrealized_pnl_usd=EXCLUDED.unrealized_pnl_usd,
+                            meta=CASE WHEN us_positions.account_id IS NULL
+                                AND us_positions.portfolio_epoch_id IS NULL
+                                AND us_positions.position_cycle_id IS NULL
+                                AND COALESCE(us_positions.meta->>'entry_exit_contract_sha256', '')
+                                    IN ('', EXCLUDED.meta->>'entry_exit_contract_sha256')
+                                AND COALESCE(us_positions.meta->>'position_lifecycle_id', '')
+                                    IN ('', EXCLUDED.meta->>'position_lifecycle_id')
+                                AND COALESCE(us_positions.meta->>'strategy_owner', '')
+                                    IN ('', 'US_STANDARD')
+                                AND COALESCE(us_positions.meta->>'account_id', '')
+                                    IN ('', EXCLUDED.meta->>'account_id')
+                                AND COALESCE(us_positions.meta->>'portfolio_epoch_id', '') = ''
+                                AND COALESCE(us_positions.meta->>'position_cycle_id', '') = ''
+                                THEN COALESCE(us_positions.meta,'{}'::jsonb) || EXCLUDED.meta
+                                ELSE us_positions.meta END
+                        RETURNING account_id, portfolio_epoch_id, position_cycle_id, meta
+                    """
                 params["meta"] = _json_param(meta_to_store)
                 result = conn.execute(text(sql), params)
                 if verified_identity:
@@ -5983,6 +6046,30 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                             str(stored.get("persisted_lifecycle") or "") != verified_identity["position_lifecycle_id"],
                         )):
                             raise RuntimeError("US_SNAPSHOT_IDENTITY_READBACK_MISMATCH")
+                if verified_identity:
+                    # The proof is currently attached to a local copy only.
+                    # Carry it to the SAME broker observation after commit;
+                    # downstream risk code must see the identical BUY scope.
+                    verified_runtime_updates.append((runtime_position, {
+                        **verified_identity, "trading_epoch_id": trading_epoch_id,
+                        "meta": dict(meta_to_store),
+                    }))
+                elif verified_legacy_identity:
+                    mapped = getattr(result, "mappings", None)
+                    stored = mapped().first() if callable(mapped) else None
+                    stored_meta = (stored or {}).get("meta") or {}
+                    if (stored and isinstance(stored_meta, dict)
+                            and all(not stored.get(k) for k in ("account_id", "portfolio_epoch_id", "position_cycle_id"))
+                            and not stored_meta.get("portfolio_epoch_id")
+                            and not stored_meta.get("position_cycle_id")
+                            and all(stored_meta.get(k) == verified_legacy_identity.get(k)
+                                    for k in ("account_id", "strategy_owner", "position_lifecycle_id",
+                                              "entry_exit_contract_sha256", "entry_exit_contract", "trading_epoch_id", "env"))):
+                        verified_runtime_updates.append((runtime_position, {
+                            **verified_legacy_identity, "meta": dict(stored_meta),
+                        }))
+                    else:
+                        logger.warning("[US_POSITIONS][LEGACY_RUNTIME_PROOF_NOT_PUBLISHED] symbol=%s", p.get("symbol"))
                 count += 1
             if stale_close_requested:
                 params = {"td": td, "symbols": symbols, "source": close_source}
@@ -5998,6 +6085,10 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                     params["trading_epoch_id"] = trading_epoch_id
                 sql += " AND NOT (UPPER(symbol) = ANY(CAST(:symbols AS text[])))"
                 conn.execute(text(sql), params)
+        # No mutation on rollback or conflicting RETURNING proof. Quantity,
+        # price and orderability stay on the authoritative broker observation.
+        for runtime_position, verified_context in verified_runtime_updates:
+            runtime_position.update(verified_context)
     except Exception as exc:
         logger.error("[US_POSITIONS][SNAPSHOT][ERROR] %s", exc)
         if authoritative_positions:
