@@ -1,0 +1,304 @@
+name: US 20261125 Authenticated Practice Readonly Acceptance
+on:
+  pull_request:
+    branches: [dual-agent]
+    types: [ready_for_review]
+permissions:
+  contents: read
+concurrency:
+  group: us-20261125-one-time-practice-readonly
+  cancel-in-progress: false
+jobs:
+  authenticated-practice-readonly:
+    # Operator requested this one-time acceptance for PR 390. Use the
+    # exact previously green candidate, not arbitrary PR/fork code.
+    if: >-
+      github.repository == 'Jeihyuck/Jeihyuck-rolling-k-auto-trade-KIS-refacored' &&
+      github.event.pull_request.number == 390 &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'feat/us-20261123-portfolio-guard-native-protection' &&
+      github.event.pull_request.user.login == 'Jeihyuck'
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: b614741a3040ba883813703e7612cd745923adc1
+          persist-credentials: false
+      - name: Pin previously validated code
+        run: test "$(git rev-parse HEAD)" = "b614741a3040ba883813703e7612cd745923adc1"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies without broker or database secrets
+        run: python -m pip install -r requirements.txt psycopg2-binary
+      - name: Authenticated KIS GET and production DB SELECT only
+        env:
+          PYTHONPATH: .
+          PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+          KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+          KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+          CANO: ${{ secrets.CANO }}
+          ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+          KIS_REST_URL: https://openapivts.koreainvestment.com:29443
+          KIS_ENV: practice
+          WSL_RUN_MARKET: US
+          TRADING_REGION: US
+          PGOPTIONS: '-c default_transaction_read_only=on'
+          NO_TRADE: '1'
+          DRY_RUN: '1'
+          DISABLE_REAL_TRADING: '1'
+          DISABLE_LIVE_TRADING: '1'
+          US_ORDER_ARMED: '0'
+          US_KIS_ORDER_ALLOWED: '0'
+          US_LIVE_TRADING_ENABLED: '0'
+          LIVE_TRADING_ENABLED: '0'
+          US_PAPER_TRADING_ENABLED: '0'
+          ALLOW_REAL_ORDER: '0'
+          KIS_HTTP_BLOCK: '0'
+          US_OFFLINE_MODE: '0'
+          OFFLINE_MODE: '0'
+          US_BALANCE_EXCHANGES: NASD,NYSE,AMEX
+        run: |
+          python - <<'PY'
+          import json
+          import logging
+          import os
+          from collections import defaultdict
+          from decimal import Decimal
+          from urllib.parse import urlsplit
+          import requests
+          from sqlalchemy import create_engine, text, event
+          logging.disable(logging.CRITICAL)
+
+          # Session-level enforcement, not just DRY_RUN flags. OAuth tokenP
+          # is the sole permitted POST; no order, cancel, hashkey or other host.
+          allowed_get = {
+              "/uapi/overseas-stock/v1/trading/inquire-balance",
+              "/uapi/overseas-stock/v1/trading/inquire-present-balance",
+              "/uapi/overseas-price/v1/quotations/dailyprice",
+          }
+          original_send = requests.sessions.Session.send
+          counts = {"oauth_post": 0, "get": 0, "order_post": 0, "blocked": 0}
+          def guarded_send(self, request, **kwargs):
+              url = urlsplit(request.url)
+              method = request.method.upper()
+              if (url.scheme != "https" or url.hostname != "openapivts.koreainvestment.com"
+                      or url.port != 29443 or url.username or url.password):
+                  counts["blocked"] += 1
+                  raise RuntimeError("UNAPPROVED_HTTP_DESTINATION")
+              if method == "GET" and url.path in allowed_get:
+                  counts["get"] += 1
+              elif method == "POST" and url.path == "/oauth2/tokenP" and counts["oauth_post"] == 0:
+                  counts["oauth_post"] += 1
+              else:
+                  counts["blocked"] += 1
+                  raise RuntimeError("UNAPPROVED_HTTP_METHOD_OR_PATH")
+              kwargs["allow_redirects"] = False
+              response = original_send(self, request, **kwargs)
+              if response.is_redirect:
+                  raise RuntimeError("UNAPPROVED_HTTP_REDIRECT")
+              return response
+          requests.sessions.Session.send = guarded_send
+
+          report = {"code_sha": "b614741a3040ba883813703e7612cd745923adc1", "runner": "github-hosted-not-WSL",
+                    "trade_submit_tested": False, "db_mutated": False, "checks": {}}
+          checks = report["checks"]
+          def check(name, func):
+              try:
+                  checks[name] = {"ok": True, "evidence": func()}
+              except Exception as exc:
+                  # Never serialize a database URL, credentials, raw KIS
+                  # response, or exception message containing those values.
+                  checks[name] = {"ok": False, "error_type": type(exc).__name__}
+          try:
+              for k in ("PBCORE_DB_URL","KIS_APP_KEY","KIS_APP_SECRET","CANO","ACNT_PRDT_CD"):
+                  if not os.environ.get(k):
+                      raise RuntimeError("REQUIRED_CONFIG_MISSING")
+              from trader.account_state import get_account_key
+              from trader.us.execution.kis_us_client import KisUSClient
+              from trader.us.data_provider import normalize_us_balance
+              from trader.us.execution.recovery_identity import current_us_portfolio_epoch
+              from trader.us.portfolio_guard_original_ledger import load_legacy_epoch_proof, fill_key
+              from trader.us.execution.us_legacy_nine_active_sell import _evidence_from_db
+              from trader.us.entry_exit_contract import US_ENTRY_EXIT_CONTRACT_VERSION
+              from trader.us.symbols import ETF_EXCHANGE_METADATA, resolve_quote_exchange
+              from trader.us.dates import canonical_us_bar_date
+              from trader.us.account_summary import parse_practice_present_balance
+              client = KisUSClient(env="practice")
+              account = get_account_key(env="practice", cano=client._cano, product_code=client._acnt_prdt_cd)
+              url = os.environ["PBCORE_DB_URL"]
+              if url.startswith("postgres://"):
+                  url = "postgresql://" + url[len("postgres://"):]
+              engine = create_engine(url, pool_pre_ping=True)
+              @event.listens_for(engine, "begin")
+              def readonly(conn):
+                  conn.exec_driver_sql("SET TRANSACTION READ ONLY")
+                  if conn.exec_driver_sql("SHOW transaction_read_only").scalar_one() != "on":
+                      raise RuntimeError("DB_READONLY_NOT_ENFORCED")
+
+              with engine.connect() as conn:
+                  active = conn.execute(text("""
+                      SELECT trading_epoch_id, account_id FROM public.trading_epochs
+                      WHERE env='practice' AND status='ACTIVE'
+                  """)).mappings().all()
+                  if len(active) != 1 or active[0]["account_id"] != account:
+                      raise RuntimeError("PRACTICE_ACCOUNT_DB_SCOPE_MISMATCH")
+                  epoch = str(active[0]["trading_epoch_id"])
+                  portfolio = current_us_portfolio_epoch(conn, env="practice", account_key=account,
+                                                          trading_epoch_id=epoch, strategy_owner="US_STANDARD")
+                  fills = [dict(r) for r in conn.execute(text("""
+                      SELECT trade_date,symbol,side,qty,price_usd,order_no,client_order_key,
+                             account_id,trading_epoch_id,portfolio_epoch_id,position_cycle_id,meta
+                      FROM public.us_fills WHERE trading_epoch_id=:epoch
+                        AND symbol<>'TQQQ' AND COALESCE(meta->>'accounting_active','true')<>'false'
+                      ORDER BY trade_date,id
+                  """), {"epoch":epoch}).mappings().all()]
+                  if not fills:
+                      raise RuntimeError("NO_NATIVE_FILL_EVIDENCE")
+                  day = str(max(f["trade_date"] for f in fills))
+                  positions = [dict(r) for r in conn.execute(text("""
+                      SELECT DISTINCT ON(symbol) symbol,qty,account_id,portfolio_epoch_id,
+                             position_cycle_id,meta,as_of
+                      FROM public.us_positions WHERE trading_epoch_id=:epoch AND as_of<=:day
+                      ORDER BY symbol,as_of DESC,created_at DESC,id DESC
+                  """), {"epoch":epoch, "day":day}).mappings().all()]
+                  checks["account_scope"] = {"ok":True, "evidence":{"trade_date":day,"db_readonly":True}}
+                  broker = {}
+                  def balance():
+                      raw = client.get_us_balance(force_refresh=True)
+                      if not (raw.get("balance_complete") is True and raw.get("balance_authoritative") is True
+                              and not raw.get("failed_exchanges")):
+                          raise RuntimeError("NATIVE_BALANCE_INCOMPLETE")
+                      normalized = normalize_us_balance(raw)
+                      if normalized.get("balance_parse_status") != "OK":
+                          raise RuntimeError("BALANCE_PARSE_FAILED")
+                      for p in normalized["positions"]:
+                          sym = str(p["symbol"]).upper()
+                          qty = Decimal(str(p["qty"]))
+                          if qty <= 0:
+                              continue
+                          if sym in broker:
+                              raise RuntimeError("DUPLICATE_BROKER_POSITION")
+                          broker[sym] = qty
+                      db = {str(p["symbol"]).upper():Decimal(str(p["qty"])) for p in positions if p["qty"]>0}
+                      if broker != db:
+                          raise RuntimeError("NATIVE_BALANCE_DB_QUANTITY_MISMATCH")
+                      return {"positions":len(broker),"quantity_mismatches":0}
+                  check("native_balance_vs_db", balance)
+
+                  def legacy_economics():
+                      keyed, groups = load_legacy_epoch_proof(conn,fills,raw_account=account,
+                          epoch=epoch,portfolio=portfolio,trade_date=day)
+                      cycle_net = defaultdict(Decimal)
+                      cycle_symbol = {}
+                      import hashlib
+                      account_hash = hashlib.sha256(account.encode()).hexdigest()
+                      for f in fills:
+                          group = keyed.get(fill_key(f))
+                          meta = f["meta"]
+                          if (meta.get("strategy_owner")!="US_STANDARD" or
+                              meta.get("fill_evidence_type")!="KIS_ORDER_CUMULATIVE_ACTUAL" or
+                              meta.get("is_synthetic") is not False):
+                              raise RuntimeError("FILL_NATIVE_EVIDENCE_INVALID")
+                          if not group and (str(f.get("account_id") or "") not in (account,account_hash)
+                              or str(f.get("portfolio_epoch_id") or "")!=portfolio or not f.get("position_cycle_id")):
+                              raise RuntimeError("CANONICAL_SCOPE_INVALID")
+                          cycle = group["management_cycle"] if group else str(f["position_cycle_id"])
+                          sym = f["symbol"]
+                          if cycle_symbol.setdefault(cycle,sym)!=sym:
+                              raise RuntimeError("CYCLE_OWNER_CONFLICT")
+                          cycle_net[cycle] += Decimal(str(f["qty"])) * (1 if f["side"]=="BUY" else -1)
+                      if any(v<0 for v in cycle_net.values()):
+                          raise RuntimeError("NEGATIVE_CYCLE_NET")
+                      open_cycles = {c:q for c,q in cycle_net.items() if q>0}
+                      seen = {}
+                      for p in positions:
+                          if p["symbol"]=="TQQQ" or p["qty"]<=0:
+                              continue
+                          group = groups.get(p["symbol"])
+                          cycle = str(p.get("position_cycle_id") or (group or {}).get("management_cycle") or "")
+                          if cycle in seen or cycle_symbol.get(cycle)!=p["symbol"]:
+                              raise RuntimeError("OPEN_CYCLE_IDENTITY_CONFLICT")
+                          seen[cycle] = Decimal(str(p["qty"]))
+                      if seen != open_cycles:
+                          raise RuntimeError("OPEN_CYCLE_QUANTITY_MISMATCH")
+                      if checks["native_balance_vs_db"]["ok"] is not True:
+                          raise RuntimeError("FRESH_KIS_BALANCE_NOT_PROVEN")
+                      return {"native_fills":len(fills),"archived_forward_fills":len(keyed),
+                              "legacy_original_groups":len(groups),"economic_cycles":len(cycle_net),
+                              "open_cycles":len(open_cycles),"quantity_mismatches":0}
+                  check("candidate_original_ledger_live_db",legacy_economics)
+
+                  def original_hwm():
+                      if checks["native_balance_vs_db"]["ok"] is not True:
+                          raise RuntimeError("FRESH_KIS_BALANCE_NOT_PROVEN")
+                      report = []
+                      for sym in ("DHR","KO","PG","TMO"):
+                          pos = next((p for p in positions if p["symbol"]==sym and p["qty"]>0),None)
+                          if pos is None or sym not in broker:
+                              raise RuntimeError("ORIGINAL_POSITION_MISSING")
+                          digest = pos["meta"].get("entry_exit_contract_sha256")
+                          evidence, reason = _evidence_from_db(conn,symbol=sym,trade_date=day,
+                              active_epoch=epoch,raw_account=account,current_holding_qty=int(broker[sym]),
+                              intent={"meta":{"source_entry_contract_sha256":digest,
+                                              "source_entry_contract_version":US_ENTRY_EXIT_CONTRACT_VERSION}})
+                          if not evidence:
+                              raise RuntimeError("ORIGINAL_LIFECYCLE_UNVERIFIED")
+                          life = evidence["original_runtime_lifecycle"]
+                          if Decimal(str(life.get("high_watermark") or 0))<=0 or not life.get("high_watermark_at"):
+                              raise RuntimeError("ORIGINAL_PEAK_UNVERIFIED")
+                          report.append({"symbol":sym,"peak":str(life["high_watermark"]),
+                                         "peak_at":life["high_watermark_at"]})
+                      return {"original_peaks":report,"durable_write_tested":False}
+                  check("original_hwm_live_source",original_hwm)
+
+                  def daily():
+                      syms = [s for s,m in ETF_EXCHANGE_METADATA.items() if m["quote_exchange"]=="AMEX"]+["KHC"]
+                      rows = []
+                      for sym in syms:
+                          exchange=resolve_quote_exchange(sym)
+                          try:
+                              native=client.get_us_daily_price(sym,exchange,count=5,as_of_date=day)
+                              dates=[canonical_us_bar_date(r.get("xymd") or r.get("date") or r.get("stck_bsop_date"))
+                                     for r in native if isinstance(r,dict)]
+                              dates=[d for d in dates if d]
+                              expected=canonical_us_bar_date(day)
+                              good=bool(dates and max(dates)==expected)
+                              rows.append({"symbol":sym,"ok":good,"rows":len(dates)})
+                          except Exception as exc:
+                              rows.append({"symbol":sym,"ok":False,"error_type":type(exc).__name__})
+                      report["daily_by_symbol"] = rows
+                      if len(rows)!=12 or not all(r["ok"] for r in rows):
+                          raise RuntimeError("DAILY_ASOF_OR_ROUTE_UNVERIFIED")
+                      return {"symbols":len(rows),"asof":day}
+                  check("native_daily_11_etf_plus_khc",daily)
+                  def present():
+                      raw=client.get_us_present_balance()
+                      if str(raw.get("rt_cd"))!="0":
+                          raise RuntimeError("PRESENT_BALANCE_UNAVAILABLE")
+                      parsed=parse_practice_present_balance(raw)
+                      return {"native_response":True,"parsed_fields":sorted(parsed.keys()),
+                              "confirmed_net_pnl_claimed":False}
+                  check("native_present_balance",present)
+          except Exception as exc:
+              report["setup_error_type"] = type(exc).__name__
+          finally:
+              report["http_counts"] = counts
+              required = {"account_scope","native_balance_vs_db","candidate_original_ledger_live_db",
+                          "original_hwm_live_source","native_daily_11_etf_plus_khc","native_present_balance"}
+              report["status"] = ("READONLY_EVIDENCE_PASS" if
+                  required == set(checks) and all(v["ok"] for v in checks.values())
+                  and not counts["blocked"] else "READONLY_EVIDENCE_INCOMPLETE")
+              print(json.dumps(report,ensure_ascii=False,sort_keys=True,default=str))
+              with open("us-20261125-readonly-acceptance.json","w",encoding="utf-8") as f:
+                  json.dump(report,f,ensure_ascii=False,sort_keys=True,default=str)
+              raise SystemExit(0 if report["status"]=="READONLY_EVIDENCE_PASS" else 1)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: us-20261125-readonly-acceptance-${{ github.run_id }}
+          path: us-20261125-readonly-acceptance.json
+          if-no-files-found: error
+          retention-days: 3
