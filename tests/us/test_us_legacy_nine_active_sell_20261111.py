@@ -1020,7 +1020,8 @@ def test_legacy_scoped_hard_stop_debt_replays_with_exact_active_epoch(scenario, 
     assert built == []
 
 
-def test_legacy_original_high_watermark_survives_empty_current_day(scenario, monkeypatch):
+@pytest.mark.parametrize("symbol", ["ABBV", "DHR", "KO", "PG", "TMO"])
+def test_legacy_original_high_watermark_survives_empty_current_day(scenario, monkeypatch, symbol):
     from contextlib import contextmanager
     from datetime import datetime, timezone
     from trader import account_state
@@ -1028,6 +1029,21 @@ def test_legacy_original_high_watermark_survives_empty_current_day(scenario, mon
     from trader.us.db import repos
 
     db, client, _ = scenario
+    # Recreate the immutable fixture BUY for each incident legacy symbol.
+    # No real account identifiers or production contracts are embedded.
+    if symbol != SYMBOL:
+        contract = build_us_entry_exit_contract({
+            "symbol": symbol, "strategy_owner": "US_STANDARD",
+            "book": "SWING_BOOK", "horizon": "SWING_CARRY",
+            "entry_reason": "TEST_ORIGINAL_BUY",
+        })
+        db.position["symbol"] = symbol
+        db.position["meta"].update(entry_exit_contract=contract,
+                                   entry_exit_contract_sha256=contract["sha256"])
+        db.buy["meta"].update(position_lifecycle_id=f"ENTRY:US_STANDARD:{symbol}",
+                              entry_exit_contract_sha256=contract["sha256"])
+        db.fills[0]["meta"].update(position_lifecycle_id=f"ENTRY:US_STANDARD:{symbol}",
+                                  entry_exit_contract_sha256=contract["sha256"])
     db.history["lifecycle"].update({
         "high_watermark": 125.0,
         "high_watermark_at": "2026-11-04T16:00:00+00:00",
@@ -1045,12 +1061,12 @@ def test_legacy_original_high_watermark_survives_empty_current_day(scenario, mon
                         lambda *a, **kw: {"trade_date": "2026-11-11", "state": {}})
     monkeypatch.setattr(lifecycle, "_save_lifecycle",
                         lambda sym, day, data: writes.append(dict(data)) or dict(data))
-    pos = {"symbol": SYMBOL, "qty": 4, "strategy_owner": "US_STANDARD",
+    pos = {"symbol": symbol, "qty": 4, "strategy_owner": "US_STANDARD",
            "position_lifecycle_id": OLD_CYCLE, "account_id": RAW_ACCOUNT,
            "env": "practice", "trading_epoch_id": EPOCH}
     now = datetime(2026, 11, 11, 16, tzinfo=timezone.utc)
     result = lifecycle.update_us_position_high_watermark(
-        symbol=SYMBOL, trade_date="2026-11-11", lifecycle_id=OLD_CYCLE,
+        symbol=symbol, trade_date="2026-11-11", lifecycle_id=OLD_CYCLE,
         current_price=120.0, entry_price=100.0, now=now, position=pos,
     )
     assert len(writes) == 1
@@ -1068,12 +1084,12 @@ def test_legacy_original_high_watermark_survives_empty_current_day(scenario, mon
                         lambda *a, **kw: {"trade_date": "2026-11-11",
                                          "state": {"lifecycle": dict(writes[-1])}})
     new_high = lifecycle.update_us_position_high_watermark(
-        symbol=SYMBOL, trade_date="2026-11-11", lifecycle_id=OLD_CYCLE,
+        symbol=symbol, trade_date="2026-11-11", lifecycle_id=OLD_CYCLE,
         current_price=130.0, entry_price=100.0, now=now, position=pos,
     )
     assert new_high["high_watermark"] == 130.0 and len(writes) == 2
     carried = lifecycle.update_us_position_high_watermark(
-        symbol=SYMBOL, trade_date="2026-11-11", lifecycle_id=OLD_CYCLE,
+        symbol=symbol, trade_date="2026-11-11", lifecycle_id=OLD_CYCLE,
         current_price=128.0, entry_price=100.0, now=now, position=pos,
     )
     assert carried["high_watermark"] == 130.0
@@ -1085,7 +1101,7 @@ def test_legacy_original_high_watermark_survives_empty_current_day(scenario, mon
     pos["legacy_nine_decision_only_provisional"] = True
     with pytest.raises(ValueError, match="US_HIGH_WATERMARK_LEGACY_ORIGINAL_UNVERIFIED"):
         lifecycle.update_us_position_high_watermark(
-            symbol=SYMBOL, trade_date="2026-11-11", lifecycle_id=OLD_CYCLE,
+            symbol=symbol, trade_date="2026-11-11", lifecycle_id=OLD_CYCLE,
             current_price=999.0, entry_price=100.0, now=now, position=pos,
         )
     assert len(writes) == 2

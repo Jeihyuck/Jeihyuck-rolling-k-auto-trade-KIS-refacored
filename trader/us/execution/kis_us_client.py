@@ -483,6 +483,8 @@ class KisUSClient:
                 rows_by_date[d] = row
                 dated.append(d)
             pages += 1
+            logger.info("[US_OHLCV][PAGE_EVIDENCE] symbol=%s exchange=%s as_of=%s raw_rows=%d accepted_rows=%d stop_at=%s",
+                        symbol, exchange, next_as_of, len(page or []), len(dated), stop_at_date)
             page_key = tuple(sorted(dated))
             if not dated or page_key in seen_pages or len(rows_by_date) >= int(required_bars):
                 break
