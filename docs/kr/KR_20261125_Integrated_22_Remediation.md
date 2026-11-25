@@ -21,7 +21,7 @@ Statuses: PARTIAL = some implementation on this branch, OPEN = remaining work, V
 | 09 P0 | TP/SL/final close | VERIFY | TP1/2/3/runner and current -3/-6 policy plus protective sell, partial/cancel/retry, final fill and DB/KIS exact match; active runtime integration evidence. |
 | 10 P1 | V3 rise-and-hold | PARTIAL | standalone candidate geometry + reconstructed fixture; integrate into canonical practice PB1 path after full proof, do not accept all-flat or lower lows. |
 | 11 P1 | Intraday rolling peak | PARTIAL | standalone causal confirmed local peak; validate complete dependency/conflict window and ordered peak/trough, no lookahead, no artificial target, owner breakout preserved. |
-| 12 P1 | Price ceiling first | PARTIAL | V2 computes diagnostic ceiling before RR rejection; standalone V3 returns price interval. Actual quote/plan/submit integration outstanding; no WAIT authorization. |
+| 12 P1 | Price ceiling first | PARTIAL | V2 computes diagnostic ceiling before RR rejection; standalone V3 returns price interval. Actual quote/plan integration added after draft creation; see progress below. No WAIT authorization. |
 | 13 P1 | HOT minute decision | OPEN | existing HOT/WARM observer 45/180s not same as decision cadence; 1 minute priority evaluation, single writer, no duplicate claims or broker rate breach. |
 | 14 P1 | Tick latency | VERIFY/OPEN | stage timing p50/p95/max, bounded lock/I/O/DB, actual 180s submit fence and separate watchdog, protect SELL priority, AM/PM continue. |
 | 15 P1 | V2 label | PARTIAL | production early UNKNOWN/WAIT policy identity fixed, regression pending; keep true owner fallback legacy; check emitted ledger serialization. |
@@ -38,7 +38,7 @@ Statuses: PARTIAL = some implementation on this branch, OPEN = remaining work, V
 - Minute observer: capture source/timezone/session, exact request anchors, bar identity/OHLCV versions and retry outcome; keep previous quarantine audit. Current 4 consecutive V2 native post-open or independent 8; no global 25-bar BUY block. Do not manufacture missing bars. V3 wider dependencies must explicitly validate all consumed bars and quarantine. Existing recovery can already return to normal; do not label every safe UNKNOWN as implementation defect.
 - Volume: native exchange event time versus local receipt must be distinguished; not bypass proof. Current 357870 candidate has BREAKOUT trigger false independently. Preserve volume/risk/owner gates.
 - Closed cycle and historical claim: read-only evidence acquisition first, explicit approval required for operational DB repairs. Existing #395 implementation should be traced, not duplicated blindly. Any unresolved evidence remains fenced only as appropriate to scope; never remove claim history.
-- V3: compare separate signal and price feasibility. Rising three closes retained; rise-and-hold requires at least one increase and nondecreasing lows + volume >=0.8; local high precedes trough, no future information. Keep 0.5% depth, 1.5 RR, 2.5% structural risk, 1% price deviation and fresh native quote/spread gates. Use KRX correct tick rounding. Current V3 module intentionally returns SIGNAL (not READY) and is not wired to runtime. Current V2 diagnostic ceiling is not authorization. For genuine ask above cap, no fake executable ask; optional passive LIMIT policy requires explicit quote verification, no upward chase, TTL/cancel/partial fill/reconcile contract, final guard and integration tests. No quantity increase on repricing. Evaluate separately by PULLBACK/MOMENTUM; keep BREAKOUT owner path.
+- V3: compare separate signal and price feasibility. Rising three closes retained; rise-and-hold requires at least one increase and nondecreasing lows + volume >=0.8; local high precedes trough, no future information. Keep 0.5% depth, 1.5 RR, 2.5% structural risk, 1% price deviation and fresh native quote/spread gates. Use KRX correct tick rounding. V3 geometry intentionally returns SIGNAL (not READY); the subsequent implementation now adapts it to the practice-only V2 enforcement path and rechecks the actual order price. Current V2 diagnostic ceiling is not authorization. For genuine ask above cap, no fake executable ask; optional passive LIMIT policy requires explicit quote verification, no upward chase, TTL/cancel/partial fill/reconcile contract, final guard and integration tests. No quantity increase on repricing. Evaluate separately by PULLBACK/MOMENTUM; keep BREAKOUT owner path.
 - Latency: do not parallelize actual submitters; observer read-only, priority polling and single writer. Existing DB timeout settings retained; no empty-list fail-open on unknown orders. Actual 180s broker deadline distinct from watchdog. Capture stage latencies before setting targets; 60s HOT decision and 5–15s signal-to-submit are design objectives, not achieved.
 - All requested items including item 09 mandatory. Draft remains blocked until every item has code or verified existing implementation and evidence. Preserve Final30, existing exits, allocation and KR_INFINITE policy. No automatic merge or operation.
 
@@ -48,3 +48,30 @@ Statuses: PARTIAL = some implementation on this branch, OPEN = remaining work, V
 3. Replay original KIS data with causal point-in-time quotes where available, at least 20 trading days and out-of-sample where possible; compare opportunity, actual executable fill model (not candle-only assumed), costs, forward MAE/MFE, realized return, MDD. Do not optimize for order count alone. No proof of Pumtech profit.
 4. Ops evidence: WSL SHA, profile, observer, AM/PM guard, close/report mail receipt; native KIS 10/27 and 11/19 + 11/25 evidence. No live mutation from PR CI. Approved practice rollout only after tests pass; no force fill, no automatic merge. Report unverified actual operating trade separately.
 5. Draft implementation at creation includes V2 label, early diagnostic ceiling, standalone V3 candidate geometry, reconstructed test fixtures. Remaining code changes and all tests/CI/runtime verification are not complete. Keep Draft.
+
+
+## 2026-11-25 implementation update (supersedes initial draft statuses)
+
+| ID | Latest disposition | Remaining verification |
+|---|---|---|
+| 01 | Implemented narrow same-day pre-hashkey zero-fill retry under same semantic unit and atomic new attempt | Fresh native all-pages no-order + forced balance and actual retry; no ambiguous or partial retry bypass |
+| 02 | Existing quarantine retained; prevent incomplete-at-request minute from maturing during I/O | Original native conflict/repair timestamps; CI |
+| 03 | Explicit stale-minute anchor added | Actual HOT freshness p95 |
+| 04 | Authenticated native retry can prove data while preserving failed breakout trigger | CI and native ETF session data |
+| 05 | Fixed exact legacy local client-key alias stored in broker_order_id on explicit reject; native ID still blocks | Actual historical reconciliation and scoped DB readback |
+| 06 | Read-only diagnosed: 10/27 order 0000011280, 174 shares, accepted and RECONCILED; original BUY fill row absent, separate imported cycle later sold 174 | Original-day native KIS execution proof needed; do not join unrelated cycle or force terminalization. Existing scoped recovery code not sufficient evidence of recovery |
+| 07 | Existing SST contract preserved | Latest CI and actual BUY-to-position/restart |
+| 08 | Same-unit zero-fill retry added; existing partial-fill/remaining action policy untouched | Latest partial fill/cancel/retry integration |
+| 09 | Existing TP/SL/final close unchanged | Latest regression and actual lifecycle |
+| 10 | V3 rise-and-hold integrated in PB1 practice ENFORCE adapter | Latest CI; original-minute replay and real quote proof |
+| 11 | Causal local peak/trough integrated | Latest CI and out-of-sample replay |
+| 12 | Diagnostic cap first; bounded genuine fresh ASK repricing integrated, quantity invariant; no fake passive ASK | Latest CI and full submit integration |
+| 13 | Existing observer priority unchanged; 60s loop target not independently proven | Further decision-latency implementation and observed timing |
+| 14 | Incomplete-minute and stale-repair changes; no relaxation of existing deadline | Stage profiling, actual tick duration; additional work if targets missed |
+| 15 | V2 early error label fixed, V3 revision and cap logged | Latest CI / emitted ledger |
+| 16 | Not completed | Independent heartbeat and actual mail delivery verification |
+| 17–20 | Existing ranking/owners/exit thresholds/duplicate fences preserved; new offline counterexamples included | Latest full regression |
+| 21 | No live trade or DB mutation performed | End-to-end regression + practice execution evidence |
+| 22 | Practice WSL profile selects V3 inside existing V2 ENFORCE; explicit flag 0 rollback | Not merged or deployed; latest CI and operating evidence required |
+
+The original draft head c72bf4df passed 10 workflows. Subsequent code commits invalidate that as final acceptance. Latest-head workflows must pass; no claim of 22/22 completion. The Pumtech fixtures reconstruct logged closes/lows/volumes and are not complete native KIS replay. No original KIS/WSL access, no account mutations, no forced trades. Keep Draft and do not merge until remaining mandatory work and evidence are resolved.
