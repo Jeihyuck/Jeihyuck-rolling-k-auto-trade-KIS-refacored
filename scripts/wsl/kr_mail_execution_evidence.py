@@ -58,6 +58,41 @@ def _failure_reason(stage: Path, trade: str, purpose: str, attempt: dict) -> str
     return str(attempt.get("reason") or "UNSPECIFIED")
 
 
+def _session_order_activity(stage: Path, trade: str, purpose: str, attempt: dict) -> dict:
+    """Count distinct terminal tick markers and owner-specific outcomes, not HTTP retries."""
+    raw = attempt.get("log_file")
+    prefix = f"runtime/logs/kr/{trade}/{purpose}/"
+    unknown = {"evidence": "MISSING_OR_UNVERIFIED", "market_data_error_ticks": None,
+               "infinite_order_attempts": None, "infinite_explicit_rejections": None,
+               "infinite_unresolved_attempts": None, "infinite_acknowledged_attempts": None}
+    if not isinstance(raw, str) or not raw.startswith(prefix) or "\\" in raw:
+        return unknown
+    try:
+        path = (stage / raw).resolve(strict=True)
+        path.relative_to((stage / prefix).resolve())
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except (OSError, ValueError):
+        return unknown
+    states = []
+    legacy_block = 0
+    data_errors = 0
+    for line in lines:
+        if "[RUN_SUMMARY][RESULT]" in line and "status=RETRYABLE_MARKET_DATA_ERROR" in line:
+            data_errors += 1
+        if "[KR_INF][TICK][AFTER_PROTECTIVE_SELL]" in line:
+            match = re.search(r" attempted=([01]) submission_state=([A-Z_]+)(?:\s|$)", line)
+            if match:
+                states.append((match.group(1) == "1", match.group(2)))
+            elif "decision=BLOCK" in line:
+                legacy_block += 1
+    return {"evidence": "LOG_READ", "market_data_error_ticks": data_errors,
+            "infinite_order_attempts": sum(attempted for attempted, _ in states) if states else None,
+            "infinite_explicit_rejections": sum(s == "REJECTED_EXPLICIT" for _, s in states) if states else None,
+            "infinite_unresolved_attempts": sum(s == "UNRESOLVED" for _, s in states) if states else None,
+            "infinite_acknowledged_attempts": sum(s == "ACKED" for _, s in states) if states else None,
+            "infinite_legacy_block_decisions": legacy_block}
+
+
 def collect_kr_execution_status(stage: Path, trade: str) -> dict[str, Any]:
     stage = Path(stage)
     manifest = _json(stage / "runtime" / "logs" / "kr" / trade / "session-manifest.json")
@@ -66,6 +101,7 @@ def collect_kr_execution_status(stage: Path, trade: str) -> dict[str, Any]:
     any_failed = False
     any_missing = False
     watchdog_alerts: dict[str, list[str]] = {}
+    order_activity: dict[str, dict] = {}
     for purpose in ("prep", "am", "afternoon", "close"):
         attempt = _latest_session(sessions.get(purpose, {}))
         if not attempt:
@@ -80,6 +116,8 @@ def collect_kr_execution_status(stage: Path, trade: str) -> dict[str, Any]:
         elif status not in {"OK", "OK_WITH_WARNINGS", "WARN", "DEGRADED", "SKIPPED_NON_TRADING_DAY"}:
             any_missing = True
         summary[purpose] = {"status": status, "reason": reason}
+        if purpose in {"am", "afternoon", "close"}:
+            order_activity[purpose] = _session_order_activity(stage, trade, purpose, attempt)
         if purpose in {"am", "afternoon"}:
             # Exact effective attempt only. Report historical watchdog alerts
             # even if later recovered; they are not fabricated broker faults.
@@ -115,9 +153,14 @@ def collect_kr_execution_status(stage: Path, trade: str) -> dict[str, Any]:
         native_gap = None
     if pb1.get("economic_settlement_pending") in (True, 1) or (native_gap is not None and native_gap > 0):
         economic = "ECONOMIC_SETTLEMENT_PENDING"
+    activity_degraded = any(
+        any((row.get(key) or 0) > 0 for key in ("market_data_error_ticks",
+            "infinite_explicit_rejections", "infinite_unresolved_attempts", "infinite_legacy_block_decisions"))
+        for row in order_activity.values()
+    )
     if any_failed:
         daily = "FAILED"
-    elif any_missing or economic in {"UNKNOWN", "ECONOMIC_SETTLEMENT_PENDING"}:
+    elif any_missing or activity_degraded or economic in {"UNKNOWN", "ECONOMIC_SETTLEMENT_PENDING"}:
         daily = "DEGRADED"
     else:
         daily = "COMPLETED"
@@ -129,6 +172,11 @@ def collect_kr_execution_status(stage: Path, trade: str) -> dict[str, Any]:
     ]
     for purpose, alerts in watchdog_alerts.items():
         summary_tokens.append(f"{purpose.upper()}_WATCHDOG=" + ",".join(alerts))
+    for purpose, row in order_activity.items():
+        summary_tokens.append(f"{purpose.upper()}_MARKET_DATA_ERROR_TICKS={row.get('market_data_error_ticks')}")
+        summary_tokens.append(f"{purpose.upper()}_INFINITE_ATTEMPTS={row.get('infinite_order_attempts')}")
+        summary_tokens.append(f"{purpose.upper()}_INFINITE_REJECTED={row.get('infinite_explicit_rejections')}")
+        summary_tokens.append(f"{purpose.upper()}_INFINITE_UNRESOLVED={row.get('infinite_unresolved_attempts')}")
     summary_tokens.append(f"CLOSE_SETTLEMENT={economic}")
     summary_tokens.append(f"TODAY_SETTLEMENT={today_economic}")
     summary_tokens.append(f"HISTORICAL_SETTLEMENT={historical_economic}")
@@ -141,6 +189,7 @@ def collect_kr_execution_status(stage: Path, trade: str) -> dict[str, Any]:
         "daily_execution_status": daily,
         "execution_sessions": summary,
         "watchdog_alerts": watchdog_alerts,
+        "order_activity_by_session": order_activity,
         "close_economic_settlement_state": economic,
         "close_today_economic_settlement_state": today_economic,
         "close_historical_economic_settlement_state": historical_economic,
