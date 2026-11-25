@@ -614,9 +614,13 @@ def _install_reconcile_guards() -> None:
 def _broker_crossed_this_tick(engine_obj: Any) -> bool:
     buy = dict(getattr(engine_obj, "_run_summary_payload", {}) or {})
     sell = dict(getattr(engine_obj, "_exit_summary_payload", {}) or {})
+    if getattr(engine_obj, "_kr_infinite_submit_attempted", False):
+        return True
     return any(
         int(value or 0) > 0
         for value in (
+            buy.get("submit_attempts"),
+            sell.get("submit_attempts"),
             buy.get("api_submitted"),
             buy.get("submitted"),
             buy.get("accepted"),
