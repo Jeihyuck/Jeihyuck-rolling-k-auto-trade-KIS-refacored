@@ -517,12 +517,52 @@ def reconcile_us_position_lifecycles(
         if os.getenv("WSL_RUN_MARKET", "").upper() == "US":
             from trader.us.execution.us_legacy_nine_active_sell import enrich_legacy_nine_v2_decision_position
             original = enrich_legacy_nine_v2_decision_position(pos, trade_date=trade_date)
-            if original.get("legacy_nine_decision_only_provisional") is True:
+            if original is not pos and original.get("legacy_nine_decision_only_provisional") is True:
                 pos.update(original)
-                # Legacy source identity is proven, but it is not an original
-                # canonical portfolio epoch. Do not fabricate one or report
-                # a failed lookup; the broker router separately proves the
-                # forward management scope when a real SELL signal arrives.
+                # Restore an independently proven historical peak even when
+                # the first live quote is unavailable. This is a carry of the
+                # original price/time pair, not a new price observation or
+                # permission to SELL under a retroactive portfolio identity.
+                archive = original.get("_verified_legacy_runtime_lifecycle") or {}
+                if authoritative and archive.get("lifecycle_id"):
+                    current_row = next((row for row in risk_candidates_by_symbol.get(symbol, [])
+                                        if str(row.get("trading_epoch_id") or "") ==
+                                           str(archive.get("trading_epoch_id") or "")), {})
+                    leaf = (current_row.get("state") or {}).get("lifecycle") or {}
+                    peak_durable = (
+                        str(current_row.get("trade_date") or "") == str(trade_date)
+                        and all(str(leaf.get(key) or "") == str(archive.get(key) or "")
+                                for key in ("lifecycle_id", "account_id", "env",
+                                            "trading_epoch_id", "strategy_owner",
+                                            "portfolio_epoch_id", "position_cycle_id"))
+                        and leaf.get("is_open") is True
+                        and _f(leaf.get("high_watermark")) >= _f(archive.get("high_watermark")) > 0
+                        and leaf.get("high_watermark_at")
+                        and leaf.get("high_watermark_source") == "us_position_risk_state"
+                        and (leaf.get("entry_policy") or {}).get("entry_exit_contract_sha256")
+                            == (archive.get("entry_policy") or {}).get("entry_exit_contract_sha256")
+                    )
+                    try:
+                        restored = leaf if peak_durable else update_us_position_high_watermark(
+                            symbol=symbol, trade_date=trade_date,
+                            lifecycle_id=str(archive["lifecycle_id"]),
+                            current_price=0.0, entry_price=0.0, now=now, position=pos,
+                        )
+                        if restored.get("is_open") is True:
+                            pos.update({
+                                "high_watermark": restored.get("high_watermark"),
+                                "max_price": restored.get("high_watermark"),
+                                "high_watermark_at": restored.get("high_watermark_at"),
+                                "high_watermark_source": restored.get("high_watermark_source"),
+                                "high_watermark_lifecycle_id": restored.get("lifecycle_id"),
+                            })
+                    except Exception as exc:
+                        logger.warning(
+                            "[US_POSITION][LIFECYCLE][LEGACY_HWM_RESTORE_UNVERIFIED] symbol=%s type=%s",
+                            symbol, type(exc).__name__,
+                        )
+                # Legacy original scope is not a canonical portfolio. Do not
+                # manufacture one; the router proves forward SELL separately.
                 logger.info(
                     "[US_POSITION][LIFECYCLE][LEGACY_ORIGINAL_LINK_VERIFIED] symbol=%s",
                     symbol,
@@ -852,6 +892,9 @@ def update_us_position_high_watermark(*, symbol: str, trade_date: str, lifecycle
         and new_high == previous
         and str(latest.get("trade_date") or "") == str(trade_date)
         and ((latest.get("state") or {}).get("lifecycle") or {}).get("lifecycle_id") == lifecycle_id
+        and _f(((latest.get("state") or {}).get("lifecycle") or {}).get("high_watermark")) == new_high
+        and ((latest.get("state") or {}).get("lifecycle") or {}).get("high_watermark_at") == lifecycle.get("high_watermark_at")
+        and ((latest.get("state") or {}).get("lifecycle") or {}).get("high_watermark_source") == "us_position_risk_state"
         and lifecycle.get("high_watermark_source") == "us_position_risk_state"
         and lifecycle.get("high_watermark_at")
         and lifecycle.get("is_open") is True
