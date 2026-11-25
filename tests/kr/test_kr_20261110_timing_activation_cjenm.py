@@ -103,7 +103,12 @@ def test_kis_observer_reuses_verified_opening_and_fetches_only_latest(monkeypatc
     monkeypatch.setattr(obs, "now_kst", lambda: datetime(2026, 11, 10, 9, 35, tzinfo=KST))
     def _save(**kwargs):
         captured = kwargs["raw_bars"]
-        assert len(captured) == 30
+        # The 09:35 row was captured before that minute completed. It
+        # must never reach persistence, even if later quote I/O crosses 09:36.
+        # Keep all 29 completed rows, in order, from the one latest request.
+        assert captured == bars[6:35]
+        assert len(captured) == 29
+        assert captured[-1]["time"] == "093400"
         assert all(row.get("date") == "20261110" for row in captured)
         return {"bars": 35, "new_bars": 35, "reused_bars": 0,
                 "source_conflicts": [], "path": "/tmp/test-observer",
