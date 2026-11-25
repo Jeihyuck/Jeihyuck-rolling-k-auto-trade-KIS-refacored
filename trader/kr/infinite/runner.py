@@ -66,6 +66,8 @@ class RunResult:
     decision: Decision
     state: State | None
     submitted: bool = False
+    submit_attempted: bool = False
+    submission_state: str = "NOT_ATTEMPTED"
 
 
 def load_regime() -> tuple[str | None, str]:
@@ -387,6 +389,7 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
             state = replace(state, status=Status.EXIT_PENDING,
                             metadata={**state.metadata, "pending_profit_stage": pending_stage})
             repository.save_state(state)
+        submit_attempted = True
         try:
             order_id, _ = executor.submit(decision, config.symbol)
         except Exception as exc:
@@ -410,7 +413,7 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
                         "KR_INF_ORDER_SUBMIT_UNRESOLVED_ACK",
                         next_status=state.status,
                     ),
-                    state,
+                    state, submit_attempted=True, submission_state="UNRESOLVED",
                 )
             repository.mark_rejected(decision.idempotency_key, str(exc))
             repository.record_execution_claim_observation(
@@ -420,7 +423,8 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
                 cumulative_filled_qty=0,
                 authoritative=True,
             )
-            return RunResult(Decision(Action.BLOCK, str(exc)), state)
+            return RunResult(Decision(Action.BLOCK, str(exc)), state, submit_attempted=True,
+                             submission_state="REJECTED_EXPLICIT")
         repository.mark_submitted(decision.idempotency_key, order_id)
         repository.record_execution_claim_observation(
             claim_identity,
@@ -456,10 +460,12 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
                              balance_grace_attempts=config.balance_reconcile_grace_attempts)
         if state is not None:
             repository.persist_reconciliation(state, post_updates)
-        return RunResult(decision, state, submitted=True)
+        return RunResult(decision, state, submitted=True, submit_attempted=True, submission_state="ACKED")
     except Exception as exc:
         logger.exception("[KR_INFINITE][BLOCK] reason=%s", exc)
-        return RunResult(Decision(Action.BLOCK, str(exc), next_status=Status.FROZEN), locals().get("state"))
+        return RunResult(Decision(Action.BLOCK, str(exc), next_status=Status.FROZEN), locals().get("state"),
+                         submit_attempted=locals().get("submit_attempted", False),
+                         submission_state="UNRESOLVED" if locals().get("submit_attempted") else "NOT_ATTEMPTED")
 
 
 def main() -> int:
