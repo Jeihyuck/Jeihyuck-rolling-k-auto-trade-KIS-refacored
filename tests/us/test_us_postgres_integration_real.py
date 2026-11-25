@@ -8,6 +8,28 @@ pytestmark = pytest.mark.skipif(not os.getenv("PBCORE_TEST_POSTGRES_URL"), reaso
 
 DAYTIME_ET = datetime(2026, 8, 24, 10, 30, tzinfo=ZoneInfo("America/New_York"))
 
+def _enable_mock_practice_router_permissions(monkeypatch):
+    """Exercise real risk permission logic with only the injected fake broker.
+
+    Keep CI's default DRY_RUN=1 for all other tests. No authenticated HTTP
+    is allowed even if a code path unexpectedly tries to create a client.
+    """
+    import requests
+
+    def unexpected_http(*args, **kwargs):
+        pytest.fail("Network HTTP is forbidden in mock-only PostgreSQL routing tests")
+
+    monkeypatch.setattr(requests.sessions.Session, "request", unexpected_http)
+    for key, value in {
+        "KIS_ENV": "practice", "STRATEGY_ENV": "practice",
+        "DRY_RUN": "0", "DISABLE_LIVE_TRADING": "0",
+        "DISABLE_REAL_TRADING": "1", "LIVE_TRADING_ENABLED": "1",
+        "US_LIVE_TRADING_ENABLED": "1", "US_ORDER_ARMED": "1",
+        "SIGNAL_ONLY": "0", "RUN_MODE": "TRADE",
+    }.items():
+        monkeypatch.setenv(key, value)
+
+
 @pytest.fixture()
 def pg_engine(monkeypatch):
     from sqlalchemy import create_engine, text
@@ -3182,6 +3204,7 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
     monkeypatch.setenv("WSL_RUN_MARKET", "US")
     monkeypatch.setenv("US_ACCOUNT_RESERVATION_MODE", "OFF")
     monkeypatch.setenv("US_ATOMIC_CLAIM_OUTBOX_ENABLED", "0")
+    _enable_mock_practice_router_permissions(monkeypatch)
     monkeypatch.setattr(order_router, "resolve_dry_run_for_us_order", lambda: False)
     claim_repo = DurableExecutionClaimRepo(
         pg_engine, us_execution_claims, us_execution_attempts,
@@ -3798,6 +3821,7 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
     monkeypatch.setenv("US_ATOMIC_CLAIM_OUTBOX_ENABLED", "1" if paper_profile else "0")
     monkeypatch.setenv("US_ACCOUNT_RESERVATION_MODE", "ENFORCE" if paper_profile else "OFF")
     monkeypatch.setenv("US_RECONCILE_WORKER_MODE", "RESERVATION_ONLY" if paper_profile else "LEGACY")
+    _enable_mock_practice_router_permissions(monkeypatch)
     monkeypatch.setattr(order_router, "resolve_dry_run_for_us_order", lambda: False)
     if paper_profile:
         import hashlib
@@ -4010,6 +4034,7 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
     monkeypatch.setattr(
         account_state, "get_account_key", lambda **_kw: raw_account,
     )
+    _enable_mock_practice_router_permissions(monkeypatch)
     monkeypatch.setattr(
         order_router, "resolve_dry_run_for_us_order", lambda: False,
     )
