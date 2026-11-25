@@ -315,3 +315,56 @@ def test_duplicate_cumulative_broker_order_is_not_an_incremental_fill(qty, price
                  "client_order_key": client, "order_no": "000000102"}
     with pytest.raises(ValueError, match="DUPLICATE_NATIVE_FILL"):
         _pnl([buy, sell, duplicate], [_position(qty=20-5-qty)])
+
+
+
+def test_signed_trading_basis_is_explicit_and_not_a_net_policy_fallback():
+    from trader.us.portfolio_profit_guard import TRADING_ACCOUNTING_METHOD
+    doc = _policy()
+    doc["accounting_method"] = TRADING_ACCOUNTING_METHOD
+    with pytest.raises(ValueError, match="SIGNATURE_INVALID"):
+        _authorize(doc)
+    doc.pop("hmac_sha256")
+    doc["hmac_sha256"] = hmac.new(KEY.encode(), canonical(doc), hashlib.sha256).hexdigest()
+    body, _ = _authorize(doc)
+    assert body["accounting_method"] == TRADING_ACCOUNTING_METHOD
+    assert body["stages"] == _policy()["stages"]
+
+
+def test_trading_basis_marks_open_and_closed_lots_without_inventing_costs():
+    from trader.us.portfolio_profit_guard import TRADING_ACCOUNTING_METHOD
+    rows = [
+        _fill("KO", "BUY", 10, "100", "101"),
+        _fill("KO", "SELL", 5, "110", "102"),
+        _fill("PG", "BUY", 2, "50", "103"),
+        _fill("PG", "SELL", 2, "60", "104"),
+    ]
+    for row in rows:
+        row.pop("native_fee_proof")
+        row.pop("commission_usd")
+        row.pop("tax_usd")
+    kwargs = dict(snapshot_at=STAMP, account_hash=ACCOUNT, trading_epoch_id=EPOCH,
+                  quote_ttl_sec=Decimal("5"), max_skew_sec=Decimal("3"),
+                  broker_full_balance_verified=True,
+                  accounting_method=TRADING_ACCOUNTING_METHOD)
+    pnl, proof = verified_sleeve_pnl(rows, [_position()], **kwargs)
+    assert pnl == Decimal("95")
+    assert proof["known_commissions_usd"] is None
+    assert proof["confirmed_net_pnl_usd"] is None
+    assert proof["broker_cash_ledger_complete"] is False
+    rows[0].update(native_fee_proof=True, commission_usd="2.50", tax_usd="0.25")
+    later, proof = verified_sleeve_pnl(rows, [_position()], **kwargs)
+    assert later == pnl  # late fee evidence must not create a false drawdown
+    assert proof["known_commissions_usd"] == Decimal("2.50")
+    assert proof["known_taxes_usd"] == Decimal("0.25")
+    assert proof["verified_fee_fill_count"] == 1
+    assert proof["all_fill_fees_verified"] is False
+    assert proof["confirmed_net_pnl_usd"] is None
+    with pytest.raises(ValueError, match="KIS_LEDGER_NET_MISMATCH"):
+        verified_sleeve_pnl(rows, [_position(qty=6)], **kwargs)
+    with pytest.raises(ValueError, match="MARK_STALE"):
+        verified_sleeve_pnl(rows, [_position(at=STAMP-timedelta(seconds=6))], **kwargs)
+    with pytest.raises(ValueError, match="DUPLICATE_NATIVE_FILL"):
+        verified_sleeve_pnl(rows+rows[:1], [_position()], **kwargs)
+    with pytest.raises(ValueError, match="TRADING_MODE_CASH_INPUT_FORBIDDEN"):
+        verified_sleeve_pnl(rows, [_position()], cash_events=[], **kwargs)
