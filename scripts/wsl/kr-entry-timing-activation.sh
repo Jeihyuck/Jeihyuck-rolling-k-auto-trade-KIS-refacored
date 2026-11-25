@@ -33,6 +33,16 @@ kr_pb1_entry_timing_defaults() {
       US_ALIGNED_V2|LEGACY_V1) ;;
       *) export KR_PB1_ENTRY_TIMING_APPROVED=0 ;;
     esac
+    # Active only inside the approved practice V2 enforcement profile.
+    # Explicit 0 is the rollback to unmodified V2; LEGACY_V1 remains separate.
+    export KR_PB1_ADAPTIVE_ENTRY_V3_ENABLED="${KR_PB1_ADAPTIVE_ENTRY_V3_ENABLED:-1}"
+    case "$KR_PB1_ADAPTIVE_ENTRY_V3_ENABLED" in
+      0|1) ;;
+      *) export KR_PB1_ENTRY_TIMING_APPROVED=0 ;;
+    esac
+    if [[ "$KR_PB1_ENTRY_OPPORTUNITY_POLICY" != "US_ALIGNED_V2" ]]; then
+      export KR_PB1_ADAPTIVE_ENTRY_V3_ENABLED=0
+    fi
     # The old quote-only parallel SHADOW must not mask the mandatory
     # completed KIS 1m ENFORCE gate or be mistaken for live BUY authorization.
     export KR_PB1_ENTRY_TIMING_SHADOW_ENABLED=0
@@ -46,13 +56,14 @@ kr_pb1_entry_timing_defaults() {
     export KR_PB1_KIS_OBSERVER_BUDGET_ENABLED="${KR_PB1_KIS_OBSERVER_BUDGET_ENABLED:-1}"
   else
     export KR_PB1_ENTRY_OPPORTUNITY_POLICY=LEGACY_V1
+    export KR_PB1_ADAPTIVE_ENTRY_V3_ENABLED=0
     export KR_PB1_ENTRY_TIMING_MODE="${KR_PB1_ENTRY_TIMING_MODE:-SHADOW}"
     export KR_PB1_ENTRY_TIMING_APPROVED="${KR_PB1_ENTRY_TIMING_APPROVED:-0}"
     export KR_PB1_ENTRY_TIMING_SHADOW_ENABLED="${KR_PB1_ENTRY_TIMING_SHADOW_ENABLED:-0}"
     export KR_PB1_OPENING_OBSERVER_ENABLED=0
     export KR_PB1_KIS_OBSERVER_BUDGET_ENABLED=0
   fi
-  echo "[KR][ENTRY_TIMING][EFFECTIVE_CONFIG] strategy_env=${STRATEGY_ENV:-unknown} kis_env=${KIS_ENV:-unknown} mode=$KR_PB1_ENTRY_TIMING_MODE approved=$KR_PB1_ENTRY_TIMING_APPROVED policy=$KR_PB1_ENTRY_OPPORTUNITY_POLICY legacy_quote_shadow=DISABLED opening_observer=$KR_PB1_OPENING_OBSERVER_ENABLED interval_sec=${KR_PB1_OPENING_OBSERVER_INTERVAL_SEC:-n/a}"
+  echo "[KR][ENTRY_TIMING][EFFECTIVE_CONFIG] strategy_env=${STRATEGY_ENV:-unknown} kis_env=${KIS_ENV:-unknown} mode=$KR_PB1_ENTRY_TIMING_MODE approved=$KR_PB1_ENTRY_TIMING_APPROVED policy=$KR_PB1_ENTRY_OPPORTUNITY_POLICY adaptive_v3=$KR_PB1_ADAPTIVE_ENTRY_V3_ENABLED legacy_quote_shadow=DISABLED opening_observer=$KR_PB1_OPENING_OBSERVER_ENABLED interval_sec=${KR_PB1_OPENING_OBSERVER_INTERVAL_SEC:-n/a}"
   if [[ "${STRATEGY_ENV:-}" == "practice" && "${KIS_ENV:-}" == "practice" ]] &&
      { [[ "$KR_PB1_ENTRY_TIMING_MODE" != "ENFORCE" ]] ||
        [[ "$KR_PB1_ENTRY_TIMING_APPROVED" != "1" ]] ||
