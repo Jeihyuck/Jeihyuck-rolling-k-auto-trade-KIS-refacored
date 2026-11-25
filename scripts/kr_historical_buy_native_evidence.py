@@ -189,17 +189,22 @@ def collect(*, engine, kis, now, code=None, trade_date=None):
                     orders.c.code == symbol, orders.c.side == "SELL",
                 )).mappings()]
                 proven_sell_qty = 0
+                sell_chain_proven = True
                 for sell in cycle_sells:
                     sell_fills = [dict(row) for row in conn.execute(sa.select(fills).where(
                         fills.c.order_id == sell["order_id"], fills.c.env == scope.env,
                         fills.c.trading_epoch_id == scope.trading_epoch_id,
                         fills.c.side == "SELL",
                     )).mappings()]
-                    proven_sell_qty += int(summarize_native_order(sell, sell_fills).get("proven_filled_qty") or 0)
-                if (exact[0]["status"] == "OPEN" and int(exact[0]["qty"]) > 0
+                    sell_qty = summarize_native_order(sell, sell_fills).get("proven_filled_qty")
+                    if sell_qty is None:
+                        sell_chain_proven = False
+                    else:
+                        proven_sell_qty += int(sell_qty)
+                if (sell_chain_proven and exact[0]["status"] == "OPEN" and int(exact[0]["qty"]) > 0
                         and proven_sell_qty + int(exact[0]["qty"]) == int(order["qty"])):
                     continue
-                if (exact[0]["status"] == "CLOSED" and int(exact[0]["qty"]) == 0
+                if (sell_chain_proven and exact[0]["status"] == "CLOSED" and int(exact[0]["qty"]) == 0
                         and proven_sell_qty == int(order["qty"])):
                     continue
             targets.append({"claim": {"trade_date": day, "action_key": None},
