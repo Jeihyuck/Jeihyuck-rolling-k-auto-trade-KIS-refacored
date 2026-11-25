@@ -65,6 +65,7 @@ def collect_kr_execution_status(stage: Path, trade: str) -> dict[str, Any]:
     summary: dict[str, dict[str, str]] = {}
     any_failed = False
     any_missing = False
+    watchdog_alerts: dict[str, list[str]] = {}
     for purpose in ("prep", "am", "afternoon", "close"):
         attempt = _latest_session(sessions.get(purpose, {}))
         if not attempt:
@@ -79,6 +80,31 @@ def collect_kr_execution_status(stage: Path, trade: str) -> dict[str, Any]:
         elif status not in {"OK", "OK_WITH_WARNINGS", "WARN", "DEGRADED", "SKIPPED_NON_TRADING_DAY"}:
             any_missing = True
         summary[purpose] = {"status": status, "reason": reason}
+        if purpose in {"am", "afternoon"}:
+            # Exact effective attempt only. Report historical watchdog alerts
+            # even if later recovered; they are not fabricated broker faults.
+            run_id = str(attempt.get("run_id") or "")
+            if re.fullmatch(r"[A-Za-z0-9_.-]+", run_id) and run_id not in {".", ".."}:
+                monitor = stage / "runtime" / "logs" / "kr" / trade / purpose / (run_id+".watchdog.log")
+                observed = set()
+                try:
+                    with monitor.open(encoding="utf-8") as file:
+                        for line in file:
+                            prefix = "[KR][SESSION_WATCHDOG] "
+                            if not line.startswith(prefix):
+                                continue
+                            try:
+                                row = json.loads(line[len(prefix):])
+                            except (ValueError, TypeError):
+                                continue
+                            if (isinstance(row, dict) and row.get("date") == trade
+                                    and row.get("session") == purpose and row.get("run_id") == run_id):
+                                observed.update(str(x) for x in row.get("alerts", [])
+                                    if isinstance(x, str) and re.fullmatch(r"[A-Z_]+", x))
+                except OSError:
+                    pass
+                if observed:
+                    watchdog_alerts[purpose] = sorted(observed)
     pb1 = _json(stage / "runtime" / "kr" / "session" / trade / "close" / "pb1_result.json")
     economic = str(pb1.get("economic_settlement_state") or "UNKNOWN")
     today_economic = str(pb1.get("today_economic_settlement_state") or "NOT_REPORTED")
@@ -101,6 +127,8 @@ def collect_kr_execution_status(stage: Path, trade: str) -> dict[str, Any]:
         )
         for name, item in summary.items()
     ]
+    for purpose, alerts in watchdog_alerts.items():
+        summary_tokens.append(f"{purpose.upper()}_WATCHDOG=" + ",".join(alerts))
     summary_tokens.append(f"CLOSE_SETTLEMENT={economic}")
     summary_tokens.append(f"TODAY_SETTLEMENT={today_economic}")
     summary_tokens.append(f"HISTORICAL_SETTLEMENT={historical_economic}")
@@ -112,6 +140,7 @@ def collect_kr_execution_status(stage: Path, trade: str) -> dict[str, Any]:
     return {
         "daily_execution_status": daily,
         "execution_sessions": summary,
+        "watchdog_alerts": watchdog_alerts,
         "close_economic_settlement_state": economic,
         "close_today_economic_settlement_state": today_economic,
         "close_historical_economic_settlement_state": historical_economic,
