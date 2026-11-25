@@ -95,6 +95,43 @@ def current_day_unfilled_evidence(payload, *, day, codes):
             for code, (count, qty) in totals.items()}
 
 
+def fresh_original_balance_quantities(kis):
+    """Fail closed on a normalized empty/stub, stale or incomplete raw balance.
+
+    This read-only collector cannot certify zero holdings from a missing raw
+    output1, an unfinished cursor or duplicate security rows.
+    """
+    started = datetime.now(timezone.utc)
+    try:
+        snapshot, source, raw = kis.get_balance_cached(
+            force=True, return_source=True, return_raw=True)
+        at = getattr(kis, "_balance_cache_at", None)
+        if (source != "api" or not isinstance(raw, dict)
+                or not isinstance(snapshot, dict)
+                or not isinstance(at, datetime) or at.tzinfo is None or at < started
+                or not _valid_original_kr_balance_snapshot(raw, at=at)
+                or raw.get("_diag_stub") or raw.get("_stub") or raw.get("_kis_disabled")
+                or snapshot.get("_diag_stub") or snapshot.get("_stub") or snapshot.get("_kis_disabled")
+                or not isinstance(raw.get("output1"), list)
+                or raw["output1"] != snapshot.get("output1")
+                or not all(key in raw and isinstance(raw[key], str) and not raw[key].strip()
+                           for key in ("ctx_area_fk100", "ctx_area_nk100"))):
+            return False, {}
+        quantities = {}
+        for row in raw["output1"]:
+            if not isinstance(row, dict):
+                return False, {}
+            code = str(row.get("pdno") or "").strip()
+            qty = str(row.get("hldg_qty") if row.get("hldg_qty") is not None else "").strip()
+            if (len(code) != 6 or not code.isascii() or not code.isdigit()
+                    or not qty.isascii() or not qty.isdigit() or code in quantities):
+                return False, {}
+            quantities[code] = int(qty)
+        return True, quantities
+    except Exception:
+        return False, {}
+
+
 def collect(*, engine, kis, now, code=None, trade_date=None):
     if getattr(kis, "env", None) != "practice":
         raise RuntimeError("PRACTICE_BROKER_REQUIRED")
@@ -289,19 +326,7 @@ def collect(*, engine, kis, now, code=None, trade_date=None):
                        "claim_action_key": claim["action_key"], "source_order_id": str(order["order_id"]),
                        "source_cycle": str(order["position_cycle_id"]),
                        "db_fill_qty": target["db_fill_qty"], "positions": target["positions"]})
-    balance_started = datetime.now(timezone.utc)
-    balance_ok = False
-    quantities = {}
-    try:
-        snapshot = kis.get_balance_cached(force=True)
-        at = getattr(kis, "_balance_cache_at", None)
-        if (isinstance(at, datetime) and at.tzinfo is not None and at >= balance_started
-                and _valid_original_kr_balance_snapshot(snapshot, at=at)
-                and not snapshot.get("_diag_stub") and not snapshot.get("_stub")):
-            quantities = {str(row["pdno"]).zfill(6): int(row["hldg_qty"]) for row in snapshot["output1"]}
-            balance_ok = True
-    except Exception:
-        pass
+    balance_ok, quantities = fresh_original_balance_quantities(kis)
     # Query today's all-page broker orders separately from the historical
     # three-day budget. An API failure must not be represented as zero orders.
     codes = {proof["code"] for proof in proofs}
@@ -318,7 +343,7 @@ def collect(*, engine, kis, now, code=None, trade_date=None):
         proof["current_holding_qty"] = quantities.get(proof["code"], 0) if balance_ok else None
         proof["recovery_authorized"] = False
         proof["reason"] = "EXACT_CYCLE_AND_CURRENT_UNFILLED_REVIEW_REQUIRED_NO_WRITE"
-    return {"version": "KR_HISTORICAL_BUY_NATIVE_EVIDENCE_V3", "env": scope.env,
+    return {"version": "KR_HISTORICAL_BUY_NATIVE_EVIDENCE_V4", "env": scope.env,
             "trading_epoch_id": scope.trading_epoch_id, "cases": proofs,
             "days_queried": len(daily) + len(failures), "orders_submitted": 0, "db_rows_modified": 0}
 

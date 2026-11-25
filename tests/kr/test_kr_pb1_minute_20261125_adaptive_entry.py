@@ -455,3 +455,37 @@ def test_closed_infinite_legacy_mirror_uses_exact_owner_economic_proof():
     assert report(o={**order,"response_json":{**row,"tot_ccld_qty":"0"}})["gap_count"] == 1
     assert report(o={**order,"position_cycle_id":"pb1-owned"})["gap_count"] == 1
     assert report(fills=[{"order_id":order_id,"side":"SELL","qty":5,"price":0}])["gap_count"] == 1
+
+
+def test_historical_buy_balance_requires_original_complete_unique_rows():
+    from datetime import datetime, timezone
+    from scripts.kr_historical_buy_native_evidence import fresh_original_balance_quantities
+
+    class Kis:
+        def __init__(self, raw, source="api", normalized=None):
+            self.raw = raw
+            self.source = source
+            self.normalized = raw if normalized is None else normalized
+
+        def get_balance_cached(self, **kwargs):
+            assert kwargs == {"force":True,"return_source":True,"return_raw":True}
+            self._balance_cache_at = datetime.now(timezone.utc)
+            return self.normalized, self.source, self.raw
+
+    empty = {"output1":[],"output2":{"dnca_tot_amt":"100"},
+             "ctx_area_fk100":"","ctx_area_nk100":""}
+    row = {"pdno":"059090","hldg_qty":"79"}
+    assert fresh_original_balance_quantities(Kis(empty)) == (True,{})
+    assert fresh_original_balance_quantities(Kis(dict(empty, output1=[row]))) == (True,{"059090":79})
+    for invalid in (
+        dict(empty, output1=None),
+        dict(empty, output1=[row,row]),
+        dict(empty, output1=[{"pdno":"059090"}]),
+        dict(empty, output1=[{"pdno":"059090","hldg_qty":"-1"}]),
+        dict(empty, output1=[{"pdno":"59090","hldg_qty":"79"}]),
+        dict(empty, ctx_area_nk100="NEXT_PAGE"),
+        dict(empty, _stub=True),
+    ):
+        assert fresh_original_balance_quantities(Kis(invalid)) == (False,{})
+    assert fresh_original_balance_quantities(Kis(empty, source="wrapper_cache")) == (False,{})
+    assert fresh_original_balance_quantities(Kis(dict(empty,output1=None), normalized=empty)) == (False,{})
