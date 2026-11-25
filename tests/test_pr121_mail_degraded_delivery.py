@@ -3,6 +3,8 @@ import os
 import shutil
 import subprocess
 import tarfile
+
+import pytest
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -270,13 +272,15 @@ def test_us_delayed_mail_uses_latest_completed_exchange_session(tmp_path):
     assert marker["trade_date"] == completed
 
 
-def test_health_distinguishes_degraded_delivery_from_mail_failure(tmp_path):
+@pytest.mark.parametrize("complete_mail", [False, True])
+def test_health_distinguishes_degraded_delivery_from_mail_failure(tmp_path, complete_mail):
     trade_date = "2026-05-26"
     root = tmp_path / "health-repo"
     scripts = root / "scripts/wsl"
     scripts.mkdir(parents=True)
     shutil.copy2(ROOT / "scripts/wsl/check-nullim-day-health.sh", scripts / "check-nullim-day-health.sh")
     _copy_calendar_runtime(root)
+    shutil.copy2(ROOT / "scripts/wsl/kr_mail_execution_evidence.py", scripts / "kr_mail_execution_evidence.py")
     verify = scripts / "verify-no-nullim-auto-scheduler.sh"
     verify.write_text("#!/usr/bin/env bash\necho '[SCHEDULER_POLICY][WSL][OK] forbidden_sources=0'\n", encoding="utf-8")
     verify.chmod(0o755)
@@ -301,13 +305,13 @@ def test_health_distinguishes_degraded_delivery_from_mail_failure(tmp_path):
         "installed_commit_sha": sha,
     }), encoding="utf-8")
     (health / f"kr-mail-{trade_date}.json").write_text(json.dumps({
-        "status": "DEGRADED",
+        "status": "OK" if complete_mail else "DEGRADED",
         "mail_sent": True,
-        "mail_delivered": True,
-        "mail_complete": False,
+        "mail_delivered": False if complete_mail else True,
+        "mail_complete": complete_mail,
         "market": "kr",
         "trade_date": trade_date,
-        "required_missing_count": 1,
+        "required_missing_count": 0 if complete_mail else 1,
         "missing_evidence": [{"code": "REQUIRED_LOG_MISSING_close", "path": "runtime/logs/kr/x/close"}],
         "archive_sha256": "x",
     }), encoding="utf-8")
@@ -328,9 +332,12 @@ def test_health_distinguishes_degraded_delivery_from_mail_failure(tmp_path):
     assert result.returncode == 1
     report = json.loads((health / f"kr-{trade_date}.json").read_text())
     assert report["mail_delivered"] is True
-    assert report["mail_complete"] is False
-    assert report["mail_ok"] is False
-    assert report["failure_reason"] == "DEGRADED_MAIL_EVIDENCE"
+    assert report["mail_complete"] is complete_mail
+    assert report["mail_ok"] is complete_mail
+    assert report["mail_smtp_accepted"] is True
+    assert report["mail_recipient_delivery_confirmed"] is (not complete_mail)
+    assert report["kr_execution_status"] == "DEGRADED"
+    assert report["failure_reason"] == ("KR_DAILY_EXECUTION_INCOMPLETE" if complete_mail else "DEGRADED_MAIL_EVIDENCE")
 
 
 
