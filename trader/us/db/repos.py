@@ -3115,7 +3115,13 @@ def save_us_position_lifecycle_atomic(symbol: str, trade_date: str, lifecycle: d
                 dict(combined.get("entry_policy") or {}),
                 dict(data.get("entry_policy") or {}),
             )
-            combined["high_watermark"] = max(high, float(prior.get("high_watermark") or 0))
+            prior_high = float(prior.get("high_watermark") or 0)
+            combined["high_watermark"] = max(high, prior_high)
+            # A delayed writer must never attach its lower price's timestamp
+            # or provenance to the already-persisted higher peak.
+            if prior_high > high or (prior_high == high and prior.get("high_watermark_at")):
+                for field in ("high_watermark_at", "high_watermark_source"):
+                    combined[field] = prior.get(field)
             if prior.get("is_open") is False:
                 combined["is_open"] = False
         state["lifecycle"] = combined
@@ -3207,6 +3213,327 @@ def save_us_position_lifecycle_atomic(symbol: str, trade_date: str, lifecycle: d
                                      ELSE 0 END,
                                 CAST(:high AS numeric)
                              ) END,
+                        -- The high price, timestamp and source are one proof.
+                        'high_watermark_at',
+                        CASE WHEN (us_position_risk_state.state->'lifecycle'->>'lifecycle_id' = :life_id
+                              AND CASE WHEN COALESCE(us_position_risk_state.state->'lifecycle'->>'high_watermark','') ~ '^[0-9]+([.][0-9]+)?
+                        CASE WHEN us_position_risk_state.state->'lifecycle'
+                                            ->>'lifecycle_id' IS DISTINCT FROM :life_id
+                             THEN COALESCE(CAST(:data AS jsonb)->'is_open', 'true'::jsonb)
+                             WHEN us_position_risk_state.state->'lifecycle'->'is_open'
+                                            = 'false'::jsonb
+                             THEN 'false'::jsonb
+                             ELSE COALESCE(CAST(:data AS jsonb)->'is_open',
+                                           'true'::jsonb)
+                        END,
+                        -- Entry provenance never becomes more recent just
+                        -- because a later worker copied a stale snapshot.
+                        'opened_at',
+                        COALESCE(
+                            CASE WHEN us_position_risk_state.state->'lifecycle'
+                                            ->>'lifecycle_id' = :life_id
+                                 THEN us_position_risk_state.state->'lifecycle'->'opened_at'
+                                 ELSE NULL END,
+                            CAST(:data AS jsonb)->'opened_at'
+                        ),
+                        'opened_trade_date',
+                        COALESCE(
+                            CASE WHEN us_position_risk_state.state->'lifecycle'
+                                            ->>'lifecycle_id' = :life_id
+                                 THEN us_position_risk_state.state->'lifecycle'->'opened_trade_date'
+                                 ELSE NULL END,
+                            CAST(:data AS jsonb)->'opened_trade_date'
+                        ),
+                        'entry_policy',
+                        CASE WHEN :repair_entry_policy = 1
+                             THEN CAST(:data AS jsonb)->'entry_policy'
+                             WHEN us_position_risk_state.state->'lifecycle'
+                                          ->>'lifecycle_id' = :life_id
+                              AND COALESCE(
+                               us_position_risk_state.state->'lifecycle'->'entry_policy',
+                               '{}'::jsonb
+                             ) <> '{}'::jsonb
+                             THEN us_position_risk_state.state->'lifecycle'->'entry_policy'
+                             ELSE COALESCE(CAST(:data AS jsonb)->'entry_policy',
+                                           '{}'::jsonb)
+                        END
+                    ), true
+                ),
+                updated_at = NOW()
+            WHERE (
+                COALESCE(us_position_risk_state.state->'lifecycle'->>'lifecycle_id', '')
+                    IN ('', :life_id)
+                OR (
+                    CAST(:confirmed_reentry AS integer) = 1
+                    AND us_position_risk_state.state->'lifecycle'->'is_open' = 'false'::jsonb
+                    AND COALESCE(us_position_risk_state.state->'lifecycle'->>'closed_at', '') <> ''
+                    AND CAST(us_position_risk_state.state->'lifecycle'->>'closed_at' AS timestamptz)
+                        < CAST(:opened_at AS timestamptz)
+                )
+              )
+              AND COALESCE(us_position_risk_state.state->'lifecycle'->>'strategy_owner', '')
+                    IN ('', :owner)
+              AND COALESCE(us_position_risk_state.state->'lifecycle'->>'account_id', '')
+                    IN ('', :account)
+              AND COALESCE(us_position_risk_state.state->'lifecycle'->>'env', '')
+                    IN ('', :env)
+            RETURNING state->'lifecycle' AS lifecycle
+        """), {
+            **fields, "td": trade_date, "sym": sym,
+            "data": _json_param(data), "high": high,
+            "confirmed_reentry": confirmed_reentry,
+            "repair_entry_policy": repair_entry_policy,
+            "opened_at": data.get("opened_at") or "1970-01-01T00:00:00+00:00",
+        }).mappings().first()
+        if not result or not isinstance(result.get("lifecycle"), dict):
+            raise RuntimeError("US_LIFECYCLE_IDENTITY_CONFLICT")
+        return dict(result["lifecycle"])
+
+
+
+                                       THEN (us_position_risk_state.state->'lifecycle'->>'high_watermark')::numeric
+                                       ELSE 0 END > CAST(:high AS numeric)
+                              OR (us_position_risk_state.state->'lifecycle'->>'lifecycle_id' = :life_id
+                                  AND CASE WHEN COALESCE(us_position_risk_state.state->'lifecycle'->>'high_watermark','') ~ '^[0-9]+([.][0-9]+)?
+                        CASE WHEN us_position_risk_state.state->'lifecycle'
+                                            ->>'lifecycle_id' IS DISTINCT FROM :life_id
+                             THEN COALESCE(CAST(:data AS jsonb)->'is_open', 'true'::jsonb)
+                             WHEN us_position_risk_state.state->'lifecycle'->'is_open'
+                                            = 'false'::jsonb
+                             THEN 'false'::jsonb
+                             ELSE COALESCE(CAST(:data AS jsonb)->'is_open',
+                                           'true'::jsonb)
+                        END,
+                        -- Entry provenance never becomes more recent just
+                        -- because a later worker copied a stale snapshot.
+                        'opened_at',
+                        COALESCE(
+                            CASE WHEN us_position_risk_state.state->'lifecycle'
+                                            ->>'lifecycle_id' = :life_id
+                                 THEN us_position_risk_state.state->'lifecycle'->'opened_at'
+                                 ELSE NULL END,
+                            CAST(:data AS jsonb)->'opened_at'
+                        ),
+                        'opened_trade_date',
+                        COALESCE(
+                            CASE WHEN us_position_risk_state.state->'lifecycle'
+                                            ->>'lifecycle_id' = :life_id
+                                 THEN us_position_risk_state.state->'lifecycle'->'opened_trade_date'
+                                 ELSE NULL END,
+                            CAST(:data AS jsonb)->'opened_trade_date'
+                        ),
+                        'entry_policy',
+                        CASE WHEN :repair_entry_policy = 1
+                             THEN CAST(:data AS jsonb)->'entry_policy'
+                             WHEN us_position_risk_state.state->'lifecycle'
+                                          ->>'lifecycle_id' = :life_id
+                              AND COALESCE(
+                               us_position_risk_state.state->'lifecycle'->'entry_policy',
+                               '{}'::jsonb
+                             ) <> '{}'::jsonb
+                             THEN us_position_risk_state.state->'lifecycle'->'entry_policy'
+                             ELSE COALESCE(CAST(:data AS jsonb)->'entry_policy',
+                                           '{}'::jsonb)
+                        END
+                    ), true
+                ),
+                updated_at = NOW()
+            WHERE (
+                COALESCE(us_position_risk_state.state->'lifecycle'->>'lifecycle_id', '')
+                    IN ('', :life_id)
+                OR (
+                    CAST(:confirmed_reentry AS integer) = 1
+                    AND us_position_risk_state.state->'lifecycle'->'is_open' = 'false'::jsonb
+                    AND COALESCE(us_position_risk_state.state->'lifecycle'->>'closed_at', '') <> ''
+                    AND CAST(us_position_risk_state.state->'lifecycle'->>'closed_at' AS timestamptz)
+                        < CAST(:opened_at AS timestamptz)
+                )
+              )
+              AND COALESCE(us_position_risk_state.state->'lifecycle'->>'strategy_owner', '')
+                    IN ('', :owner)
+              AND COALESCE(us_position_risk_state.state->'lifecycle'->>'account_id', '')
+                    IN ('', :account)
+              AND COALESCE(us_position_risk_state.state->'lifecycle'->>'env', '')
+                    IN ('', :env)
+            RETURNING state->'lifecycle' AS lifecycle
+        """), {
+            **fields, "td": trade_date, "sym": sym,
+            "data": _json_param(data), "high": high,
+            "confirmed_reentry": confirmed_reentry,
+            "repair_entry_policy": repair_entry_policy,
+            "opened_at": data.get("opened_at") or "1970-01-01T00:00:00+00:00",
+        }).mappings().first()
+        if not result or not isinstance(result.get("lifecycle"), dict):
+            raise RuntimeError("US_LIFECYCLE_IDENTITY_CONFLICT")
+        return dict(result["lifecycle"])
+
+
+
+                                           THEN (us_position_risk_state.state->'lifecycle'->>'high_watermark')::numeric
+                                           ELSE 0 END = CAST(:high AS numeric)
+                                  AND NULLIF(us_position_risk_state.state->'lifecycle'->>'high_watermark_at','') IS NOT NULL))
+                             THEN us_position_risk_state.state->'lifecycle'->'high_watermark_at'
+                             ELSE CAST(:data AS jsonb)->'high_watermark_at' END,
+                        'high_watermark_source',
+                        CASE WHEN (us_position_risk_state.state->'lifecycle'->>'lifecycle_id' = :life_id
+                              AND CASE WHEN COALESCE(us_position_risk_state.state->'lifecycle'->>'high_watermark','') ~ '^[0-9]+([.][0-9]+)?
+                        CASE WHEN us_position_risk_state.state->'lifecycle'
+                                            ->>'lifecycle_id' IS DISTINCT FROM :life_id
+                             THEN COALESCE(CAST(:data AS jsonb)->'is_open', 'true'::jsonb)
+                             WHEN us_position_risk_state.state->'lifecycle'->'is_open'
+                                            = 'false'::jsonb
+                             THEN 'false'::jsonb
+                             ELSE COALESCE(CAST(:data AS jsonb)->'is_open',
+                                           'true'::jsonb)
+                        END,
+                        -- Entry provenance never becomes more recent just
+                        -- because a later worker copied a stale snapshot.
+                        'opened_at',
+                        COALESCE(
+                            CASE WHEN us_position_risk_state.state->'lifecycle'
+                                            ->>'lifecycle_id' = :life_id
+                                 THEN us_position_risk_state.state->'lifecycle'->'opened_at'
+                                 ELSE NULL END,
+                            CAST(:data AS jsonb)->'opened_at'
+                        ),
+                        'opened_trade_date',
+                        COALESCE(
+                            CASE WHEN us_position_risk_state.state->'lifecycle'
+                                            ->>'lifecycle_id' = :life_id
+                                 THEN us_position_risk_state.state->'lifecycle'->'opened_trade_date'
+                                 ELSE NULL END,
+                            CAST(:data AS jsonb)->'opened_trade_date'
+                        ),
+                        'entry_policy',
+                        CASE WHEN :repair_entry_policy = 1
+                             THEN CAST(:data AS jsonb)->'entry_policy'
+                             WHEN us_position_risk_state.state->'lifecycle'
+                                          ->>'lifecycle_id' = :life_id
+                              AND COALESCE(
+                               us_position_risk_state.state->'lifecycle'->'entry_policy',
+                               '{}'::jsonb
+                             ) <> '{}'::jsonb
+                             THEN us_position_risk_state.state->'lifecycle'->'entry_policy'
+                             ELSE COALESCE(CAST(:data AS jsonb)->'entry_policy',
+                                           '{}'::jsonb)
+                        END
+                    ), true
+                ),
+                updated_at = NOW()
+            WHERE (
+                COALESCE(us_position_risk_state.state->'lifecycle'->>'lifecycle_id', '')
+                    IN ('', :life_id)
+                OR (
+                    CAST(:confirmed_reentry AS integer) = 1
+                    AND us_position_risk_state.state->'lifecycle'->'is_open' = 'false'::jsonb
+                    AND COALESCE(us_position_risk_state.state->'lifecycle'->>'closed_at', '') <> ''
+                    AND CAST(us_position_risk_state.state->'lifecycle'->>'closed_at' AS timestamptz)
+                        < CAST(:opened_at AS timestamptz)
+                )
+              )
+              AND COALESCE(us_position_risk_state.state->'lifecycle'->>'strategy_owner', '')
+                    IN ('', :owner)
+              AND COALESCE(us_position_risk_state.state->'lifecycle'->>'account_id', '')
+                    IN ('', :account)
+              AND COALESCE(us_position_risk_state.state->'lifecycle'->>'env', '')
+                    IN ('', :env)
+            RETURNING state->'lifecycle' AS lifecycle
+        """), {
+            **fields, "td": trade_date, "sym": sym,
+            "data": _json_param(data), "high": high,
+            "confirmed_reentry": confirmed_reentry,
+            "repair_entry_policy": repair_entry_policy,
+            "opened_at": data.get("opened_at") or "1970-01-01T00:00:00+00:00",
+        }).mappings().first()
+        if not result or not isinstance(result.get("lifecycle"), dict):
+            raise RuntimeError("US_LIFECYCLE_IDENTITY_CONFLICT")
+        return dict(result["lifecycle"])
+
+
+
+                                       THEN (us_position_risk_state.state->'lifecycle'->>'high_watermark')::numeric
+                                       ELSE 0 END > CAST(:high AS numeric)
+                              OR (us_position_risk_state.state->'lifecycle'->>'lifecycle_id' = :life_id
+                                  AND CASE WHEN COALESCE(us_position_risk_state.state->'lifecycle'->>'high_watermark','') ~ '^[0-9]+([.][0-9]+)?
+                        CASE WHEN us_position_risk_state.state->'lifecycle'
+                                            ->>'lifecycle_id' IS DISTINCT FROM :life_id
+                             THEN COALESCE(CAST(:data AS jsonb)->'is_open', 'true'::jsonb)
+                             WHEN us_position_risk_state.state->'lifecycle'->'is_open'
+                                            = 'false'::jsonb
+                             THEN 'false'::jsonb
+                             ELSE COALESCE(CAST(:data AS jsonb)->'is_open',
+                                           'true'::jsonb)
+                        END,
+                        -- Entry provenance never becomes more recent just
+                        -- because a later worker copied a stale snapshot.
+                        'opened_at',
+                        COALESCE(
+                            CASE WHEN us_position_risk_state.state->'lifecycle'
+                                            ->>'lifecycle_id' = :life_id
+                                 THEN us_position_risk_state.state->'lifecycle'->'opened_at'
+                                 ELSE NULL END,
+                            CAST(:data AS jsonb)->'opened_at'
+                        ),
+                        'opened_trade_date',
+                        COALESCE(
+                            CASE WHEN us_position_risk_state.state->'lifecycle'
+                                            ->>'lifecycle_id' = :life_id
+                                 THEN us_position_risk_state.state->'lifecycle'->'opened_trade_date'
+                                 ELSE NULL END,
+                            CAST(:data AS jsonb)->'opened_trade_date'
+                        ),
+                        'entry_policy',
+                        CASE WHEN :repair_entry_policy = 1
+                             THEN CAST(:data AS jsonb)->'entry_policy'
+                             WHEN us_position_risk_state.state->'lifecycle'
+                                          ->>'lifecycle_id' = :life_id
+                              AND COALESCE(
+                               us_position_risk_state.state->'lifecycle'->'entry_policy',
+                               '{}'::jsonb
+                             ) <> '{}'::jsonb
+                             THEN us_position_risk_state.state->'lifecycle'->'entry_policy'
+                             ELSE COALESCE(CAST(:data AS jsonb)->'entry_policy',
+                                           '{}'::jsonb)
+                        END
+                    ), true
+                ),
+                updated_at = NOW()
+            WHERE (
+                COALESCE(us_position_risk_state.state->'lifecycle'->>'lifecycle_id', '')
+                    IN ('', :life_id)
+                OR (
+                    CAST(:confirmed_reentry AS integer) = 1
+                    AND us_position_risk_state.state->'lifecycle'->'is_open' = 'false'::jsonb
+                    AND COALESCE(us_position_risk_state.state->'lifecycle'->>'closed_at', '') <> ''
+                    AND CAST(us_position_risk_state.state->'lifecycle'->>'closed_at' AS timestamptz)
+                        < CAST(:opened_at AS timestamptz)
+                )
+              )
+              AND COALESCE(us_position_risk_state.state->'lifecycle'->>'strategy_owner', '')
+                    IN ('', :owner)
+              AND COALESCE(us_position_risk_state.state->'lifecycle'->>'account_id', '')
+                    IN ('', :account)
+              AND COALESCE(us_position_risk_state.state->'lifecycle'->>'env', '')
+                    IN ('', :env)
+            RETURNING state->'lifecycle' AS lifecycle
+        """), {
+            **fields, "td": trade_date, "sym": sym,
+            "data": _json_param(data), "high": high,
+            "confirmed_reentry": confirmed_reentry,
+            "repair_entry_policy": repair_entry_policy,
+            "opened_at": data.get("opened_at") or "1970-01-01T00:00:00+00:00",
+        }).mappings().first()
+        if not result or not isinstance(result.get("lifecycle"), dict):
+            raise RuntimeError("US_LIFECYCLE_IDENTITY_CONFLICT")
+        return dict(result["lifecycle"])
+
+
+
+                                           THEN (us_position_risk_state.state->'lifecycle'->>'high_watermark')::numeric
+                                           ELSE 0 END = CAST(:high AS numeric)
+                                  AND NULLIF(us_position_risk_state.state->'lifecycle'->>'high_watermark_at','') IS NOT NULL))
+                             THEN us_position_risk_state.state->'lifecycle'->'high_watermark_source'
+                             ELSE CAST(:data AS jsonb)->'high_watermark_source' END,
                         'is_open',
                         CASE WHEN us_position_risk_state.state->'lifecycle'
                                             ->>'lifecycle_id' IS DISTINCT FROM :life_id

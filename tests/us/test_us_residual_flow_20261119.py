@@ -120,7 +120,9 @@ def test_completed_daily_io_before_after_same_production_path(monkeypatch, capsy
     calls = []
     def load(**kw):
         calls.append(kw["symbol"])
-        time.sleep(.002)
+        # 20 ms fixed simulated remote DB roundtrip, not a live latency
+        # claim. The former 2 ms was dominated by runner scheduling noise.
+        time.sleep(.020)
         return deepcopy(rows)
     monkeypatch.setattr(repo, "load_recent_us_daily_bars", load)
     monkeypatch.setattr(repo, "get_latest_us_daily_date", lambda **kw: pytest.fail("duplicate latest-date query"))
@@ -156,6 +158,9 @@ def test_completed_daily_io_before_after_same_production_path(monkeypatch, capsy
     assert len(before) == len(after) == 12
     assert all(len(x["rows"]) == 260 for x in after)
     assert before == after  # same bars AND quality/provenance metadata
+    # Exact DB-call reduction is the deterministic performance contract.
+    # Keep the end-to-end controlled-latency assertion as well.
+    assert before_calls - len(calls) == 30
     assert after_sec < before_sec
     print({"before_db_reads": before_calls, "after_db_reads": len(calls),
            "before_ms": round(before_sec*1000, 2), "after_ms": round(after_sec*1000, 2)})
@@ -397,3 +402,16 @@ def test_forward_abort_certificate_binds_original_stage_using_pr368_proof(scenar
         assert recorded[0][1]["meta"]["router_abort_runtime_lifecycle_id"] == runtime
         assert recorded[0][2]["require_db"] is True
         assert intent["position_lifecycle_id"] == runtime  # no source or runtime retagging
+
+
+def test_completed_daily_copy_isolates_nested_provenance():
+    from trader.us.data_provider import _copy_completed_daily_result
+    original = {"quality": "OK", "rows": [{"close": 100.0, "extra": {"source": ["native"]}}]}
+    copied = _copy_completed_daily_result(original)
+    copied["rows"][0]["extra"]["source"].append("corrupt")
+    assert original["rows"][0]["extra"]["source"] == ["native"]
+    flat = {"quality": "OK", "rows": [{"close": 100.0, "xymd": "20261123"}]}
+    copied = _copy_completed_daily_result(flat)
+    copied["rows"][0]["close"] = -1
+    copied["rows"].clear()
+    assert flat["rows"] == [{"close": 100.0, "xymd": "20261123"}]

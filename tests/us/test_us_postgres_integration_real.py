@@ -4982,3 +4982,30 @@ def test_v3_atomic_pre_http_tp_stage_and_intent_under_same_pg_commit(
                 "WHERE client_order_key=:key"
             ), {"key": key}).scalar_one()
         assert (intent_status, stage_status) == ("PENDING", "PENDING"), suffix
+
+
+def test_postgres_hwm_atomic_pair_preserved_under_delayed_writer(pg_engine, monkeypatch):
+    from trader.us.db import repos
+    from sqlalchemy import text
+    monkeypatch.setattr(repos, "_us_state_epoch_id", lambda *a, **kw: "hwm-pair-epoch")
+    with pg_engine.begin() as conn:
+        repos._ensure_us_position_risk_state_table(conn)
+        conn.execute(text("DELETE FROM us_position_risk_state WHERE symbol='HWMPAIR' AND trading_epoch_id='hwm-pair-epoch'"))
+    base = {"lifecycle_id": "hwm-pair-cycle", "is_open": True,
+            "env": "practice", "strategy_owner": "US_STANDARD",
+            "account_id": "practice:fixture", "trading_epoch_id": "hwm-pair-epoch",
+            "high_watermark_source": "us_position_risk_state"}
+    day = "2026-11-24"
+    peak = {**base, "high_watermark": 130.0, "high_watermark_at": "2026-11-24T15:00:00+00:00"}
+    assert repos.save_us_position_lifecycle_atomic("HWMPAIR", day, peak)["high_watermark"] == 130
+    stale = {**base, "high_watermark": 120.0, "high_watermark_at": "2026-11-24T16:00:00+00:00",
+             "high_watermark_source": "stale_writer"}
+    for price in (120.0, 130.0):
+        result = repos.save_us_position_lifecycle_atomic("HWMPAIR", day, {**stale, "high_watermark": price})
+        assert result["high_watermark"] == 130
+        assert result["high_watermark_at"] == peak["high_watermark_at"]
+        assert result["high_watermark_source"] == peak["high_watermark_source"]
+    newer = {**base, "high_watermark": 140.0, "high_watermark_at": "2026-11-24T17:00:00+00:00"}
+    result = repos.save_us_position_lifecycle_atomic("HWMPAIR", day, newer)
+    assert result["high_watermark"] == 140
+    assert result["high_watermark_at"] == newer["high_watermark_at"]
