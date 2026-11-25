@@ -2955,10 +2955,11 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
     )
     assert first_lifecycle["high_watermark"] == 470.0
 
+    runtime_position = {"symbol": "AMGN", "exchange": "NASDAQ", "qty": 6,
+                        "avg_cost": 461.8, "current_px": 469.0,
+                        "balance_source": "kis_balance_authoritative", "meta": {}}
     assert repos.save_position_snapshot(
-        [{"symbol": "AMGN", "exchange": "NASDAQ", "qty": 6,
-          "avg_cost": 461.8, "current_px": 469.0,
-          "balance_source": "kis_balance_authoritative", "meta": {}}],
+        [runtime_position],
         trade_date="2026-11-11",
         balance_fetch_status="OK", balance_parse_status="OK",
         authoritative_positions=True, preserve_previous_positions=False,
@@ -2975,6 +2976,12 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
     assert tomorrow["meta"]["position_lifecycle_id"] == cycle
     assert tomorrow["meta"]["lineage_identity_status"] == "VERIFIED_CURRENT_EPOCH_CONTINUITY"
     assert tomorrow["meta"]["entry_exit_contract_sha256"] == contract["sha256"]
+    # The live runner consumes the original broker dict, not a separate SELECT.
+    assert runtime_position["position_lifecycle_id"] == cycle
+    assert runtime_position["strategy_owner"] == "US_STANDARD"
+    assert runtime_position["meta"]["entry_exit_contract_sha256"] == contract["sha256"]
+    assert runtime_position["qty"] == 6
+    assert runtime_position["current_px"] == 469.0
 
     # Regression 2026-11-23: a verified native BUY and snapshot can both
     # be durable, yet the restarted DB consumer formerly compared its

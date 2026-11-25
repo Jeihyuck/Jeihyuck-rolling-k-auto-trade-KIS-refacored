@@ -243,6 +243,36 @@ def is_effective_prep_contract(
     return True
 
 
+def entry_revision_proof(trade_date: str, contract: dict, prep: dict) -> tuple[bool, str]:
+    """A BUY-ready artifact must agree with DB completion and the actual pin."""
+    import re
+    from trader.us.run_manifest import verify_run_revision
+
+    data = prep.get("result") if isinstance(prep.get("result"), dict) else {}
+    yes = (1, True, "1", "true", "True")
+    artifact_entry = contract.get("entry_can_proceed") in yes
+    db_entry = data.get("entry_can_proceed") in yes
+    if not artifact_entry and not db_entry:
+        return True, "exit_only_no_entry_revision_required"
+    if not artifact_entry or not db_entry:
+        return False, "entry_permission_mismatch"
+    allowed, reason = db_prep_entry_permission(prep.get("status"), data)
+    if not allowed:
+        return False, reason
+    artifact_rev = str(contract.get("run_revision") or contract.get("git_commit_sha") or "")
+    db_rev = str(data.get("run_revision") or data.get("git_commit_sha") or "")
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", artifact_rev) or artifact_rev != db_rev:
+        return False, "artifact_db_revision_mismatch"
+    try:
+        verdict = verify_run_revision(trade_date, artifact_rev)
+        manifest = verdict.get("manifest") or {}
+        if verdict.get("ok") is not True or str(manifest.get("trade_date") or "") != trade_date:
+            return False, "run_manifest_revision_unverified"
+    except (ValueError, OSError, TypeError, AttributeError):
+        return False, "run_manifest_revision_unverified"
+    return True, "entry_revision_verified"
+
+
 def check_effective_prep_sources(trade_date: str, *, min_rows: int = 10) -> dict[str, Any]:
     """One read-only artifact/DB/provenance verdict for all WSL PREP gates.
 
@@ -272,7 +302,9 @@ def check_effective_prep_sources(trade_date: str, *, min_rows: int = 10) -> dict
         and provenance.get("ok") is True
         and locked_rows_match_prep_run(prep, locked_rows)
     )
-    return {**result, "ok": bool(ok), "reason": "ok" if ok else "db_live_contract_invalid",
+    revision_ok, revision_reason = entry_revision_proof(trade_date, contract, prep) if ok else (False, "db_live_contract_invalid")
+    ok = ok and revision_ok
+    return {**result, "ok": bool(ok), "reason": "ok" if ok else revision_reason,
             "benchmark_recovery_required": benchmark_recovery_required(contract),
             "run_id": run_id if ok else None,
             "status": contract.get("status"), "artifact_count": len(artifact_rows),

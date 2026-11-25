@@ -163,6 +163,7 @@ def refresh_tp_source_quotes(
             continue
         updated = dict(row)
         updated.update({
+            "last_price": price,
             "current_price": price,
             "current_price_usd": price,
             "resolved_current_price": price,
