@@ -53,7 +53,7 @@ def exact_buy_evidence(payload, *, day, code, odno, qty):
                                                            default=str).encode()).hexdigest()}
 
 
-def collect(*, engine, kis, now, code=None):
+def collect(*, engine, kis, now, code=None, trade_date=None):
     if getattr(kis, "env", None) != "practice":
         raise RuntimeError("PRACTICE_BROKER_REQUIRED")
     scope = resolve_kr_recovery_scope(engine=engine, env="practice", kis=kis)
@@ -77,6 +77,8 @@ def collect(*, engine, kis, now, code=None):
         )
         if code:
             query = query.where(claims.c.lifecycle_id.like("%:"+code))
+        if trade_date is not None:
+            query = query.where(claims.c.trade_date == trade_date)
         for claim in conn.execute(query.order_by(claims.c.trade_date, claims.c.action_key).limit(8)).mappings():
             attempt = conn.execute(sa.select(attempts).where(
                 attempts.c.action_key == claim["action_key"],
@@ -138,7 +140,7 @@ def collect(*, engine, kis, now, code=None):
             if not isinstance(created, datetime) or created.tzinfo is None:
                 continue
             day = created.astimezone(KST).date()
-            if day >= today:
+            if day >= today or (trade_date is not None and day != trade_date):
                 continue
             request = order.get("request_json")
             response = order.get("response_json")
@@ -181,9 +183,13 @@ def collect(*, engine, kis, now, code=None):
                             "order": order, "db_fill_qty": sum(int(f.get("qty") or 0) for f in native),
                             "positions": positions})
             seen.add(identity)
-    targets.sort(key=lambda t: (t["claim"]["trade_date"], str(t["order"]["order_id"])))
+    targets.sort(key=lambda t: (
+        any(str(p.get("position_cycle_id")) == str(t["order"].get("position_cycle_id"))
+            for p in t["positions"]),
+        str(t["claim"]["trade_date"]), str(t["order"]["order_id"])))
     proofs = []
     daily = {}
+    failures = {}
     for target in targets:
         claim, order = target["claim"], target["order"]
         day = claim["trade_date"]
@@ -192,11 +198,17 @@ def collect(*, engine, kis, now, code=None):
         symbol = str(order["code"])
         odno = str(order["kis_odno"])
         try:
+            if day in failures:
+                raise RuntimeError("ORIGINAL_DAY_QUERY_ALREADY_FAILED")
             if day not in daily:
-                if len(daily) >= 3:
+                if len(daily) + len(failures) >= 3:
                     proofs.append({"code": symbol, "odno": odno, "source_order_id": str(order["order_id"]), "state": "DEFERRED_DAY_BUDGET"})
                     continue
-                daily[day] = _daily_ccld_all_pages_for_date(kis, day)
+                try:
+                    daily[day] = _daily_ccld_all_pages_for_date(kis, day)
+                except Exception as exc:
+                    failures[day] = type(exc).__name__
+                    raise
             proof = exact_buy_evidence(daily[day], day=day, code=symbol, odno=odno,
                                        qty=int(order["qty"]))
         except Exception as exc:
@@ -225,12 +237,13 @@ def collect(*, engine, kis, now, code=None):
         proof["reason"] = "EXACT_CYCLE_AND_CURRENT_UNFILLED_REVIEW_REQUIRED_NO_WRITE"
     return {"version": "KR_HISTORICAL_BUY_NATIVE_EVIDENCE_V2", "env": scope.env,
             "trading_epoch_id": scope.trading_epoch_id, "cases": proofs,
-            "days_queried": len(daily), "orders_submitted": 0, "db_rows_modified": 0}
+            "days_queried": len(daily) + len(failures), "orders_submitted": 0, "db_rows_modified": 0}
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--code")
+    parser.add_argument("--trade-date", type=date.fromisoformat)
     args = parser.parse_args(argv)
     if args.code and (len(args.code) != 6 or not args.code.isascii() or not args.code.isdigit()):
         parser.error("six-digit KR code required")
@@ -246,7 +259,7 @@ def main(argv=None):
     engine = get_engine()
     try:
         evidence = collect(engine=engine, kis=KisAPI(kis_env="practice"),
-                           now=datetime.now(KST), code=args.code)
+                           now=datetime.now(KST), code=args.code, trade_date=args.trade_date)
         print(json.dumps(evidence, ensure_ascii=False, default=str, indent=2))
         return 0 if evidence["cases"] and all(
             row["state"] == "ORIGINAL_FULL_EXECUTION_PROVEN" and row["fresh_balance_proven"]
