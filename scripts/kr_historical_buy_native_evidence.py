@@ -113,6 +113,75 @@ def collect(*, engine, kis, now, code=None):
             )).mappings().all()
             targets.append({"claim": dict(claim), "order": order, "db_fill_qty": int(db_qty),
                             "positions": [dict(p) for p in positions]})
+    # Include all prior-day signed source BUYs with missing native economics
+    # or a missing exact lifecycle, not merely the currently UNCERTAIN claim.
+    # This includes imported-and-already-closed positions: do not reopen them.
+    from trader.db.repos import _assert_kr_buy_entry_contract
+    from trader.kr.order_execution_evidence import summarize_native_order
+    seen = {str(t["order"]["order_id"]) for t in targets}
+    with engine.connect() as conn:
+        source_query = sa.select(orders).where(
+            orders.c.env == scope.env,
+            orders.c.trading_epoch_id == scope.trading_epoch_id,
+            orders.c.strategy == "pb1_pullback_close",
+            orders.c.side == "BUY",
+            orders.c.code != "122630",
+        ).order_by(orders.c.created_at, orders.c.order_id)
+        if code:
+            source_query = source_query.where(orders.c.code == code)
+        for raw in conn.execute(source_query).mappings():
+            order = dict(raw)
+            identity = str(order["order_id"])
+            if identity in seen:
+                continue
+            created = order.get("submitted_at") or order.get("created_at")
+            if not isinstance(created, datetime) or created.tzinfo is None:
+                continue
+            day = created.astimezone(KST).date()
+            if day >= today:
+                continue
+            request = order.get("request_json")
+            response = order.get("response_json")
+            try:
+                if isinstance(request, str):
+                    request = json.loads(request)
+                if isinstance(response, str):
+                    response = json.loads(response)
+                if (not isinstance(request, dict)
+                        or request.get("enforce_entry_contract") is not True
+                        or not isinstance(response, dict)
+                        or request.get("entry_contract_sha256") !=
+                        (response.get("_kr_buy_entry_contract") or {}).get("entry_contract_sha256")):
+                    continue
+                _assert_kr_buy_entry_contract(request)
+            except (ValueError, TypeError, RuntimeError, AttributeError):
+                continue
+            if not order_matches_recovery_scope(conn=conn, schema=schema, order=order,
+                        strategy="pb1_pullback_close", scope=scope):
+                continue
+            symbol = str(order["code"])
+            odno = str(order.get("kis_odno") or "")
+            if len(odno) != 10 or not odno.isascii() or not odno.isdigit():
+                continue
+            native = [dict(row) for row in conn.execute(sa.select(fills).where(
+                fills.c.order_id == order["order_id"], fills.c.env == scope.env,
+                fills.c.trading_epoch_id == scope.trading_epoch_id, fills.c.side == "BUY",
+            )).mappings()]
+            positions = [dict(row) for row in conn.execute(sa.select(
+                pos.c.position_cycle_id, pos.c.qty, pos.c.status, pos.c.position_origin
+            ).where(
+                pos.c.env == scope.env, pos.c.trading_epoch_id == scope.trading_epoch_id,
+                pos.c.portfolio_epoch_id == order["portfolio_epoch_id"], pos.c.code == symbol,
+            )).mappings()]
+            exact = [p for p in positions if str(p["position_cycle_id"]) == str(order["position_cycle_id"])]
+            evidence = summarize_native_order(order, native)
+            if len(exact) == 1 and evidence.get("proven_filled_qty") == order["qty"]:
+                continue
+            targets.append({"claim": {"trade_date": day, "action_key": None},
+                            "order": order, "db_fill_qty": sum(int(f.get("qty") or 0) for f in native),
+                            "positions": positions})
+            seen.add(identity)
+    targets.sort(key=lambda t: (t["claim"]["trade_date"], str(t["order"]["order_id"])))
     proofs = []
     daily = {}
     for target in targets:
@@ -124,8 +193,8 @@ def collect(*, engine, kis, now, code=None):
         odno = str(order["kis_odno"])
         try:
             if day not in daily:
-                if len(daily) >= 2:
-                    proofs.append({"code": symbol, "odno": odno, "state": "DEFERRED_DAY_BUDGET"})
+                if len(daily) >= 3:
+                    proofs.append({"code": symbol, "odno": odno, "source_order_id": str(order["order_id"]), "state": "DEFERRED_DAY_BUDGET"})
                     continue
                 daily[day] = _daily_ccld_all_pages_for_date(kis, day)
             proof = exact_buy_evidence(daily[day], day=day, code=symbol, odno=odno,
@@ -154,7 +223,7 @@ def collect(*, engine, kis, now, code=None):
         proof["current_holding_qty"] = quantities.get(proof["code"], 0) if balance_ok else None
         proof["recovery_authorized"] = False
         proof["reason"] = "EXACT_CYCLE_AND_CURRENT_UNFILLED_REVIEW_REQUIRED_NO_WRITE"
-    return {"version": "KR_HISTORICAL_BUY_NATIVE_EVIDENCE_V1", "env": scope.env,
+    return {"version": "KR_HISTORICAL_BUY_NATIVE_EVIDENCE_V2", "env": scope.env,
             "trading_epoch_id": scope.trading_epoch_id, "cases": proofs,
             "days_queried": len(daily), "orders_submitted": 0, "db_rows_modified": 0}
 
