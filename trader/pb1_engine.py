@@ -15983,20 +15983,34 @@ class PB1Engine:
         from datetime import timedelta
         start_date = end_date - timedelta(days=max(days, 90))
 
+        # Consult the same TTL cache *before* opening a DB connection.
+        # Previously every tick downloaded all 30 daily histories even when
+        # the existing consumer immediately discarded all cached rows.
+        # No change to the cache key/TTL, data normalization or selection.
+        pending_codes = []
+        hit = 0
+        for code in dict.fromkeys(kr_codes):
+            if daily_cache.get(("daily", code, days)) is not None:
+                hit += 1
+            else:
+                pending_codes.append(code)
+        if not pending_codes:
+            logger.info("[KR][PB1][OHLCV][BATCH_PRELOAD][CACHE_ONLY] hit=%s db_queries=0 elapsed=%.3f",
+                        hit, time.monotonic()-t_start)
+            return
         try:
             engine = make_engine()
-            bulk_map = load_price_daily_bulk(engine, kr_codes, start_date, end_date)
+            bulk_map = load_price_daily_bulk(engine, pending_codes, start_date, end_date)
         except Exception as exc:
             logger.warning("[KR][PB1][OHLCV][BATCH_PRELOAD][ERROR] err=%s", exc)
             return
 
-        hit = 0
         miss = 0
-        for code in kr_codes:
+        for code in pending_codes:
             candles = bulk_map.get(code) or []
             cache_key = ("daily", code, days)
             if daily_cache.get(cache_key) is not None:
-                # 이미 캐시에 있으면 건너뜀
+                # Another reader may have filled the cache during the query.
                 hit += 1
                 continue
             if not candles:
