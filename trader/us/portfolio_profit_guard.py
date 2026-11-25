@@ -15,6 +15,9 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 POLICY_PURPOSE = "US_STANDARD_PORTFOLIO_GIVEBACK_SELL_V1"
+NET_ACCOUNTING_METHOD = "NATIVE_FILLS_PLUS_FRESH_KIS_MARK_V1"
+TRADING_ACCOUNTING_METHOD = "NATIVE_TRADING_PNL_BEFORE_COSTS_V1"
+ACCOUNTING_METHODS = frozenset({NET_ACCOUNTING_METHOD, TRADING_ACCOUNTING_METHOD})
 
 
 def canonical(value: dict) -> bytes:
@@ -90,7 +93,7 @@ def verify_portfolio_policy(
         raise ValueError("PORT_GUARD_POLICY_VERSION_MISSING")
     if not (_utc(body.get("effective_at")) <= now_utc.astimezone(timezone.utc) < _utc(body.get("expires_at"))):
         raise ValueError("PORT_GUARD_POLICY_NOT_IN_FORCE")
-    if body.get("accounting_method") != "NATIVE_FILLS_PLUS_FRESH_KIS_MARK_V1":
+    if body.get("accounting_method") not in ACCOUNTING_METHODS:
         raise ValueError("PORT_GUARD_ACCOUNTING_METHOD_UNVERIFIED")
     if body.get("mark_source") not in ("KIS_BID", "KIS_EXECUTABLE_QUOTE"):
         raise ValueError("PORT_GUARD_MARK_SOURCE_UNVERIFIED")
@@ -144,6 +147,7 @@ def verified_sleeve_pnl(
     broker_full_balance_verified: bool = False,
     broker_cash_ledger_complete: bool = False,
     cash_events: list[dict] | None = None,
+    accounting_method: str = NET_ACCOUNTING_METHOD,
 ) -> tuple[Decimal, dict]:
     """Strict KIS-native fill economics, no arbitrary cash allocation.
 
@@ -161,14 +165,22 @@ def verified_sleeve_pnl(
     # Trading-profit is NOT a 'net PnL' if commission, tax and cash
     # distributions have not been authoritatively checked. Missing broker
     # events cannot be replaced by silently asserting that they are $0.
-    if broker_cash_ledger_complete is not True or not isinstance(cash_events, list):
+    if accounting_method not in ACCOUNTING_METHODS:
+        raise ValueError("PORT_GUARD_ACCOUNTING_METHOD_UNVERIFIED")
+    net_mode = accounting_method == NET_ACCOUNTING_METHOD
+    if net_mode and (broker_cash_ledger_complete is not True or not isinstance(cash_events, list)):
         raise ValueError("PORT_GUARD_NET_CASH_EVENTS_UNVERIFIED")
+    # Trading mode has a stable pre-cost basis. Do not switch the HWM
+    # when fees arrive later; verified charges are separate diagnostics.
+    if not net_mode and (cash_events is not None or broker_cash_ledger_complete):
+        raise ValueError("PORT_GUARD_TRADING_MODE_CASH_INPUT_FORBIDDEN")
     book: dict[str, dict] = {}
     unique: set[tuple] = set()
     from trader.us.utils.order_no import normalize_us_order_no
     points = []
     buy_total = sell_total = Decimal("0")
     commissions = taxes = distributions = Decimal("0")
+    verified_fee_count = 0
     for f in fills:
         if (str(f.get("strategy_owner") or "") != "US_STANDARD"
                 or str(f.get("symbol") or "").upper() == "TQQQ"
@@ -188,14 +200,16 @@ def verified_sleeve_pnl(
         price = _decimal(f.get("price_usd"))
         if qty <= 0 or qty != qty.to_integral_value() or price <= 0:
             raise ValueError("PORT_GUARD_FILL_ECONOMICS_INVALID")
-        if f.get("native_fee_proof") is not True:
+        if f.get("native_fee_proof") is True:
+            fee = _decimal(f.get("commission_usd"))
+            tax = _decimal(f.get("tax_usd"))
+            if fee < 0 or tax < 0:
+                raise ValueError("PORT_GUARD_COST_NEGATIVE")
+            commissions += fee
+            taxes += tax
+            verified_fee_count += 1
+        elif net_mode:
             raise ValueError("PORT_GUARD_BROKER_FEES_UNVERIFIED")
-        fee = _decimal(f.get("commission_usd"))
-        tax = _decimal(f.get("tax_usd"))
-        if fee < 0 or tax < 0:
-            raise ValueError("PORT_GUARD_COST_NEGATIVE")
-        commissions += fee
-        taxes += tax
         # Each row is a cumulative native execution total, not an incremental
         # fill. A changed quantity, average price, client alias or zero
         # padding cannot turn a duplicate broker order into new economics.
@@ -261,6 +275,22 @@ def verified_sleeve_pnl(
         if amounts["net_qty"] != holdings[sym]["qty"]:
             raise ValueError("PORT_GUARD_KIS_LEDGER_NET_MISMATCH")
         marked += amounts["net_qty"] * holdings[sym]["mark"]
+    gross = sell_total + marked - buy_total
+    if not net_mode:
+        # No cash movements enter trade economics; unobserved costs are
+        # unknown, not zero. Never label gross trade PnL as net profit.
+        return gross, {
+            "buy_total": buy_total, "sell_total": sell_total,
+            "marked_open_equity": marked, "gross_trading_pnl_usd": gross,
+            "known_commissions_usd": commissions if verified_fee_count else None,
+            "known_taxes_usd": taxes if verified_fee_count else None,
+            "verified_fee_fill_count": verified_fee_count,
+            "total_fill_count": len(fills),
+            "all_fill_fees_verified": verified_fee_count == len(fills),
+            "broker_cash_ledger_complete": False,
+            "confirmed_net_pnl_usd": None,
+            "method": TRADING_ACCOUNTING_METHOD,
+        }
     cash_ids = set()
     for event in cash_events:
         if not isinstance(event, dict):
@@ -287,7 +317,9 @@ def verified_sleeve_pnl(
                  "broker_cash_adjustments_usd": distributions,
                  "verified_cash_event_count": len(cash_events),
                  "broker_cash_ledger_complete": True,
-                 "method": "NATIVE_FILLS_PLUS_FRESH_KIS_MARK_V1"}
+                 "gross_trading_pnl_usd": gross,
+                 "confirmed_net_pnl_usd": pnl,
+                 "method": NET_ACCOUNTING_METHOD}
 
 
 def triggered_stage(*, pnl: Decimal, hwm: Decimal, policy: dict) -> int:
