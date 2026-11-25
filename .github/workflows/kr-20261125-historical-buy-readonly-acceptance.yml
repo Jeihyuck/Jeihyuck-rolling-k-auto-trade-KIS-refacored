@@ -1,0 +1,153 @@
+name: KR 20261125 Historical BUY Authenticated Readonly Evidence
+on:
+  pull_request:
+    branches: [dual-agent]
+    types: [synchronize]
+permissions:
+  contents: read
+concurrency:
+  group: kr-398-one-time-historical-buy-readonly
+  cancel-in-progress: false
+jobs:
+  native-historical-readonly:
+    # One-time exact parent transition; never run arbitrary PR/fork code with secrets.
+    if: >-
+      github.repository == 'Jeihyuck/Jeihyuck-rolling-k-auto-trade-KIS-refacored' &&
+      github.event.pull_request.number == 398 &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'fix/kr-20261125-integrated-22' &&
+      github.event.pull_request.user.login == 'Jeihyuck' &&
+      github.event.before == '43b6af1b3f60a626fed8bd29326ee95f9112e89a'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 43b6af1b3f60a626fed8bd29326ee95f9112e89a
+          persist-credentials: false
+      - name: Confirm exact reviewed revision
+        run: test "$(git rev-parse HEAD)" = "43b6af1b3f60a626fed8bd29326ee95f9112e89a"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install and verify offline without credentials
+        run: |
+          python -m pip install -r requirements.txt pytest
+          python -m pytest -q tests/test_kr_mail_execution_evidence_20261111.py
+          python -m py_compile scripts/kr_historical_buy_native_evidence.py
+      - name: Original order and current balance evidence (no orders, no DB writes)
+        env:
+          PYTHONPATH: .
+          PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+          KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+          KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+          CANO: ${{ secrets.CANO }}
+          ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+          PGOPTIONS: '-c default_transaction_read_only=on'
+          KIS_ENV: practice
+          STRATEGY_ENV: practice
+          WSL_RUN_MARKET: KR
+          TRADING_EPOCH_ENFORCE: '1'
+          MARKET: KR
+          PB1_MARKET_SCOPE: KRX
+          FORCE_HTTP: '1'
+          KIS_CCLD_EXCG_ID_DVSN_CD: ALL
+          NO_TRADE: '1'
+          DRY_RUN: '1'
+          DISABLE_REAL_TRADING: '1'
+          DISABLE_LIVE_TRADING: '1'
+          LIVE_TRADING_ENABLED: '0'
+          KR_LIVE_TRADING_ENABLED: '0'
+          KR_ORDER_ARMED: '0'
+          ALLOW_REAL_ORDER: '0'
+        run: |
+          python - <<'PY'
+          import json
+          import logging
+          import os
+          from datetime import date, datetime
+          from urllib.parse import urlsplit
+          from zoneinfo import ZoneInfo
+          import requests
+          import sqlalchemy as sa
+
+          logging.disable(logging.CRITICAL)
+          allowed_get = {
+              "/uapi/domestic-stock/v1/trading/inquire-balance",
+              "/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
+          }
+          counts = {"oauth_post": 0, "get": 0, "blocked": 0}
+          original_send = requests.sessions.Session.send
+          def guarded_send(self, request, **kwargs):
+              url = urlsplit(request.url)
+              method = request.method.upper()
+              if (url.scheme != "https" or url.hostname != "openapivts.koreainvestment.com"
+                      or url.port != 29443 or url.username or url.password):
+                  counts["blocked"] += 1
+                  raise RuntimeError("UNAPPROVED_HTTP_DESTINATION")
+              if method == "GET" and url.path in allowed_get:
+                  counts["get"] += 1
+              elif method == "POST" and url.path == "/oauth2/tokenP" and counts["oauth_post"] == 0:
+                  counts["oauth_post"] += 1
+              else:
+                  counts["blocked"] += 1
+                  raise RuntimeError("UNAPPROVED_HTTP_METHOD_OR_PATH")
+              kwargs["allow_redirects"] = False
+              response = original_send(self, request, **kwargs)
+              if response.is_redirect:
+                  raise RuntimeError("UNAPPROVED_HTTP_REDIRECT")
+              return response
+          requests.sessions.Session.send = guarded_send
+
+          report = {"code_sha": "43b6af1b3f60a626fed8bd29326ee95f9112e89a", "runner": "github-hosted-not-WSL",
+                    "recovery_authorized": False, "orders_submitted": 0,
+                    "db_rows_modified": 0, "cases": [], "http": counts}
+          engine = None
+          ok = False
+          try:
+              for key in ("PBCORE_DB_URL", "KIS_APP_KEY", "KIS_APP_SECRET", "CANO", "ACNT_PRDT_CD"):
+                  if not os.environ.get(key):
+                      raise RuntimeError("REQUIRED_CONFIG_MISSING")
+              from trader.db.engine import make_engine
+              from trader.kis_wrapper import KisAPI
+              from scripts.kr_historical_buy_native_evidence import collect
+              engine = make_engine()
+              @sa.event.listens_for(engine, "begin")
+              def readonly(conn):
+                  conn.exec_driver_sql("SET TRANSACTION READ ONLY")
+                  if conn.exec_driver_sql("SHOW transaction_read_only").scalar_one() != "on":
+                      raise RuntimeError("DB_READONLY_NOT_ENFORCED")
+              with engine.connect() as conn:
+                  assert conn.exec_driver_sql("SHOW transaction_read_only").scalar_one() == "on"
+              kis = KisAPI(kis_env="practice")
+              for code, day, odno in (
+                  ("293490", date(2026, 10, 27), "0000011280"),
+                  ("059090", date(2026, 10, 29), "0000011865"),
+              ):
+                  evidence = collect(engine=engine, kis=kis, now=datetime.now(ZoneInfo("Asia/Seoul")),
+                                     code=code, trade_date=day)
+                  rows = [r for r in evidence["cases"] if r["code"] == code and r["odno"] == odno]
+                  if len(rows) != 1:
+                      report["cases"].append({"code":code,"state":"EXACT_SOURCE_NOT_UNIQUE",
+                                              "count":len(rows)})
+                      continue
+                  row = rows[0]
+                  # Allowlisted scalars only; never print raw broker output, keys,
+                  # account identity, request/response headers, or exception text.
+                  report["cases"].append({k:row.get(k) for k in (
+                      "code","odno","trade_date","state","qty","notional","avg_price",
+                      "native_row_sha256","db_fill_qty","fresh_balance_proven",
+                      "current_holding_qty","current_day_unfilled","recovery_authorized")})
+              ok = len(report["cases"]) == 2 and all(
+                  row.get("state") == "ORIGINAL_FULL_EXECUTION_PROVEN"
+                  and row.get("fresh_balance_proven") is True
+                  and (row.get("current_day_unfilled") or {}).get("state") == "CURRENT_DAY_NO_UNFILLED_PROVEN"
+                  for row in report["cases"]) and counts["blocked"] == 0
+          except Exception as exc:
+              report["error_type"] = type(exc).__name__
+          finally:
+              if engine is not None:
+                  engine.dispose()
+          print(json.dumps(report, ensure_ascii=False, default=str))
+          raise SystemExit(0 if ok else 2)
+          PY
