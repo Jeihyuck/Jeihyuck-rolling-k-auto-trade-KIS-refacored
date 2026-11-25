@@ -811,3 +811,20 @@ def test_held_infinite_rejects_cached_or_fallback_cash_without_order(
     )
     assert not kis.orders
     assert not repo.intents
+
+
+def test_duplicate_held_add_keeps_owner_reason_without_fake_cash(armed_practice_env):
+    from trader.kr.infinite.policy_state import idempotency_key
+    state = active()
+    key = idempotency_key(state.cycle_id, DAY, "BUY", state.units_used+1)
+    repo = FakeRepository(state, [OrderIntent(1, state.cycle_id, DAY, "BUY",
+        key, 303, status="REJECTED", unit_sequence=2)])
+    kis = FakeKIS(qty=100, average=100, price=99)
+    def forbidden_cash(*args):
+        pytest.fail("duplicate intent must not query orderable cash")
+    kis.get_orderable_cash = forbidden_cash
+    result = run_once(config=config(), kis=kis, repository=repo,
+        regime_provider=REGIME, trade_date=DAY, kis_env="practice")
+    assert result.decision.action == Action.WAIT
+    assert result.decision.reason == "DUPLICATE_INTENT"
+    assert not kis.orders
