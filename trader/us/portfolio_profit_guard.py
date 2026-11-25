@@ -18,6 +18,7 @@ POLICY_PURPOSE = "US_STANDARD_PORTFOLIO_GIVEBACK_SELL_V1"
 NET_ACCOUNTING_METHOD = "NATIVE_FILLS_PLUS_FRESH_KIS_MARK_V1"
 TRADING_ACCOUNTING_METHOD = "NATIVE_TRADING_PNL_BEFORE_COSTS_V1"
 ACCOUNTING_METHODS = frozenset({NET_ACCOUNTING_METHOD, TRADING_ACCOUNTING_METHOD})
+LEGACY_ACCOUNTING_SCOPE = "VERIFIED_ORIGINAL_ACCOUNT_EPOCH_V1"
 
 
 def canonical(value: dict) -> bytes:
@@ -95,6 +96,11 @@ def verify_portfolio_policy(
         raise ValueError("PORT_GUARD_POLICY_NOT_IN_FORCE")
     if body.get("accounting_method") not in ACCOUNTING_METHODS:
         raise ValueError("PORT_GUARD_ACCOUNTING_METHOD_UNVERIFIED")
+    if body.get("legacy_accounting_scope") is not None and (
+        body["accounting_method"] != TRADING_ACCOUNTING_METHOD
+        or body["legacy_accounting_scope"] != LEGACY_ACCOUNTING_SCOPE
+    ):
+        raise ValueError("PORT_GUARD_LEGACY_ACCOUNTING_SCOPE_UNVERIFIED")
     if body.get("mark_source") not in ("KIS_BID", "KIS_EXECUTABLE_QUOTE"):
         raise ValueError("PORT_GUARD_MARK_SOURCE_UNVERIFIED")
     ttl = _decimal(body.get("quote_ttl_sec"))
