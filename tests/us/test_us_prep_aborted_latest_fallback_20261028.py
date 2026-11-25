@@ -241,7 +241,8 @@ def test_auto_clear_only_original_prep_missing_preflight_marker(monkeypatch, tmp
     monkeypatch.setattr("trader.us.run_manifest.verify_run_revision",
                         lambda *args: {"ok": True})
     monkeypatch.setattr(effective, "check_effective_prep_sources",
-                        lambda *a: {"ok": True, "run_id": "same"})
+                        lambda *a: {"ok": True, "run_id": "same",
+                                    "entry_authorized": True, "entry_revision": "pinned"})
     success, reason = effective.clear_recovered_us_prep_preflight_marker(
         trade_date="2026-10-27", expected_run_id="same",
         current_revision="pinned",
@@ -292,4 +293,39 @@ def test_manual_or_invalid_preflight_marker_never_auto_cleared(monkeypatch, tmp_
     )
     assert not success
     assert reason == "preflight_marker_not_auto_recoverable"
+    assert marker.exists()
+
+
+def test_preflight_marker_requires_entry_authorization_and_exact_revision(monkeypatch, tmp_path):
+    import json
+    import trader.us.prep_effective as effective
+    monkeypatch.chdir(tmp_path)
+    marker = tmp_path / "runtime/health/us-prep-missing-2026-10-27.json"
+    marker.parent.mkdir(parents=True)
+    marker.write_text(json.dumps({
+        "trade_date": "2026-10-27", "status": "EXIT_ONLY",
+        "reason": "prep_missing_after_preflight_recovery",
+        "entry_can_proceed": 0, "exit_can_proceed": 1,
+        "close_can_proceed": 1,
+    }))
+    monkeypatch.setattr("trader.us.run_manifest.verify_run_revision",
+                        lambda *args: {"ok": True})
+    for proof, expected_reason in (
+        ({"ok": True, "run_id": "same", "entry_authorized": False},
+         "preflight_recovery_entry_not_authorized"),
+        ({"ok": True, "run_id": "same", "entry_authorized": True,
+          "entry_revision": "another"}, "preflight_recovery_entry_revision_mismatch"),
+    ):
+        monkeypatch.setattr(effective, "check_effective_prep_sources", lambda *a: proof)
+        assert effective.clear_recovered_us_prep_preflight_marker(
+            trade_date="2026-10-27", expected_run_id="same", current_revision="pinned",
+        ) == (False, expected_reason)
+        assert marker.exists()
+
+    def broken_manifest(*args):
+        raise ValueError("invalid manifest")
+    monkeypatch.setattr("trader.us.run_manifest.verify_run_revision", broken_manifest)
+    assert effective.clear_recovered_us_prep_preflight_marker(
+        trade_date="2026-10-27", expected_run_id="same", current_revision="pinned",
+    ) == (False, "preflight_recovery_revision_unverified")
     assert marker.exists()

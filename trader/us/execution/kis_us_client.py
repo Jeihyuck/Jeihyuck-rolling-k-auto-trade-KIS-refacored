@@ -418,6 +418,10 @@ class KisUSClient:
         self._assert_not_offline("get_us_daily_price")
         tr = get_tr_info("us_daily_price")
         headers = self._build_headers(tr["tr_id"])
+        # Symbol-level ETF metadata overrides the canonical/listing venue for quotes only.
+        from trader.us.symbols import ETF_EXCHANGE_METADATA, resolve_quote_exchange
+        if str(symbol).strip().upper() in ETF_EXCHANGE_METADATA:
+            exchange = resolve_quote_exchange(symbol)
         bymd = resolve_us_dailyprice_bymd(as_of_date)
         logger.info(
             "[US_DATA_PROVIDER][DAILYPRICE] symbol=%s exchange=%s bymd=%s",
@@ -435,12 +439,18 @@ class KisUSClient:
         }
         cache_key = ("dailyprice", symbol.upper(), self._resolve_quote_excd(exchange), bymd)
         cached = self._response_cache.get(cache_key)
-        if cached:
+        # Only cache nonempty responses briefly; a recovery run must refetch.
+        ttl = max(0.0, float(os.getenv("US_KIS_DAILY_CACHE_TTL_SEC", "60") or 60))
+        recovery = os.getenv("US_PREP_RECOVERY_RUN", "0") == "1"
+        if cached and not recovery and time.time() - cached[0] < ttl and cached[1].get("output2"):
             logger.debug("[US_KIS][CACHE_HIT] endpoint=GET_dailyprice symbol=%s bymd=%s", symbol, bymd)
             return (cached[1].get("output2") or [])[:count]
+        self._response_cache.pop(cache_key, None)
         result = self._get(tr["path"], headers=headers, params=params)
-        self._response_cache[cache_key] = (time.time(), result)
-        return (result.get("output2") or [])[:count]
+        rows = result.get("output2") or []
+        if rows:
+            self._response_cache[cache_key] = (time.time(), result)
+        return rows[:count]
 
 
     def get_us_daily_price_history(
@@ -473,6 +483,8 @@ class KisUSClient:
                 rows_by_date[d] = row
                 dated.append(d)
             pages += 1
+            logger.info("[US_OHLCV][PAGE_EVIDENCE] symbol=%s exchange=%s as_of=%s raw_rows=%d accepted_rows=%d stop_at=%s",
+                        symbol, exchange, next_as_of, len(page or []), len(dated), stop_at_date)
             page_key = tuple(sorted(dated))
             if not dated or page_key in seen_pages or len(rows_by_date) >= int(required_bars):
                 break
@@ -489,6 +501,25 @@ class KisUSClient:
     # ------------------------------------------------------------------
     # Account
     # ------------------------------------------------------------------
+
+    def get_us_present_balance(self) -> dict:
+        """Read-only practice account summary, KRW basis; never order authority.
+
+        Official KIS v1_해외주식-008 (VTRP6504R). Practice output1/2 may be
+        absent and US holdings may lag during trading. Do not substitute
+        this endpoint for the position, orderable cash or native fill API.
+        """
+        self._assert_not_offline("get_us_present_balance")
+        if getattr(self, "env", "practice") != "practice":
+            raise KisUSClientError("US_PRESENT_BALANCE_PRACTICE_ONLY")
+        tr = get_tr_info("us_present_balance")
+        return self._get(
+            tr["path"], headers=self._build_headers(tr["tr_id"]),
+            params={"CANO": self._cano, "ACNT_PRDT_CD": self._acnt_prdt_cd,
+                    "WCRC_FRCR_DVSN_CD": "01", "NATN_CD": "840",
+                    "TR_MKET_CD": "00", "INQR_DVSN_CD": "00"},
+            max_attempts_override=2,
+        )
 
     def get_us_balance(self, force_refresh: bool = False) -> dict:
         """해외주식 잔고 조회 (다중 거래소).
@@ -513,6 +544,7 @@ class KisUSClient:
         exchanges = [e.strip().upper() for e in exchanges_env.split(",") if e.strip()]
         if not exchanges:
             exchanges = ["NASD", "NYSE", "AMEX"]
+        configured_exchanges = tuple(exchanges)
         configured_budget = max(0.1, float(os.getenv("US_BALANCE_FETCH_BUDGET_SEC", "30")))
         tick_remaining = float("inf") if self._tick_context is None else self._tick_context.remaining_sec()
         # Balance is a pre-routing stage.  Preserve a dedicated portion of the
@@ -624,7 +656,12 @@ class KisUSClient:
                 ",".join([row.get("ovrs_pdno", row.get("pdno", "?")) for row in merged_output1 if isinstance(row, dict)]),
             )
         
-            balance_complete = not failed_exchanges and len(exchange_result_counts) == len(exchanges)
+            # A successful subset is not a complete account balance. In particular
+            # it cannot close positions on venues omitted for a tight tick budget.
+            omitted = set(configured_exchanges) - set(exchanges)
+            for omitted_exchange in omitted:
+                failed_exchanges[omitted_exchange] = "TARGETED_EXIT_REFRESH_NOT_FULL_ACCOUNT"
+            balance_complete = not failed_exchanges and len(exchange_result_counts) == len(configured_exchanges)
             result_payload = {
                 "rt_cd": "0",
                 "output1": merged_output1,

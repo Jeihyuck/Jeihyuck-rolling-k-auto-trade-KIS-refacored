@@ -2512,7 +2512,29 @@ def run_trade_tick(
         and recon.get("authoritative_positions") is True
         and recon.get("preserve_previous_positions") is False
     )
-    if authoritative_recon:
+    # reconcile_positions already commits the same authoritative observation.
+    # Skip the second write only when no subsequent fill/replay writer ran.
+    # Stage4 is independent: preserve rebind if there are observed fills or
+    # any unresolved current claims, and never skip for custom providers
+    # that cannot prove their first persistence.
+    _snapshot_reuse = (
+        authoritative_recon
+        and recon.get("position_snapshot_committed") is True
+        and _stage4_mode
+        and not fills_today
+        and int(ack_recon.get("pending_count") or 0) == 0
+        and int(ack_recon.get("unresolved_count") or 0) == 0
+        and all(
+            str(p.get("symbol") or "").upper() == "TQQQ"
+            or ((p.get("meta") or {}).get("lineage_identity_status")
+                in {"VERIFIED_ORIGINAL_KIS_BUY", "VERIFIED_CURRENT_EPOCH_CONTINUITY"}
+                and p.get("position_lifecycle_id") and p.get("portfolio_epoch_id"))
+            for p in recon_positions
+        )
+    )
+    if _snapshot_reuse:
+        logger.info("[US_POSITIONS][SNAPSHOT][REUSE_COMMITTED] count=%d", len(recon_positions))
+    elif authoritative_recon:
         try:
             save_position_snapshot(
                 recon_positions,
@@ -2684,6 +2706,11 @@ def run_trade_tick(
             _lc = lifecycle_map.get(str(_p.get("symbol") or "").upper())
             if _lc:
                 _p["position_lifecycle_id"] = _lc.get("lifecycle_id")
+                # Scope fields come from the verified lifecycle; never use
+                # this to overwrite a conflicting broker/BUY assertion.
+                for _scope_field in ("env", "trading_epoch_id", "portfolio_epoch_id", "position_cycle_id"):
+                    if _p.get(_scope_field) in (None, "") and _lc.get(_scope_field) not in (None, ""):
+                        _p[_scope_field] = _lc[_scope_field]
                 # Preserve authoritative account/owner for exact stop revision
                 # and durable obligation scope, never infer from a ticker.
                 if str(_lc.get("account_id") or "").strip():
@@ -2698,6 +2725,8 @@ def run_trade_tick(
                 _p["high_watermark"] = _lc.get("high_watermark")
                 _p["max_price"] = _lc.get("high_watermark")
                 _p["high_watermark_source"] = _lc.get("high_watermark_source")
+                _p["high_watermark_at"] = _lc.get("high_watermark_at")
+                _p["high_watermark_lifecycle_id"] = _lc.get("lifecycle_id")
     except Exception as _lc_exc:
         logger.warning("[US_POSITION][LIFECYCLE][WARN] err=%s", _lc_exc)
     from trader.us.symbols import normalize_us_exchange
@@ -3285,17 +3314,32 @@ def run_trade_tick(
         # unrelated DB/market-state I/O runs. Recheck TP-only copies just
         # before the TP decision; the native router still requires a separate
         # executable KIS quote and authoritative stage/claim permission.
-        tp_decision_positions = current_positions
+        tp_quote_refresh = None
         if real_order_mode and not offline and not force_now:
             from trader.us.execution.tp_signal_quote_refresh import (
                 refresh_tp_source_quotes,
             )
-            tp_decision_positions = refresh_tp_source_quotes(
-                current_positions, provider,
-                exclude_symbols=existing_sell_symbols,
-            )
+            # Refresh each eligible symbol AFTER the TP state/legacy proof
+            # reads, not an entire batch that ages while those reads run.
+            _tp_refresh_budget = 12.0
+            _tp_refresh_reads = 0
+            def tp_quote_refresh(position):
+                nonlocal _tp_refresh_budget, _tp_refresh_reads
+                budget = min(3.0, _tp_refresh_budget, tick_context.remaining_sec())
+                if budget <= 0 or _tp_refresh_reads >= 12:
+                    return position
+                _tp_refresh_reads += 1
+                started = time.monotonic()
+                try:
+                    return refresh_tp_source_quotes(
+                        [position], provider, budget_sec=budget, max_reads=1,
+                        exclude_symbols=existing_sell_symbols,
+                    )[0]
+                finally:
+                    _tp_refresh_budget -= time.monotonic() - started
         profit_capture_intents = build_profit_capture_intents(
-            tp_decision_positions, market_state_overlay, existing_sell_symbols,
+            current_positions, market_state_overlay, existing_sell_symbols,
+            quote_refresh=tp_quote_refresh,
             now=now, trade_date=trade_date,
             defer_pending_until_claim=(real_order_mode and not offline),
             # Tick-start calendar time is not the end of TP evaluation.

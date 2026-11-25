@@ -41,6 +41,13 @@ TR_REGISTRY: dict[str, dict] = {
         "method": "GET",
         "description": "해외주식 잔고 조회 (모의)",
     },
+    # Official practice present-balance endpoint (output3 only is supported).
+    "us_present_balance": {
+        "tr_id": "VTRP6504R",
+        "path": "/uapi/overseas-stock/v1/trading/inquire-present-balance",
+        "method": "GET",
+        "description": "해외주식 체결기준현재잔고 (모의)",
+    },
     # 해외주식 주문 가능 현금
     "us_orderable_cash": {
         "tr_id": "VTTS3007R",

@@ -140,7 +140,9 @@ _SYMBOL_EXCHANGE_MAP: dict[str, str] = {
     "ELV": "NYSE", "ZTS": "NYSE", "SYK": "NYSE", "BSX": "NYSE",
     "EW": "NYSE", "HUM": "NYSE", "HCA": "NYSE", "MCK": "NYSE",
     "PG": "NYSE", "KO": "NYSE", "PEP": "NASDAQ", "MDLZ": "NASDAQ",
-    "CL": "NYSE", "KMB": "NYSE", "GIS": "NYSE", "KHC": "NASDAQ",
+    # KHC common stock transferred from Nasdaq to NYSE on 2026-09-14.
+    # SEC Form 8-A: 0001637459-26-000061; the ticker did not change.
+    "CL": "NYSE", "KMB": "NYSE", "GIS": "NYSE", "KHC": "NYSE",
     "KR": "NYSE", "HSY": "NYSE", "SYY": "NYSE", "ADM": "NYSE", "TAP": "NYSE",
     "DE": "NYSE", "HON": "NASDAQ", "GE": "NYSE", "MMM": "NYSE",
     "RTX": "NYSE", "LMT": "NYSE", "UPS": "NYSE", "FDX": "NYSE",

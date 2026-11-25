@@ -191,6 +191,22 @@ def normalize_daily_row(row: dict) -> dict:
     return result
 
 
+def _copy_completed_daily_result(result: dict) -> dict:
+    """Fast defensive copy for flat OHLCV rows; preserve nested data isolation."""
+    from copy import deepcopy
+    scalar_types = {str, int, float, bool, type(None), date, datetime, Decimal}
+    rows = result.get("rows")
+    if type(rows) is not list:
+        return deepcopy(result)
+    if any(type(value) not in scalar_types
+           for key, value in result.items() if key != "rows"):
+        return deepcopy(result)
+    if any(type(row) is not dict or any(type(value) not in scalar_types
+                                      for value in row.values()) for row in rows):
+        return deepcopy(result)
+    return {**result, "rows": [row.copy() for row in rows]}
+
+
 def normalize_daily_rows(symbol: str, rows: list[dict]) -> list[dict]:
     """일봉 row list를 정규화하고 필수 로그를 남긴다."""
     rows_raw = len(rows)
@@ -758,6 +774,7 @@ class USDataProvider:
 
     def get_isolated_exit_quote(
         self, symbol: str, exchange: str, *, stage_deadline: float,
+        max_quote_age_sec: float | None = None,
     ) -> dict:
         """Price-only I/O for concurrent protective-exit snapshot preparation.
 
@@ -784,7 +801,16 @@ class USDataProvider:
         client = isolate._get_client()
         client._stage_deadline = float(stage_deadline)
         client._stage_max_attempts = 1
-        return isolate.get_current_price(symbol, exchange)
+        if max_quote_age_sec is None:
+            return isolate.get_current_price(symbol, exchange)
+        return isolate.get_current_price(symbol, exchange, max_quote_age_sec=max_quote_age_sec)
+
+    def get_isolated_tp_quote(self, symbol: str, exchange: str, *, stage_deadline: float) -> dict:
+        from trader.us.execution.tp_signal_quote_refresh import SOURCE_TTL_SEC
+        return self.get_isolated_exit_quote(
+            symbol, exchange, stage_deadline=stage_deadline,
+            max_quote_age_sec=SOURCE_TTL_SEC,
+        )
 
     def _load_daily_prices_from_db(
         self, symbol: str, market: str = "US", days: int = 120
@@ -873,7 +899,7 @@ class USDataProvider:
             )
             return None
 
-    def get_current_price(self, symbol: str, exchange: str) -> dict:
+    def get_current_price(self, symbol: str, exchange: str, *, max_quote_age_sec: float | None = None) -> dict:
         """현재가 조회 (KIS → DB stale fallback)."""
         if self._stage_cancelled():
             from trader.us.execution.kis_us_client import KisUSTemporaryError
@@ -921,6 +947,20 @@ class USDataProvider:
                     ctx.count("quote_cache_hits")
                     return cached
         started = __import__("time").monotonic()
+        ws_age_limit = float(os.getenv("KIS_WS_FRESH_MAX_AGE_SEC_US", "15") or 15)
+        if max_quote_age_sec is not None:
+            ws_age_limit = min(ws_age_limit, max(0.0, float(max_quote_age_sec)))
+
+        def _ws_fresh_enough(quote):
+            if not quote:
+                return False
+            if max_quote_age_sec is None:
+                return True
+            try:
+                age = __import__("time").time() - float(quote.get("received_at") or 0)
+                return 0 <= age <= ws_age_limit
+            except (TypeError, ValueError, OverflowError):
+                return False
 
         # Opt-in session-owned collector avoids forking an active WS thread.
         # The collector has no trading/order capability. Its socket may be
@@ -936,9 +976,9 @@ class USDataProvider:
                 from trader.marketdata.us_ws_collector import get_quote
                 fresh = get_quote(
                     symbol, exchange, env=self._env,
-                    max_age_sec=float(os.getenv("KIS_WS_FRESH_MAX_AGE_SEC_US", "15") or 15),
+                    max_age_sec=ws_age_limit,
                 )
-                if fresh:
+                if _ws_fresh_enough(fresh):
                     data = {
                         "last": str(fresh.get("last") or "0"),
                         "open": "0", "high": "0", "low": "0", "tvol": "0",
@@ -970,14 +1010,14 @@ class USDataProvider:
                 from trader.marketdata.kis_ws_price import get_kis_ws_price_service
                 ws_service = get_kis_ws_price_service()
                 ws_service.subscribe_us(symbol, exchange)
-                ws_max_age = float(os.getenv("KIS_WS_FRESH_MAX_AGE_SEC_US", "15") or 15)
+                ws_max_age = ws_age_limit
                 ws_wait = float(os.getenv("KIS_WS_INITIAL_WAIT_SEC", "0.35") or 0.35)
                 ws_quote = ws_service.get_fresh_quote("US", symbol, max_age_sec=ws_max_age)
                 if ws_quote is None and ws_wait > 0:
                     ws_quote = ws_service.wait_for_fresh_quote(
                         "US", symbol, max_age_sec=ws_max_age, wait_sec=ws_wait
                     )
-                if ws_quote:
+                if _ws_fresh_enough(ws_quote):
                     if self._stage_cancelled():
                         from trader.us.execution.kis_us_client import KisUSTemporaryError
                         raise KisUSTemporaryError("entry stage cancelled after websocket quote")
@@ -1144,7 +1184,6 @@ class USDataProvider:
     ) -> dict:
         # Completed bars are immutable for this tick's trade date. Live quotes,
         # balances, claims and pre-HTTP SELL checks never use this cache.
-        from copy import deepcopy
         ctx = self._tick_context
         if ctx is None or self._stage_cancelled():
             return self._get_completed_daily_prices_result_uncached(
@@ -1157,12 +1196,12 @@ class USDataProvider:
         key = (str(symbol).upper(), str(exchange).upper(), str(trade_date), int(required_bars))
         if key in cache:
             ctx.count("completed_daily_cache_hits")
-            return deepcopy(cache[key])
+            return _copy_completed_daily_result(cache[key])
         result = self._get_completed_daily_prices_result_uncached(
             symbol, exchange, trade_date=trade_date,
             required_bars=required_bars, allow_http_sync=allow_http_sync)
         if result.get("quality") == "OK" and not self._stage_cancelled():
-            cache[key] = deepcopy(result)
+            cache[key] = _copy_completed_daily_result(result)
         return result
 
     def _get_completed_daily_prices_result_uncached(
@@ -1220,9 +1259,13 @@ class USDataProvider:
         max_pages = int(os.getenv("US_DAILY_BACKFILL_MAX_PAGES", "6") or 6)
         client = None if self._offline else self._get_client()
 
+        http_attempts = 0
+
         def _fetch_history(*, as_of: str, need: int, stop_at: str | None, direction: str) -> list[dict]:
+            nonlocal http_attempts
             if self._offline:
                 return _make_stub_daily(symbol, max(required + 5, need + 5))
+            http_attempts += 1
             if hasattr(client, "get_us_daily_price_history"):
                 self.stats["daily_http_call_count"] += 1
                 return client.get_us_daily_price_history(symbol, exchange, as_of_date=as_of, required_bars=need, stop_at_date=stop_at, max_pages=max_pages)
@@ -1233,7 +1276,13 @@ class USDataProvider:
         total_upserted = 0
         if db_latest is None or db_latest < expected_latest:
             logger.info("[US_OHLCV][SYNC_GAP] symbol=%s direction=forward db_latest=%s expected_latest=%s", symbol, db_latest, expected_latest)
-            fetched = _fetch_history(as_of=str(trade_date), need=required, stop_at=(db_latest.isoformat() if db_latest else None), direction="forward")
+            # A trade-day request during PREP can return today's incomplete
+            # bar or an empty response. Request the last completed NY session.
+            fetched = _fetch_history(as_of=expected_latest.strftime("%Y%m%d"), need=required,
+                                     stop_at=(db_latest.isoformat() if db_latest else None), direction="forward")
+            fetched = [row for row in (fetched or []) if isinstance(row, dict)
+                       and (day := canonical_us_bar_date(row.get("date") or row.get("xymd") or row.get("stck_bsop_date"))) is not None
+                       and day <= expected_latest]
             total_fetched += len(fetched or [])
             total_upserted += upsert_us_daily_bars(symbol=symbol, bars=fetched, source="KIS_US_DAILY")
             rows = load_recent_us_daily_bars(symbol=symbol, before_date=trade_date, limit=required)
@@ -1261,7 +1310,7 @@ class USDataProvider:
         duplicate_count = int(audit.get("duplicate_count") or 0)
         quality = "OK" if len(rows) >= required and audit_last_date == expected_latest and invalid_close_count == 0 and duplicate_count == 0 else ("STALE" if audit_last_date != expected_latest else "INSUFFICIENT_HISTORY")
         logger.info("[US_OHLCV][VERIFY] symbol=%s quality=%s valid_bar_count=%d latest=%s expected=%s invalid_close_count=%s duplicate_count=%s", symbol, quality, len(rows), db_latest, expected_latest, audit.get("invalid_close_count"), audit.get("duplicate_count"))
-        return {"rows": normalize_daily_rows(symbol, rows), "quality": quality, "valid_bar_count": len(rows), "db_latest": db_latest.isoformat() if db_latest else None, "expected_latest": expected_latest.isoformat(), "invalid_close_count": invalid_close_count, "duplicate_count": duplicate_count, "http_sync_attempted": total_fetched > 0, "http_sync_succeeded": total_fetched == 0 or total_upserted > 0}
+        return {"rows": normalize_daily_rows(symbol, rows), "quality": quality, "valid_bar_count": len(rows), "db_latest": db_latest.isoformat() if db_latest else None, "expected_latest": expected_latest.isoformat(), "invalid_close_count": invalid_close_count, "duplicate_count": duplicate_count, "http_sync_attempted": http_attempts > 0, "http_sync_succeeded": http_attempts > 0 and quality == "OK", "http_sync_call_count": http_attempts, "http_rows_fetched": total_fetched if http_attempts else 0, "rows_upserted": total_upserted}
 
     def get_completed_daily_prices(
         self,
@@ -1357,14 +1406,30 @@ class USDataProvider:
             # Re-raise original exception if not temporary or no DB fallback
             raise
 
+    def get_account_summary_observation(self) -> dict:
+        """Separate reporting-only KIS account observation from holdings truth."""
+        from trader.us.account_summary import parse_practice_present_balance
+        if self._offline:
+            return {"status": "UNAVAILABLE", "reason": "offline"}
+        try:
+            raw = self._get_client().get_us_present_balance()
+            return parse_practice_present_balance(raw)
+        except Exception as exc:
+            logger.warning("[US_ACCOUNT_SUMMARY][UNAVAILABLE] type=%s", type(exc).__name__)
+            return {"status": "UNAVAILABLE", "reason": type(exc).__name__}
+
     def get_balance(self, force_refresh: bool = False) -> dict:
         """잔고 조회."""
         ctx = self._tick_context
         if ctx is not None:
             ctx.count("balance_logical_calls")
-            if ctx.balance_snapshot_at is not None and ctx.balance_snapshot:
+            if not force_refresh and ctx.balance_snapshot_at is not None and ctx.balance_snapshot:
                 ctx.count("balance_cache_hits")
                 return ctx.balance_snapshot
+            if force_refresh:
+                # A failed explicit refresh must not resurrect an older cached balance.
+                ctx.balance_snapshot = {}
+                ctx.balance_snapshot_at = None
         started = __import__("time").monotonic()
         if self._offline:
             return {
@@ -1388,7 +1453,9 @@ class USDataProvider:
                 ctx.count("balance_http_calls")
             raw = self._get_client().get_us_balance(force_refresh=force_refresh)
             result = normalize_us_balance(raw)
-            if ctx is not None and result.get("balance_complete", True):
+            if (ctx is not None and result.get("balance_complete", True)
+                    and result.get("balance_authoritative", True)
+                    and result.get("balance_parse_status") == "OK"):
                 ctx.balance_snapshot = result
                 ctx.balance_snapshot_at = __import__("time").monotonic()
             return result

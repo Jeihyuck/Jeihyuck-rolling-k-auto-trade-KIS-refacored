@@ -8,6 +8,28 @@ pytestmark = pytest.mark.skipif(not os.getenv("PBCORE_TEST_POSTGRES_URL"), reaso
 
 DAYTIME_ET = datetime(2026, 8, 24, 10, 30, tzinfo=ZoneInfo("America/New_York"))
 
+def _enable_mock_practice_router_permissions(monkeypatch):
+    """Exercise real risk permission logic with only the injected fake broker.
+
+    Keep CI's default DRY_RUN=1 for all other tests. No authenticated HTTP
+    is allowed even if a code path unexpectedly tries to create a client.
+    """
+    import requests
+
+    def unexpected_http(*args, **kwargs):
+        pytest.fail("Network HTTP is forbidden in mock-only PostgreSQL routing tests")
+
+    monkeypatch.setattr(requests.sessions.Session, "request", unexpected_http)
+    for key, value in {
+        "KIS_ENV": "practice", "STRATEGY_ENV": "practice",
+        "DRY_RUN": "0", "DISABLE_LIVE_TRADING": "0",
+        "DISABLE_REAL_TRADING": "1", "LIVE_TRADING_ENABLED": "1",
+        "US_LIVE_TRADING_ENABLED": "1", "US_ORDER_ARMED": "1",
+        "SIGNAL_ONLY": "0", "RUN_MODE": "TRADE",
+    }.items():
+        monkeypatch.setenv(key, value)
+
+
 @pytest.fixture()
 def pg_engine(monkeypatch):
     from sqlalchemy import create_engine, text
@@ -2955,10 +2977,11 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
     )
     assert first_lifecycle["high_watermark"] == 470.0
 
+    runtime_position = {"symbol": "AMGN", "exchange": "NASDAQ", "qty": 6,
+                        "avg_cost": 461.8, "current_px": 469.0,
+                        "balance_source": "kis_balance_authoritative", "meta": {}}
     assert repos.save_position_snapshot(
-        [{"symbol": "AMGN", "exchange": "NASDAQ", "qty": 6,
-          "avg_cost": 461.8, "current_px": 469.0,
-          "balance_source": "kis_balance_authoritative", "meta": {}}],
+        [runtime_position],
         trade_date="2026-11-11",
         balance_fetch_status="OK", balance_parse_status="OK",
         authoritative_positions=True, preserve_previous_positions=False,
@@ -2975,6 +2998,12 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
     assert tomorrow["meta"]["position_lifecycle_id"] == cycle
     assert tomorrow["meta"]["lineage_identity_status"] == "VERIFIED_CURRENT_EPOCH_CONTINUITY"
     assert tomorrow["meta"]["entry_exit_contract_sha256"] == contract["sha256"]
+    # The live runner consumes the original broker dict, not a separate SELECT.
+    assert runtime_position["position_lifecycle_id"] == cycle
+    assert runtime_position["strategy_owner"] == "US_STANDARD"
+    assert runtime_position["meta"]["entry_exit_contract_sha256"] == contract["sha256"]
+    assert runtime_position["qty"] == 6
+    assert runtime_position["current_px"] == 469.0
 
     # Regression 2026-11-23: a verified native BUY and snapshot can both
     # be durable, yet the restarted DB consumer formerly compared its
@@ -3175,6 +3204,7 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
     monkeypatch.setenv("WSL_RUN_MARKET", "US")
     monkeypatch.setenv("US_ACCOUNT_RESERVATION_MODE", "OFF")
     monkeypatch.setenv("US_ATOMIC_CLAIM_OUTBOX_ENABLED", "0")
+    _enable_mock_practice_router_permissions(monkeypatch)
     monkeypatch.setattr(order_router, "resolve_dry_run_for_us_order", lambda: False)
     claim_repo = DurableExecutionClaimRepo(
         pg_engine, us_execution_claims, us_execution_attempts,
@@ -3622,6 +3652,8 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
     router and fake broker ACK; neither a real KIS request nor a KIS fill.
     """
     import json
+    import hashlib
+    import trader.account_state as account_state
     from datetime import datetime, timezone
     from uuid import uuid4
     from sqlalchemy import text
@@ -3641,6 +3673,9 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
     # us_positions and account reservations deliberately survive the lean
     # fixture, so each invocation must own its own practice account + epoch.
     epoch += "-" + uuid4().hex
+    raw_account = f"practice:ten-symbol-concurrency-integration-{epoch}"
+    account_fingerprint = hashlib.sha256(raw_account.encode()).hexdigest()
+    monkeypatch.setattr(account_state, "get_account_key", lambda **_kw: raw_account)
     symbols = ["ABBV", "AMGN", "DHR", "HCA", "KO",
                "KR", "MCK", "PFE", "PG", "TMO"]
     blocked = {"KO", "KR", "TMO"} if multiple_unresolved else {"KO"}
@@ -3684,6 +3719,10 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
                 "sleeve_id": "US_STANDARD",
                 "position_lifecycle_id": f"fixture-cycle-{sym}",
                 "position_cycle_id": f"fixture-cycle-{sym}",
+                "portfolio_epoch_id": "portfolio-fixture",
+                "trading_epoch_id": epoch,
+                "broker_account_hash": account_fingerprint,
+                "env": "practice",
                 "entry_exit_contract": signed,
                 "entry_exit_contract_sha256": signed["sha256"],
                 "entry_time": "2026-11-10T16:00:00+00:00",
@@ -3701,10 +3740,11 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
                     as_of,symbol,exchange,qty,avg_cost,current_px,trading_epoch_id,
                     account_id,portfolio_epoch_id,position_cycle_id,meta)
                 VALUES ('2026-11-12',:sym,'NASDAQ',4,100,:price,:epoch,
-                        'hash-fixture','portfolio-fixture',:cycle,CAST(:meta AS jsonb))
+                        :account,'portfolio-fixture',:cycle,CAST(:meta AS jsonb))
             """), {
                 "sym": sym, "price": 100 if sym == "ABBV" else 80,
-                "epoch": epoch, "cycle": None if sym == "ABBV" else f"fixture-cycle-{sym}",
+                "epoch": epoch, "account": account_fingerprint,
+                "cycle": None if sym == "ABBV" else f"fixture-cycle-{sym}",
                 "meta": json.dumps(meta),
             })
         for blocked_symbol in blocked:
@@ -3754,6 +3794,9 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
     assert not (blocked | {"ABBV"}).intersection(found)
     for sym, intent in found.items():
         assert intent["position_lifecycle_id"] == f"fixture-cycle-{sym}"
+        assert intent["broker_account_hash"] == account_fingerprint
+        assert intent["trading_epoch_id"] == epoch
+        assert intent["portfolio_epoch_id"] == "portfolio-fixture"
         assert intent["source_entry_contract_sha256"] == (
             positions[sym]["meta"]["entry_exit_contract_sha256"]
         )
@@ -3791,11 +3834,10 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
     monkeypatch.setenv("US_ATOMIC_CLAIM_OUTBOX_ENABLED", "1" if paper_profile else "0")
     monkeypatch.setenv("US_ACCOUNT_RESERVATION_MODE", "ENFORCE" if paper_profile else "OFF")
     monkeypatch.setenv("US_RECONCILE_WORKER_MODE", "RESERVATION_ONLY" if paper_profile else "LEGACY")
+    _enable_mock_practice_router_permissions(monkeypatch)
     monkeypatch.setattr(order_router, "resolve_dry_run_for_us_order", lambda: False)
     if paper_profile:
-        import hashlib
         from pathlib import Path
-        import trader.account_state as account_state
         from trader.us import config as us_cfg
         from trader.us.execution import reservation_reconcile_worker
         with pg_engine.begin() as conn:
@@ -3805,11 +3847,6 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
         # Each parameter is a separate simulated brokerage account. Prior
         # tests leave active reservations by design, and production correctly
         # counts the same account's reservations across different epochs.
-        raw_account = f"practice:ten-symbol-concurrency-integration-{epoch}"
-        account_fingerprint = hashlib.sha256(raw_account.encode()).hexdigest()
-        monkeypatch.setattr(
-            account_state, "get_account_key", lambda **_kw: raw_account,
-        )
         monkeypatch.setattr(repos, "_us_execution_claim_scope", lambda: {
             "env": "practice",
             "account_id": account_fingerprint,
@@ -4003,6 +4040,7 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
     monkeypatch.setattr(
         account_state, "get_account_key", lambda **_kw: raw_account,
     )
+    _enable_mock_practice_router_permissions(monkeypatch)
     monkeypatch.setattr(
         order_router, "resolve_dry_run_for_us_order", lambda: False,
     )
@@ -4474,6 +4512,13 @@ engine.dispose()
     sell = sells[0]
     assert sell["source_entry_contract_sha256"] == signed["sha256"]
     assert sell["position_lifecycle_id"] == cycle
+    # Do not repair the generated SELL in the test: canonical scope must
+    # survive the real DB -> resolver -> exit producer handoff.
+    for field, expected in (("position_cycle_id", cycle),
+                            ("portfolio_epoch_id", portfolio),
+                            ("trading_epoch_id", epoch)):
+        assert sell.get(field) == expected, (field, sell)
+        assert sell["meta"].get(field) == expected, (field, sell)
     sell["trade_date"] = "2026-11-11"
     sell.setdefault("exchange", "NASDAQ")
     sell.setdefault("holding_qty", 6)
@@ -4975,3 +5020,79 @@ def test_v3_atomic_pre_http_tp_stage_and_intent_under_same_pg_commit(
                 "WHERE client_order_key=:key"
             ), {"key": key}).scalar_one()
         assert (intent_status, stage_status) == ("PENDING", "PENDING"), suffix
+
+
+def test_postgres_hwm_atomic_pair_preserved_under_delayed_writer(pg_engine, monkeypatch):
+    from trader.us.db import repos
+    from sqlalchemy import text
+    monkeypatch.setattr(repos, "_us_state_epoch_id", lambda *a, **kw: "hwm-pair-epoch")
+    with pg_engine.begin() as conn:
+        repos._ensure_us_position_risk_state_table(conn)
+        conn.execute(text("DELETE FROM us_position_risk_state WHERE symbol='HWMPAIR' AND trading_epoch_id='hwm-pair-epoch'"))
+    base = {"lifecycle_id": "hwm-pair-cycle", "is_open": True,
+            "env": "practice", "strategy_owner": "US_STANDARD",
+            "account_id": "practice:fixture", "trading_epoch_id": "hwm-pair-epoch",
+            "high_watermark_source": "us_position_risk_state"}
+    day = "2026-11-24"
+    peak = {**base, "high_watermark": 130.0, "high_watermark_at": "2026-11-24T15:00:00+00:00"}
+    assert repos.save_us_position_lifecycle_atomic("HWMPAIR", day, peak)["high_watermark"] == 130
+    stale = {**base, "high_watermark": 120.0, "high_watermark_at": "2026-11-24T16:00:00+00:00",
+             "high_watermark_source": "stale_writer"}
+    for price in (120.0, 130.0):
+        result = repos.save_us_position_lifecycle_atomic("HWMPAIR", day, {**stale, "high_watermark": price})
+        assert result["high_watermark"] == 130
+        assert result["high_watermark_at"] == peak["high_watermark_at"]
+        assert result["high_watermark_source"] == peak["high_watermark_source"]
+    newer = {**base, "high_watermark": 140.0, "high_watermark_at": "2026-11-24T17:00:00+00:00"}
+    result = repos.save_us_position_lifecycle_atomic("HWMPAIR", day, newer)
+    assert result["high_watermark"] == 140
+    assert result["high_watermark_at"] == newer["high_watermark_at"]
+
+
+@pytest.mark.parametrize("symbol", ["DHR", "KO", "PG", "TMO"])
+def test_pg_verified_legacy_snapshot_runtime_handoff_without_new_cycle(pg_engine, monkeypatch, symbol):
+    from trader.us.db import repos
+    from trader.us import original_buy_lineage
+    from trader.us.execution import us_legacy_nine_active_sell as legacy
+    from trader.us.entry_exit_contract import build_us_entry_exit_contract
+    from sqlalchemy import text
+
+    epoch = "legacy-runtime-handoff-fixture"
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda *a, **kw: epoch)
+    monkeypatch.setattr(original_buy_lineage, "verified_new_buy_snapshot_identity", lambda **kw: None)
+    monkeypatch.setattr(original_buy_lineage, "verified_carried_us_snapshot_identity", lambda **kw: None)
+    contract = build_us_entry_exit_contract({
+        "symbol": symbol, "strategy_owner": "US_STANDARD", "book": "SWING_BOOK",
+        "horizon": "SWING_CARRY", "entry_reason": "TEST_ORIGINAL_BUY",
+    })
+    # Isolate the real UPSERT/RETURNING and runtime handoff; actual original
+    # proof is independently exercised by the legacy-nine acceptance tests.
+    proof = {"strategy_owner": "US_STANDARD", "account_id": "practice:fixture",
+             "env": "practice", "trading_epoch_id": epoch,
+             "position_lifecycle_id": "legacy-original-fixture-cycle",
+             "entry_exit_contract": contract, "entry_exit_contract_sha256": contract["sha256"],
+             "entry_exit_contract_version": contract["version"],
+             "lineage_identity_status": "VERIFIED_LEGACY_ORIGINAL"}
+    monkeypatch.setattr(legacy, "verified_legacy_snapshot_context", lambda *a, **kw: dict(proof))
+    row = {"symbol": symbol, "exchange": "NYSE", "qty": 2, "avg_cost": 100.0,
+           "current_px": 110.0, "meta": {}}
+    kwargs = dict(trade_date="2026-11-24", balance_fetch_status="OK", balance_parse_status="OK",
+                  authoritative_positions=True, preserve_previous_positions=True)
+    assert repos.save_position_snapshot([row], **kwargs) == 1
+    assert row["position_lifecycle_id"] == proof["position_lifecycle_id"]
+    assert row["env"] == "practice" and row["strategy_owner"] == "US_STANDARD"
+    assert row["meta"]["entry_exit_contract_sha256"] == contract["sha256"]
+    assert not row.get("portfolio_epoch_id") and not row.get("position_cycle_id")
+    with pg_engine.begin() as conn:
+        stored = conn.execute(text("SELECT account_id, portfolio_epoch_id, position_cycle_id, meta FROM us_positions WHERE trading_epoch_id=:epoch AND symbol=:symbol"), {"epoch": epoch, "symbol": symbol}).mappings().one()
+        assert stored["account_id"] is None and stored["portfolio_epoch_id"] is None and stored["position_cycle_id"] is None
+        assert stored["meta"]["position_lifecycle_id"] == proof["position_lifecycle_id"]
+        conn.execute(text("UPDATE us_positions SET position_cycle_id='different-canonical-cycle' WHERE trading_epoch_id=:epoch AND symbol=:symbol"), {"epoch": epoch, "symbol": symbol})
+    conflicting = {"symbol": symbol, "exchange": "NYSE", "qty": 1, "avg_cost": 100.0, "current_px": 111.0, "meta": {}}
+    assert repos.save_position_snapshot([conflicting], **kwargs) == 1
+    assert not conflicting.get("position_lifecycle_id")
+    with pg_engine.connect() as conn:
+        stored = conn.execute(text("SELECT qty, position_cycle_id, meta FROM us_positions WHERE trading_epoch_id=:epoch AND symbol=:symbol"), {"epoch": epoch, "symbol": symbol}).mappings().one()
+        assert stored["qty"] == 1
+        assert stored["position_cycle_id"] == "different-canonical-cycle"
+        assert stored["meta"]["entry_exit_contract_sha256"] == contract["sha256"]
