@@ -377,6 +377,7 @@ exit "${FINAL_RC}"
 def test_final_health_requires_real_mail_and_returns_matching_exit_code(tmp_path):
     root=tmp_path/"health-repo"; scripts=root/"scripts/wsl"; scripts.mkdir(parents=True)
     shutil.copy2(ROOT/"scripts/wsl/check-nullim-day-health.sh",scripts/"check-nullim-day-health.sh")
+    shutil.copy2(ROOT/"scripts/wsl/kr_mail_execution_evidence.py",scripts/"kr_mail_execution_evidence.py")
     shutil.copy2(ROOT/"scripts/wsl/check-nullim-trading-day.py",scripts/"check-nullim-trading-day.py")
     shutil.copy2(ROOT/"scripts/wsl/resolve-nullim-python.sh",scripts/"resolve-nullim-python.sh")
     verify=scripts/"verify-no-nullim-auto-scheduler.sh"; verify.write_text("#!/usr/bin/env bash\necho '[SCHEDULER_POLICY][WSL][OK] forbidden_sources=0'\n"); verify.chmod(0o755)
@@ -393,7 +394,24 @@ def test_final_health_requires_real_mail_and_returns_matching_exit_code(tmp_path
     assert dry.returncode == 1
     (health/f"kr-mail-{DATE}.json").write_text(json.dumps({"status":"OK","mail_sent":True,"market":"kr","trade_date":DATE,"required_missing_count":0,"archive_sha256":"x"}))
     success=subprocess.run(["bash",str(scripts/"check-nullim-day-health.sh"),"kr",DATE],cwd=root,env=health_env)
-    assert success.returncode == 0
+    # SMTP success alone must not mask absent trading sessions.
+    assert success.returncode == 1
+    report=json.loads((health/f"kr-{DATE}.json").read_text())
+    assert report["failure_reason"] == "KR_DAILY_EXECUTION_INCOMPLETE"
+    assert report["mail_smtp_accepted"] is True
+    assert report["mail_recipient_delivery_confirmed"] is False
+    # A truly healthy day has all four same-day terminal sessions and
+    # completed economic settlement as well as a complete SMTP archive.
+    manifest={"sessions":{name:{"effective_run_id":name+"-1",
+        "attempts":[{"run_id":name+"-1","status":"OK","reason":"SESSION_END"}]}
+        for name in ("prep","am","afternoon","close")}}
+    (log.parent.parent/"session-manifest.json").write_text(json.dumps(manifest))
+    close=root/f"runtime/kr/session/{DATE}/close/pb1_result.json"
+    close.parent.mkdir(parents=True)
+    close.write_text(json.dumps({"economic_settlement_state":"COMPLETE","native_priced_sell_gap_count":0}))
+    healthy=subprocess.run(["bash",str(scripts/"check-nullim-day-health.sh"),"kr",DATE],cwd=root,env=health_env)
+    assert healthy.returncode == 0
+    assert json.loads((health/f"kr-{DATE}.json").read_text())["kr_execution_status"] == "COMPLETED"
 
 
 def test_stage4_referenced_worker_log_archived_and_redacted(tmp_path):
