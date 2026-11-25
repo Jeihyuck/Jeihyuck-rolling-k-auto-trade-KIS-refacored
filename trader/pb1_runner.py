@@ -8198,12 +8198,20 @@ def run_once(
                         and getattr(engine_runner, "_kr_post_exit_reconcile_ok", True)
                     ),
                 )
+                engine_runner._kr_infinite_submit_attempted = bool(
+                    getattr(kr_inf_run_result, "submit_attempted", False)
+                    or kr_inf_run_result.submitted
+                )
                 logger.info(
-                    "[KR_INF][TICK][AFTER_PROTECTIVE_SELL] symbol=122630 owner=KR_INFINITE decision=%s reason=%s shared_balance=1",
+                    "[KR_INF][TICK][AFTER_PROTECTIVE_SELL] symbol=122630 owner=KR_INFINITE decision=%s reason=%s shared_balance=1 attempted=%s submission_state=%s",
                     kr_inf_run_result.decision.action.value,
                     kr_inf_run_result.decision.reason,
+                    int(engine_runner._kr_infinite_submit_attempted),
+                    getattr(kr_inf_run_result, "submission_state", "UNKNOWN"),
                 )
             except Exception as inf_exc:
+                # Cannot prove the owner did not cross the submission boundary.
+                engine_runner._kr_infinite_submit_attempted = True
                 logger.exception("[KR_INF][BLOCK] reason=isolated_exception_after_protective_exit error=%s", inf_exc)
 
         engine_runner._kr_after_protective_exit = _kr_after_protective_exit
