@@ -3652,6 +3652,8 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
     router and fake broker ACK; neither a real KIS request nor a KIS fill.
     """
     import json
+    import hashlib
+    import trader.account_state as account_state
     from datetime import datetime, timezone
     from uuid import uuid4
     from sqlalchemy import text
@@ -3671,6 +3673,9 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
     # us_positions and account reservations deliberately survive the lean
     # fixture, so each invocation must own its own practice account + epoch.
     epoch += "-" + uuid4().hex
+    raw_account = f"practice:ten-symbol-concurrency-integration-{epoch}"
+    account_fingerprint = hashlib.sha256(raw_account.encode()).hexdigest()
+    monkeypatch.setattr(account_state, "get_account_key", lambda **_kw: raw_account)
     symbols = ["ABBV", "AMGN", "DHR", "HCA", "KO",
                "KR", "MCK", "PFE", "PG", "TMO"]
     blocked = {"KO", "KR", "TMO"} if multiple_unresolved else {"KO"}
@@ -3714,6 +3719,10 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
                 "sleeve_id": "US_STANDARD",
                 "position_lifecycle_id": f"fixture-cycle-{sym}",
                 "position_cycle_id": f"fixture-cycle-{sym}",
+                "portfolio_epoch_id": "portfolio-fixture",
+                "trading_epoch_id": epoch,
+                "broker_account_hash": account_fingerprint,
+                "env": "practice",
                 "entry_exit_contract": signed,
                 "entry_exit_contract_sha256": signed["sha256"],
                 "entry_time": "2026-11-10T16:00:00+00:00",
@@ -3731,10 +3740,11 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
                     as_of,symbol,exchange,qty,avg_cost,current_px,trading_epoch_id,
                     account_id,portfolio_epoch_id,position_cycle_id,meta)
                 VALUES ('2026-11-12',:sym,'NASDAQ',4,100,:price,:epoch,
-                        'hash-fixture','portfolio-fixture',:cycle,CAST(:meta AS jsonb))
+                        :account,'portfolio-fixture',:cycle,CAST(:meta AS jsonb))
             """), {
                 "sym": sym, "price": 100 if sym == "ABBV" else 80,
-                "epoch": epoch, "cycle": None if sym == "ABBV" else f"fixture-cycle-{sym}",
+                "epoch": epoch, "account": account_fingerprint,
+                "cycle": None if sym == "ABBV" else f"fixture-cycle-{sym}",
                 "meta": json.dumps(meta),
             })
         for blocked_symbol in blocked:
@@ -3784,6 +3794,9 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
     assert not (blocked | {"ABBV"}).intersection(found)
     for sym, intent in found.items():
         assert intent["position_lifecycle_id"] == f"fixture-cycle-{sym}"
+        assert intent["broker_account_hash"] == account_fingerprint
+        assert intent["trading_epoch_id"] == epoch
+        assert intent["portfolio_epoch_id"] == "portfolio-fixture"
         assert intent["source_entry_contract_sha256"] == (
             positions[sym]["meta"]["entry_exit_contract_sha256"]
         )
@@ -3824,9 +3837,7 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
     _enable_mock_practice_router_permissions(monkeypatch)
     monkeypatch.setattr(order_router, "resolve_dry_run_for_us_order", lambda: False)
     if paper_profile:
-        import hashlib
         from pathlib import Path
-        import trader.account_state as account_state
         from trader.us import config as us_cfg
         from trader.us.execution import reservation_reconcile_worker
         with pg_engine.begin() as conn:
@@ -3836,11 +3847,6 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
         # Each parameter is a separate simulated brokerage account. Prior
         # tests leave active reservations by design, and production correctly
         # counts the same account's reservations across different epochs.
-        raw_account = f"practice:ten-symbol-concurrency-integration-{epoch}"
-        account_fingerprint = hashlib.sha256(raw_account.encode()).hexdigest()
-        monkeypatch.setattr(
-            account_state, "get_account_key", lambda **_kw: raw_account,
-        )
         monkeypatch.setattr(repos, "_us_execution_claim_scope", lambda: {
             "env": "practice",
             "account_id": account_fingerprint,
