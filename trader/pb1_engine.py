@@ -3896,7 +3896,22 @@ class PB1Engine:
                 price_above_vwap=cf.features.get("above_vwap"),
                 daily_source=str((daily_meta or {}).get("source") or "UNKNOWN"),
             )
-            if native.get("confirmation_state") == "VERIFIED":
+            # A complete authenticated native quote can prove the data even
+            # when the owner BREAKOUT price trigger is explicitly false.
+            # Keep FAILED (never VERIFIED) in that case, instead of retaining
+            # the obsolete missing-clock UNKNOWN forever.
+            native_policy_wait = (
+                native.get("confirmation_state") == "FAILED"
+                and native.get("failure_reason") == "breakout_price_trigger_missing"
+                and native.get("quote_source") == "KIS_REST_TIME_ITEMCONCLUSION"
+                and native.get("quote_identity_attestation") == "AUTHENTICATED_REST_REQUEST"
+                and bool(native.get("quote_as_of"))
+                and native.get("quote_transport_age_seconds") is not None
+                and native.get("exchange_quote_age_seconds") is not None
+                and native.get("intraday_cumulative_volume") is not None
+                and not trigger_ok
+            )
+            if native.get("confirmation_state") == "VERIFIED" or native_policy_wait:
                 native["initial_quote_evidence_failure"] = initial_reason
                 native["independent_native_trade_row"] = True
                 proof = native
@@ -5992,6 +6007,9 @@ class PB1Engine:
                     # 0.5% slippage vs symmetric 0.4% gate investigation.
                     # These observations do NOT relax or authorize BUY.
                     "entry_policy": _timing.get("entry_policy", "LEGACY_V1"),
+                    "adaptive_revision": _timing.get("adaptive_revision"),
+                    "rebound_pattern": _timing.get("rebound_pattern"),
+                    "diagnostic_entry_ceiling": _timing.get("diagnostic_entry_ceiling"),
                     "reference_source": _timing.get("reference_source"),
                     "recent_closes": _timing.get("recent_closes"),
                     "recent_lows": _timing.get("recent_lows"),
@@ -11433,7 +11451,11 @@ class PB1Engine:
         # Keep the 0.4% symmetric price gate while avoiding the mechanical
         # +0.5% prpr buffer. Only verified, fresh, scope-matched KIS evidence
         # can LOWER the final LIMIT; a missing/unsafe quote cannot reprice.
-        if isinstance(cf.features, dict) and cf.features.get("order_price_source") == "prpr_slippage":
+        if isinstance(cf.features, dict) and (
+            cf.features.get("order_price_source") == "prpr_slippage"
+            or (cf.features.get("order_price_source") == "ask"
+                and os.getenv("KR_PB1_ADAPTIVE_ENTRY_V3_ENABLED", "0") == "1")
+        ):
             from trader.kr.entry_timing_price import (
                 maybe_bound_pb1_prpr_fallback,
                 apply_verified_bounded_limit,
