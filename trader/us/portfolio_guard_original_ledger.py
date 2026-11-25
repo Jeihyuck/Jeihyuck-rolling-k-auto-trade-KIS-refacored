@@ -19,10 +19,9 @@ from sqlalchemy import text
 from trader.us.entry_exit_contract import (
     US_ENTRY_EXIT_CONTRACT_VERSION, verify_us_entry_exit_contract,
 )
-from trader.us.portfolio_profit_guard import _decimal
+from trader.us.portfolio_profit_guard import _decimal, LEGACY_ACCOUNTING_SCOPE
 from trader.us.utils.order_no import normalize_us_order_no
 
-LEGACY_ACCOUNTING_SCOPE = "VERIFIED_ORIGINAL_ACCOUNT_EPOCH_V1"
 _FORWARD_VERSION = "US_LEGACY_NINE_V2_SELL_V1"
 _SCOPE_FIELDS = ("account_id", "portfolio_epoch_id", "position_cycle_id")
 
@@ -284,3 +283,72 @@ def load_legacy_epoch_proof(conn, fills: list[dict], *, raw_account: str,
         raw_account=raw_account, epoch=epoch, portfolio=portfolio,
         portfolio_start_day=started.date(),
     )
+
+
+def prepare_legacy_management_position(conn, position: dict, group: dict, *,
+                                       raw_account: str, epoch: str, portfolio: str,
+                                       trade_date: str) -> tuple[dict, bool]:
+    """Prepare an ephemeral forward-management candidate, NOT order authority.
+
+    The canonical router must independently re-prove the original DB lineage
+    and current native KIS holdings/order book before any SELL. No original
+    position, BUY, fill, or risk-state record is rewritten here.
+    """
+    from trader.us.execution.us_legacy_nine_active_sell import (
+        _evidence_from_db, _row_in_active_practice_scope,
+    )
+    symbol = str(position.get("symbol") or "").upper()
+    meta = _meta(position)
+    original = group["original_cycle"]
+    management = group["management_cycle"]
+    digest = group["contract_sha"]
+    qty = _decimal(position.get("qty") or position.get("holding_qty") or 0)
+    _require(symbol == group["symbol"] and qty > 0 and qty == group["net_qty"],
+             "CURRENT_GROUP_QUANTITY_MISMATCH")
+    _require(_row_in_active_practice_scope(position, account=raw_account, epoch=epoch),
+             "CURRENT_ACCOUNT_SCOPE_CONFLICT")
+    for source in (position, meta):
+        _require(not source.get("portfolio_epoch_id") and not source.get("position_cycle_id")
+                 and source.get("position_lifecycle_id") in (None, "", original)
+                 and source.get("entry_exit_contract_sha256") in (None, "", digest)
+                 and source.get("strategy_owner") in (None, "", "US_STANDARD")
+                 and source.get("sleeve_id") in (None, "", "US_STANDARD"),
+                 "CURRENT_ORIGINAL_SCOPE_CONFLICT")
+        supplied = source.get("entry_exit_contract")
+        if supplied is not None:
+            _require(isinstance(supplied, dict) and verify_us_entry_exit_contract(supplied)
+                     and supplied.get("sha256") == digest, "CURRENT_CONTRACT_CONFLICT")
+    evidence, reason = _evidence_from_db(
+        conn, symbol=symbol, trade_date=trade_date, active_epoch=epoch,
+        raw_account=raw_account, current_holding_qty=int(qty),
+        intent={"meta": {"source_entry_contract_sha256": digest,
+                         "source_entry_contract_version": US_ENTRY_EXIT_CONTRACT_VERSION}},
+    )
+    _require(evidence is not None, "CURRENT_POSITION_ORIGINAL_UNVERIFIED:" + str(reason))
+    _require(evidence["original_cycle"] == original and evidence["v2_sha"] == digest
+             and evidence["source_buy_day"] == group["buy_day"]
+             and normalize_us_order_no(evidence["source_buy_order"]) ==
+                 normalize_us_order_no(group["buy_order_no"])
+             and evidence["holding"] == int(qty), "CURRENT_POSITION_SOURCE_MISMATCH")
+    account_hash = hashlib.sha256(raw_account.encode()).hexdigest()
+    forward = {
+        "position_cycle_id": management, "position_lifecycle_id": management,
+        "portfolio_epoch_id": portfolio, "trading_epoch_id": epoch,
+        "broker_account_hash": account_hash, "strategy_owner": "US_STANDARD",
+        "forward_management_not_original_buy": True,
+        "us_legacy_forward_management_version": _FORWARD_VERSION,
+        "source_original_runtime_lifecycle_id": original,
+        "source_original_buy_date": group["buy_day"],
+        "source_original_buy_order_no": group["buy_order_no"],
+        "source_original_entry_exit_contract_sha256": digest,
+        "entry_exit_contract": group["contract"],
+        "entry_exit_contract_sha256": digest,
+        "entry_exit_contract_version": US_ENTRY_EXIT_CONTRACT_VERSION,
+    }
+    # Do not carry an earlier caller's alleged authorization to the planner.
+    # The native router derives its own authorization from fresh evidence.
+    out_meta = {**meta, **forward}
+    out_meta.pop("automated_sell_authorized", None)
+    out = {**position, **forward, "meta": out_meta}
+    out.pop("automated_sell_authorized", None)
+    return out, bool(evidence.get("old_unresolved") or evidence.get("zero_fill_sell_proofs"))
