@@ -5621,6 +5621,11 @@ class FillsRepo:
                     self._schema.orders.c.position_cycle_id,
                     self._schema.orders.c.portfolio_epoch_id,
                     self._schema.orders.c.trading_epoch_id,
+                    self._schema.orders.c.env,
+                    self._schema.orders.c.code,
+                    self._schema.orders.c.side,
+                    self._schema.orders.c.market,
+                    self._schema.orders.c.kis_odno,
                 ).where(
                     self._schema.orders.c.order_id
                     == uuid_value_for_url(db_url, order_id)
@@ -5636,6 +5641,26 @@ class FillsRepo:
                 position_cycle_id = position_cycle_id or provenance.get("position_cycle_id")
                 portfolio_epoch_id = portfolio_epoch_id or provenance.get("portfolio_epoch_id")
                 trading_epoch_id = trading_epoch_id or provenance.get("trading_epoch_id")
+        # Only a bound, matching native KR fill may inherit listing market.
+        # Never infer market from the exchange code KRX or the ticker alone.
+        exact_native_market = None
+        if (order_id is not None and provenance
+                and (fill_meta_json or {}).get("evidence_kind") in {
+                    "KIS_ORDER_CUMULATIVE_EXECUTION", "KIS_INDIVIDUAL_EXECUTION"}
+                and str(provenance.get("market") or "") in {"KOSPI", "KOSDAQ"}
+                and str(provenance.get("env") or "") == str(env)
+                and str(provenance.get("code") or "") == str(code)
+                and str(provenance.get("side") or "") == str(side)
+                and kis_odno and str(provenance.get("kis_odno") or "").isdigit()
+                and str(kis_odno).isdigit()
+                and int(str(kis_odno)) > 0
+                and int(str(kis_odno)) == int(str(provenance["kis_odno"]))
+                and all(provenance.get(key) for key in
+                        ("position_cycle_id", "portfolio_epoch_id", "trading_epoch_id"))):
+            exact_native_market = str(provenance["market"])
+            if market not in (None, "", "KRX", exact_native_market):
+                raise RuntimeError("KR_FILL_ORDER_MARKET_MISMATCH")
+            market = exact_native_market
         active_epoch_id = active_trading_epoch_id(
             _conn if _conn is not None else self.engine,
             env=env, account_id=get_account_key(env=env), required=trading_epoch_enforced()
@@ -5690,6 +5715,14 @@ class FillsRepo:
             "portfolio_epoch_id": portfolio_epoch_id,
             **_entry_meta_columns(fill_meta_json, json_field="fill_meta_json"),
         }
+        if exact_native_market:
+            # On replay, fill only a missing market. A conflicting persisted
+            # market is never overwritten and remains an audit violation.
+            update_cols["market"] = sa.case(
+                (sa.or_(self._schema.fills.c.market.is_(None),
+                        self._schema.fills.c.market == ""), exact_native_market),
+                else_=self._schema.fills.c.market,
+            )
         # A broker order cumulative snapshot has a stable *evidence* identity,
         # but its qty and notional increase as the order fills. Do not append
         # a second fill for 10->52 or 15->17, and never regress on a stale
