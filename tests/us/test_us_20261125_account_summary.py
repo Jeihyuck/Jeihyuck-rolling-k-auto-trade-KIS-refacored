@@ -37,3 +37,25 @@ def test_practice_present_balance_get_uses_official_endpoint(monkeypatch):
     assert observed["headers"]["tr_id"] == "VTRP6504R"
     assert observed["params"]["WCRC_FRCR_DVSN_CD"] == "01"
     assert observed["params"]["NATN_CD"] == "840"
+
+
+def test_explicit_usd_currency_row_is_reporting_evidence_only():
+    raw = {"rt_cd": "0", "output3": {"tot_asst_amt": "300000000"},
+           "output2": [{"crcy_cd": "USD", "frcr_dncl_amt_2": "1234.56",
+                        "frcr_drwg_psbl_amt_1": "1000"},
+                       {"crcy_cd": "HKD", "frcr_dncl_amt_2": "9999"}]}
+    observed = parse_practice_present_balance(raw)
+    assert observed["broker_reported_usd_deposits"] == 1234.56
+    assert observed["broker_reported_usd_withdrawable"] == 1000
+    assert observed["cash_usd"] is None and observed["account_equity_usd"] is None
+    raw["output2"].append(dict(raw["output2"][0]))
+    observed = parse_practice_present_balance(raw)
+    assert observed["broker_reported_usd_deposits"] is None
+    assert observed["usd_currency_observation_status"] == "UNAVAILABLE"
+
+
+def test_malformed_pagination_metadata_cannot_supply_summary():
+    assert parse_practice_present_balance({
+        "rt_cd": "0", "output3": {"tot_asst_amt": "300000000"},
+        "_response_meta": "malformed",
+    })["status"] == "UNAVAILABLE"
