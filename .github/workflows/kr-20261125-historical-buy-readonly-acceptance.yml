@@ -17,23 +17,23 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.head.ref == 'fix/kr-20261125-integrated-22' &&
       github.event.pull_request.user.login == 'Jeihyuck' &&
-      github.event.before == '43b6af1b3f60a626fed8bd29326ee95f9112e89a'
+      github.event.before == '4daa248b1b71a085912f5528a5c0bfd4848181e8'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 43b6af1b3f60a626fed8bd29326ee95f9112e89a
+          ref: 4daa248b1b71a085912f5528a5c0bfd4848181e8
           persist-credentials: false
       - name: Confirm exact reviewed revision
-        run: test "$(git rev-parse HEAD)" = "43b6af1b3f60a626fed8bd29326ee95f9112e89a"
+        run: test "$(git rev-parse HEAD)" = "4daa248b1b71a085912f5528a5c0bfd4848181e8"
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       - name: Install and verify offline without credentials
         run: |
           python -m pip install -r requirements.txt pytest
-          python -m pytest -q tests/test_kr_mail_execution_evidence_20261111.py
+          python -m pytest -q tests/test_kr_mail_execution_evidence_20261111.py tests/kr/test_kr_practice_readonly_auth.py
           python -m py_compile scripts/kr_historical_buy_native_evidence.py
       - name: Original order and current balance evidence (no orders, no DB writes)
         env:
@@ -66,42 +66,23 @@ jobs:
           import logging
           import os
           from datetime import date, datetime
-          from urllib.parse import urlsplit
+          import time
           from zoneinfo import ZoneInfo
           import requests
           import sqlalchemy as sa
 
           logging.disable(logging.CRITICAL)
-          allowed_get = {
-              "/uapi/domestic-stock/v1/trading/inquire-balance",
-              "/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
-          }
-          counts = {"oauth_post": 0, "get": 0, "blocked": 0}
-          original_send = requests.sessions.Session.send
-          def guarded_send(self, request, **kwargs):
-              url = urlsplit(request.url)
-              method = request.method.upper()
-              if (url.scheme != "https" or url.hostname != "openapivts.koreainvestment.com"
-                      or url.port != 29443 or url.username or url.password):
-                  counts["blocked"] += 1
-                  raise RuntimeError("UNAPPROVED_HTTP_DESTINATION")
-              if method == "GET" and url.path in allowed_get:
-                  counts["get"] += 1
-              elif method == "POST" and url.path == "/oauth2/tokenP" and counts["oauth_post"] == 0:
-                  counts["oauth_post"] += 1
-              else:
-                  counts["blocked"] += 1
-                  raise RuntimeError("UNAPPROVED_HTTP_METHOD_OR_PATH")
-              kwargs["allow_redirects"] = False
-              response = original_send(self, request, **kwargs)
-              if response.is_redirect:
-                  raise RuntimeError("UNAPPROVED_HTTP_REDIRECT")
-              return response
+          from scripts.kr_practice_readonly_auth import PracticeReadonlyGuard
+          guard = PracticeReadonlyGuard(requests.sessions.Session.send)
+          def guarded_send(session, request, **kwargs):
+              return guard.send(session, request, **kwargs)
           requests.sessions.Session.send = guarded_send
+          counts = guard.counts
 
-          report = {"code_sha": "43b6af1b3f60a626fed8bd29326ee95f9112e89a", "runner": "github-hosted-not-WSL",
+          report = {"code_sha": "4daa248b1b71a085912f5528a5c0bfd4848181e8", "runner": "github-hosted-not-WSL",
                     "recovery_authorized": False, "orders_submitted": 0,
-                    "db_rows_modified": 0, "cases": [], "http": counts}
+                    "db_rows_modified": 0, "cases": [], "http": counts,
+                    "token_diagnostics": guard.token_responses}
           engine = None
           ok = False
           try:
@@ -119,7 +100,16 @@ jobs:
                       raise RuntimeError("DB_READONLY_NOT_ENFORCED")
               with engine.connect() as conn:
                   assert conn.exec_driver_sql("SHOW transaction_read_only").scalar_one() == "on"
-              kis = KisAPI(kis_env="practice")
+              try:
+                  kis = KisAPI(kis_env="practice")
+              except Exception:
+                  wait = guard.retry_wait_seconds()
+                  if wait is None:
+                      raise
+                  # Wrapper may already have waited; enforce minimum elapsed
+                  # from first request and allow only one explicit retry.
+                  time.sleep(wait + 0.1)
+                  kis = KisAPI(kis_env="practice")
               for code, day, odno in (
                   ("293490", date(2026, 10, 27), "0000011280"),
                   ("059090", date(2026, 10, 29), "0000011865"),
