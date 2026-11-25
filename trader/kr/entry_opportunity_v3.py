@@ -1,8 +1,8 @@
-"""Offline candidate geometry for KR PB1 Adaptive Entry V3.
+"""Candidate geometry for KR PB1 Adaptive Entry V3.
 
 This module is deliberately NOT an order authority. It consumes only
 caller-verified native completed bars, never replaces Final30/owner/risk,
-and cannot be wired into submission until the release gates are satisfied.
+and is consumed only through the practice PB1 enforcement adapter.
 """
 from __future__ import annotations
 
@@ -73,14 +73,19 @@ def candidate_geometry(*, family, opening, post, now, independent=False,
             return result("WAIT", "REBOUND_NOT_CONFIRMED", pattern=pattern, volume_ratio=ratio)
         # Opening high remains the fallback. A later local peak is eligible
         # only when it is followed by a lower low before the final rebound.
-        high = max(float(b["high"]) for b in (window[:-3] if independent else opening))
-        trough = min(float(b["low"]) for b in window[-(8 if independent else 15):])
+        if independent:
+            peak_index = max(range(len(window)-3), key=lambda i: float(window[i]["high"]))
+            high = float(window[peak_index]["high"])
+            trough = min(float(b["low"]) for b in window[peak_index+1:-2])
+        else:
+            high = max(float(b["high"]) for b in opening)
+            trough = min(float(b["low"]) for b in window[-15:-2])
         source = "INDEPENDENT_WINDOW" if independent else "OPENING_HIGH"
         for i in range(len(window)-4, 0, -1):
             peak = float(window[i]["high"])
             if (peak >= float(window[i-1]["high"])
                     and peak > float(window[i+1]["high"])):
-                later = min(float(b["low"]) for b in window[i+1:-1])
+                later = min(float(b["low"]) for b in window[i+1:-2])
                 if later < peak and (peak-later)/peak >= MIN_DEPTH:
                     # Do not replace a valid opening target just to enlarge RR.
                     if independent or peak > high:
