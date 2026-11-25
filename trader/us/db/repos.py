@@ -5731,10 +5731,12 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
             })
         return len(positions)
     count = 0
+    verified_runtime_updates = []
     try:
         with engine.begin() as conn:
             trading_epoch_id = _active_us_epoch(conn)
             for p in positions:
+                runtime_position = p
                 # Proactively bind a NEW US_STANDARD BUY from the original,
                 # uniquely matching KIS fill/order/intent *before* writing
                 # the first authoritative broker balance snapshot. Never
@@ -5983,6 +5985,14 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                             str(stored.get("persisted_lifecycle") or "") != verified_identity["position_lifecycle_id"],
                         )):
                             raise RuntimeError("US_SNAPSHOT_IDENTITY_READBACK_MISMATCH")
+                if verified_identity:
+                    # The proof is currently attached to a local copy only.
+                    # Carry it to the SAME broker observation after commit;
+                    # downstream risk code must see the identical BUY scope.
+                    verified_runtime_updates.append((runtime_position, {
+                        **verified_identity, "trading_epoch_id": trading_epoch_id,
+                        "meta": dict(meta_to_store),
+                    }))
                 count += 1
             if stale_close_requested:
                 params = {"td": td, "symbols": symbols, "source": close_source}
@@ -5998,6 +6008,10 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                     params["trading_epoch_id"] = trading_epoch_id
                 sql += " AND NOT (UPPER(symbol) = ANY(CAST(:symbols AS text[])))"
                 conn.execute(text(sql), params)
+        # No mutation on rollback or conflicting RETURNING proof. Quantity,
+        # price and orderability stay on the authoritative broker observation.
+        for runtime_position, verified_context in verified_runtime_updates:
+            runtime_position.update(verified_context)
     except Exception as exc:
         logger.error("[US_POSITIONS][SNAPSHOT][ERROR] %s", exc)
         if authoritative_positions:

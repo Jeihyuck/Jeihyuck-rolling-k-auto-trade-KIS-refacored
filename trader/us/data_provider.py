@@ -1366,9 +1366,13 @@ class USDataProvider:
         ctx = self._tick_context
         if ctx is not None:
             ctx.count("balance_logical_calls")
-            if ctx.balance_snapshot_at is not None and ctx.balance_snapshot:
+            if not force_refresh and ctx.balance_snapshot_at is not None and ctx.balance_snapshot:
                 ctx.count("balance_cache_hits")
                 return ctx.balance_snapshot
+            if force_refresh:
+                # A failed explicit refresh must not resurrect an older cached balance.
+                ctx.balance_snapshot = {}
+                ctx.balance_snapshot_at = None
         started = __import__("time").monotonic()
         if self._offline:
             return {

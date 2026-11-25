@@ -1005,7 +1005,7 @@ def resolve_profit_capture_stage_quantity(
     return min(runner_capacity, stage_qty)
 
 
-def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_sell_symbols: set[str] | None = None, now=None, trade_date: str | None = None, profit_capture_state: dict[str, dict] | None = None, *, defer_pending_until_claim: bool = False, decision_clock=None, decision_clock_real_time: bool = False) -> list[dict]:
+def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_sell_symbols: set[str] | None = None, now=None, trade_date: str | None = None, profit_capture_state: dict[str, dict] | None = None, *, defer_pending_until_claim: bool = False, decision_clock=None, decision_clock_real_time: bool = False, quote_refresh=None) -> list[dict]:
     """Evaluate frozen TP with a clock captured when an executable decision is formed.
 
     ``now`` retains the tick's market-calendar/replay semantics. It must not be
@@ -1130,6 +1130,18 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
                 sym, exc,
             )
             continue
+        # Refresh only decision inputs, after immutable contract/state reads.
+        # No stale order or reservation is reused; the full threshold and
+        # quantity calculation below uses the new price.
+        if callable(quote_refresh):
+            eligible_stage = any(
+                not bool(meta.get(flag) or meta_state.get(flag) or state.get(flag) or state.get(flag.replace("_done", "_pending")))
+                and (idx == 0 or bool(state.get(stages[idx - 1][0]) or meta.get(stages[idx - 1][0])))
+                for idx, (flag, _, _, _) in enumerate(stages)
+            )
+            if eligible_stage and (p.get("position_lifecycle_id") or meta_state.get("position_lifecycle_id")):
+                p = quote_refresh(p)
+                price = _price(p)
         try:
             executable = as_decimal(price, name="executable_price")
             broker_avg, avg_provenance = authoritative_broker_avg(p, now=now)
