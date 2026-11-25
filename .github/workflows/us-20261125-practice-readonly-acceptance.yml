@@ -11,7 +11,7 @@ concurrency:
 jobs:
   authenticated-practice-readonly:
     # Operator requested this one-time acceptance for PR 390. Use the
-    # exact previously green candidate, not arbitrary PR/fork code.
+    # exact candidate with the KHC listing transfer correction, not arbitrary PR/fork code.
     if: >-
       github.repository == 'Jeihyuck/Jeihyuck-rolling-k-auto-trade-KIS-refacored' &&
       github.event.pull_request.number == 390 &&
@@ -23,15 +23,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: b614741a3040ba883813703e7612cd745923adc1
+          ref: 19e5da6862112faf64af51e3b8db3a4f75faac90
           persist-credentials: false
-      - name: Pin previously validated code
-        run: test "$(git rev-parse HEAD)" = "b614741a3040ba883813703e7612cd745923adc1"
+      - name: Pin exact KHC-corrected candidate
+        run: test "$(git rev-parse HEAD)" = "19e5da6862112faf64af51e3b8db3a4f75faac90"
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       - name: Install dependencies without broker or database secrets
-        run: python -m pip install -r requirements.txt psycopg2-binary
+        run: python -m pip install -r requirements.txt psycopg2-binary pytest
+      - name: Verify KHC corrected route before loading any credentials
+        run: python -m pytest -q tests/us/test_us_20261125_market_data_recovery.py -k 'khc or nasdaq_quote_route or etf_quote_route'
       - name: Authenticated KIS GET and production DB SELECT only
         env:
           PYTHONPATH: .
@@ -101,7 +103,7 @@ jobs:
               return response
           requests.sessions.Session.send = guarded_send
 
-          report = {"code_sha": "b614741a3040ba883813703e7612cd745923adc1", "runner": "github-hosted-not-WSL",
+          report = {"code_sha": "19e5da6862112faf64af51e3b8db3a4f75faac90", "runner": "github-hosted-not-WSL",
                     "trade_submit_tested": False, "db_mutated": False, "checks": {}}
           checks = report["checks"]
           def check(name, func):
