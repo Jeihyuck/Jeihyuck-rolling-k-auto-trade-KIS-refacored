@@ -1105,3 +1105,66 @@ def test_legacy_original_high_watermark_survives_empty_current_day(scenario, mon
             current_price=999.0, entry_price=100.0, now=now, position=pos,
         )
     assert len(writes) == 2
+
+
+
+@pytest.mark.parametrize("symbol", ["DHR", "KO", "PG", "TMO"])
+def test_authoritative_legacy_reconcile_restores_original_peak_before_quote(scenario, monkeypatch, symbol):
+    from contextlib import contextmanager
+    from datetime import datetime, timezone
+    from trader import account_state
+    from trader.us import position_lifecycle_state as lifecycle
+    from trader.us.db import repos
+
+    db, client, _ = scenario
+    contract = build_us_entry_exit_contract({
+        "symbol": symbol, "strategy_owner": "US_STANDARD",
+        "book": "SWING_BOOK", "horizon": "SWING_CARRY",
+        "entry_reason": "TEST_ORIGINAL_BUY",
+    })
+    db.position["symbol"] = symbol
+    db.position["meta"].update(entry_exit_contract=contract,
+                               entry_exit_contract_sha256=contract["sha256"])
+    db.buy["meta"].update(position_lifecycle_id=f"ENTRY:US_STANDARD:{symbol}",
+                          entry_exit_contract_sha256=contract["sha256"])
+    db.fills[0]["meta"].update(position_lifecycle_id=f"ENTRY:US_STANDARD:{symbol}",
+                              entry_exit_contract_sha256=contract["sha256"])
+    db.history["lifecycle"].update({
+        "high_watermark": 125.0,
+        "high_watermark_at": "2026-11-04T16:00:00+00:00",
+        "high_watermark_source": "us_position_risk_state",
+    })
+    class Engine:
+        @contextmanager
+        def connect(self):
+            yield db
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: Engine())
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda *a, **kw: EPOCH)
+    monkeypatch.setattr(account_state, "resolve_env_name", lambda: "practice")
+    monkeypatch.setattr(lifecycle, "load_latest_open_us_position_lifecycles", lambda *a: {})
+    writes = []
+    def latest(*a, **kw):
+        return {"trade_date": "2026-11-11", "trading_epoch_id": EPOCH,
+                "state": {"lifecycle": dict(writes[-1])} if writes else {}}
+    monkeypatch.setattr(repos, "load_us_position_risk_state_candidates_batch",
+                        lambda *a: {symbol: [latest()]})
+    monkeypatch.setattr(lifecycle, "load_latest_us_position_risk_state", latest)
+    monkeypatch.setattr(lifecycle, "_save_lifecycle",
+                        lambda sym, day, data: writes.append(dict(data)) or dict(data))
+    pos = {"symbol": symbol, "qty": 4, "strategy_owner": "US_STANDARD",
+           "account_id": RAW_ACCOUNT, "env": "practice", "trading_epoch_id": EPOCH}
+    kwargs = dict(positions=[pos], trade_date="2026-11-11",
+                  now=datetime(2026, 11, 11, 16, tzinfo=timezone.utc),
+                  env="practice", managed_owners={"US_STANDARD"})
+    lifecycle.reconcile_us_position_lifecycles(authoritative=False, **kwargs)
+    assert writes == []
+    lifecycle.reconcile_us_position_lifecycles(authoritative=True, **kwargs)
+    assert len(writes) == 1
+    assert pos["high_watermark"] == 125.0
+    assert pos["high_watermark_at"] == "2026-11-04T16:00:00+00:00"
+    assert writes[0]["lifecycle_id"] == OLD_CYCLE
+    assert not writes[0].get("portfolio_epoch_id")
+    assert not writes[0].get("position_cycle_id")
+    lifecycle.reconcile_us_position_lifecycles(authoritative=True, **kwargs)
+    assert len(writes) == 1
+    assert client.order_days_requested == []
