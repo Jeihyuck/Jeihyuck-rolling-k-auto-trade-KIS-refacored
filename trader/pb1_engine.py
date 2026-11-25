@@ -16475,6 +16475,25 @@ class PB1Engine:
         logger.info("[ENTRY][STYLE_GATE][VCP]%s code=%s ok=%s vcp_score=%s rs=%s atr_pct=%s reasons=%s", "" if ok else "[REJECT]", code, int(ok), vcp, rs, atr, reasons)
         return ok, reasons, {"setup_source": "entry_style_vcp", "entry_reason": "ENTRY_VCP", "decision_family": "ENTRY_VCP"}
 
+    def _compute_kr_daily_features_cached(self, code: str, df, *, min_candles: int) -> dict:
+        """Memoize only the pure daily feature calculation, never an entry verdict."""
+        import hashlib
+        from trader.cache_ttl import daily_cache
+        try:
+            # Every input used by the pure compute_features function participates.
+            # The frame is not modified; changed rows/columns/dtypes invalidate.
+            digest = hashlib.sha256(pd.util.hash_pandas_object(df, index=True).values.tobytes()).hexdigest()
+            key = ("kr_pb1_pure_daily_features_v1", code, int(min_candles),
+                   tuple(str(x) for x in df.columns), tuple(str(x) for x in df.dtypes), digest)
+            cached = daily_cache.get(key)
+        except Exception:
+            return compute_pb1_features(df, min_candles=min_candles)
+        if isinstance(cached, dict):
+            return dict(cached)
+        result = compute_pb1_features(df, min_candles=min_candles)
+        daily_cache.set(key, dict(result), 1800)
+        return result
+
     def _compute_candidates_from_codes(self, codes: list[str]) -> list[CandidateFeature]:
         # ── [KR][PB1] scope guard + batch OHLCV preload ─────────────────────
         # 한국장 PB1 trade 모드일 때 final30 코드 전체를 단일 DB 커넥션으로
@@ -16573,7 +16592,12 @@ class PB1Engine:
                             )
                             continue
                     else:
-                        fresh_features = compute_pb1_features(df, min_candles=min(self.min_candles, max(20, len(df))))
+                        _minimum = min(self.min_candles, max(20, len(df)))
+                        fresh_features = (
+                            self._compute_kr_daily_features_cached(code, df, min_candles=_minimum)
+                            if _kr_pb1_scope and str(getattr(self, "env", "")).lower() == "practice"
+                            else compute_pb1_features(df, min_candles=_minimum)
+                        )
                         self._merge_non_missing(
                             merged_features,
                             fresh_features,
