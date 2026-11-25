@@ -72,3 +72,28 @@ def test_tp_refresh_replaces_first_price_alias(monkeypatch):
     fresh = refresh_tp_source_quotes([old], Provider())[0]
     assert _price(fresh) == 100
     assert _price(old) == 110
+
+
+
+def test_forward_sync_uses_completed_date_and_never_writes_incomplete_trade_day():
+    from datetime import date, timedelta
+    from trader.us.db.price_daily_repo import upsert_us_daily_bars, load_recent_us_daily_bars
+    reset_us_daily_memory()
+    def bar(day, price=100):
+        return {"date": day.isoformat(), "open": price, "high": price, "low": price,
+                "close": price, "volume": 100}
+    previous = date(2026, 11, 20)
+    upsert_us_daily_bars(symbol="SPY", bars=[bar(previous-timedelta(days=i)) for i in range(260)], source="TEST")
+    class Client:
+        def get_us_daily_price_history(self, symbol, exchange, **kw):
+            assert symbol == "SPY" and exchange == "AMEX"
+            assert kw["as_of_date"] == "20261123"
+            return [bar(date(2026,11,23)), bar(date(2026,11,24),999)]
+    provider = USDataProvider(offline=True)
+    provider._client = Client()
+    provider._offline = False
+    result = provider.get_completed_daily_prices_result("SPY","AMEX",trade_date="2026-11-24",
+                                                        required_bars=260,allow_http_sync=True)
+    assert result["quality"] == "OK" and result["db_latest"] == "2026-11-23"
+    rows = load_recent_us_daily_bars(symbol="SPY", before_date="2026-11-25", limit=260)
+    assert all(str(row["date"]) != "2026-11-24" for row in rows)

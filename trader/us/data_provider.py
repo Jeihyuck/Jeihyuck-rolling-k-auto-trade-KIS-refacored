@@ -1237,7 +1237,13 @@ class USDataProvider:
         total_upserted = 0
         if db_latest is None or db_latest < expected_latest:
             logger.info("[US_OHLCV][SYNC_GAP] symbol=%s direction=forward db_latest=%s expected_latest=%s", symbol, db_latest, expected_latest)
-            fetched = _fetch_history(as_of=str(trade_date), need=required, stop_at=(db_latest.isoformat() if db_latest else None), direction="forward")
+            # A trade-day request during PREP can return today's incomplete
+            # bar or an empty response. Request the last completed NY session.
+            fetched = _fetch_history(as_of=expected_latest.strftime("%Y%m%d"), need=required,
+                                     stop_at=(db_latest.isoformat() if db_latest else None), direction="forward")
+            fetched = [row for row in (fetched or []) if isinstance(row, dict)
+                       and (day := canonical_us_bar_date(row.get("date") or row.get("xymd") or row.get("stck_bsop_date"))) is not None
+                       and day <= expected_latest]
             total_fetched += len(fetched or [])
             total_upserted += upsert_us_daily_bars(symbol=symbol, bars=fetched, source="KIS_US_DAILY")
             rows = load_recent_us_daily_bars(symbol=symbol, before_date=trade_date, limit=required)

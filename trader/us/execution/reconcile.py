@@ -356,6 +356,7 @@ def reconcile_positions(provider: Any | None = None, *, trade_date: str | None =
         "balance_fetch_status": "OK",
         "authoritative_positions": True,
         "preserve_previous_positions": False,
+        "position_snapshot_committed": True,
         "block_new_entry": False,
     }
 

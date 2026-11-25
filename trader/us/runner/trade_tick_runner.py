@@ -2512,7 +2512,29 @@ def run_trade_tick(
         and recon.get("authoritative_positions") is True
         and recon.get("preserve_previous_positions") is False
     )
-    if authoritative_recon:
+    # reconcile_positions already commits the same authoritative observation.
+    # Skip the second write only when no subsequent fill/replay writer ran.
+    # Stage4 is independent: preserve rebind if there are observed fills or
+    # any unresolved current claims, and never skip for custom providers
+    # that cannot prove their first persistence.
+    _snapshot_reuse = (
+        authoritative_recon
+        and recon.get("position_snapshot_committed") is True
+        and _stage4_mode
+        and not fills_today
+        and int(ack_recon.get("pending_count") or 0) == 0
+        and int(ack_recon.get("unresolved_count") or 0) == 0
+        and all(
+            str(p.get("symbol") or "").upper() == "TQQQ"
+            or ((p.get("meta") or {}).get("lineage_identity_status")
+                in {"VERIFIED_ORIGINAL_KIS_BUY", "VERIFIED_CURRENT_EPOCH_CONTINUITY"}
+                and p.get("position_lifecycle_id") and p.get("portfolio_epoch_id"))
+            for p in recon_positions
+        )
+    )
+    if _snapshot_reuse:
+        logger.info("[US_POSITIONS][SNAPSHOT][REUSE_COMMITTED] count=%d", len(recon_positions))
+    elif authoritative_recon:
         try:
             save_position_snapshot(
                 recon_positions,
