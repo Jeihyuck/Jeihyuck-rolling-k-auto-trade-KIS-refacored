@@ -30,6 +30,8 @@ on:
       - "scripts/kr_opening_observer.py"
       - "scripts/kr_historical_buy_native_evidence.py"
       - "scripts/wsl/check-nullim-day-health.sh"
+      - "scripts/wsl/kr_mail_execution_evidence.py"
+      - "tests/test_kr_mail_execution_evidence_20261111.py"
       - "tests/test_pr121_mail_degraded_delivery.py"
       - "scripts/wsl/kr-entry-timing-activation.sh"
       - "tests/kr/test_kr_pb1_minute_*.py"
@@ -98,4 +100,5 @@ jobs:
             tests/kr/test_kr_20261124_closed_cycle_claim_recovery.py \
             tests/kr/test_kr_20261113_pb1_native_volume_rescue.py \
             tests/kr/test_kr_pb1_minute_20261125_adaptive_entry.py \
+            tests/test_kr_mail_execution_evidence_20261111.py \
             tests/test_pr121_mail_degraded_delivery.py::test_health_distinguishes_degraded_delivery_from_mail_failure

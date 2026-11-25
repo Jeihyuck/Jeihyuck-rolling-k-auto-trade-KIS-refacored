@@ -6,7 +6,10 @@ never contacts KIS, a DB, or a trading runner and never authorizes an order.
 from __future__ import annotations
 
 import json
+import math
 import re
+from datetime import datetime, timedelta
+from statistics import median
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +34,68 @@ def _latest_session(entry: dict) -> dict:
         if attempt.get("run_id") == effective_id and effective_id:
             return attempt
     return candidates[-1] if candidates else {}
+
+
+def _latest_recorded_attempt(entry: dict) -> dict:
+    """The last recorded attempt can fail after an earlier effective success."""
+    if not isinstance(entry, dict) or not isinstance(entry.get("attempts"), list):
+        return {}
+    return next((a for a in reversed(entry["attempts"]) if isinstance(a, dict)), {})
+
+
+def _sample_stats(values: list[float]) -> dict:
+    if not values:
+        return {"samples": 0, "p50": None, "p95": None, "max": None}
+    values = sorted(values)
+    return {"samples": len(values), "p50": round(median(values), 3),
+            "p95": round(values[math.ceil(len(values) * .95) - 1], 3),
+            "max": round(values[-1], 3)}
+
+
+def _entry_timing_observations(lines: list[str], trade: str) -> dict:
+    """Measure logged pre-submit evaluation only; never infer HOT coverage.
+
+    A time gap between two pre-submit evaluations may include changing
+    eligibility, and is not the end-to-end HOT scheduling cadence.
+    """
+    by_code: dict[str, set[datetime]] = {}
+    durations = []
+    seen = set()
+    invalid = 0
+    for line in lines:
+        if "[KR][ENTRY][DECISION_LATENCY]" not in line:
+            continue
+        attrs = dict(re.findall(r"([a-z_]+)=([^\s]+)", line.split("[KR][ENTRY][DECISION_LATENCY]", 1)[1]))
+        try:
+            code = attrs["code"]
+            when = datetime.fromisoformat(attrs["decision_at"])
+            elapsed = float(attrs["eval_elapsed_ms"])
+            if (not re.fullmatch(r"[0-9]{6}", code) or when.utcoffset() != timedelta(hours=9)
+                    or when.date().isoformat() != trade
+                    or not math.isfinite(elapsed) or elapsed < 0
+                    or not attrs.get("state") or not attrs.get("style")):
+                raise ValueError("INVALID_TIMING_SAMPLE")
+        except (KeyError, ValueError, TypeError):
+            invalid += 1
+            continue
+        key = (code, when, attrs["style"])
+        if key in seen:
+            invalid += 1
+            continue
+        seen.add(key)
+        durations.append(elapsed)
+        by_code.setdefault(code, set()).add(when)
+    gaps = []
+    for times in by_code.values():
+        ordered = sorted(times)
+        gaps.extend((right-left).total_seconds()
+                    for left, right in zip(ordered, ordered[1:]))
+    return {"evidence_scope": "PRE_SUBMIT_EVALUATION_ONLY",
+            "hot_60s_acceptance": "NOT_PROVEN",
+            "invalid_or_duplicate_samples": invalid,
+            "observed_symbols": len(by_code),
+            "evaluation_elapsed_ms": _sample_stats(durations),
+            "same_symbol_observed_gap_sec": _sample_stats(gaps)}
 
 
 def _failure_reason(stage: Path, trade: str, purpose: str, attempt: dict) -> str:
@@ -86,6 +151,7 @@ def _session_order_activity(stage: Path, trade: str, purpose: str, attempt: dict
             elif "decision=BLOCK" in line:
                 legacy_block += 1
     return {"evidence": "LOG_READ", "market_data_error_ticks": data_errors,
+            "entry_timing": _entry_timing_observations(lines, trade),
             "infinite_order_attempts": sum(attempted for attempted, _ in states) if states else None,
             "infinite_explicit_rejections": sum(s == "REJECTED_EXPLICIT" for _, s in states) if states else None,
             "infinite_unresolved_attempts": sum(s == "UNRESOLVED" for _, s in states) if states else None,
@@ -102,8 +168,25 @@ def collect_kr_execution_status(stage: Path, trade: str) -> dict[str, Any]:
     any_missing = False
     watchdog_alerts: dict[str, list[str]] = {}
     order_activity: dict[str, dict] = {}
+    latest_attempts: dict[str, dict] = {}
     for purpose in ("prep", "am", "afternoon", "close"):
-        attempt = _latest_session(sessions.get(purpose, {}))
+        entry = sessions.get(purpose, {})
+        attempt = _latest_session(entry)
+        newest = _latest_recorded_attempt(entry)
+        if newest:
+            latest_status = str(newest.get("status") or "UNKNOWN").upper()
+            latest_attempts[purpose] = {"run_id": str(newest.get("run_id") or ""),
+                                        "status": latest_status,
+                                        "reason": str(newest.get("reason") or "")}
+            if newest.get("run_id") != attempt.get("run_id"):
+                # Preserve the effective run for its order evidence. Do not
+                # let it hide a later failed or unfinished actual attempt.
+                if latest_status in {"FAILED", "FAIL", "TIMEOUT", "RETRYABLE_DEGRADED"}:
+                    any_failed = True
+                    latest_attempts[purpose]["reason"] = _failure_reason(stage, trade, purpose, newest)
+                elif latest_status not in {"OK", "OK_WITH_WARNINGS", "WARN", "DEGRADED",
+                                           "SKIPPED_NON_TRADING_DAY", "SKIP_DUPLICATE"}:
+                    any_missing = True
         if not attempt:
             summary[purpose] = {"status": "MISSING", "reason": "SESSION_LOG_MISSING"}
             any_missing = True
@@ -170,6 +253,10 @@ def collect_kr_execution_status(stage: Path, trade: str) -> dict[str, Any]:
         )
         for name, item in summary.items()
     ]
+    for purpose, newest in latest_attempts.items():
+        effective = _latest_session(sessions.get(purpose, {}))
+        if newest["run_id"] != str(effective.get("run_id") or ""):
+            summary_tokens.append(f"{purpose.upper()}_LATEST_ATTEMPT={newest['status']}:{newest['reason']}")
     for purpose, alerts in watchdog_alerts.items():
         summary_tokens.append(f"{purpose.upper()}_WATCHDOG=" + ",".join(alerts))
     for purpose, row in order_activity.items():
@@ -177,6 +264,11 @@ def collect_kr_execution_status(stage: Path, trade: str) -> dict[str, Any]:
         summary_tokens.append(f"{purpose.upper()}_INFINITE_ATTEMPTS={row.get('infinite_order_attempts')}")
         summary_tokens.append(f"{purpose.upper()}_INFINITE_REJECTED={row.get('infinite_explicit_rejections')}")
         summary_tokens.append(f"{purpose.upper()}_INFINITE_UNRESOLVED={row.get('infinite_unresolved_attempts')}")
+        timing = row.get("entry_timing")
+        if timing:
+            summary_tokens.append(f"{purpose.upper()}_PRE_SUBMIT_EVAL_SAMPLES={timing['evaluation_elapsed_ms']['samples']}")
+            summary_tokens.append(f"{purpose.upper()}_PRE_SUBMIT_EVAL_P95_MS={timing['evaluation_elapsed_ms']['p95']}")
+            summary_tokens.append(f"{purpose.upper()}_HOT_60S={timing['hot_60s_acceptance']}")
     summary_tokens.append(f"CLOSE_SETTLEMENT={economic}")
     summary_tokens.append(f"TODAY_SETTLEMENT={today_economic}")
     summary_tokens.append(f"HISTORICAL_SETTLEMENT={historical_economic}")
@@ -188,6 +280,7 @@ def collect_kr_execution_status(stage: Path, trade: str) -> dict[str, Any]:
     return {
         "daily_execution_status": daily,
         "execution_sessions": summary,
+        "latest_recorded_attempts": latest_attempts,
         "watchdog_alerts": watchdog_alerts,
         "order_activity_by_session": order_activity,
         "close_economic_settlement_state": economic,
