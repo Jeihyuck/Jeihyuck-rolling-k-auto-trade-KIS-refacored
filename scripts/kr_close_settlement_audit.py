@@ -211,8 +211,8 @@ def _stored_infinite_sell_proof(order: dict, candidates: list[dict]) -> dict | N
                 or intent.get("attempt_state") != "FILLED"
                 or intent.get("authoritative") is not True
                 or intent.get("attempt_bound") is not True
-                or intent.get("side") not in {"SELL_PARTIAL", "SELL_ALL"}
-                or intent.get("action") not in {"SELL:TP1", "SELL:TP2"}
+                or (intent.get("side"), intent.get("action")) not in {
+                    ("SELL_PARTIAL", "SELL:TP1"), ("SELL_ALL", "SELL:TP2")}
                 or not intent.get("cycle_id")
                 or any(int(intent[k]) != q for k in (
                     "requested_qty", "filled_qty", "target_qty",
@@ -430,7 +430,10 @@ def load_snapshot(engine: sa.Engine, *, env: str, epoch: str, day: date) -> dict
             FROM public.positions WHERE env=:env AND trading_epoch_id=:epoch
         """), {"env": env, "epoch": epoch}).mappings()]
         infinite_owner_settlements = []
-        if env == "practice" and engine.dialect.name == "postgresql":
+        if (env == "practice" and engine.dialect.name == "postgresql"
+                and all(sa.inspect(conn).has_table(name, schema="public") for name in (
+                    "kr_infinite_order_intents", "trading_epochs",
+                    "execution_claims", "execution_attempts"))):
             # Exact account+epoch, dedicated intent, terminal claim, unique
             # authoritative attempt. No dependence on the newer current cycle.
             infinite_owner_settlements = [dict(row) for row in conn.execute(text("""
