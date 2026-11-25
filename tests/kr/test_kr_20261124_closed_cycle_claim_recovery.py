@@ -106,3 +106,30 @@ def test_closed_cycle_recovery_fails_closed(fault):
     assert retire_closed_pb1_rejected_claims(engine=e, scope=SCOPE, holdings_rows=holdings, now=NOW) == 0
     with e.connect() as c:
         assert c.execute(sa.select(s.execution_claims.c.action_state)).scalar_one() == "RETRYABLE"
+
+
+@pytest.mark.parametrize("broker_id_kind, expected", [
+    ("local_alias", 1), ("native", 0), ("other_local", 0),
+    ("alias_with_native_odno", 0), ("alias_with_accepted", 0),
+])
+def test_closed_cycle_rejected_legacy_local_alias(broker_id_kind, expected):
+    e,s,key = _db()
+    local_key = "practice:pb1_pullback_close:2026-11-19:028050:EXIT:SELL:KR_US_RUNNER_FINAL:close:1"
+    values = {"client_order_key": local_key, "broker_order_id": local_key}
+    if broker_id_kind == "native":
+        values["broker_order_id"] = "0000001234"
+    elif broker_id_kind == "other_local":
+        values["broker_order_id"] = local_key + ":other"
+    elif broker_id_kind == "alias_with_native_odno":
+        values["kis_odno"] = "0000001234"
+    elif broker_id_kind == "alias_with_accepted":
+        values["response_json"] = {"rt_cd":"1", "_order_execution":{
+            "accepted":True, "code":CODE, "side":"SELL", "broker_order_id":None}}
+    with e.begin() as c:
+        c.execute(s.execution_attempts.update().values(client_order_key=local_key))
+        c.execute(s.orders.update().where(s.orders.c.order_id=="rejected").values(**values))
+    assert retire_closed_pb1_rejected_claims(engine=e, scope=SCOPE, holdings_rows=[], now=NOW) == expected
+    with e.connect() as c:
+        assert c.execute(sa.select(s.execution_claims.c.action_state)).scalar_one() == (
+            "SUPERSEDED" if expected else "RETRYABLE")
+        assert c.execute(sa.select(sa.func.count()).select_from(s.fills)).scalar_one() == 7
