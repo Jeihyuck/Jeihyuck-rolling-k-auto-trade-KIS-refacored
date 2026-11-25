@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 import logging
@@ -193,7 +193,7 @@ class KISExecutor:
             return None
         return BrokerOrderState("EXPIRED", 0)
 
-    def _original_daily_ccld_pages(self, order_date: date) -> dict | None:
+    def _original_daily_ccld_pages(self, order_date: date, *, strict: bool = False) -> dict | None:
         """Return bounded *complete* KIS pages for the original order day.
 
         Continuation calls happen only when KIS explicitly supplies a
@@ -226,7 +226,10 @@ class KISExecutor:
                     == "daily_ccld_fail_open"
                     or raw.get("rt_cd") not in (None, "0", 0)):
                 return {"_kr_inf_first_page_unavailable": True} if page == 1 else None
-            chunk = raw.get("output1") or raw.get("output") or []
+            if strict and (raw.get("rt_cd") not in ("0", 0)
+                           or not isinstance(raw.get("output1"), list)):
+                return None
+            chunk = raw["output1"] if strict else (raw.get("output1") or raw.get("output") or [])
             if isinstance(chunk, dict):
                 chunk = [chunk]
             if not isinstance(chunk, list) or any(
@@ -266,6 +269,26 @@ class KISExecutor:
         )
         return None
 
+    def verify_retry_balance(self, symbol: str, position: BrokerPosition) -> bool:
+        """Fresh original balance proof, not the tick's injected/cache copy."""
+        if self.kis_env != "practice" or symbol != "122630":
+            return False
+        try:
+            started = datetime.now(timezone.utc)
+            raw = self.kis.get_balance_cached(force=True)
+            at = getattr(self.kis, "_balance_cache_at", None)
+            from trader.kr.broker_truth_hardening import _valid_original_kr_balance_snapshot
+            if (not isinstance(at, datetime) or at.tzinfo is None or at < started
+                    or not _valid_original_kr_balance_snapshot(raw, at=at)
+                    or raw.get("_stub") or raw.get("_diag_stub")):
+                return False
+            row = self._position_row(raw, symbol)
+            return (int(row["hldg_qty"]) == position.qty > 0
+                    and int(row["ord_psbl_qty"]) == position.orderable_qty
+                    and abs(float(row["pchs_avg_pric"])-position.average_price) < 0.01)
+        except (AttributeError, KeyError, TypeError, ValueError, RuntimeError, OverflowError):
+            return False
+
     def verify_no_same_day_symbol_order(self, symbol: str, day: date) -> bool:
         """Conservative pre-hashkey retry evidence; no empty-on-error fallback.
 
@@ -275,7 +298,7 @@ class KISExecutor:
         """
         if self.kis_env != "practice" or symbol != "122630":
             return False
-        raw = self._original_daily_ccld_pages(day)
+        raw = self._original_daily_ccld_pages(day, strict=True)
         if (not isinstance(raw, dict) or raw.get("rt_cd") != "0"
                 or not raw.get("_kr_inf_ccld_verified_pages")
                 or not isinstance(raw.get("output1"), list)):
