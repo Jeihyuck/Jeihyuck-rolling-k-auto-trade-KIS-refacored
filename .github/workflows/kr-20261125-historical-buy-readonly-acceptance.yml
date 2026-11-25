@@ -17,16 +17,16 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.head.ref == 'fix/kr-20261125-integrated-22' &&
       github.event.pull_request.user.login == 'Jeihyuck' &&
-      github.event.before == '4daa248b1b71a085912f5528a5c0bfd4848181e8'
+      github.event.before == 'bd3f44c1e8daa57d7e74c0b231e50a061c6ba851'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 4daa248b1b71a085912f5528a5c0bfd4848181e8
+          ref: bd3f44c1e8daa57d7e74c0b231e50a061c6ba851
           persist-credentials: false
       - name: Confirm exact reviewed revision
-        run: test "$(git rev-parse HEAD)" = "4daa248b1b71a085912f5528a5c0bfd4848181e8"
+        run: test "$(git rev-parse HEAD)" = "bd3f44c1e8daa57d7e74c0b231e50a061c6ba851"
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -51,6 +51,7 @@ jobs:
           MARKET: KR
           PB1_MARKET_SCOPE: KRX
           FORCE_HTTP: '1'
+          KIS_HTTP_MAX_RETRIES: '1'
           KIS_CCLD_EXCG_ID_DVSN_CD: ALL
           NO_TRADE: '1'
           DRY_RUN: '1'
@@ -79,10 +80,12 @@ jobs:
           requests.sessions.Session.send = guarded_send
           counts = guard.counts
 
-          report = {"code_sha": "4daa248b1b71a085912f5528a5c0bfd4848181e8", "runner": "github-hosted-not-WSL",
+          report = {"code_sha": "bd3f44c1e8daa57d7e74c0b231e50a061c6ba851", "runner": "github-hosted-not-WSL",
                     "recovery_authorized": False, "orders_submitted": 0,
                     "db_rows_modified": 0, "cases": [], "http": counts,
-                    "token_diagnostics": guard.token_responses}
+                    "token_diagnostics": guard.token_responses,
+                    "transport_failures": guard.transport_failures,
+                    "blocked_reasons": guard.blocked_reasons}
           engine = None
           ok = False
           try:
