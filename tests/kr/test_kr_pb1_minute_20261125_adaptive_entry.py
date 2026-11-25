@@ -367,3 +367,24 @@ def test_independent_owner_attempt_requires_fresh_post_order_balance():
     from trader.kr.broker_truth_hardening import _broker_crossed_this_tick
     assert _broker_crossed_this_tick(SimpleNamespace(_kr_infinite_submit_attempted=True))
     assert not _broker_crossed_this_tick(SimpleNamespace(_kr_infinite_submit_attempted=False))
+
+
+def test_pure_daily_feature_cache_preserves_changed_frame_and_returns_copy(monkeypatch):
+    import pandas as pd
+    from trader import cache_ttl
+    from trader import pb1_engine as pb1
+    monkeypatch.setattr(cache_ttl, "daily_cache", cache_ttl.TTLCache())
+    calls = []
+    def compute(df, *, min_candles):
+        calls.append(min_candles)
+        return {"close":float(df.close.iloc[-1])}
+    monkeypatch.setattr(pb1, "compute_pb1_features", compute)
+    engine = pb1.PB1Engine.__new__(pb1.PB1Engine)
+    frame = pd.DataFrame({"close":[100., 101.]})
+    first = engine._compute_kr_daily_features_cached("251970", frame, min_candles=2)
+    first["close"] = 999
+    assert engine._compute_kr_daily_features_cached("251970", frame, min_candles=2) == {"close":101.}
+    assert calls == [2]
+    frame.loc[1, "close"] = 102
+    assert engine._compute_kr_daily_features_cached("251970", frame, min_candles=2) == {"close":102.}
+    assert calls == [2, 2]
