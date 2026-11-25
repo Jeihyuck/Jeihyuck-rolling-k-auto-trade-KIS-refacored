@@ -95,3 +95,100 @@ def test_v2_error_policy_identity(monkeypatch, mode):
 def test_v3_no_owner_bypass():
     assert candidate_geometry(family="BREAKOUT", opening=[], post=[], now=DAY,
                               original_setup_ok=True)["reason"] == "OWNER_PATH_REQUIRED"
+
+
+def test_v3_runtime_adapter_keeps_existing_live_quote_guard(monkeypatch):
+    from trader.kr.entry_opportunity_v2 import validate_live_quote
+    post = [bar(36, 76100, 76000, 200),
+            bar(37, 76300, 76000, 207),
+            bar(38, 76400, 76300, 250),
+            bar(39, 76400, 76400, 252)]
+    now = DAY+timedelta(minutes=40, seconds=57)
+    rows = []
+    for b in opening()+post:
+        at = datetime.fromisoformat(b["timestamp"])
+        rows.append(dict(b, date=at.strftime("%Y%m%d"), time=at.strftime("%H%M%S"),
+                         open=b["close"]))
+    payload = {"bars": rows, "source_conflicts": [], "vwap": None, "vwap_source": "UNKNOWN"}
+    monkeypatch.setenv("KR_PB1_ENTRY_OPPORTUNITY_POLICY", "US_ALIGNED_V2")
+    monkeypatch.setattr(contract, "load_opening_proof", lambda **_: payload)
+    kw = dict(env="practice", account_scope="test", code="251970", now=now,
+              style="ENTRY_MOMENTUM", setup_ok=True, trigger_ok=False,
+              pivot=None, order_price=76500)
+    monkeypatch.setenv("KR_PB1_ADAPTIVE_ENTRY_V3_ENABLED", "0")
+    assert contract.evaluate_proof_for_candidate(**kw)["state"] == "WAIT"
+    monkeypatch.setenv("KR_PB1_ADAPTIVE_ENTRY_V3_ENABLED", "1")
+    proof = contract.evaluate_proof_for_candidate(**kw)
+    assert proof["state"] == "READY_SHADOW", proof
+    assert proof["entry_policy"] == "US_ALIGNED_V2"
+    assert proof["adaptive_revision"] == "V3"
+    assert proof["risk_reward_reference"] == 5.0
+    quote = dict(source="KIS_REST_INQUIRE_PRICE",
+                 source_identity="AUTHENTICATED_REST_REQUEST_BOUND",
+                 requested_symbol="251970", market="KR", received_at=now.timestamp()-1,
+                 last=76400, ask=76500, bid=76400)
+    check = dict(code="251970", timing=proof, quote=quote, now=now, order_price=76500)
+    assert validate_live_quote(**check)["state"] == "READY"
+    assert validate_live_quote(**{**check, "quote": {**quote, "ask":76600}})["state"] == "WAIT"
+    assert validate_live_quote(**{**check, "quote": {**quote, "received_at":now.timestamp()-16}})["state"] == "UNKNOWN"
+    payload["source_conflicts"] = [post[-1]["timestamp"]]
+    assert contract.evaluate_proof_for_candidate(**kw)["state"] == "UNKNOWN"
+    payload["source_conflicts"] = []
+    assert contract.evaluate_proof_for_candidate(**{**kw, "setup_ok":False})["state"] == "INVALID"
+
+
+def test_minute_captured_before_close_cannot_mature_during_other_io():
+    from scripts.kr_opening_observer import _request_completed_rows, _stale_minute_anchor
+    request = DAY+timedelta(minutes=39, seconds=59)
+    rows = [dict(date="20261125", time="093800", open=76400, high=76400,
+                 low=76300, close=76400, volume=100, _kis_http_observation_id="a"*32),
+            dict(date="20261125", time="093900", open=76400, high=76500,
+                 low=76400, close=76500, volume=20, _kis_http_observation_id="b"*32)]
+    assert _request_completed_rows(rows, request) == rows[:1]
+    assert _request_completed_rows(rows, request+timedelta(seconds=2)) == rows
+    assert _stale_minute_anchor({"reason":"COMPLETED_BAR_STALE"}, request) == "093900"
+
+
+def test_hashkey_retry_proof_is_zero_fill_and_same_unit_only():
+    from trader.kr.infinite.repository import InfiniteRepository
+    from trader.kr.infinite.models import State, BrokerPosition
+    now = DAY+timedelta(minutes=40)
+    state = State(cycle_id="owned", units_used=3)
+    pos = BrokerPosition(39, 39, 54268.256, 47070)
+    row = dict(status="REJECTED", broker_order_id=None, filled_qty=0,
+               action_state="RETRYABLE", active_attempt_id=None, claim_conflicts=0,
+               cumulative_filled_qty=0, requested_qty=15, target_qty=15,
+               remaining_target_qty=15, unit_sequence=4, idempotency_key="key",
+               updated_at=now-timedelta(seconds=61),
+               metadata=dict(strategy_owner="KR_INFINITE", pre_order_holding_qty=39,
+                             pre_order_avg_price=54268.256, pre_order_orderable_qty=39,
+                             rejection="request failed after retries: /uapi/hashkey err=HTTP 500"))
+    attempt = dict(attempt_state="REJECTED_EXPLICIT", authoritative=True,
+                   cumulative_filled_qty=0, client_order_key="key")
+    proof = InfiniteRepository._prehash_retry_proven
+    assert proof(row, [attempt], state, pos, now)
+    for bad in ({"broker_order_id":"999"}, {"filled_qty":1}, {"active_attempt_id":"pending"},
+                {"action_state":"UNCERTAIN"}, {"remaining_target_qty":14},
+                {"unit_sequence":5}, {"updated_at":now}):
+        assert not proof({**row, **bad}, [attempt], state, pos, now)
+    assert not proof(row, [{**attempt, "authoritative":False}], state, pos, now)
+    assert not proof(row, [attempt]*3, state, pos, now)
+    assert not proof(row, [attempt], state, BrokerPosition(40,40,54268.256,47070), now)
+
+
+@pytest.mark.parametrize("response,expected", [
+    ({"rt_cd":"0", "output1":[]}, True),
+    ({"rt_cd":"0", "output1":[{"pdno":"005930"}]}, True),
+    ({"rt_cd":"0", "output1":[{"pdno":"122630"}]}, False),
+    ({"rt_cd":"0", "output1":[{}]}, False),
+    ({"rt_cd":"0"}, False),
+    ({"output1":[]}, False),
+    ({"rt_cd":"1", "output1":[]}, False),
+    ({"rt_cd":"0", "output1":[], "_fill_source":"daily_ccld_fail_open"}, False),
+])
+def test_hashkey_retry_native_no_order_requires_explicit_complete_success(response, expected):
+    from types import SimpleNamespace
+    from trader.kr.infinite.executor import KISExecutor
+    kis = SimpleNamespace(inquire_daily_ccld=lambda **_: response)
+    assert KISExecutor(kis, "practice").verify_no_same_day_symbol_order("122630", DAY.date()) is expected
+    assert not KISExecutor(kis, "real").verify_no_same_day_symbol_order("122630", DAY.date())
