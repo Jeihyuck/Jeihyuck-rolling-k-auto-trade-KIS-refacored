@@ -5803,6 +5803,7 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                                 )
                     except Exception as exc:
                         verified_identity = None
+                        verified_legacy_identity = None
                         logger.warning(
                             "[US_POSITIONS][ORIGINAL_SCOPE][UNAVAILABLE] symbol=%s error=%s "
                             "action=SAVE_UNVERIFIED_BALANCE_ONLY",
@@ -5994,6 +5995,37 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                                   meta->>'strategy_owner' AS persisted_owner,
                                   meta->>'position_lifecycle_id' AS persisted_lifecycle
                     """
+                if verified_legacy_identity:
+                    # The historical BUY has no canonical portfolio scope.
+                    # Keep authoritative quantity updates independent, but never
+                    # replace another cycle's contract or publish mismatched
+                    # legacy proof into the in-memory SELL decision.
+                    sql = """
+                        INSERT INTO us_positions
+                          (as_of, symbol, exchange, qty, avg_cost, current_px,
+                           unrealized_pnl_usd, trading_epoch_id, meta)
+                        VALUES (:as_of, :symbol, :exchange, :qty, :avg_cost, :current_px,
+                                :unrealized_pnl_usd, :trading_epoch_id, CAST(:meta AS jsonb))
+                        ON CONFLICT (trading_epoch_id, as_of, symbol, exchange)
+                        DO UPDATE SET qty=EXCLUDED.qty, avg_cost=EXCLUDED.avg_cost,
+                            current_px=EXCLUDED.current_px, unrealized_pnl_usd=EXCLUDED.unrealized_pnl_usd,
+                            meta=CASE WHEN us_positions.account_id IS NULL
+                                AND us_positions.portfolio_epoch_id IS NULL
+                                AND us_positions.position_cycle_id IS NULL
+                                AND COALESCE(us_positions.meta->>'entry_exit_contract_sha256', '')
+                                    IN ('', EXCLUDED.meta->>'entry_exit_contract_sha256')
+                                AND COALESCE(us_positions.meta->>'position_lifecycle_id', '')
+                                    IN ('', EXCLUDED.meta->>'position_lifecycle_id')
+                                AND COALESCE(us_positions.meta->>'strategy_owner', '')
+                                    IN ('', 'US_STANDARD')
+                                AND COALESCE(us_positions.meta->>'account_id', '')
+                                    IN ('', EXCLUDED.meta->>'account_id')
+                                AND COALESCE(us_positions.meta->>'portfolio_epoch_id', '') = ''
+                                AND COALESCE(us_positions.meta->>'position_cycle_id', '') = ''
+                                THEN COALESCE(us_positions.meta,'{}'::jsonb) || EXCLUDED.meta
+                                ELSE us_positions.meta END
+                        RETURNING account_id, portfolio_epoch_id, position_cycle_id, meta
+                    """
                 params["meta"] = _json_param(meta_to_store)
                 result = conn.execute(text(sql), params)
                 if verified_identity:
@@ -6022,6 +6054,22 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                         **verified_identity, "trading_epoch_id": trading_epoch_id,
                         "meta": dict(meta_to_store),
                     }))
+                elif verified_legacy_identity:
+                    mapped = getattr(result, "mappings", None)
+                    stored = mapped().first() if callable(mapped) else None
+                    stored_meta = (stored or {}).get("meta") or {}
+                    if (stored and isinstance(stored_meta, dict)
+                            and all(not stored.get(k) for k in ("account_id", "portfolio_epoch_id", "position_cycle_id"))
+                            and not stored_meta.get("portfolio_epoch_id")
+                            and not stored_meta.get("position_cycle_id")
+                            and all(stored_meta.get(k) == verified_legacy_identity.get(k)
+                                    for k in ("account_id", "strategy_owner", "position_lifecycle_id",
+                                              "entry_exit_contract_sha256", "entry_exit_contract", "trading_epoch_id", "env"))):
+                        verified_runtime_updates.append((runtime_position, {
+                            **verified_legacy_identity, "meta": dict(stored_meta),
+                        }))
+                    else:
+                        logger.warning("[US_POSITIONS][LEGACY_RUNTIME_PROOF_NOT_PUBLISHED] symbol=%s", p.get("symbol"))
                 count += 1
             if stale_close_requested:
                 params = {"td": td, "symbols": symbols, "source": close_source}

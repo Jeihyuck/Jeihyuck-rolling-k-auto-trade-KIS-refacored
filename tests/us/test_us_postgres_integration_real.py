@@ -5009,3 +5009,52 @@ def test_postgres_hwm_atomic_pair_preserved_under_delayed_writer(pg_engine, monk
     result = repos.save_us_position_lifecycle_atomic("HWMPAIR", day, newer)
     assert result["high_watermark"] == 140
     assert result["high_watermark_at"] == newer["high_watermark_at"]
+
+
+@pytest.mark.parametrize("symbol", ["DHR", "KO", "PG", "TMO"])
+def test_pg_verified_legacy_snapshot_runtime_handoff_without_new_cycle(pg_engine, monkeypatch, symbol):
+    from trader.us.db import repos
+    from trader.us import original_buy_lineage
+    from trader.us.execution import us_legacy_nine_active_sell as legacy
+    from trader.us.entry_exit_contract import build_us_entry_exit_contract
+    from sqlalchemy import text
+
+    epoch = "legacy-runtime-handoff-fixture"
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda *a, **kw: epoch)
+    monkeypatch.setattr(original_buy_lineage, "verified_new_buy_snapshot_identity", lambda **kw: None)
+    monkeypatch.setattr(original_buy_lineage, "verified_carried_us_snapshot_identity", lambda **kw: None)
+    contract = build_us_entry_exit_contract({
+        "symbol": symbol, "strategy_owner": "US_STANDARD", "book": "SWING_BOOK",
+        "horizon": "SWING_CARRY", "entry_reason": "TEST_ORIGINAL_BUY",
+    })
+    # Isolate the real UPSERT/RETURNING and runtime handoff; actual original
+    # proof is independently exercised by the legacy-nine acceptance tests.
+    proof = {"strategy_owner": "US_STANDARD", "account_id": "practice:fixture",
+             "env": "practice", "trading_epoch_id": epoch,
+             "position_lifecycle_id": "legacy-original-fixture-cycle",
+             "entry_exit_contract": contract, "entry_exit_contract_sha256": contract["sha256"],
+             "entry_exit_contract_version": contract["version"],
+             "lineage_identity_status": "VERIFIED_LEGACY_ORIGINAL"}
+    monkeypatch.setattr(legacy, "verified_legacy_snapshot_context", lambda *a, **kw: dict(proof))
+    row = {"symbol": symbol, "exchange": "NYSE", "qty": 2, "avg_cost": 100.0,
+           "current_px": 110.0, "meta": {}}
+    kwargs = dict(trade_date="2026-11-24", balance_fetch_status="OK", balance_parse_status="OK",
+                  authoritative_positions=True, preserve_previous_positions=True)
+    assert repos.save_position_snapshot([row], **kwargs) == 1
+    assert row["position_lifecycle_id"] == proof["position_lifecycle_id"]
+    assert row["env"] == "practice" and row["strategy_owner"] == "US_STANDARD"
+    assert row["meta"]["entry_exit_contract_sha256"] == contract["sha256"]
+    assert not row.get("portfolio_epoch_id") and not row.get("position_cycle_id")
+    with pg_engine.begin() as conn:
+        stored = conn.execute(text("SELECT account_id, portfolio_epoch_id, position_cycle_id, meta FROM us_positions WHERE trading_epoch_id=:epoch AND symbol=:symbol"), {"epoch": epoch, "symbol": symbol}).mappings().one()
+        assert stored["account_id"] is None and stored["portfolio_epoch_id"] is None and stored["position_cycle_id"] is None
+        assert stored["meta"]["position_lifecycle_id"] == proof["position_lifecycle_id"]
+        conn.execute(text("UPDATE us_positions SET position_cycle_id='different-canonical-cycle' WHERE trading_epoch_id=:epoch AND symbol=:symbol"), {"epoch": epoch, "symbol": symbol})
+    conflicting = {"symbol": symbol, "exchange": "NYSE", "qty": 1, "avg_cost": 100.0, "current_px": 111.0, "meta": {}}
+    assert repos.save_position_snapshot([conflicting], **kwargs) == 1
+    assert not conflicting.get("position_lifecycle_id")
+    with pg_engine.connect() as conn:
+        stored = conn.execute(text("SELECT qty, position_cycle_id, meta FROM us_positions WHERE trading_epoch_id=:epoch AND symbol=:symbol"), {"epoch": epoch, "symbol": symbol}).mappings().one()
+        assert stored["qty"] == 1
+        assert stored["position_cycle_id"] == "different-canonical-cycle"
+        assert stored["meta"]["entry_exit_contract_sha256"] == contract["sha256"]
