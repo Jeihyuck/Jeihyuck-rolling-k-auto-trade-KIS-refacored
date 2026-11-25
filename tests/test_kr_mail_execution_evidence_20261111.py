@@ -117,3 +117,22 @@ def test_nov16_close_reports_samsung_today_settled_separately_from_kodex_history
     assert result["close_historical_priced_sell_gap_count"] == 2
     assert "TODAY_SETTLEMENT=TODAY_ECONOMIC_SETTLED" in result["execution_summary"]
     assert "HISTORICAL_SETTLEMENT=HISTORICAL_ECONOMIC_PENDING" in result["execution_summary"]
+
+
+def test_watchdog_alerts_reported_for_exact_current_session_only(tmp_path):
+    trade = "2026-11-11"
+    m = _manifest()
+    for row in m["sessions"].values():
+        row["attempts"][0].update(status="OK",reason="SESSION_END")
+    _write(tmp_path, f"runtime/logs/kr/{trade}/session-manifest.json", m)
+    _write(tmp_path, f"runtime/kr/session/{trade}/close/pb1_result.json",
+           {"economic_settlement_state":"COMPLETE","native_priced_sell_gap_count":0})
+    warning = {"date":trade,"session":"am","run_id":"am-1",
+               "alerts":["TICK_COMPLETION_STALE"]}
+    other = dict(warning, run_id="older", alerts=["SESSION_PARENT_EXITED_WITHOUT_TERMINAL"])
+    _write(tmp_path, f"runtime/logs/kr/{trade}/am/am-1.watchdog.log",
+           "\n".join("[KR][SESSION_WATCHDOG] "+json.dumps(x) for x in [warning,other]))
+    report = _helper().collect_kr_execution_status(tmp_path, trade)
+    assert report["daily_execution_status"] == "COMPLETED"
+    assert report["watchdog_alerts"] == {"am":["TICK_COMPLETION_STALE"]}
+    assert "AM_WATCHDOG=TICK_COMPLETION_STALE" in report["execution_summary"]
