@@ -192,3 +192,42 @@ def test_hashkey_retry_native_no_order_requires_explicit_complete_success(respon
     kis = SimpleNamespace(inquire_daily_ccld=lambda **_: response)
     assert KISExecutor(kis, "practice").verify_no_same_day_symbol_order("122630", DAY.date()) is expected
     assert not KISExecutor(kis, "real").verify_no_same_day_symbol_order("122630", DAY.date())
+
+
+@pytest.mark.parametrize("ask,expected", [(77300, "BOUNDED_LIMIT"), (77400, "BLOCK"), (None, "BLOCK")])
+def test_adaptive_actual_ask_reprice_no_passive_or_chase(monkeypatch, ask, expected):
+    from types import SimpleNamespace
+    from trader.kr import entry_timing_price as price
+    from trader import account_state
+    now = DAY+timedelta(minutes=44, seconds=56)
+    class FixedClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+    monkeypatch.setattr(price, "datetime", FixedClock)
+    monkeypatch.setenv("KR_PB1_ADAPTIVE_ENTRY_V3_ENABLED", "1")
+    monkeypatch.setenv("KR_PB1_ENTRY_OPPORTUNITY_POLICY", "US_ALIGNED_V2")
+    monkeypatch.setenv("KR_PB1_ENTRY_TIMING_MODE", "ENFORCE")
+    monkeypatch.setenv("KR_PB1_ENTRY_TIMING_APPROVED", "1")
+    monkeypatch.setattr(account_state, "get_account_key", lambda **_: "offline")
+    monkeypatch.setattr(contract, "load_opening_proof", lambda **_: {"bars":[{"close":77200}]})
+    monkeypatch.setattr(contract, "evaluate_proof_for_candidate", lambda **_: {
+        "state":"READY_SHADOW", "entry_policy":"US_ALIGNED_V2",
+        "reference_price":77200, "max_entry_price":77300})
+    quote = dict(source="KIS_REST_INQUIRE_PRICE", source_identity="AUTHENTICATED_REST_REQUEST_BOUND",
+                 requested_symbol="251970", market="KR", received_at=now.timestamp()-1,
+                 last=77200, bid=77200, ask=ask)
+    engine = SimpleNamespace(STRATEGY_NAME="pb1_pullback_close", env="practice",
+                             kis=SimpleNamespace(get_price_snapshot=lambda *a,**k: quote))
+    cf = SimpleNamespace(code="251970", features={"order_price_source":"ask",
+                        "entry_style_selected":"MOMENTUM", "setup_ok":True})
+    result = price.maybe_bound_pb1_prpr_fallback(engine=engine, cf=cf, stage="PB1-AM",
+                         order_type="LIMIT", original_price=77400, now=now)
+    assert result["state"] == expected, result
+    if expected == "BOUNDED_LIMIT":
+        assert result["new_limit"] == 77300 and result["not_order_authorization"]
+        plan = {"qty":15}
+        assert price.apply_verified_bounded_limit(cf=cf,plan=plan,price_proof=result,
+                            original_price=77400,qty=15) == 77300
+        assert plan["qty"] == 15 and plan["planned_value"] == 77300*15
+        assert cf.features["order_price_source"] == "timing_bounded_verified_ask"
