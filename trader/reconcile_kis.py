@@ -3600,8 +3600,16 @@ def reconcile_kis(
     # Skip historical import/meta repair ONLY on exact active-cycle parity;
     # unknown/partial/stale proofs retain the old fail-closed recovery.
     repair_fastpath = False
-    repair_fastpath_reason = "STALE_OR_UNPROVEN_BALANCE"
-    if (os.getenv("KR_EXACT_PARITY_HISTORICAL_REPAIR_FASTPATH", "1") == "1"
+    repair_fastpath_reason = (
+        "STALE_OR_UNPROVEN_BALANCE" if historical_recovery
+        else "CURRENT_ONLY_NO_HISTORICAL_PARITY_SCAN"
+    )
+    # Current-only already skips all historical position/meta repair.
+    # Repeating the full historical parity scan (and its unresolved-activity
+    # DB query) here cannot authorize or change that repair. Keep the later
+    # current broker activity, frozen-contract and claim checks intact.
+    if (historical_recovery
+            and os.getenv("KR_EXACT_PARITY_HISTORICAL_REPAIR_FASTPATH", "1") == "1"
             and not reset_mode and fresh_balance_proven):
         try:
             from trader.kr.reconcile_parity_fastpath import historical_repair_unnecessary
