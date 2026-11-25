@@ -256,6 +256,32 @@ def test_historical_buy_native_evidence_never_confuses_ack_and_fill():
     assert exact_buy_evidence(dict(page([complete]), _sep29_complete=False), **kw)["state"] == "NATIVE_HISTORY_UNVERIFIED"
 
 
+def test_historical_buy_current_day_unfilled_evidence_fails_closed():
+    from datetime import date
+    from scripts.kr_historical_buy_native_evidence import current_day_unfilled_evidence
+    day = date(2026, 11, 25)
+    def check(rows, **overrides):
+        payload = {"rt_cd": "0", "_sep29_complete": True, "output1": rows}
+        payload.update(overrides)
+        return current_day_unfilled_evidence(payload, day=day, codes={"293490", "059090"})
+    row = dict(pdno="293490", odno="0000012345", ord_dt="20261125",
+               sll_buy_dvsn_cd="01", rmn_qty="7")
+    assert check([])["293490"]["state"] == "CURRENT_DAY_NO_UNFILLED_PROVEN"
+    actual = check([row])
+    assert actual["293490"] == {"state": "CURRENT_DAY_UNFILLED_PRESENT",
+                                 "unfilled_order_count": 1, "unfilled_qty": 7}
+    assert actual["059090"]["state"] == "CURRENT_DAY_NO_UNFILLED_PROVEN"
+    assert check([dict(row, rmn_qty="0")])["293490"]["unfilled_qty"] == 0
+    for invalid in ([dict(row, rmn_qty=None)], [dict(row, ord_dt="20261124")],
+                    [row, row], [dict(row, sll_buy_dvsn_cd="")],
+                    [dict(row, rmn_qty="-1")], [dict(row, pdno="")]):
+        assert check(invalid)["293490"]["state"] == "CURRENT_DAY_UNFILLED_UNVERIFIED"
+        assert check(invalid)["059090"]["unfilled_qty"] is None
+    assert check([], _sep29_complete=False)["293490"]["unfilled_qty"] is None
+    assert check([], _diag_stub=True)["293490"]["unfilled_qty"] is None
+    assert check([], rt_cd="-1")["293490"]["unfilled_qty"] is None
+
+
 def test_independent_watchdog_ignores_old_success_and_detects_stale_exact_run(tmp_path):
     import json
     from datetime import datetime, timezone, timedelta

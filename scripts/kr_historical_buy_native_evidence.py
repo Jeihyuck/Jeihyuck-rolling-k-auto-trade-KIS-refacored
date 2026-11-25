@@ -53,9 +53,53 @@ def exact_buy_evidence(payload, *, day, code, odno, qty):
                                                            default=str).encode()).hexdigest()}
 
 
+def current_day_unfilled_evidence(payload, *, day, codes):
+    """Read-only KIS same-day ALL-exchange snapshot; never authorizes recovery.
+
+    An incomplete page, malformed identity, duplicate order or missing remaining
+    quantity is UNKNOWN, not zero. An older-day claim is not settled by this
+    snapshot; the exact original order and lifecycle still require proof.
+    """
+    unknown = {code: {"state": "CURRENT_DAY_UNFILLED_UNVERIFIED",
+                      "unfilled_order_count": None, "unfilled_qty": None}
+               for code in codes}
+    if (not isinstance(payload, dict) or payload.get("rt_cd") != "0"
+            or payload.get("_sep29_complete") is not True
+            or payload.get("_diag_stub") or payload.get("_stub")
+            or payload.get("_ccld_status")
+            or not isinstance(payload.get("output1"), list)):
+        return unknown
+    totals = {code: [0, 0] for code in codes}
+    seen = set()
+    for row in payload["output1"]:
+        if not isinstance(row, dict):
+            return unknown
+        code = str(row.get("pdno") or "")
+        odno = str(row.get("odno") or "")
+        raw_qty = str(row.get("rmn_qty") if row.get("rmn_qty") is not None else "")
+        if (len(code) != 6 or not code.isascii() or not code.isdigit()
+                or len(odno) != 10 or not odno.isascii() or not odno.isdigit()
+                or str(row.get("ord_dt") or "") != day.strftime("%Y%m%d")
+                or str(row.get("sll_buy_dvsn_cd") or "") not in {"01", "02"}
+                or not raw_qty.isascii() or not raw_qty.isdigit()
+                or odno in seen):
+            return unknown
+        seen.add(odno)
+        qty = int(raw_qty)
+        if code in totals and qty:
+            totals[code][0] += 1
+            totals[code][1] += qty
+    return {code: {"state": "CURRENT_DAY_UNFILLED_PRESENT" if count else
+                           "CURRENT_DAY_NO_UNFILLED_PROVEN",
+                   "unfilled_order_count": count, "unfilled_qty": qty}
+            for code, (count, qty) in totals.items()}
+
+
 def collect(*, engine, kis, now, code=None, trade_date=None):
     if getattr(kis, "env", None) != "practice":
         raise RuntimeError("PRACTICE_BROKER_REQUIRED")
+    if str(os.getenv("KIS_CCLD_EXCG_ID_DVSN_CD") or "ALL").strip().upper() != "ALL":
+        raise RuntimeError("ALL_EXCHANGE_NATIVE_HISTORY_REQUIRED")
     scope = resolve_kr_recovery_scope(engine=engine, env="practice", kis=kis)
     if scope is None:
         raise RuntimeError("ACTIVE_ACCOUNT_EPOCH_REQUIRED")
@@ -258,12 +302,23 @@ def collect(*, engine, kis, now, code=None, trade_date=None):
             balance_ok = True
     except Exception:
         pass
+    # Query today's all-page broker orders separately from the historical
+    # three-day budget. An API failure must not be represented as zero orders.
+    codes = {proof["code"] for proof in proofs}
+    current_orders = None
+    if codes:
+        try:
+            current_orders = _daily_ccld_all_pages_for_date(kis, today)
+        except Exception:
+            pass
+    unfilled = current_day_unfilled_evidence(current_orders, day=today, codes=codes)
     for proof in proofs:
+        proof["current_day_unfilled"] = unfilled[proof["code"]]
         proof["fresh_balance_proven"] = balance_ok
         proof["current_holding_qty"] = quantities.get(proof["code"], 0) if balance_ok else None
         proof["recovery_authorized"] = False
         proof["reason"] = "EXACT_CYCLE_AND_CURRENT_UNFILLED_REVIEW_REQUIRED_NO_WRITE"
-    return {"version": "KR_HISTORICAL_BUY_NATIVE_EVIDENCE_V2", "env": scope.env,
+    return {"version": "KR_HISTORICAL_BUY_NATIVE_EVIDENCE_V3", "env": scope.env,
             "trading_epoch_id": scope.trading_epoch_id, "cases": proofs,
             "days_queried": len(daily) + len(failures), "orders_submitted": 0, "db_rows_modified": 0}
 
@@ -291,6 +346,7 @@ def main(argv=None):
         print(json.dumps(evidence, ensure_ascii=False, default=str, indent=2))
         return 0 if evidence["cases"] and all(
             row["state"] == "ORIGINAL_FULL_EXECUTION_PROVEN" and row["fresh_balance_proven"]
+            and row["current_day_unfilled"]["state"] == "CURRENT_DAY_NO_UNFILLED_PROVEN"
             for row in evidence["cases"]) else 2
     finally:
         engine.dispose()
