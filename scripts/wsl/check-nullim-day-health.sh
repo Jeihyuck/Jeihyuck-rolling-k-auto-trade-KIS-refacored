@@ -95,7 +95,14 @@ if mail_marker.exists():
         delivered = bool(identity_ok and marker.get('status') in {'OK','DEGRADED'} and marker.get('mail_sent') is True)
         complete = bool(delivered and marker.get('status') == 'OK' and int(marker.get('required_missing_count') or 0) == 0)
         result['mail_status'] = marker.get('status')
+        # Compatibility field mail_delivered historically meant accepted by SMTP.
+        # For KR report the transport and recipient proof separately.
         result['mail_delivered'] = delivered
+        if market == 'kr':
+            result['mail_smtp_accepted'] = delivered
+            result['mail_recipient_delivery_confirmed'] = bool(delivered and marker.get('mail_delivered') is True)
+            result['mail_delivery_status'] = ('CONFIRMED' if result['mail_recipient_delivery_confirmed']
+                else 'UNCONFIRMED_AFTER_SMTP_ACCEPT' if delivered else 'NOT_PROVEN')
         result['mail_complete'] = complete
         result['mail_ok'] = complete
         result['mail_required_missing_count'] = int(marker.get('required_missing_count') or 0)
@@ -123,6 +130,19 @@ if market == 'us':
         except Exception as e: result['prep_error']=str(e)
 else:
     result['prep_final30_ok'] = 'final30=30' in blob or 'final30_rows=30' in blob
+    # Independent end-of-day check: an OK CLOSE (or any single successful
+    # tick) must not hide a failed/missing AM or PM. Use the current day's
+    # manifest and economic settlement report, never the prior day's log.
+    try:
+        sys.path.insert(0, str(root/'scripts/wsl'))
+        from kr_mail_execution_evidence import collect_kr_execution_status
+        kr_execution = collect_kr_execution_status(root, trade_date)
+        result['kr_execution_status'] = kr_execution['daily_execution_status']
+        result['kr_execution_sessions'] = kr_execution['execution_sessions']
+        result['kr_execution_summary'] = kr_execution['execution_summary']
+    except Exception as exc:
+        result['kr_execution_status'] = 'UNVERIFIED'
+        result['kr_execution_audit_error_type'] = type(exc).__name__
 result['ok'] = bool(result.get('tick_count',0) >= 2 or re.search(r'session_end|graceful_shutdown|retryable close failure', blob, re.I))
 if not result.get('scheduler_owner_matches'):
     result['ok']=False
@@ -133,6 +153,9 @@ if not result.get('scheduler_sha_matches'):
 if not result['mail_ok']:
     result['ok']=False
     result.setdefault('failure_reason','DEGRADED_MAIL_EVIDENCE' if result.get('mail_delivered') else 'FAILED_MAIL_VALIDATION')
+if market == 'kr' and result.get('kr_execution_status') != 'COMPLETED':
+    result['ok']=False
+    result.setdefault('failure_reason','KR_DAILY_EXECUTION_INCOMPLETE')
 if forbidden or advisory_unavailable:
     result['ok']=False
     result['failure_reason']='SCHEDULER_POLICY_VIOLATION' if forbidden else 'PB1_ADVISORY_LOCK_UNAVAILABLE'
