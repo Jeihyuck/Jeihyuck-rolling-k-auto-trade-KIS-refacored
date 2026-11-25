@@ -500,6 +500,25 @@ class KisUSClient:
     # Account
     # ------------------------------------------------------------------
 
+    def get_us_present_balance(self) -> dict:
+        """Read-only practice account summary, KRW basis; never order authority.
+
+        Official KIS v1_해외주식-008 (VTRP6504R). Practice output1/2 may be
+        absent and US holdings may lag during trading. Do not substitute
+        this endpoint for the position, orderable cash or native fill API.
+        """
+        self._assert_not_offline("get_us_present_balance")
+        if getattr(self, "env", "practice") != "practice":
+            raise KisUSClientError("US_PRESENT_BALANCE_PRACTICE_ONLY")
+        tr = get_tr_info("us_present_balance")
+        return self._get(
+            tr["path"], headers=self._build_headers(tr["tr_id"]),
+            params={"CANO": self._cano, "ACNT_PRDT_CD": self._acnt_prdt_cd,
+                    "WCRC_FRCR_DVSN_CD": "01", "NATN_CD": "840",
+                    "TR_MKET_CD": "00", "INQR_DVSN_CD": "00"},
+            max_attempts_override=2,
+        )
+
     def get_us_balance(self, force_refresh: bool = False) -> dict:
         """해외주식 잔고 조회 (다중 거래소).
         

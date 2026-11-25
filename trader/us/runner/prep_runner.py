@@ -397,7 +397,10 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         sync_ok: list[str] = []
         sync_ok_evidence: dict[str, dict] = {}
         sync_failed: list[dict] = []
-        for sym in sorted(sync_symbols):
+        # Required benchmark recovery first, then other ETFs and held symbols.
+        # A late universe scan must not starve the global entry data gate.
+        mandatory_benchmarks = {"SPY", "QQQ", "SMH"}
+        for sym in sorted(sync_symbols, key=lambda s: (0 if s in mandatory_benchmarks else 1 if s in benchmark_symbols else 2 if s in open_position_symbols else 3, s)):
             if sym in exchange_failed_symbols:
                 failure = next(row for row in registry_summary["failures"] if row["symbol"] == sym)
                 sync_failed.append({"symbol": sym, "failure_type": "exchange_resolution", "reason": failure["reason"]})
