@@ -307,3 +307,37 @@ def test_kr_daily_preload_only_queries_ttl_misses(monkeypatch):
     cache.cache[("daily","251970",60)] = (cached, 0)
     engine._kr_pb1_batch_preload_ohlcv(["251970"],days=60)
     assert calls[-1] == ["251970"]
+
+
+def test_kr_practice_optional_cash_hashkey_is_endpoint_scoped(monkeypatch):
+    from trader import kis_wrapper as mod
+    api = mod.KisAPI.__new__(mod.KisAPI)
+    api.env = "practice"
+    calls = []
+    monkeypatch.setattr(api, "_create_hashkey", lambda body: calls.append(body) or "legacy")
+    monkeypatch.setattr(mod, "API_BASE_URL", "https://openapivts.koreainvestment.com:29443")
+    monkeypatch.delenv("KR_PRACTICE_ORDER_HASHKEY_REQUIRED", raising=False)
+    assert api._domestic_cash_order_hashkey({"ORD_QTY":"15"}) is None
+    assert not calls
+    monkeypatch.setenv("KR_PRACTICE_ORDER_HASHKEY_REQUIRED", "1")
+    assert api._domestic_cash_order_hashkey({}) == "legacy"
+    monkeypatch.setenv("KR_PRACTICE_ORDER_HASHKEY_REQUIRED", "0")
+    api.env = "real"
+    assert api._domestic_cash_order_hashkey({}) == "legacy"
+    api.env = "practice"
+    monkeypatch.setattr(mod, "API_BASE_URL", "https://unexpected.example")
+    assert api._domestic_cash_order_hashkey({}) == "legacy"
+
+
+def test_close_zero_pb1_recovery_does_not_hide_infinite_economic_debt():
+    from scripts.kr_cross_day_sell_reconcile_close import merge_close_audit_debt
+    before = {"state":"BATCH_COMPLETE", "eligible":0}
+    gaps = [{"code":"122630","order_id":"old-5","qty":5},
+            {"code":"122630","order_id":"old-6","qty":6}]
+    result = merge_close_audit_debt(before, {"gap_count":2,"gaps":gaps})
+    assert result["state"] == "BATCH_WITH_PENDING"
+    assert result["close_remaining_gap_count"] == 2
+    assert [x["order_id"] for x in result["close_remaining_gaps"]] == ["old-5","old-6"]
+    assert all(x["recovery_owner"] == "KR_INFINITE" for x in result["close_remaining_gaps"])
+    assert merge_close_audit_debt(before, {"gap_count":0,"gaps":[]})["state"] == "BATCH_COMPLETE"
+    assert merge_close_audit_debt(before, {"gap_count":2,"gaps":[]})["close_audit_verified"] is False
