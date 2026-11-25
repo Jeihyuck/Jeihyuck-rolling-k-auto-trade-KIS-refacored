@@ -186,13 +186,20 @@ def clear_recovered_us_prep_preflight_marker(
         return False, "preflight_marker_not_auto_recoverable"
     if not expected_run_id or not current_revision or current_revision == "unknown":
         return False, "preflight_recovery_identity_missing"
-    if verify_run_revision(trade_date, current_revision).get("ok") is not True:
+    try:
+        if verify_run_revision(trade_date, current_revision).get("ok") is not True:
+            return False, "preflight_recovery_revision_unverified"
+    except (OSError, ValueError, TypeError, AttributeError):
         return False, "preflight_recovery_revision_unverified"
     # This is the same source checker invoked by the canonical WSL preflight.
     # It verifies actual artifact + DB completed run + scored locked watchlist.
     proof = check_effective_prep_sources(trade_date)
     if proof.get("ok") is not True or str(proof.get("run_id") or "") != expected_run_id:
         return False, "preflight_recovery_artifact_db_run_unverified"
+    if proof.get("entry_authorized") is not True:
+        return False, "preflight_recovery_entry_not_authorized"
+    if proof.get("entry_revision") != current_revision:
+        return False, "preflight_recovery_entry_revision_mismatch"
     try:
         current = path.stat()
         if (current.st_ino, current.st_mtime_ns, current.st_size) != (
@@ -304,7 +311,10 @@ def check_effective_prep_sources(trade_date: str, *, min_rows: int = 10) -> dict
     )
     revision_ok, revision_reason = entry_revision_proof(trade_date, contract, prep) if ok else (False, "db_live_contract_invalid")
     ok = ok and revision_ok
+    entry_authorized = bool(ok and revision_reason == "entry_revision_verified")
     return {**result, "ok": bool(ok), "reason": "ok" if ok else revision_reason,
+            "entry_authorized": entry_authorized,
+            "entry_revision": str(contract.get("run_revision") or contract.get("git_commit_sha") or "") if entry_authorized else None,
             "benchmark_recovery_required": benchmark_recovery_required(contract),
             "run_id": run_id if ok else None,
             "status": contract.get("status"), "artifact_count": len(artifact_rows),
