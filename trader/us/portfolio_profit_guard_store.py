@@ -19,7 +19,8 @@ from sqlalchemy import text
 
 from trader.us.portfolio_profit_guard import (
     canonical, plan_verified_guard_sell, triggered_stage,
-    verify_portfolio_policy, _decimal,
+    verify_portfolio_policy, _decimal, ACCOUNTING_METHODS, NET_ACCOUNTING_METHOD,
+    TRADING_ACCOUNTING_METHOD,
 )
 
 logger = logging.getLogger(__name__)
@@ -227,7 +228,7 @@ def persist_guard_observation_and_reserve(
         raise PortfolioGuardUnavailable("PORT_GUARD_SNAPSHOT_TIME_UNVERIFIED")
     if not snapshot_id or not isinstance(verified_accounting, dict):
         raise PortfolioGuardUnavailable("PORT_GUARD_ACCOUNTING_PROOF_MISSING")
-    if verified_accounting.get("method") != "NATIVE_FILLS_PLUS_FRESH_KIS_MARK_V1":
+    if verified_accounting.get("method") not in ACCOUNTING_METHODS:
         raise PortfolioGuardUnavailable("PORT_GUARD_ACCOUNTING_METHOD_MISMATCH")
     if any(p.get("snapshot_native_kis") is not True for p in complete_native_positions):
         raise PortfolioGuardUnavailable("PORT_GUARD_KIS_POSITION_PROOF_MISSING")
@@ -246,6 +247,8 @@ def persist_guard_observation_and_reserve(
     if auth is None:
         return {"state": "UNAUTHORIZED", "intents": [], "reason": "NO_ACTIVE_SIGNED_POLICY"}
     policy, digest = auth
+    if verified_accounting["method"] != policy["accounting_method"]:
+        raise PortfolioGuardUnavailable("PORT_GUARD_SIGNED_ACCOUNTING_METHOD_MISMATCH")
     scope = {
         "policy_id": policy["policy_id"], "policy_version": policy["policy_version"],
         "account": account_hash, "epoch": trading_epoch_id,
@@ -253,6 +256,7 @@ def persist_guard_observation_and_reserve(
     }
     state_rows = conn.execute(text("""
         SELECT high_water_pnl_usd,latest_pnl_usd,last_snapshot_at,
+               accounting_method,baseline_provenance,
                episode_id,episode_anchor,stage_no,state,revision
         FROM public.us_portfolio_guard_state
         WHERE policy_id=:policy_id AND policy_version=:policy_version
@@ -280,9 +284,11 @@ def persist_guard_observation_and_reserve(
                "snapshot": snapshot_id, "at": snapshot_at,
                "baseline": json.dumps({"snapshot_id": snapshot_id,
                                        "source": "FIRST_VERIFIED_AFTER_POLICY_EFFECTIVE",
-                                       "pnl_usd": str(pnl)}, sort_keys=True)})
+                                       "pnl_usd": str(pnl),
+                                       "policy_sha256": digest}, sort_keys=True)})
         state_rows = conn.execute(text("""
             SELECT high_water_pnl_usd,latest_pnl_usd,last_snapshot_at,
+               accounting_method,baseline_provenance,
                    episode_id,episode_anchor,stage_no,state,revision
             FROM public.us_portfolio_guard_state
             WHERE policy_id=:policy_id AND policy_version=:policy_version
@@ -298,6 +304,11 @@ def persist_guard_observation_and_reserve(
             return {"state": "BLOCKED", "intents": [], "reason": "BASELINE_RACE_RECHECK"}
         return {"state": "WATCH", "intents": [], "reason": "FIRST_VERIFIED_BASELINE"}
     prior = dict(state_rows[0])
+    if prior["accounting_method"] != policy["accounting_method"]:
+        raise PortfolioGuardUnavailable("PORT_GUARD_HWM_ACCOUNTING_METHOD_MISMATCH")
+    baseline = prior.get("baseline_provenance") or {}
+    if baseline.get("policy_sha256") not in (None, digest):
+        raise PortfolioGuardUnavailable("PORT_GUARD_HWM_POLICY_DIGEST_MISMATCH")
     if prior["last_snapshot_at"] and prior["last_snapshot_at"] >= snapshot_at:
         return {"state": "BLOCKED", "intents": [], "reason": "STALE_OR_DUPLICATE_SNAPSHOT"}
     hwm = max(_decimal(prior["high_water_pnl_usd"]), pnl)
@@ -858,13 +869,20 @@ def build_authorized_portfolio_guard_intents(
             quote_ttl_sec=_decimal(policy["quote_ttl_sec"]),
             max_skew_sec=_decimal(policy["max_snapshot_skew_sec"]),
             broker_full_balance_verified=True,
-            # A zero-row cash-event list is NOT proof of no dividend or
-            # corporate-action cash. Until the native KIS broker cash ledger
-            # imports a dated completeness certificate, do not arm a SELL.
+            # A separately signed trading-PnL policy may use verified
+            # pre-cost economics. The old net policy STILL requires native
+            # fee and cash completeness; never silently fall back.
+            accounting_method=policy["accounting_method"],
             broker_cash_ledger_complete=False,
             cash_events=None,
         )
+        logger.info(
+            "[US_PORT_GUARD][VALUATION] method=%s pnl_usd=%s confirmed_net_pnl_usd=%s fee_fill_count=%s",
+            economics["method"], pnl, economics.get("confirmed_net_pnl_usd"),
+            economics.get("verified_fee_fill_count"),
+        )
         snapshot_id = hashlib.sha256(canonical({
+            "accounting_method": economics["method"],
             "policy_sha256": manifest_digest, "epoch": epoch,
             "portfolio": portfolio, "quote_asof": [
                 [p["symbol"], p["quote_asof_utc"], p["holding_qty"], p["mark_bid_usd"]]
