@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import re
 import time
+
+import requests
 from urllib.parse import urlsplit
 
 _ALLOWED_GET = frozenset({
@@ -46,9 +48,12 @@ class PracticeReadonlyGuard:
         self._last_token_start = None
         self.counts = {"oauth_post": 0, "get": 0, "blocked": 0}
         self.token_responses = []
+        self.transport_failures = []
+        self.blocked_reasons = []
 
     def _block(self, reason):
         self.counts["blocked"] += 1
+        self.blocked_reasons.append(reason)
         raise RuntimeError(reason)
 
     def send(self, session, request, **kwargs):
@@ -77,11 +82,28 @@ class PracticeReadonlyGuard:
         else:
             self._block("UNAPPROVED_HTTP_METHOD_OR_PATH")
         kwargs["allow_redirects"] = False
-        response = self._send(session, request, **kwargs)
+        try:
+            response = self._send(session, request, **kwargs)
+        except requests.exceptions.RequestException as exc:
+            # Record bounded transport classification before the runtime wrapper
+            # has a chance to retry. A lost OAuth response is NOT proof that no
+            # token was issued. Stop this audit without another token request.
+            error = ("TLS_ERROR" if isinstance(exc, requests.exceptions.SSLError)
+                     else "CONNECT_TIMEOUT" if isinstance(exc, requests.exceptions.ConnectTimeout)
+                     else "READ_TIMEOUT" if isinstance(exc, requests.exceptions.ReadTimeout)
+                     else "PROXY_ERROR" if isinstance(exc, requests.exceptions.ProxyError)
+                     else "CONNECTION_ERROR" if isinstance(exc, requests.exceptions.ConnectionError)
+                     else "REQUEST_ERROR")
+            self.transport_failures.append({"scope": "OAUTH" if token else "READONLY_GET",
+                                            "state": error})
+            if token:
+                raise RuntimeError("TOKEN_TRANSPORT_OUTCOME_UNKNOWN_NO_RETRY") from None
+            raise
+        if token:
+            # Capture status even if a redirect must be refused.
+            self.token_responses.append(token_diagnostic(response))
         if response.is_redirect:
             self._block("UNAPPROVED_HTTP_REDIRECT")
-        if token:
-            self.token_responses.append(token_diagnostic(response))
         return response
 
     def retry_wait_seconds(self):

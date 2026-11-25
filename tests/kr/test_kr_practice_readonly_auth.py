@@ -74,3 +74,61 @@ def test_only_readonly_practice_endpoints_allowed():
         with pytest.raises(RuntimeError):
             guard.send(None, _request(method,path,base))
     assert len(sent) == 1
+
+
+def test_transport_failure_is_reported_before_wrapper_retry_and_never_reissues():
+    import requests
+    for exc, state in [
+        (requests.exceptions.SSLError("private-url"), "TLS_ERROR"),
+        (requests.exceptions.ConnectTimeout("private-url"), "CONNECT_TIMEOUT"),
+        (requests.exceptions.ReadTimeout("private-url"), "READ_TIMEOUT"),
+        (requests.exceptions.ProxyError("private-url"), "PROXY_ERROR"),
+        (requests.exceptions.ConnectionError("private-url"), "CONNECTION_ERROR"),
+    ]:
+        def send(*args, **kwargs):
+            raise exc
+        guard = PracticeReadonlyGuard(send)
+        with pytest.raises(RuntimeError, match="TOKEN_TRANSPORT_OUTCOME_UNKNOWN_NO_RETRY"):
+            guard.send(None, _request("POST", "/oauth2/tokenP"))
+        assert guard.transport_failures == [{"scope":"OAUTH","state":state}]
+        assert guard.token_responses == []
+        assert guard.counts == {"oauth_post":1,"get":0,"blocked":0}
+        assert guard.retry_wait_seconds() is None
+        with pytest.raises(RuntimeError, match="TOKEN_RETRY_NOT_AUTHORIZED"):
+            guard.send(None, _request("POST", "/oauth2/tokenP"))
+        assert guard.blocked_reasons == ["TOKEN_RETRY_NOT_AUTHORIZED"]
+        assert "private-url" not in str(guard.transport_failures)
+
+
+def test_redirect_status_is_captured_but_redirect_is_never_followed():
+    response = Response(302, {})
+    response.is_redirect = True
+    seen = []
+    def send(session, request, **kwargs):
+        seen.append(kwargs)
+        return response
+    guard = PracticeReadonlyGuard(send)
+    with pytest.raises(RuntimeError, match="UNAPPROVED_HTTP_REDIRECT"):
+        guard.send(None, _request("POST", "/oauth2/tokenP"))
+    assert seen == [{"allow_redirects": False}]
+    assert guard.token_responses[0]["http_status"] == 302
+    assert guard.blocked_reasons == ["UNAPPROVED_HTTP_REDIRECT"]
+    assert guard.retry_wait_seconds() is None
+
+
+def test_requests_session_integration_captures_transport_failure(monkeypatch):
+    import requests
+    session = requests.Session()
+    calls = []
+    def fail(request, **kwargs):
+        calls.append(request.method)
+        raise requests.exceptions.ReadTimeout("sensitive")
+    monkeypatch.setattr(session.get_adapter("https://"), "send", fail)
+    guard = PracticeReadonlyGuard(requests.sessions.Session.send)
+    monkeypatch.setattr(requests.sessions.Session, "send",
+                        lambda self, request, **kwargs: guard.send(self, request, **kwargs))
+    with pytest.raises(RuntimeError, match="TOKEN_TRANSPORT_OUTCOME_UNKNOWN_NO_RETRY"):
+        session.post("https://openapivts.koreainvestment.com:29443/oauth2/tokenP",
+                     json={"appsecret":"fake-test-secret"}, timeout=1)
+    assert calls == ["POST"]
+    assert guard.transport_failures == [{"scope":"OAUTH","state":"READ_TIMEOUT"}]
