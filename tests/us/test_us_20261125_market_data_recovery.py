@@ -12,10 +12,36 @@ def test_etf_quote_route_separate_from_order(symbol):
     assert resolve_quote_exchange_code(symbol) == "AMS"
     assert resolve_order_exchange(symbol) == "NYSE"
 
-@pytest.mark.parametrize("symbol", "QQQ SMH QQQM SOXX TQQQ KHC".split())
+@pytest.mark.parametrize("symbol", "QQQ SMH QQQM SOXX TQQQ".split())
 def test_nasdaq_quote_route_unchanged(symbol):
     assert resolve_quote_exchange_code(symbol) == "NAS"
     assert resolve_order_exchange(symbol) == "NASDAQ"
+
+def test_khc_20260914_listing_transfer_uses_nyse_not_nasdaq():
+    from trader.us.symbols import resolve_order_exchange_code
+    from trader.us.execution.kis_us_client import KisUSClient
+    assert resolve_exchange("KHC") == "NYSE"
+    assert resolve_quote_exchange("KHC") == "NYSE"
+    assert resolve_quote_exchange_code("KHC") == "NYS"
+    assert resolve_order_exchange("KHC") == "NYSE"
+    assert resolve_order_exchange_code("KHC") == "NYSE"
+    # Verify the actual client daily API request, not only the mapping.
+    client = KisUSClient(env="practice", offline=True)
+    client._offline = False
+    client._build_headers = lambda tr_id: {}
+    calls = []
+    def get(path, headers, params):
+        calls.append((path, dict(params)))
+        return {"output2": [{"xymd": "20261124", "clos": "25.0"}]}
+    client._get = get
+    rows = client.get_us_daily_price("KHC", resolve_quote_exchange("KHC"),
+                                    count=5, as_of_date="20261124")
+    assert rows == [{"xymd": "20261124", "clos": "25.0"}]
+    assert len(calls) == 1
+    assert calls[0][1]["EXCD"] == "NYS"
+    assert calls[0][1]["SYMB"] == "KHC"
+    assert calls[0][1]["BYMD"] == "20261124"
+
 
 def test_empty_http_is_attempted_but_failed():
     reset_us_daily_memory()
