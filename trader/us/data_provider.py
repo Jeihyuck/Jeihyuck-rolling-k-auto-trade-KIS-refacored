@@ -1396,7 +1396,9 @@ class USDataProvider:
                 ctx.count("balance_http_calls")
             raw = self._get_client().get_us_balance(force_refresh=force_refresh)
             result = normalize_us_balance(raw)
-            if ctx is not None and result.get("balance_complete", True):
+            if (ctx is not None and result.get("balance_complete", True)
+                    and result.get("balance_authoritative", True)
+                    and result.get("balance_parse_status") == "OK"):
                 ctx.balance_snapshot = result
                 ctx.balance_snapshot_at = __import__("time").monotonic()
             return result

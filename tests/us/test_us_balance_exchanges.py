@@ -70,3 +70,25 @@ def test_us_balance_symbol_duplicate_merge():
     assert int(merged[0]["ovrs_cblc_qty"]) == 15
     # market_value 합산: 1500 + 750 = 2250
     assert float(merged[0]["ovrs_stck_evlu_amt"]) == 2250.0
+
+
+
+def test_targeted_balance_is_never_authoritative(monkeypatch):
+    import time
+    from trader.us.execution.kis_us_client import KisUSClient
+    from trader.us.execution.tick_context import TickExecutionContext
+    monkeypatch.setenv("US_BALANCE_EXCHANGES", "NASD,NYSE,AMEX")
+    client = KisUSClient(env="practice", offline=True)
+    client._offline = False
+    client._assert_not_offline = lambda _: None
+    ctx = TickExecutionContext("2026-11-24", "am", "run", 1, "targeted",
+                               deadline=time.monotonic()+10)
+    ctx.exchange_by_symbol = {"ABBV": "NYSE"}
+    client._tick_context = ctx
+    monkeypatch.setattr(client, "_get_us_balance_single_exchange",
+                        lambda exchange: {"output1": [], "output2": {}})
+    result = client.get_us_balance(force_refresh=True)
+    assert result["queried_exchanges"] == ["NYSE"]
+    assert result["balance_complete"] is False
+    assert result["balance_authoritative"] is False
+    assert set(result["failed_exchanges"]) == {"NASD", "AMEX"}

@@ -62,7 +62,7 @@ def test_real_provider_paths_use_tick_scoped_caches_and_counters():
     provider = USDataProvider(offline=False).bind_tick_context(ctx)
     client = _CountingClient()
     provider._client = client
-    assert provider.get_balance(force_refresh=True) == provider.get_balance(force_refresh=True)
+    assert provider.get_balance(force_refresh=True) == provider.get_balance()
     assert provider.get_current_price("JNJ", "NYSE") == provider.get_current_price("JNJ", "NYSE")
     assert provider.get_orderable_cash("JNJ", "NYSE", 266.66) == provider.get_orderable_cash("JNJ", "NYSE", 266.66)
     assert (client.balance, client.quote, client.cash) == (1, 1, 1)
@@ -77,11 +77,31 @@ def test_slow_provider_duplicate_requests_finish_inside_scaled_deadline():
     client = _CountingClient(delay=.03)
     provider._client = client
     started = time.monotonic()
-    for _ in range(2):
-        provider.get_balance(force_refresh=True)
+    for index in range(2):
+        provider.get_balance(force_refresh=(index == 0))
         provider.get_current_price("JNJ", "NYSE")
         provider.get_orderable_cash("JNJ", "NYSE", 266.66)
     elapsed = time.monotonic() - started
     assert elapsed < .14
     assert ctx.has_budget(0)
     assert (client.balance, client.quote, client.cash) == (1, 1, 1)
+
+
+def test_explicit_balance_refresh_bypasses_tick_cache_and_failed_refresh_invalidates_it():
+    ctx = TickExecutionContext("2026-11-24", "am", "run", 1, "refresh")
+    provider = USDataProvider(offline=False).bind_tick_context(ctx)
+    class Client(_CountingClient):
+        def get_us_balance(self, force_refresh=False):
+            self.balance += 1
+            if self.balance == 3:
+                raise RuntimeError("broker unavailable")
+            return {"output1": [], "output2": {"observation": str(self.balance)}}
+    client = Client()
+    provider._client = client
+    assert provider.get_balance(force_refresh=True)["output2"]["observation"] == "1"
+    assert provider.get_balance()["output2"]["observation"] == "1"
+    assert provider.get_balance(force_refresh=True)["output2"]["observation"] == "2"
+    with pytest.raises(RuntimeError):
+        provider.get_balance(force_refresh=True)
+    assert ctx.balance_snapshot_at is None
+    assert provider.get_balance()["output2"]["observation"] == "4"

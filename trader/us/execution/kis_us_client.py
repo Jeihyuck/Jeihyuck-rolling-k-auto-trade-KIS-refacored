@@ -523,6 +523,7 @@ class KisUSClient:
         exchanges = [e.strip().upper() for e in exchanges_env.split(",") if e.strip()]
         if not exchanges:
             exchanges = ["NASD", "NYSE", "AMEX"]
+        configured_exchanges = tuple(exchanges)
         configured_budget = max(0.1, float(os.getenv("US_BALANCE_FETCH_BUDGET_SEC", "30")))
         tick_remaining = float("inf") if self._tick_context is None else self._tick_context.remaining_sec()
         # Balance is a pre-routing stage.  Preserve a dedicated portion of the
@@ -634,7 +635,12 @@ class KisUSClient:
                 ",".join([row.get("ovrs_pdno", row.get("pdno", "?")) for row in merged_output1 if isinstance(row, dict)]),
             )
         
-            balance_complete = not failed_exchanges and len(exchange_result_counts) == len(exchanges)
+            # A successful subset is not a complete account balance. In particular
+            # it cannot close positions on venues omitted for a tight tick budget.
+            omitted = set(configured_exchanges) - set(exchanges)
+            for omitted_exchange in omitted:
+                failed_exchanges[omitted_exchange] = "TARGETED_EXIT_REFRESH_NOT_FULL_ACCOUNT"
+            balance_complete = not failed_exchanges and len(exchange_result_counts) == len(configured_exchanges)
             result_payload = {
                 "rt_cd": "0",
                 "output1": merged_output1,

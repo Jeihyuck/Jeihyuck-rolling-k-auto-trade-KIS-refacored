@@ -646,9 +646,16 @@ def reconcile_ack_orders_with_balance(
             )
 
     kis_position_by_symbol: dict[str, dict] = {}
+    balance_verified = False
     try:
         balance = _get_balance_force_refresh(provider)
+        if (not isinstance(balance, dict)
+                or str(balance.get("balance_parse_status") or "OK").upper() != "OK"
+                or balance.get("balance_complete") is False
+                or balance.get("balance_authoritative") is False):
+            raise RuntimeError("ack_balance_not_authoritative")
         kis_position_by_symbol = _build_kis_position_by_symbol(balance.get("positions", []))
+        balance_verified = True
     except Exception as exc:
         logger.warning("[US_RECONCILE][ACK_RECONCILE][WARN] balance fetch failed: %s", exc)
 
@@ -695,7 +702,8 @@ def reconcile_ack_orders_with_balance(
             logger.warning("[US_RECONCILE][ACK_RECONCILE][INVALID_QTY] symbol=%s order_no=%s side=%s qty=%d reason=missing_qty_requested", symbol, order_no, side, qty)
         fallback_fill_price, fallback_price_source = _resolve_order_fill_price(order)
         pre_qty_for_delta, _pre_source = _extract_pre_order_position_qty(order)
-        post_qty_for_delta = int((kis_position_by_symbol.get(symbol) or {}).get("qty") or 0)
+        post_qty_for_delta = (int((kis_position_by_symbol.get(symbol) or {}).get("qty") or 0)
+                              if balance_verified else None)
         delta_confirmation = confirm_order_by_balance_delta(side, qty, pre_qty_for_delta, post_qty_for_delta)
 
         atomic_scope_active = False
@@ -1119,7 +1127,7 @@ def reconcile_ack_orders_with_balance(
             or broker_status in {"OPEN", "PENDING", "ACK_OPEN", "WORKING", "PARTIALLY_FILLED"}
         )
         reservation = bool(
-            side == "SELL" and pre_qty_for_delta is not None and current_qty == pre_qty_for_delta
+            balance_verified and side == "SELL" and pre_qty_for_delta is not None and current_qty == pre_qty_for_delta
             and qty > 0 and current_orderable <= max(0, pre_qty_for_delta - qty)
         )
         if remaining_qty > 0 and (explicit_open or reservation):
