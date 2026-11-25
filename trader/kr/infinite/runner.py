@@ -260,6 +260,7 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
             allow_entry=allow_entry, best_ask=position.current_price,
             minutes_since_open=minutes_since_open,
         )
+        retry_key = None
         if allow_entry and position.qty > 0 and state is not None:
             sleeve_remaining = max(
                 0.0, float(state.allocated_capital_krw) - float(state.filled_notional),
@@ -267,6 +268,18 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
             preview_cash = max(0.0, min(float(state.unit_krw), sleeve_remaining))
             if preview_cash >= position.current_price:
                 preview = evaluate(orderable_cash=preview_cash, **decision_args)
+                # Only an owner-policy duplicate WAIT may enter the narrow
+                # same-day pre-hashkey recovery path. Never delay protective SELL.
+                if preview.reason == "DUPLICATE_INTENT" and env == "practice":
+                    lookup = getattr(repository, "retryable_add_key", None)
+                    if callable(lookup):
+                        candidate_key = lookup(state, day, env, position)
+                        remaining = kr_tick_remaining_sec()
+                        if (candidate_key and (remaining == float("inf") or remaining >= 20)
+                                and executor.verify_no_same_day_symbol_order(config.symbol, day)):
+                            retry_key = candidate_key
+                            decision_args["existing_intent_keys"] = existing_keys - {retry_key}
+                            preview = evaluate(orderable_cash=preview_cash, **decision_args)
                 if preview.action in {Action.BUY, Action.RECOVERY}:
                     # No SELL remains actionable at this point; the preview
                     # has already run the owner's full exit-first policy.
@@ -328,15 +341,27 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
             return RunResult(Decision(Action.BLOCK, "KR_INF_CANONICAL_ORDER_GATE_CLOSED"), state)
         if state is None or not state.cycle_id:
             return RunResult(Decision(Action.BLOCK, "KR_INF_CYCLE_ID_MISSING", next_status=Status.FROZEN), state)
-        if not repository.create_intent(state, decision, day, market_state):
-            return RunResult(Decision(Action.WAIT, "DUPLICATE_INTENT"), state)
-        claim_identity, claim = repository.claim_submit(
-            state=state,
-            decision=decision,
-            trade_date=day,
-            symbol=config.symbol,
-            env=env,
-        )
+        if retry_key and decision.idempotency_key == retry_key:
+            remaining = kr_tick_remaining_sec()
+            if remaining != float("inf") and remaining < min_remaining:
+                return RunResult(Decision(Action.WAIT, "KR_INF_RETRY_DEADLINE"), state)
+            retry = repository.retry_add_submit(
+                state=state, decision=decision, day=day, env=env, position=position,
+                broker_no_order_proven=True,
+            )
+            if retry is None:
+                return RunResult(Decision(Action.WAIT, "KR_INF_RETRY_PROOF_CHANGED"), state)
+            claim_identity, claim = retry
+        else:
+            if not repository.create_intent(state, decision, day, market_state):
+                return RunResult(Decision(Action.WAIT, "DUPLICATE_INTENT"), state)
+            claim_identity, claim = repository.claim_submit(
+                state=state,
+                decision=decision,
+                trade_date=day,
+                symbol=config.symbol,
+                env=env,
+            )
         if not claim.acquired:
             logger.error(
                 "[KR_INFINITE][EXECUTION_CLAIM][BLOCK] action_key=%s reason=%s",
