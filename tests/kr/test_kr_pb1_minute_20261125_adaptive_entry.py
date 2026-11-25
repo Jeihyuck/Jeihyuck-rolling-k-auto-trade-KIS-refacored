@@ -254,3 +254,29 @@ def test_historical_buy_native_evidence_never_confuses_ack_and_fill():
     assert exact_buy_evidence(page([dict(complete, sll_buy_dvsn_cd="01")]), **kw)["state"] == "ORIGINAL_FULL_EXECUTION_NOT_PROVEN"
     assert exact_buy_evidence(page([dict(complete, ord_dt="20261028")]), **kw)["state"] == "ORIGINAL_ORDER_NOT_UNIQUE"
     assert exact_buy_evidence(dict(page([complete]), _sep29_complete=False), **kw)["state"] == "NATIVE_HISTORY_UNVERIFIED"
+
+
+def test_independent_watchdog_ignores_old_success_and_detects_stale_exact_run(tmp_path):
+    import json
+    from datetime import datetime, timezone, timedelta
+    from scripts.kr_session_watchdog import inspect
+    start = datetime(2026,11,25,0,30,tzinfo=timezone.utc)
+    now = start+timedelta(seconds=421)
+    day = tmp_path/"runtime/logs/kr/2026-11-25"
+    (day/"am").mkdir(parents=True)
+    manifest = day/"session-manifest.json"
+    current = {"run_id":"current","status":"RUNNING"}
+    def write():
+        manifest.write_text(json.dumps({"sessions":{"am":{
+            "effective_run_id":"old","attempts":[{"run_id":"old","status":"OK"},current]}}}))
+    write()
+    kw = dict(root=tmp_path,trade_date="2026-11-25",session="am",run_id="current",
+              started=start,now=now,observer_required=False,max_tick_age=420)
+    assert inspect(**kw)["alerts"] == ["TICK_COMPLETION_STALE"]
+    assert "SESSION_PARENT_EXITED_WITHOUT_TERMINAL" in inspect(**kw,parent_alive=False)["alerts"]
+    (day/"am/current.log").write_text("[PB1][TICK][DONE] kind=am now="+(now-timedelta(seconds=20)).isoformat())
+    assert inspect(**kw)["state"] == "MONITORING"
+    assert "OBSERVER_LOG_STALE_OR_MISSING" in inspect(**{**kw,"observer_required":True})["alerts"]
+    current["status"]="OK"
+    write()
+    assert inspect(**kw)["state"] == "TERMINAL"
