@@ -231,3 +231,26 @@ def test_adaptive_actual_ask_reprice_no_passive_or_chase(monkeypatch, ask, expec
                             original_price=77400,qty=15) == 77300
         assert plan["qty"] == 15 and plan["planned_value"] == 77300*15
         assert cf.features["order_price_source"] == "timing_bounded_verified_ask"
+
+
+def test_historical_buy_native_evidence_never_confuses_ack_and_fill():
+    from scripts.kr_historical_buy_native_evidence import exact_buy_evidence
+    from datetime import date
+    day = date(2026, 10, 27)
+    kw = dict(day=day, code="293490", odno="0000011280", qty=174)
+    # Reconstructed ACK vs hypothetical completed native row; not actual fill.
+    ack = dict(pdno="293490", odno="0000011280", ord_dt="20261027",
+               sll_buy_dvsn_cd="02", ord_qty="174", tot_ccld_qty="0",
+               rmn_qty="174", tot_ccld_amt="0", avg_prvs="0", cncl_yn="N")
+    complete = dict(ack, tot_ccld_qty="174", rmn_qty="0",
+                    tot_ccld_amt=str(174*11750), avg_prvs="11750")
+    def page(rows):
+        return {"rt_cd":"0", "_sep29_complete":True, "output1":rows}
+    assert exact_buy_evidence(page([ack]), **kw)["state"] == "ORIGINAL_FULL_EXECUTION_NOT_PROVEN"
+    result = exact_buy_evidence(page([complete]), **kw)
+    assert result["state"] == "ORIGINAL_FULL_EXECUTION_PROVEN"
+    assert result["notional"] == str(174*11750)
+    assert exact_buy_evidence(page([complete, complete]), **kw)["state"] == "ORIGINAL_ORDER_NOT_UNIQUE"
+    assert exact_buy_evidence(page([dict(complete, sll_buy_dvsn_cd="01")]), **kw)["state"] == "ORIGINAL_FULL_EXECUTION_NOT_PROVEN"
+    assert exact_buy_evidence(page([dict(complete, ord_dt="20261028")]), **kw)["state"] == "ORIGINAL_ORDER_NOT_UNIQUE"
+    assert exact_buy_evidence(dict(page([complete]), _sep29_complete=False), **kw)["state"] == "NATIVE_HISTORY_UNVERIFIED"
