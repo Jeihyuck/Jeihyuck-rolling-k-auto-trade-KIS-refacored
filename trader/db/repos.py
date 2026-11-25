@@ -5784,6 +5784,10 @@ class FillsRepo:
                 existing_fill = conn.execute(
                     select(
                         self._schema.fills.c.fill_id,
+                        self._schema.fills.c.order_id,
+                        self._schema.fills.c.code,
+                        self._schema.fills.c.side,
+                        self._schema.fills.c.market,
                         self._schema.fills.c.trading_epoch_id,
                         self._schema.fills.c.portfolio_epoch_id,
                         self._schema.fills.c.position_cycle_id,
@@ -5793,6 +5797,13 @@ class FillsRepo:
                     ).where(and_(*collision_conditions))
                 ).mappings().first()
                 if existing_fill is not None:
+                    if exact_native_market and (
+                        str(existing_fill.get("order_id") or "") != str(payload["order_id"])
+                        or str(existing_fill.get("code") or "") != str(code)
+                        or str(existing_fill.get("side") or "") != str(side)
+                        or existing_fill.get("market") not in (None, "", exact_native_market)
+                    ):
+                        raise RuntimeError("KR_FILL_NATIVE_IDENTITY_COLLISION")
                     if order_cumulative:
                         old_qty = int(existing_fill.get("qty") or 0)
                         old_exact_amount = _exact_broker_cumulative_notional(
