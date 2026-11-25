@@ -6,6 +6,8 @@ on:
       - "trader/kr/opening_bar_contract.py"
       - "trader/kr/entry_opportunity_v2.py"
       - "trader/kr/entry_opportunity_v3.py"
+      - "trader/kr/entry_timing_price.py"
+      - "tests/kr/test_kr_20261113_pb1_native_volume_rescue.py"
       - "trader/kr/entry_priority_queue.py"
       - "trader/kr/kis_observer_budget.py"
       - "trader/kis_wrapper.py"
@@ -91,4 +93,5 @@ jobs:
             tests/kr/test_kr_20261110_timing_activation_cjenm.py \
             tests/kr/test_kr_20261124_recurring_execution.py \
             tests/kr/test_kr_20261124_closed_cycle_claim_recovery.py \
+            tests/kr/test_kr_20261113_pb1_native_volume_rescue.py \
             tests/kr/test_kr_pb1_minute_20261125_adaptive_entry.py
