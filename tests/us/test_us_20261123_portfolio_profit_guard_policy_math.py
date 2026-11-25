@@ -368,3 +368,249 @@ def test_trading_basis_marks_open_and_closed_lots_without_inventing_costs():
         verified_sleeve_pnl(rows+rows[:1], [_position()], **kwargs)
     with pytest.raises(ValueError, match="TRADING_MODE_CASH_INPUT_FORBIDDEN"):
         verified_sleeve_pnl(rows, [_position()], cash_events=[], **kwargs)
+
+
+
+# Original archived native economics must never be assigned a retroactive
+# portfolio identity. These are credential-free fixtures; no original rows
+# or strategy settings from production are embedded.
+def _legacy_guard_fixture(symbol="KO", *, close=False):
+    from datetime import date
+    from trader.us.entry_exit_contract import build_us_entry_exit_contract
+    from trader.us.portfolio_guard_original_ledger import legacy_management_cycle
+    raw = "synthetic-legacy-guard-account"
+    account = hashlib.sha256(raw.encode()).hexdigest()
+    original = "original-runtime-cycle-" + symbol
+    day = "2026-10-27"
+    contract = build_us_entry_exit_contract({
+        "symbol": symbol, "strategy_owner": "US_STANDARD",
+        "book": "SWING_BOOK", "horizon": "SWING_CARRY",
+        "entry_reason": "TEST_ORIGINAL_BUY",
+    })
+    digest = contract["sha256"]
+    management = legacy_management_cycle(
+        raw_account=raw, epoch=EPOCH, portfolio=PORT,
+        original_cycle=original, symbol=symbol, contract_sha=digest,
+    )
+    fills, orders = [], []
+
+    def add(side, qty, price, order_no, when, meta, scoped=False):
+        common = {"symbol": symbol, "side": side, "trade_date": when,
+                  "order_no": order_no, "client_order_key": "key-" + order_no,
+                  "account_id": account if scoped else None,
+                  "portfolio_epoch_id": PORT if scoped else None,
+                  "position_cycle_id": management if scoped else None,
+                  "trading_epoch_id": EPOCH}
+        meta = {"strategy_owner": "US_STANDARD", "is_synthetic": False,
+                "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+                "trading_epoch_id": EPOCH, **meta}
+        import copy
+        fills.append({**common, "qty": qty, "price_usd": price, "meta": copy.deepcopy(meta)})
+        orders.append({**common, "qty_requested": qty, "qty_filled": qty,
+                       "avg_price_usd": price, "env": "practice", "dry_run": False,
+                       "status": "FILLED", "meta": copy.deepcopy(meta)})
+
+    add("BUY", 10, "100", "000101", day, {
+        "position_lifecycle_id": "ENTRY:US_STANDARD:" + symbol,
+        "entry_exit_contract": contract, "entry_exit_contract_sha256": digest,
+    })
+    add("SELL", 2, "110", "102", "2026-11-02", {
+        "position_lifecycle_id": original, "source_entry_contract_sha256": digest,
+    })
+    add("SELL", 8 if close else 3, "120", "103", "2026-11-20", {
+        "position_lifecycle_id": management, "position_cycle_id": management,
+        "portfolio_epoch_id": PORT, "broker_account_hash": account,
+        "forward_management_not_original_buy": True, "automated_sell_authorized": True,
+        "us_legacy_forward_management_version": "US_LEGACY_NINE_V2_SELL_V1",
+        "source_original_runtime_lifecycle_id": original,
+        "source_original_buy_date": day, "source_original_buy_order_no": "101",
+        "source_original_entry_exit_contract_sha256": digest,
+    }, scoped=True)
+    histories = [{"symbol": symbol, "trading_epoch_id": EPOCH, "lifecycle": {
+        "lifecycle_id": original, "opened_trade_date": day, "account_id": raw,
+        "trading_epoch_id": EPOCH, "strategy_owner": "US_STANDARD",
+        "env": "practice", "is_open": True,
+    }}]
+    args = dict(raw_account=raw, epoch=EPOCH, portfolio=PORT,
+                portfolio_start_day=date(2026, 11, 4))
+    return fills, orders, histories, args, management
+
+
+def test_legacy_original_and_forward_economics_proven_without_retroactive_scope():
+    from trader.us.portfolio_guard_original_ledger import prove_legacy_epoch_fills, fill_key
+    rows, orders, histories, args, cycle = _legacy_guard_fixture()
+    keyed, groups = prove_legacy_epoch_fills(rows, orders, histories, **args)
+    assert len(keyed) == 3
+    assert groups["KO"]["net_qty"] == 5
+    assert all(group["management_cycle"] == cycle for group in keyed.values())
+    assert keyed[fill_key(rows[0])]["original_cycle"] == histories[0]["lifecycle"]["lifecycle_id"]
+    assert rows[0]["account_id"] is None
+    assert rows[0]["portfolio_epoch_id"] is None
+    assert rows[0]["position_cycle_id"] is None
+    assert rows[2]["position_cycle_id"] == cycle
+
+
+def test_closed_original_and_new_canonical_buy_same_symbol_remain_separate():
+    from trader.us.portfolio_guard_original_ledger import prove_legacy_epoch_fills, fill_key
+    rows, orders, histories, args, cycle = _legacy_guard_fixture("ABBV", close=True)
+    rows.append({**rows[0], "trade_date": "2026-11-23", "order_no": "104",
+                 "client_order_key": "new-buy", "account_id": hashlib.sha256(args["raw_account"].encode()).hexdigest(),
+                 "portfolio_epoch_id": PORT, "position_cycle_id": "new-native-cycle"})
+    keyed, groups = prove_legacy_epoch_fills(rows, orders, histories, **args)
+    assert groups["ABBV"]["net_qty"] == 0
+    assert groups["ABBV"]["management_cycle"] == cycle
+    assert fill_key(rows[-1]) not in keyed
+
+
+@pytest.mark.parametrize("mutation,reason", [
+    ("missing_order", "ORIGINAL_ORDER_NOT_UNIQUE"),
+    ("duplicate_order", "ORIGINAL_ORDER_NOT_UNIQUE"),
+    ("wrong_price", "ORIGINAL_ORDER_ECONOMICS_MISMATCH"),
+    ("foreign_history", "ORIGINAL_RUNTIME_ACCOUNT_OR_CYCLE_CONFLICT"),
+    ("wrong_forward", "FORWARD_SELL_SOURCE_CONFLICT"),
+    ("partial_scope", "PARTIAL_SCOPE_UNVERIFIED"),
+    ("synthetic", "NATIVE_EVIDENCE_INVALID"),
+    ("tampered_buy", "ORIGINAL_BUY_CONTRACT_INVALID"),
+    ("wrong_legacy_sell", "ARCHIVED_SELL_SOURCE_CONFLICT"),
+    ("wrong_legacy_date", "BUY_NOT_PREPORTFOLIO"),
+])
+def test_legacy_proof_rejects_conflicting_or_unverified_sources(mutation, reason):
+    from trader.us.portfolio_guard_original_ledger import prove_legacy_epoch_fills
+    rows, orders, histories, args, _ = _legacy_guard_fixture()
+    if mutation == "missing_order":
+        orders.pop(0)
+    elif mutation == "duplicate_order":
+        orders.append(dict(orders[0]))
+    elif mutation == "wrong_price":
+        orders[1]["avg_price_usd"] = "111"
+    elif mutation == "foreign_history":
+        histories[0]["lifecycle"]["account_id"] = "other-account"
+    elif mutation == "wrong_forward":
+        rows[2]["meta"]["source_original_buy_order_no"] = "999"
+    elif mutation == "partial_scope":
+        rows[0]["portfolio_epoch_id"] = PORT
+    elif mutation == "synthetic":
+        rows[1]["meta"]["is_synthetic"] = True
+    elif mutation == "tampered_buy":
+        rows[0]["meta"]["entry_exit_contract"]["sha256"] = "bad"
+    elif mutation == "wrong_legacy_sell":
+        rows[1]["meta"]["position_lifecycle_id"] = "other-original-cycle"
+        orders[1]["meta"]["position_lifecycle_id"] = "other-original-cycle"
+    elif mutation == "wrong_legacy_date":
+        from datetime import date
+        args["portfolio_start_day"] = date(2026, 10, 27)
+    with pytest.raises(ValueError, match=reason):
+        prove_legacy_epoch_fills(rows, orders, histories, **args)
+
+
+def test_legacy_history_scope_requires_explicit_signed_trading_basis():
+    from trader.us.portfolio_profit_guard import LEGACY_ACCOUNTING_SCOPE, TRADING_ACCOUNTING_METHOD
+    signed = _policy()
+    signed["legacy_accounting_scope"] = LEGACY_ACCOUNTING_SCOPE
+    with pytest.raises(ValueError, match="SIGNATURE_INVALID"):
+        _authorize(signed)
+    signed.pop("hmac_sha256")
+    signed["hmac_sha256"] = hmac.new(KEY.encode(), canonical(signed), hashlib.sha256).hexdigest()
+    with pytest.raises(ValueError, match="LEGACY_ACCOUNTING_SCOPE_UNVERIFIED"):
+        _authorize(signed)
+    signed.pop("hmac_sha256")
+    signed["accounting_method"] = TRADING_ACCOUNTING_METHOD
+    signed["hmac_sha256"] = hmac.new(KEY.encode(), canonical(signed), hashlib.sha256).hexdigest()
+    assert _authorize(signed)[0]["legacy_accounting_scope"] == LEGACY_ACCOUNTING_SCOPE
+
+
+def test_runtime_portfolio_guard_legacy_ledger_to_canonical_intent(monkeypatch):
+    from contextlib import contextmanager
+    from trader import account_state
+    from trader.us.db import repos
+    from trader.us.execution import recovery_identity, us_legacy_nine_active_sell as legacy
+    from trader.us import portfolio_profit_guard_store as store
+    from trader.us.portfolio_profit_guard import LEGACY_ACCOUNTING_SCOPE, TRADING_ACCOUNTING_METHOD
+    from trader.us.portfolio_guard_original_ledger import prove_legacy_epoch_fills
+
+    rows, orders, histories, args, cycle = _legacy_guard_fixture()
+    _, groups = prove_legacy_epoch_fills(rows, orders, histories, **args)
+    group = groups["KO"]
+    account = hashlib.sha256(args["raw_account"].encode()).hexdigest()
+
+    class Result:
+        def __init__(self, rows): self.rows = rows
+        def mappings(self): return self
+        def all(self): return self.rows
+
+    class Conn:
+        def execute(self, query, params):
+            sql = str(query)
+            if "SELECT DISTINCT symbol FROM public.us_orders" in sql:
+                return Result([])
+            if "FROM public.us_execution_claims" in sql:
+                return Result([])
+            if "FROM public.us_fills" in sql:
+                return Result(rows)
+            if "SELECT started_at FROM public.portfolio_epochs" in sql:
+                return Result([{"started_at": datetime(2026,11,4,tzinfo=timezone.utc)}])
+            if "FROM public.us_orders" in sql:
+                return Result(orders)
+            if "FROM public.us_position_risk_state" in sql:
+                return Result(histories)
+            raise AssertionError(sql)
+
+    class Engine:
+        @contextmanager
+        def begin(self): yield Conn()
+
+    for key, val in {"US_PORTFOLIO_GUARD_ACTIVE":"1", "KIS_ENV":"practice",
+                     "US_WS_COLLECTOR_ENABLED":"1", "US_SHARED_KIS_LIMITER_ENABLED":"1"}.items():
+        monkeypatch.setenv(key, val)
+    monkeypatch.setattr(account_state, "get_account_key", lambda **kw: args["raw_account"])
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda *a, **kw: EPOCH)
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: Engine())
+    monkeypatch.setattr(recovery_identity, "current_us_portfolio_epoch", lambda *a, **kw: PORT)
+    # Confirm the shared production forward scope computes the same identity.
+    assert legacy._verified_prospective_legacy_scope(
+        Conn(), evidence={"original_cycle": group["original_cycle"], "v2_sha": group["contract_sha"]},
+        symbol="KO", raw_account=args["raw_account"], epoch=EPOCH,
+    ) == (PORT, cycle, account)
+    monkeypatch.setattr(legacy, "_evidence_from_db", lambda *a, **kw: ({
+        "original_cycle": group["original_cycle"], "v2_sha": group["contract_sha"],
+        "source_buy_day": group["buy_day"], "source_buy_order": group["buy_order_no"],
+        "holding": 5, "old_unresolved": [], "zero_fill_sell_proofs": [],
+    }, "DB_LEGACY_EVIDENCE_VERIFIED"))
+    policy = _policy()
+    policy.pop("hmac_sha256")
+    policy.update(account_hash=account, accounting_method=TRADING_ACCOUNTING_METHOD,
+                  legacy_accounting_scope=LEGACY_ACCOUNTING_SCOPE)
+    monkeypatch.setattr(store, "_get_policy", lambda *a, **kw: (policy, "f"*64))
+    monkeypatch.setattr("trader.marketdata.us_ws_collector.get_quote", lambda *a, **kw: {
+        "bid": "105", "received_at": datetime.now(timezone.utc).timestamp(),
+    })
+    captured = []
+    def reserve(conn, **kwargs):
+        captured.append(kwargs)
+        return {"state":"PLANNED", "intents":[{"symbol":"KO", "position_cycle_id":cycle,
+                 "action_key":"US_PPG_synthetic", "episode_id":"ep", "stage_no":1, "qty":1}]}
+    monkeypatch.setattr(store, "persist_guard_observation_and_reserve", reserve)
+    original = {"symbol":"KO", "qty":5, "orderable_qty":5, "strategy_owner":"US_STANDARD",
+                "meta":{"entry_exit_contract":group["contract"],
+                        "entry_exit_contract_sha256":group["contract_sha"],
+                        "position_lifecycle_id":group["original_cycle"]}}
+    kwargs = dict(current_positions=[original], trade_date="2026-11-24", env="practice",
+                  authoritative_native_balance=True, excluded_sell_symbols=set())
+    output = store.build_authorized_portfolio_guard_intents(**kwargs)
+    # 2*110 + 3*120 + 5*105 - 10*100 = $105, before costs.
+    assert captured[0]["verified_pnl_usd"] == Decimal("105")
+    assert captured[0]["verified_accounting"]["legacy_fill_count"] == 3
+    assert captured[0]["native_verified_sold_qty_by_cycle"] == {cycle:5}
+    assert output[0]["meta"]["forward_management_not_original_buy"] is True
+    assert output[0]["meta"]["source_original_runtime_lifecycle_id"] == group["original_cycle"]
+    assert output[0]["meta"].get("automated_sell_authorized") is not True
+    assert output[0]["position_cycle_id"] == cycle
+    assert original.get("position_cycle_id") is None
+    assert original["meta"]["position_lifecycle_id"] == group["original_cycle"]
+    # Unapproved scope and balance mismatch never reach reservation.
+    policy.pop("legacy_accounting_scope")
+    assert store.build_authorized_portfolio_guard_intents(**kwargs) == []
+    policy["legacy_accounting_scope"] = LEGACY_ACCOUNTING_SCOPE
+    original["qty"] = 4
+    assert store.build_authorized_portfolio_guard_intents(**kwargs) == []
+    assert len(captured) == 1
