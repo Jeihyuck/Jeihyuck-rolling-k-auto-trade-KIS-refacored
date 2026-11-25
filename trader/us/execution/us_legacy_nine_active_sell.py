@@ -510,7 +510,7 @@ def verified_legacy_snapshot_context(conn, *, position: dict, trade_date: str,
             return None
     management = _json(contract.get("management"))
     return {
-        "strategy_owner": "US_STANDARD", "account_id": account,
+        "strategy_owner": "US_STANDARD", "account_id": account, "env": "practice",
         "trading_epoch_id": active_epoch,
         "position_lifecycle_id": evidence["original_cycle"],
         "entry_exit_contract": contract, "entry_exit_contract_sha256": evidence["v2_sha"],
