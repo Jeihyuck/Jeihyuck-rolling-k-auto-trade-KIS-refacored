@@ -19,7 +19,7 @@ import time
 from trader.account_state import get_account_key
 from trader.kr.opening_bar_contract import (
     KST, save_opening_proof, load_opening_proof, inspect_completed_bar_coverage,
-    diagnose_native_bar_rows,
+    diagnose_native_bar_rows, _source_time,
 )
 from trader.runtime_paths import repo_root
 from trader.time_utils import now_kst
@@ -289,6 +289,34 @@ def _recent_repair_due(code: str) -> bool:
     return True
 
 
+def _request_completed_rows(rows, requested_at):
+    """An in-progress candle cannot become completed while other I/O runs.
+
+    Retain malformed rows for the existing diagnostics, but exclude a
+    same-session current/future minute based on the request's original clock.
+    Preserve the raw HTTP observation ID and all native values.
+    """
+    requested_at = requested_at.astimezone(KST)
+    minute = requested_at.replace(second=0, microsecond=0)
+    accepted = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        stamp = _source_time(row, requested_at.date().isoformat())
+        if stamp is not None and stamp >= minute:
+            continue
+        accepted.append(row)
+    return accepted
+
+
+def _stale_minute_anchor(coverage, observed_at):
+    """Explicit completed-minute close boundary after a stale observation."""
+    if (coverage.get("reason") != "COMPLETED_BAR_STALE"
+            and coverage.get("native_post_open_window_reason") != "COMPLETED_BAR_STALE"):
+        return None
+    return observed_at.astimezone(KST).replace(second=0, microsecond=0).strftime("%H%M%S")
+
+
 def run_once(*, kis, codes: list[str], observed_at: datetime,
              sleep_between: float = 0.8, refresh_clock=None) -> dict:
     """No order methods are called; all I/O is read-only KIS and local proofs."""
@@ -346,6 +374,7 @@ def run_once(*, kis, codes: list[str], observed_at: datetime,
             recent_anchor = _recent_gap_anchor(
                 opening_coverage, (stored or {}).get("bars") or [], observed_at,
             )
+            recent_anchor = recent_anchor or _stale_minute_anchor(opening_coverage, observed_at)
             if recent_anchor and recent_anchor not in anchors and _recent_repair_due(code):
                 anchors.append(recent_anchor)
                 logger.info("[KR][OPENING_OBSERVER][RECENT_GAP_REPAIR] code=%s anchor=%s", code, recent_anchor)
@@ -369,6 +398,9 @@ def run_once(*, kis, codes: list[str], observed_at: datetime,
             data: list[dict] = []
             for anchor in dict.fromkeys(anchors):
                 try:
+                    request_at = (refresh_clock().astimezone(KST) if refresh_clock else observed_at)
+                    if request_at.date() != session_date:
+                        break
                     minute_requests += 1
                     try:
                         rows = kis.get_intraday_candles_today(
@@ -383,7 +415,10 @@ def run_once(*, kis, codes: list[str], observed_at: datetime,
                             code, start_hhmm=anchor,
                         )
                     if isinstance(rows, list):
-                        data.extend(row for row in rows if isinstance(row, dict))
+                        accepted = _request_completed_rows(rows, request_at)
+                        logger.info("[KR][OPENING_OBSERVER][REQUEST_BOUNDARY] code=%s anchor=%s request_at=%s accepted=%s excluded=%s",
+                                    code, anchor, request_at.isoformat(), len(accepted), len(rows)-len(accepted))
+                        data.extend(accepted)
                 except Exception as minute_exc:
                     native_request_failures += 1
                     logger.warning(
@@ -454,6 +489,7 @@ def run_once(*, kis, codes: list[str], observed_at: datetime,
             if (coverage["reason"] == "OPENING_BARS_MISSING_OR_INCOMPLETE"
                     and repair_due):
                 try:
+                    repair_at = (refresh_clock().astimezone(KST) if refresh_clock else observed_at)
                     minute_requests += 1
                     try:
                         repair_rows = kis.get_intraday_candles_today(
@@ -469,7 +505,7 @@ def run_once(*, kis, codes: list[str], observed_at: datetime,
                         result = save_opening_proof(
                             env="practice", account_scope=scope, code=code,
                             now=proof_now,
-                            raw_bars=[row for row in repair_rows if isinstance(row, dict)],
+                            raw_bars=_request_completed_rows(repair_rows, repair_at),
                             vwap=vwap if verified_vwap else None,
                             vwap_source=("KIS_NATIVE_WEIGHTED_AVG"
                                          if verified_vwap else "UNKNOWN"),

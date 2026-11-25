@@ -2377,6 +2377,17 @@ class KisAPI:
         except Exception as e:
             logger.error(f"[토큰 재발급 실패] {e}")
 
+    # Domestic cash orders: KIS official sample makes hashkey optional.
+    # Practice endpoint explicitly returned EGW00318 on 2026-11-25.
+    # Keep other markets/environments and unknown endpoints unchanged.
+    def _domestic_cash_order_hashkey(self, body_dict: dict) -> str | None:
+        if (str(self.env).lower() == "practice"
+                and str(API_BASE_URL).rstrip("/") == "https://openapivts.koreainvestment.com:29443"
+                and os.getenv("KR_PRACTICE_ORDER_HASHKEY_REQUIRED", "0") == "0"):
+            logger.info("[KIS][ORDER][HASHKEY_OMITTED] scope=KR_PRACTICE_CASH reason=OPTIONAL_KIS_CONTRACT")
+            return None
+        return self._create_hashkey(body_dict)
+
     # HashKey
     def _create_hashkey(self, body_dict: dict) -> str:
         url = f"{API_BASE_URL}/uapi/hashkey"
@@ -4987,7 +4998,7 @@ class KisAPI:
 
                 # HashKey
                 try:
-                    hk = self._create_hashkey(body)
+                    hk = self._domestic_cash_order_hashkey(body)
                 except Exception as e:
                     logger.error(f"[ORDER_HASH_FAIL] body={body} ex={e}")
                     last_err = e
@@ -5342,7 +5353,7 @@ class KisAPI:
         }
         payload_price = int(body["ORD_UNPR"])
         assert isinstance(payload_price, int) and payload_price % tick_size == 0
-        hk = self._create_hashkey(body)
+        hk = self._domestic_cash_order_hashkey(body)
         tr_list = _pick_tr(self.env, "ORDER_BUY")
         if not tr_list:
             raise Exception("ORDER_BUY TR 미구성")
@@ -5482,7 +5493,7 @@ class KisAPI:
             "ORD_UNPR": str(int(price)),
             "EXCG_ID_DVSN_CD": "KRX",
         }
-        hk = self._create_hashkey(body)
+        hk = self._domestic_cash_order_hashkey(body)
         tr_list = _pick_tr(self.env, "ORDER_SELL")
         if not tr_list:
             raise Exception("ORDER_SELL TR 미구성")

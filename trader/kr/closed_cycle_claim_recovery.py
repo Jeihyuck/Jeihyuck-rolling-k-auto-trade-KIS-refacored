@@ -109,8 +109,14 @@ def prove_closed_rejected_sell(*, claim, position, orders, fills, attempts,
             response = _mapping(order.get("response_json"))
             exec_meta = _mapping(response.get("_order_execution"))
             request = _mapping(order.get("request_json"))
+            # Older journal rows used the local client key as broker_order_id
+            # even for explicit pre-acceptance rejects. Only that exact alias
+            # is admissible; any native or other ID remains a hard blocker.
+            stored_id = str(order.get("broker_order_id") or "")
+            local_alias = (stored_id == key and key.startswith(f"{env}:")
+                           and ":EXIT:SELL:" in key)
             if (order.get("side") != "SELL" or order.get("status") not in {"ERROR", "REJECTED"}
-                    or order.get("kis_odno") or order.get("broker_order_id")
+                    or order.get("kis_odno") or (stored_id and not local_alias)
                     or str(response.get("rt_cd")) != "1" or exec_meta.get("accepted") is not False
                     or exec_meta.get("broker_order_id") or exec_meta.get("code") != code
                     or exec_meta.get("side") != "SELL"

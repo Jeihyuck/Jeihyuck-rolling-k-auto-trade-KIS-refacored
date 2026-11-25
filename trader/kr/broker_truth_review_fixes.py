@@ -315,12 +315,24 @@ def _recover_proven_policy_positions_fixed(
         if code == base.KR_INFINITE_SYMBOL:
             review.append(code)
             foreign_owner_review.append(code)
+            broker_qty = int((kis.get(code) or {}).get("qty") or 0)
+            # A matching imported PB1 mirror is not a signed PB1 position.
+            # Still require exact Infinite provenance before clearing review.
+            mirror = code_positions[0] if len(code_positions) == 1 else {}
+            legacy_mirror = (
+                str(mirror.get("position_origin") or "").upper() == "IMPORTED"
+                and broker_qty > 0
+                and int(mirror.get("qty") or 0) == broker_qty
+                and not base._json_dict(mirror.get("entry_exit_plan_json"))
+                and str(mirror.get("exit_policy_family") or "").upper() in {"", "POLICY_MISSING"}
+            )
             logger.error(
                 "[KR_BROKER_TRUTH][FOREIGN_STRATEGY_OWNER_REVIEW] "
                 "code=%s declared_owner=%s reserved_owner=%s "
-                "broker_qty=%s action=NO_PB1_RECOVERY",
-                code, strategy, base.KR_INFINITE_STRATEGY_ID,
-                int((kis.get(code) or {}).get("qty") or 0),
+                "broker_qty=%s reason=%s action=NO_PB1_RECOVERY",
+                code, strategy, base.KR_INFINITE_STRATEGY_ID, broker_qty,
+                "LEGACY_MIRROR_PROVENANCE_UNVERIFIED" if legacy_mirror
+                else "RESERVED_OWNER_POSITION_CONFLICT",
             )
             continue
         if len(code_positions) != 1:

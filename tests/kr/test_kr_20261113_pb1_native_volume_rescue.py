@@ -132,3 +132,14 @@ def test_real_account_does_not_enable_practice_fallback(monkeypatch):
     engine.env = "real"
     assert _run(engine, cf)["confirmation_state"] == "UNKNOWN"
     assert calls == []
+
+
+def test_native_breakout_quote_proves_data_but_not_missing_trigger(monkeypatch):
+    calls = []
+    engine, cf = _fixture(monkeypatch, lambda code: calls.append(code) or _native())
+    result = _run(engine, cf, style="ENTRY_BREAKOUT", trigger_ok=False)
+    assert calls == ["219130"]
+    assert result["confirmation_state"] == "FAILED", result
+    assert result["failure_reason"] == "breakout_price_trigger_missing"
+    assert result["initial_quote_evidence_failure"] == "kis_exchange_quote_time_missing"
+    assert result["independent_native_trade_row"] is True

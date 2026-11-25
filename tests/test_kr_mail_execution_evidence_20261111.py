@@ -117,3 +117,62 @@ def test_nov16_close_reports_samsung_today_settled_separately_from_kodex_history
     assert result["close_historical_priced_sell_gap_count"] == 2
     assert "TODAY_SETTLEMENT=TODAY_ECONOMIC_SETTLED" in result["execution_summary"]
     assert "HISTORICAL_SETTLEMENT=HISTORICAL_ECONOMIC_PENDING" in result["execution_summary"]
+
+
+def test_watchdog_alerts_reported_for_exact_current_session_only(tmp_path):
+    trade = "2026-11-11"
+    m = _manifest()
+    for row in m["sessions"].values():
+        row["attempts"][0].update(status="OK",reason="SESSION_END")
+    _write(tmp_path, f"runtime/logs/kr/{trade}/session-manifest.json", m)
+    _write(tmp_path, f"runtime/kr/session/{trade}/close/pb1_result.json",
+           {"economic_settlement_state":"COMPLETE","native_priced_sell_gap_count":0})
+    warning = {"date":trade,"session":"am","run_id":"am-1",
+               "alerts":["TICK_COMPLETION_STALE"]}
+    other = dict(warning, run_id="older", alerts=["SESSION_PARENT_EXITED_WITHOUT_TERMINAL"])
+    _write(tmp_path, f"runtime/logs/kr/{trade}/am/am-1.watchdog.log",
+           "\n".join("[KR][SESSION_WATCHDOG] "+json.dumps(x) for x in [warning,other]))
+    report = _helper().collect_kr_execution_status(tmp_path, trade)
+    assert report["daily_execution_status"] == "COMPLETED"
+    assert report["watchdog_alerts"] == {"am":["TICK_COMPLETION_STALE"]}
+    assert "AM_WATCHDOG=TICK_COMPLETION_STALE" in report["execution_summary"]
+
+
+def test_effective_success_does_not_hide_later_failed_attempt(tmp_path):
+    trade = "2026-11-11"
+    m = _manifest()
+    for row in m["sessions"].values():
+        row["attempts"][0].update(status="OK", reason="SESSION_END")
+    m["sessions"]["am"]["attempts"].append(
+        {"run_id": "am-2", "status": "FAILED", "reason": "EXIT_CODE_1"})
+    _write(tmp_path, f"runtime/logs/kr/{trade}/session-manifest.json", m)
+    _write(tmp_path, f"runtime/kr/session/{trade}/close/pb1_result.json",
+           {"economic_settlement_state":"COMPLETE","native_priced_sell_gap_count":0})
+    report = _helper().collect_kr_execution_status(tmp_path, trade)
+    assert report["execution_sessions"]["am"]["status"] == "OK"
+    assert report["latest_recorded_attempts"]["am"]["status"] == "FAILED"
+    assert report["daily_execution_status"] == "FAILED"
+    assert "AM_LATEST_ATTEMPT=FAILED:EXIT_CODE_1" in report["execution_summary"]
+    m["sessions"]["am"]["attempts"][-1].update(status="RUNNING")
+    _write(tmp_path, f"runtime/logs/kr/{trade}/session-manifest.json", m)
+    assert _helper().collect_kr_execution_status(tmp_path, trade)["daily_execution_status"] == "DEGRADED"
+    m["sessions"]["am"]["attempts"][-1].update(status="SKIP_DUPLICATE")
+    _write(tmp_path, f"runtime/logs/kr/{trade}/session-manifest.json", m)
+    assert _helper().collect_kr_execution_status(tmp_path, trade)["daily_execution_status"] == "COMPLETED"
+
+
+def test_pre_submit_latency_is_measured_but_not_hot_cadence_proof():
+    def event(code, stamp, ms):
+        return (f"[KR][ENTRY][DECISION_LATENCY] code={code} style=PULLBACK "
+                f"decision_at={stamp} latest_bar_ts=None eval_elapsed_ms={ms} state=WAIT reason=WAIT")
+    a = event("293490", "2026-11-25T09:10:00+09:00", 10)
+    b = event("293490", "2026-11-25T09:11:10+09:00", 30)
+    c = event("059090", "2026-11-25T09:10:05+09:00", 20)
+    bad = event("059090", "2026-11-24T09:10:05+09:00", 1)
+    nan = event("059090", "2026-11-25T09:10:06+09:00", "nan")
+    report = _helper()._entry_timing_observations([a,b,c,a,bad,nan], "2026-11-25")
+    assert report["evaluation_elapsed_ms"] == {"samples":3, "p50":20, "p95":30, "max":30}
+    assert report["same_symbol_observed_gap_sec"]["max"] == 70
+    assert report["invalid_or_duplicate_samples"] == 3
+    assert report["hot_60s_acceptance"] == "NOT_PROVEN"
+    assert _helper()._entry_timing_observations([], "2026-11-25")["evaluation_elapsed_ms"]["p95"] is None

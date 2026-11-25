@@ -3896,7 +3896,22 @@ class PB1Engine:
                 price_above_vwap=cf.features.get("above_vwap"),
                 daily_source=str((daily_meta or {}).get("source") or "UNKNOWN"),
             )
-            if native.get("confirmation_state") == "VERIFIED":
+            # A complete authenticated native quote can prove the data even
+            # when the owner BREAKOUT price trigger is explicitly false.
+            # Keep FAILED (never VERIFIED) in that case, instead of retaining
+            # the obsolete missing-clock UNKNOWN forever.
+            native_policy_wait = (
+                native.get("confirmation_state") == "FAILED"
+                and native.get("failure_reason") == "breakout_price_trigger_missing"
+                and native.get("quote_source") == "KIS_REST_TIME_ITEMCONCLUSION"
+                and native.get("quote_identity_attestation") == "AUTHENTICATED_REST_REQUEST"
+                and bool(native.get("quote_as_of"))
+                and native.get("quote_transport_age_seconds") is not None
+                and native.get("exchange_quote_age_seconds") is not None
+                and native.get("intraday_cumulative_volume") is not None
+                and not trigger_ok
+            )
+            if native.get("confirmation_state") == "VERIFIED" or native_policy_wait:
                 native["initial_quote_evidence_failure"] = initial_reason
                 native["independent_native_trade_row"] = True
                 proof = native
@@ -5943,6 +5958,7 @@ class PB1Engine:
             )
         if _timing_eligible:
             _timing_now = now_kst()
+            _timing_started = time.monotonic()
             _timing = evaluate_proof_for_candidate(
                 env=self.env,
                 account_scope=get_account_key(env=self.env),
@@ -5976,6 +5992,11 @@ class PB1Engine:
                 _timing = {**_timing, "live_quote_validation": _quote_check}
                 if _quote_check["state"] != "READY":
                     _timing.update(state=_quote_check["state"], reason=_quote_check["reason"])
+            logger.info(
+                "[KR][ENTRY][DECISION_LATENCY] code=%s style=%s decision_at=%s latest_bar_ts=%s eval_elapsed_ms=%.1f state=%s reason=%s",
+                cf.code, _timing_style, now_kst().isoformat(), _timing.get("latest_bar_ts"),
+                1000.0 * (time.monotonic() - _timing_started), _timing.get("state"), _timing.get("reason"),
+            )
             # Preserve the actual pre-submit timing verdict in the existing
             # candidate evaluation/ORDER_SKIP payload for later read-only audits.
             # This does not authorize trades or alter owner strategy thresholds.
@@ -5992,6 +6013,9 @@ class PB1Engine:
                     # 0.5% slippage vs symmetric 0.4% gate investigation.
                     # These observations do NOT relax or authorize BUY.
                     "entry_policy": _timing.get("entry_policy", "LEGACY_V1"),
+                    "adaptive_revision": _timing.get("adaptive_revision"),
+                    "rebound_pattern": _timing.get("rebound_pattern"),
+                    "diagnostic_entry_ceiling": _timing.get("diagnostic_entry_ceiling"),
                     "reference_source": _timing.get("reference_source"),
                     "recent_closes": _timing.get("recent_closes"),
                     "recent_lows": _timing.get("recent_lows"),
@@ -11433,7 +11457,11 @@ class PB1Engine:
         # Keep the 0.4% symmetric price gate while avoiding the mechanical
         # +0.5% prpr buffer. Only verified, fresh, scope-matched KIS evidence
         # can LOWER the final LIMIT; a missing/unsafe quote cannot reprice.
-        if isinstance(cf.features, dict) and cf.features.get("order_price_source") == "prpr_slippage":
+        if isinstance(cf.features, dict) and (
+            cf.features.get("order_price_source") == "prpr_slippage"
+            or (cf.features.get("order_price_source") == "ask"
+                and os.getenv("KR_PB1_ADAPTIVE_ENTRY_V3_ENABLED", "0") == "1")
+        ):
             from trader.kr.entry_timing_price import (
                 maybe_bound_pb1_prpr_fallback,
                 apply_verified_bounded_limit,
@@ -15961,20 +15989,34 @@ class PB1Engine:
         from datetime import timedelta
         start_date = end_date - timedelta(days=max(days, 90))
 
+        # Consult the same TTL cache *before* opening a DB connection.
+        # Previously every tick downloaded all 30 daily histories even when
+        # the existing consumer immediately discarded all cached rows.
+        # No change to the cache key/TTL, data normalization or selection.
+        pending_codes = []
+        hit = 0
+        for code in dict.fromkeys(kr_codes):
+            if daily_cache.get(("daily", code, days)) is not None:
+                hit += 1
+            else:
+                pending_codes.append(code)
+        if not pending_codes:
+            logger.info("[KR][PB1][OHLCV][BATCH_PRELOAD][CACHE_ONLY] hit=%s db_queries=0 elapsed=%.3f",
+                        hit, time.monotonic()-t_start)
+            return
         try:
             engine = make_engine()
-            bulk_map = load_price_daily_bulk(engine, kr_codes, start_date, end_date)
+            bulk_map = load_price_daily_bulk(engine, pending_codes, start_date, end_date)
         except Exception as exc:
             logger.warning("[KR][PB1][OHLCV][BATCH_PRELOAD][ERROR] err=%s", exc)
             return
 
-        hit = 0
         miss = 0
-        for code in kr_codes:
+        for code in pending_codes:
             candles = bulk_map.get(code) or []
             cache_key = ("daily", code, days)
             if daily_cache.get(cache_key) is not None:
-                # 이미 캐시에 있으면 건너뜀
+                # Another reader may have filled the cache during the query.
                 hit += 1
                 continue
             if not candles:
@@ -16433,6 +16475,25 @@ class PB1Engine:
         logger.info("[ENTRY][STYLE_GATE][VCP]%s code=%s ok=%s vcp_score=%s rs=%s atr_pct=%s reasons=%s", "" if ok else "[REJECT]", code, int(ok), vcp, rs, atr, reasons)
         return ok, reasons, {"setup_source": "entry_style_vcp", "entry_reason": "ENTRY_VCP", "decision_family": "ENTRY_VCP"}
 
+    def _compute_kr_daily_features_cached(self, code: str, df, *, min_candles: int) -> dict:
+        """Memoize only the pure daily feature calculation, never an entry verdict."""
+        import hashlib
+        from trader.cache_ttl import daily_cache
+        try:
+            # Every input used by the pure compute_features function participates.
+            # The frame is not modified; changed rows/columns/dtypes invalidate.
+            digest = hashlib.sha256(pd.util.hash_pandas_object(df, index=True).values.tobytes()).hexdigest()
+            key = ("kr_pb1_pure_daily_features_v1", code, int(min_candles),
+                   tuple(str(x) for x in df.columns), tuple(str(x) for x in df.dtypes), digest)
+            cached = daily_cache.get(key)
+        except Exception:
+            return compute_pb1_features(df, min_candles=min_candles)
+        if isinstance(cached, dict):
+            return dict(cached)
+        result = compute_pb1_features(df, min_candles=min_candles)
+        daily_cache.set(key, dict(result), 1800)
+        return result
+
     def _compute_candidates_from_codes(self, codes: list[str]) -> list[CandidateFeature]:
         # ── [KR][PB1] scope guard + batch OHLCV preload ─────────────────────
         # 한국장 PB1 trade 모드일 때 final30 코드 전체를 단일 DB 커넥션으로
@@ -16531,7 +16592,12 @@ class PB1Engine:
                             )
                             continue
                     else:
-                        fresh_features = compute_pb1_features(df, min_candles=min(self.min_candles, max(20, len(df))))
+                        _minimum = min(self.min_candles, max(20, len(df)))
+                        fresh_features = (
+                            self._compute_kr_daily_features_cached(code, df, min_candles=_minimum)
+                            if _kr_pb1_scope and str(getattr(self, "env", "")).lower() == "practice"
+                            else compute_pb1_features(df, min_candles=_minimum)
+                        )
                         self._merge_non_missing(
                             merged_features,
                             fresh_features,

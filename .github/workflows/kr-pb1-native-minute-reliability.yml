@@ -4,6 +4,10 @@ on:
     branches: [dual-agent]
     paths:
       - "trader/kr/opening_bar_contract.py"
+      - "trader/kr/entry_opportunity_v2.py"
+      - "trader/kr/entry_opportunity_v3.py"
+      - "trader/kr/entry_timing_price.py"
+      - "tests/kr/test_kr_20261113_pb1_native_volume_rescue.py"
       - "trader/kr/entry_priority_queue.py"
       - "trader/kr/kis_observer_budget.py"
       - "trader/kis_wrapper.py"
@@ -24,6 +28,11 @@ on:
       - "tests/kr/test_kr_pb1_kis_http_audit.py"
       - "tests/kr/test_kr_session_metrics_accumulator.py"
       - "scripts/kr_opening_observer.py"
+      - "scripts/kr_historical_buy_native_evidence.py"
+      - "scripts/wsl/check-nullim-day-health.sh"
+      - "scripts/wsl/kr_mail_execution_evidence.py"
+      - "tests/test_kr_mail_execution_evidence_20261111.py"
+      - "tests/test_pr121_mail_degraded_delivery.py"
       - "scripts/wsl/kr-entry-timing-activation.sh"
       - "tests/kr/test_kr_pb1_minute_*.py"
       - "tests/kr/test_kr_20261124_recurring_execution.py"
@@ -88,4 +97,8 @@ jobs:
             tests/kr/test_kr_20261029_price_aware_opening.py \
             tests/kr/test_kr_20261110_timing_activation_cjenm.py \
             tests/kr/test_kr_20261124_recurring_execution.py \
-            tests/kr/test_kr_20261124_closed_cycle_claim_recovery.py
+            tests/kr/test_kr_20261124_closed_cycle_claim_recovery.py \
+            tests/kr/test_kr_20261113_pb1_native_volume_rescue.py \
+            tests/kr/test_kr_pb1_minute_20261125_adaptive_entry.py \
+            tests/test_kr_mail_execution_evidence_20261111.py \
+            tests/test_pr121_mail_degraded_delivery.py::test_health_distinguishes_degraded_delivery_from_mail_failure

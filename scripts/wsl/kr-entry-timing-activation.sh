@@ -33,6 +33,16 @@ kr_pb1_entry_timing_defaults() {
       US_ALIGNED_V2|LEGACY_V1) ;;
       *) export KR_PB1_ENTRY_TIMING_APPROVED=0 ;;
     esac
+    # Active only inside the approved practice V2 enforcement profile.
+    # Explicit 0 is the rollback to unmodified V2; LEGACY_V1 remains separate.
+    export KR_PB1_ADAPTIVE_ENTRY_V3_ENABLED="${KR_PB1_ADAPTIVE_ENTRY_V3_ENABLED:-1}"
+    case "$KR_PB1_ADAPTIVE_ENTRY_V3_ENABLED" in
+      0|1) ;;
+      *) export KR_PB1_ENTRY_TIMING_APPROVED=0 ;;
+    esac
+    if [[ "$KR_PB1_ENTRY_OPPORTUNITY_POLICY" != "US_ALIGNED_V2" ]]; then
+      export KR_PB1_ADAPTIVE_ENTRY_V3_ENABLED=0
+    fi
     # The old quote-only parallel SHADOW must not mask the mandatory
     # completed KIS 1m ENFORCE gate or be mistaken for live BUY authorization.
     export KR_PB1_ENTRY_TIMING_SHADOW_ENABLED=0
@@ -46,13 +56,14 @@ kr_pb1_entry_timing_defaults() {
     export KR_PB1_KIS_OBSERVER_BUDGET_ENABLED="${KR_PB1_KIS_OBSERVER_BUDGET_ENABLED:-1}"
   else
     export KR_PB1_ENTRY_OPPORTUNITY_POLICY=LEGACY_V1
+    export KR_PB1_ADAPTIVE_ENTRY_V3_ENABLED=0
     export KR_PB1_ENTRY_TIMING_MODE="${KR_PB1_ENTRY_TIMING_MODE:-SHADOW}"
     export KR_PB1_ENTRY_TIMING_APPROVED="${KR_PB1_ENTRY_TIMING_APPROVED:-0}"
     export KR_PB1_ENTRY_TIMING_SHADOW_ENABLED="${KR_PB1_ENTRY_TIMING_SHADOW_ENABLED:-0}"
     export KR_PB1_OPENING_OBSERVER_ENABLED=0
     export KR_PB1_KIS_OBSERVER_BUDGET_ENABLED=0
   fi
-  echo "[KR][ENTRY_TIMING][EFFECTIVE_CONFIG] strategy_env=${STRATEGY_ENV:-unknown} kis_env=${KIS_ENV:-unknown} mode=$KR_PB1_ENTRY_TIMING_MODE approved=$KR_PB1_ENTRY_TIMING_APPROVED policy=$KR_PB1_ENTRY_OPPORTUNITY_POLICY legacy_quote_shadow=DISABLED opening_observer=$KR_PB1_OPENING_OBSERVER_ENABLED interval_sec=${KR_PB1_OPENING_OBSERVER_INTERVAL_SEC:-n/a}"
+  echo "[KR][ENTRY_TIMING][EFFECTIVE_CONFIG] strategy_env=${STRATEGY_ENV:-unknown} kis_env=${KIS_ENV:-unknown} mode=$KR_PB1_ENTRY_TIMING_MODE approved=$KR_PB1_ENTRY_TIMING_APPROVED policy=$KR_PB1_ENTRY_OPPORTUNITY_POLICY adaptive_v3=$KR_PB1_ADAPTIVE_ENTRY_V3_ENABLED legacy_quote_shadow=DISABLED opening_observer=$KR_PB1_OPENING_OBSERVER_ENABLED interval_sec=${KR_PB1_OPENING_OBSERVER_INTERVAL_SEC:-n/a}"
   if [[ "${STRATEGY_ENV:-}" == "practice" && "${KIS_ENV:-}" == "practice" ]] &&
      { [[ "$KR_PB1_ENTRY_TIMING_MODE" != "ENFORCE" ]] ||
        [[ "$KR_PB1_ENTRY_TIMING_APPROVED" != "1" ]] ||
@@ -64,6 +75,24 @@ kr_pb1_entry_timing_defaults() {
 kr_pb1_opening_observer_start() {
   local log_dir="${1:?log directory required}" trade_date="${2:?trade date required}"
   [[ "${STRATEGY_ENV:-}" == "practice" && "${KIS_ENV:-}" == "practice" ]] || return 0
+  # Read-only watchdog monitors this exact AM/PM run, including when the
+  # observer is intentionally disabled. No inherited trading/mail locks.
+  local watchdog_session="${NULLIM_SESSION_PURPOSE:-}"
+  if [[ "${KR_PB1_SESSION_WATCHDOG_ENABLED:-1}" == "1" && -n "${NULLIM_RUN_ID:-}" ]] &&
+     [[ "$watchdog_session" == "am" || "$watchdog_session" == "afternoon" ]]; then
+    local watchdog_log="$log_dir/$watchdog_session/${NULLIM_RUN_ID}.watchdog.log"
+    (
+      for fd in "${NULLIM_SESSION_LOCK_FD:-}" "${NULLIM_SNAPSHOT_FD:-}"; do
+        if [[ "$fd" =~ ^[0-9]+$ ]]; then eval "exec ${fd}>&-"; fi
+      done
+      unset NULLIM_SESSION_LOCK_FD NULLIM_SESSION_LOCK_FILE NULLIM_SESSION_LOCK_TOKEN NULLIM_SNAPSHOT_FD
+      exec timeout --kill-after=5s 24000 env NO_TRADE=1 DISABLE_REAL_TRADING=1 \
+        python -m scripts.kr_session_watchdog --date "$trade_date" \
+          --session "$watchdog_session" --run-id "$NULLIM_RUN_ID" --parent-pid "$" \
+          --observer-required "${KR_PB1_OPENING_OBSERVER_ENABLED:-0}"
+    ) >>"$watchdog_log" 2>&1 </dev/null &
+    echo "[KR][SESSION_WATCHDOG][LAUNCH] pid=$! log=$watchdog_log read_only=1"
+  fi
   [[ "${KR_PB1_OPENING_OBSERVER_ENABLED:-0}" == "1" ]] || {
     echo "[KR][ENTRY_TIMING][OBSERVER_DISABLED] practice entry timing proof may be UNKNOWN"
     return 0
@@ -89,7 +118,11 @@ kr_pb1_opening_observer_start() {
     if [[ -n "${NULLIM_SESSION_LOCK_FD:-}" ]]; then
       eval "exec ${NULLIM_SESSION_LOCK_FD}>&-"
     fi
-    unset NULLIM_SESSION_LOCK_FD NULLIM_SESSION_LOCK_FILE NULLIM_SESSION_LOCK_TOKEN
+    # The observer also must not retain the mail packaging snapshot lock.
+    if [[ "${NULLIM_SNAPSHOT_FD:-}" =~ ^[0-9]+$ ]]; then
+      eval "exec ${NULLIM_SNAPSHOT_FD}>&-"
+    fi
+    unset NULLIM_SESSION_LOCK_FD NULLIM_SESSION_LOCK_FILE NULLIM_SESSION_LOCK_TOKEN NULLIM_SNAPSHOT_FD
     exec flock -n "runtime/locks/kr-pb1-opening-observer-${trade_date}.lock" \
       timeout --kill-after=15s 24000 \
       env NO_TRADE=1 DISABLE_REAL_TRADING=1 DISABLE_LIVE_TRADING=1 \

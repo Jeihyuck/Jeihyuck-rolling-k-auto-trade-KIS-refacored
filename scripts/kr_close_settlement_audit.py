@@ -157,9 +157,82 @@ def _broker_order_day(value: Any) -> date | None:
     return timestamp.astimezone(timezone(timedelta(hours=9))).date()
 
 
+def _stored_infinite_sell_proof(order: dict, candidates: list[dict]) -> dict | None:
+    """Verify a legacy PB1 mirror against the dedicated owner journal.
+
+    A previous cycle need not remain the current KR_INFINITE state row.
+    Stored native economics are not a fresh broker query. Never insert a
+    second PB1 fill for a proven owner SELL or change current sleeve state.
+    """
+    from decimal import Decimal, InvalidOperation
+    if (order.get("code") != "122630" or order.get("side") != "SELL"
+            or order.get("status") != "FILLED" or not order.get("order_id")
+            or order.get("position_cycle_id")):
+        return None
+    day = _broker_order_day(order.get("created_at"))
+    if day is None:
+        return None
+    odno = str(order.get("kis_odno") or "")
+    if len(odno) != 10 or not odno.isascii() or not odno.isdigit() or not int(odno):
+        return None
+    matches = [row for row in candidates if str(row.get("broker_order_id")) == odno
+               and str(row.get("trade_date")) == day.isoformat()]
+    if len(matches) != 1:
+        return None
+    intent = matches[0]
+    try:
+        raw = order.get("response_json")
+        row = json.loads(raw) if isinstance(raw, str) else raw
+        q = int(order["qty"])
+        amount = Decimal(str(row["tot_ccld_amt"]))
+        avg = Decimal(str(row["avg_prvs"]))
+        filled_amount = Decimal(str(intent["filled_notional_krw"]))
+        if (q <= 0 or not amount.is_finite() or amount <= 0 or
+                not avg.is_finite() or avg <= 0 or not filled_amount.is_finite()
+                or row.get("source_order_id") != str(order["order_id"])
+                or row.get("source_client_order_key") != order.get("client_order_key")
+                or order.get("client_order_key") !=
+                    f"practice:pb1_pullback_close:{day:%Y%m%d}:122630:SELL:{odno}"
+                or order.get("broker_order_id") != odno
+                or row.get("pdno") != "122630" or row.get("odno") != odno
+                or row.get("ord_dt") != day.strftime("%Y%m%d")
+                or row.get("sll_buy_dvsn_cd") != "01" or row.get("cncl_yn") != "N"
+                or int(row["rmn_qty"]) != 0 or int(row["ord_qty"]) != q
+                or int(row["tot_ccld_qty"]) != q or int(row["rjct_qty"]) != 0
+                or int(row["cncl_cfrm_qty"]) != 0
+                or amount != filled_amount or abs(amount / q - avg) > Decimal("1")
+                or intent.get("status") != "FILLED"
+                or intent.get("strategy_id") != "KR_INFINITE_V1"
+                or intent.get("strategy_owner") != "KR_INFINITE"
+                or intent.get("account_bound") is not True
+                or intent.get("action_state") != "SATISFIED"
+                or int(intent.get("claim_conflicts", -1)) != 0
+                or intent.get("active_attempt_id") is not None
+                or intent.get("attempt_state") != "FILLED"
+                or intent.get("authoritative") is not True
+                or intent.get("attempt_bound") is not True
+                or (intent.get("side"), intent.get("action")) not in {
+                    ("SELL_PARTIAL", "SELL:TP1"), ("SELL_ALL", "SELL:TP2")}
+                or not intent.get("cycle_id")
+                or any(int(intent[k]) != q for k in (
+                    "requested_qty", "filled_qty", "target_qty",
+                    "cumulative_filled_qty", "attempt_requested_qty",
+                    "attempt_filled_qty"))
+                or int(intent["remaining_target_qty"]) != 0):
+            return None
+    except (KeyError, TypeError, ValueError, InvalidOperation, AttributeError):
+        return None
+    return {"order_id": str(order["order_id"]), "broker_order_id": odno,
+            "trade_date": day.isoformat(), "cycle_id": str(intent["cycle_id"]),
+            "owner": "KR_INFINITE", "qty": q, "notional": str(amount),
+            "proof_source": "STORED_KIS_CUMULATIVE_AND_OWNER_CLAIM_ATTEMPT",
+            "fresh_kis_query": False}
+
+
 def audit_sell_settlement(
     *, orders: list[dict], fills: list[dict], positions: list[dict],
     trade_date: date | None = None,
+    infinite_owner_settlements: list[dict] | None = None,
 ) -> dict[str, Any]:
     """Return missing priced SELL fill quantities, never synthesize executions."""
     by_order: dict[str, list[dict]] = defaultdict(list)
@@ -173,6 +246,7 @@ def audit_sell_settlement(
     gaps = []
     inspected = 0
     excluded_infinite_mirror_orders = 0
+    stored_infinite_proofs = []
     explicit_preack_rejections_excluded = 0
     bucket_counts = {"today": 0, "historical": 0, "undated": 0}
     certified_mirror_sell_ids = set()
@@ -216,6 +290,11 @@ def audit_sell_settlement(
             # certified these exact broker IDs and retired its legacy mirror.
             excluded_infinite_mirror_orders += 1
             continue
+        if not by_order.get(str(order.get("order_id") or "")):
+            owner_proof = _stored_infinite_sell_proof(order, infinite_owner_settlements or [])
+            if owner_proof is not None:
+                stored_infinite_proofs.append(owner_proof)
+                continue
         inspected += 1
         dated = _broker_order_day(order.get("created_at"))
         bucket = (
@@ -294,6 +373,8 @@ def audit_sell_settlement(
         ),
         "sell_orders_checked": inspected,
         "certified_infinite_mirror_sells_excluded": excluded_infinite_mirror_orders,
+        "stored_infinite_owner_sells_verified": len(stored_infinite_proofs),
+        "stored_infinite_owner_evidence": stored_infinite_proofs,
         "explicit_preack_rejections_excluded": explicit_preack_rejections_excluded,
         "gap_count": len(gaps),
         "gaps": gaps,
@@ -348,6 +429,40 @@ def load_snapshot(engine: sa.Engine, *, env: str, epoch: str, day: date) -> dict
             SELECT code, position_cycle_id, status, qty, closed_reason, {meta_projection}
             FROM public.positions WHERE env=:env AND trading_epoch_id=:epoch
         """), {"env": env, "epoch": epoch}).mappings()]
+        infinite_owner_settlements = []
+        if (env == "practice" and engine.dialect.name == "postgresql"
+                and all(sa.inspect(conn).has_table(name, schema="public") for name in (
+                    "kr_infinite_order_intents", "trading_epochs",
+                    "execution_claims", "execution_attempts"))):
+            # Exact account+epoch, dedicated intent, terminal claim, unique
+            # authoritative attempt. No dependence on the newer current cycle.
+            infinite_owner_settlements = [dict(row) for row in conn.execute(text("""
+                SELECT i.strategy_id, i.cycle_id, i.side, i.status, i.trade_date,
+                    i.broker_order_id, i.requested_qty, i.filled_qty,
+                    i.filled_notional_krw, c.strategy_owner, c.action_state,
+                    c.action, c.target_qty, c.cumulative_filled_qty,
+                    c.remaining_target_qty, c.claim_conflicts, c.active_attempt_id,
+                    a.attempt_state, a.authoritative,
+                    a.requested_qty AS attempt_requested_qty,
+                    a.cumulative_filled_qty AS attempt_filled_qty,
+                    (c.account_id=encode(sha256(convert_to(t.account_id,'UTF8')),'hex')) AS account_bound,
+                    (a.attempt_id=i.metadata::jsonb->>'execution_submit_attempt_id'
+                     AND a.client_order_key=i.idempotency_key) AS attempt_bound
+                FROM public.kr_infinite_order_intents i
+                JOIN public.trading_epochs t ON t.trading_epoch_id=i.trading_epoch_id
+                    AND t.env=:env AND t.status='ACTIVE'
+                JOIN public.execution_claims c ON c.action_key=i.metadata::jsonb->>'execution_claim_action_key'
+                    AND c.env=t.env AND c.market='KR' AND c.trading_epoch_id=t.trading_epoch_id
+                    AND c.trade_date=i.trade_date AND c.lifecycle_id='122630:'||i.cycle_id
+                JOIN public.execution_attempts a ON a.action_key=c.action_key
+                WHERE i.trading_epoch_id=:epoch AND i.symbol='122630'
+                    AND i.strategy_id='KR_INFINITE_V1'
+                    AND i.side IN ('SELL_PARTIAL','SELL_ALL') AND i.trade_date<=:day
+                    AND i.metadata::jsonb->>'strategy_owner'='KR_INFINITE'
+                    AND i.metadata::jsonb->>'trading_epoch_id'=i.trading_epoch_id
+                    AND (SELECT count(*) FROM public.execution_attempts z
+                        WHERE z.action_key=c.action_key)=1
+            """), {"epoch": epoch, "env": env, "day": day}).mappings()]
     # Use the broker's own product name when present, but never trust a JSON
     # label as strategy owner or settlement authority.
     for row in orders:
@@ -356,7 +471,8 @@ def load_snapshot(engine: sa.Engine, *, env: str, epoch: str, day: date) -> dict
             row["name"] = raw.get("prdt_name") or row.get("code")
         except (ValueError, TypeError):
             row["name"] = row.get("code")
-    return {"orders": orders, "fills": fills, "positions": positions}
+    return {"orders": orders, "fills": fills, "positions": positions,
+            "infinite_owner_settlements": infinite_owner_settlements}
 
 
 def main(argv: list[str] | None = None) -> int:
