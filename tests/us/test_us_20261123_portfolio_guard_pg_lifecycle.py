@@ -164,11 +164,12 @@ def _p(qty, bid):
     }
 
 
-def _record(conn, *, pnl, qty, bid, now, snap, sold):
+def _record(conn, *, pnl, qty, bid, now, snap, sold,
+            method="NATIVE_FILLS_PLUS_FRESH_KIS_MARK_V1"):
     return persist_guard_observation_and_reserve(
         conn, account_hash=ACCOUNT, trading_epoch_id=EPOCH,
         portfolio_epoch_id=PORT, verified_pnl_usd=Decimal(str(pnl)),
-        verified_accounting={"method": "NATIVE_FILLS_PLUS_FRESH_KIS_MARK_V1"},
+        verified_accounting={"method": method},
         complete_native_positions=[_p(qty,bid)],
         snapshot_id=snap,snapshot_at=now,
         existing_sell_symbols=set(),
@@ -384,3 +385,38 @@ def test_reentry_two_workers_serialized_budget_and_retry_fenced(store, monkeypat
         assert rows[0]["notional_usd"] == Decimal("60")
     # A local retry may not create a duplicate budget reservation or HTTP.
     assert "BUY_KEY_ALREADY_RESERVED" in submit_mock(rows[0]["client_order_key"])
+
+
+
+def test_pg_signed_trading_basis_triggers_and_cannot_reuse_net_hwm(store):
+    from trader.us.portfolio_profit_guard import TRADING_ACCOUNTING_METHOD
+    engine, now = store
+    with engine.begin() as conn:
+        with pytest.raises(PortfolioGuardUnavailable, match="SIGNED_ACCOUNTING_METHOD_MISMATCH"):
+            _record(conn, pnl="100", qty=10, bid="100", now=now,
+                    snap="unsigned-basis", sold=0, method=TRADING_ACCOUNTING_METHOD)
+        doc = conn.execute(text(
+            "SELECT authorization_json FROM public.us_portfolio_guard_policy"
+        )).scalar_one()
+        doc.pop("hmac_sha256")
+        doc["accounting_method"] = TRADING_ACCOUNTING_METHOD
+        doc["hmac_sha256"] = hmac.new(KEY.encode(), canonical(doc), hashlib.sha256).hexdigest()
+        conn.execute(text("""
+            UPDATE public.us_portfolio_guard_policy
+            SET authorization_json=CAST(:doc AS jsonb), authorization_sha256=:digest
+        """), {"doc": json.dumps(doc), "digest": policy_digest(doc)})
+        baseline = _record(conn, pnl="100", qty=10, bid="100", now=now,
+                           snap="trade-baseline", sold=0, method=TRADING_ACCOUNTING_METHOD)
+        assert baseline["state"] == "WATCH"
+        with pytest.raises(PortfolioGuardUnavailable, match="SIGNED_ACCOUNTING_METHOD_MISMATCH"):
+            _record(conn, pnl="75", qty=10, bid="95", now=now+timedelta(seconds=1),
+                    snap="net-mix", sold=0)
+        trigger = _record(conn, pnl="75", qty=10, bid="95", now=now+timedelta(seconds=1),
+                          snap="trade-trigger", sold=0, method=TRADING_ACCOUNTING_METHOD)
+        assert trigger["state"] == "PLANNED"
+        assert trigger["intents"][0]["qty"] == 2
+        state = conn.execute(text(
+            "SELECT accounting_method, high_water_pnl_usd FROM public.us_portfolio_guard_state"
+        )).mappings().one()
+        assert state["accounting_method"] == TRADING_ACCOUNTING_METHOD
+        assert state["high_water_pnl_usd"] == Decimal("100")
