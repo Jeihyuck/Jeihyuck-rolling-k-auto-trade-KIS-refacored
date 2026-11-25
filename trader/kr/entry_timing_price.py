@@ -157,13 +157,17 @@ def maybe_bound_pb1_prpr_fallback(
     if not isinstance(features, dict):
         return {"state": "NOT_APPLICABLE"}
     symbol = str(getattr(cf, "code", "") or "").removeprefix("A").zfill(6)
+    source = str(features.get("order_price_source") or "")
+    adaptive_ask = (source == "ask"
+                    and active_entry_policy("practice") == "US_ALIGNED_V2"
+                    and os.getenv("KR_PB1_ADAPTIVE_ENTRY_V3_ENABLED", "0") == "1")
     if not (
         str(getattr(engine, "STRATEGY_NAME", "")) == "pb1_pullback_close"
         and str(getattr(engine, "env", "")).lower() == "practice"
         and str(stage or "").upper() != "PB1-CLOSE"
         and str(order_type or "").upper() == "LIMIT"
         and len(symbol) == 6 and symbol.isdigit() and symbol != "122630"
-        and str(features.get("order_price_source") or "") == "prpr_slippage"
+        and (source == "prpr_slippage" or adaptive_ask)
         and str(os.getenv("KR_PB1_ENTRY_TIMING_MODE") or "ENFORCE").upper() == "ENFORCE"
         and os.getenv("KR_PB1_ENTRY_TIMING_APPROVED", "1") == "1"
     ):
@@ -198,16 +202,40 @@ def maybe_bound_pb1_prpr_fallback(
         pivot=features.get("pivot"), order_price=close,
     )
     if timing.get("state") != "READY_SHADOW":
-        return {"state": "BLOCK", "reason": "TIMING_NOT_READY",
-                "signal_state": timing.get("state"),
-                "signal_reason": timing.get("reason")}
+        # A verified signal may be expensive at the minute close itself.
+        # Probe its diagnostic ceiling, then rerun the actual evaluator.
+        # No WAIT proof is converted directly into an order.
+        ceiling = _pos(timing.get("diagnostic_entry_ceiling"))
+        if adaptive_ask and ceiling and ceiling < reference_price:
+            timing = evaluate_proof_for_candidate(
+                env="practice", account_scope=account_scope, code=symbol,
+                now=now, style=style,
+                setup_ok=bool(features.get("setup_ok", getattr(cf, "setup_ok", False))),
+                trigger_ok=bool(features.get("breakout_trigger_ok") or features.get("trigger_ok")),
+                pivot=features.get("pivot"), order_price=ceiling,
+            )
+        if timing.get("state") != "READY_SHADOW":
+            return {"state": "BLOCK", "reason": "TIMING_NOT_READY",
+                    "signal_state": timing.get("state"),
+                    "signal_reason": timing.get("reason")}
+    if adaptive_ask and timing.get("entry_policy") != "US_ALIGNED_V2":
+        return {"state": "NOT_APPLICABLE"}
+    if adaptive_ask and reference_price <= float(timing.get("max_entry_price") or 0):
+        return {"state": "NOT_APPLICABLE"}
     try:
-        quote = engine._get_price_snapshot_cached(symbol, market="J")
+        if adaptive_ask:
+            # A real ASK can only be lowered to another verified real ASK.
+            api = getattr(engine, "kis", None) or getattr(engine, "kis_api", None)
+            quote = api.get_price_snapshot(symbol, market="J") if api else {}
+            if not isinstance(quote, dict) or not _pos(quote.get("ask")) or not _pos(quote.get("bid")):
+                return {"state": "BLOCK", "reason": "ADAPTIVE_ASK_QUOTE_UNVERIFIED"}
+        else:
+            quote = engine._get_price_snapshot_cached(symbol, market="J")
     except Exception:
         return {"state": "BLOCK", "reason": "QUOTE_FETCH_UNAVAILABLE"}
     if active_entry_policy("practice") == "US_ALIGNED_V2" and reference_price <= float(timing.get("max_entry_price") or 0):
         return {"state": "NOT_APPLICABLE"}
-    return resolve_bounded_prpr_limit(
+    result = resolve_bounded_prpr_limit(
         code=symbol, original_price=reference_price,
         timing=timing,
         quote=quote if isinstance(quote, dict) else {},
@@ -217,6 +245,11 @@ def maybe_bound_pb1_prpr_fallback(
         # authenticated quote as time travelling / stale.
         observed_at=datetime.now(KST),
     )
+    if adaptive_ask and result.get("state") == "BOUNDED_LIMIT":
+        if result.get("reason") != "VERIFIED_ASK":
+            return {"state": "BLOCK", "reason": "ADAPTIVE_ASK_PASSIVE_FORBIDDEN"}
+        result = {**result, "source": "KR_PB1_ADAPTIVE_VERIFIED_ASK"}
+    return result
 
 
 
@@ -246,13 +279,15 @@ def apply_verified_bounded_limit(
     ):
         raise ValueError("KR_BOUND_PRICE_PROOF_INVALID")
     notional = float(bounded) * qty
+    source = ("timing_bounded_verified_ask" if price_proof.get("source") == "KR_PB1_ADAPTIVE_VERIFIED_ASK"
+              else "timing_bounded_prpr_limit")
     plan.update(
         limit_price=float(bounded), order_price=float(bounded),
-        planned_value=notional, price_source="timing_bounded_prpr_limit",
+        planned_value=notional, price_source=source,
     )
     features.update(
         limit_price=float(bounded), order_price=float(bounded),
-        order_price_source="timing_bounded_prpr_limit",
+        order_price_source=source,
         planned_value=notional,
     )
     cf.planned_value = notional
