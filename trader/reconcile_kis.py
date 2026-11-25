@@ -2003,6 +2003,12 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
             if str(active_now) != str(strict_sell_epoch_id):
                 raise RuntimeError("KR_CUMULATIVE_REPAIR_ACTIVE_EPOCH_CHANGED")
         if source_order:
+            # Native daily-ccld often omits the listing market or supplies
+            # the exchange (KRX), not KOSPI/KOSDAQ. The exact scoped durable
+            # order is authoritative for the listing market.
+            source_market = str(source_order.get("market") or "").strip()
+            if source_market:
+                market = source_market
             source_request = _json_dict(source_order.get("request_json"))
             source_response = _json_dict(source_order.get("response_json"))
             if side == "BUY":
