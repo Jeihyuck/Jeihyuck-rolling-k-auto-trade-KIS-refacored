@@ -101,6 +101,14 @@ def evaluate_reclaim(*, family, opening, post, now, order_price, independent,
     risk = price-stop
     facts.update(structural_stop_reference=stop, structural_target_reference=high,
                  risk_reference_is_live_stop_order=False)
+    # Compute the feasible structural interval even if the proposed ask
+    # fails. Diagnostic only: WAIT still has no max_entry_price/authority.
+    rr_cap = (high+MIN_RR*stop)/(1+MIN_RR)
+    risk_cap = stop/(1-MAX_RISK)
+    raw_cap = min(rr_cap, risk_cap, close*(1+MAX_DEVIATION))
+    cap, _ = normalize_kr_order_price(raw_cap, side="SELL")
+    facts.update(rr_price_ceiling=rr_cap, max_risk_price_ceiling=risk_cap,
+                 diagnostic_entry_ceiling=cap if stop < cap < high else None)
     if risk <= 0:
         return result("WAIT", "NO_VALID_STRUCTURAL_RISK")
     rr = (high-price)/risk
@@ -111,11 +119,6 @@ def evaluate_reclaim(*, family, opening, post, now, order_price, independent,
     if rr < MIN_RR:
         return result("WAIT", "PULLBACK_NO_ROOM_VS_STOP" if family=="PULLBACK"
                       else "INSUFFICIENT_ROOM_VS_STOP")
-    rr_cap = (high+MIN_RR*stop)/(1+MIN_RR)
-    risk_cap = stop/(1-MAX_RISK)
-    raw_cap = min(rr_cap, risk_cap, close*(1+MAX_DEVIATION))
-    cap, _ = normalize_kr_order_price(raw_cap, side="SELL")
-    facts.update(rr_price_ceiling=rr_cap, max_risk_price_ceiling=risk_cap)
     if cap < price or not stop < cap < high:
         return result("WAIT", "ORDER_PRICE_ABOVE_CONFIRMED_CAP")
     return result("READY_SHADOW", "US_ALIGNED_RECLAIM_CONFIRMED",
