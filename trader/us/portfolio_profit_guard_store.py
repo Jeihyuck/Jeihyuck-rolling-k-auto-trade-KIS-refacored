@@ -20,7 +20,7 @@ from sqlalchemy import text
 from trader.us.portfolio_profit_guard import (
     canonical, plan_verified_guard_sell, triggered_stage,
     verify_portfolio_policy, _decimal, ACCOUNTING_METHODS, NET_ACCOUNTING_METHOD,
-    TRADING_ACCOUNTING_METHOD,
+    TRADING_ACCOUNTING_METHOD, LEGACY_ACCOUNTING_SCOPE,
 )
 
 logger = logging.getLogger(__name__)
@@ -249,6 +249,11 @@ def persist_guard_observation_and_reserve(
     policy, digest = auth
     if verified_accounting["method"] != policy["accounting_method"]:
         raise PortfolioGuardUnavailable("PORT_GUARD_SIGNED_ACCOUNTING_METHOD_MISMATCH")
+    if verified_accounting.get("legacy_fill_count", 0) and (
+        policy.get("legacy_accounting_scope") != LEGACY_ACCOUNTING_SCOPE
+        or verified_accounting.get("legacy_accounting_scope") != LEGACY_ACCOUNTING_SCOPE
+    ):
+        raise PortfolioGuardUnavailable("PORT_GUARD_SIGNED_LEGACY_SCOPE_MISMATCH")
     scope = {
         "policy_id": policy["policy_id"], "policy_version": policy["policy_version"],
         "account": account_hash, "epoch": trading_epoch_id,
@@ -661,6 +666,10 @@ def build_authorized_portfolio_guard_intents(
     from trader.us.db.repos import _get_engine_or_none, _active_us_epoch
     from trader.us.execution.recovery_identity import current_us_portfolio_epoch
     from trader.us.portfolio_profit_guard import verified_sleeve_pnl, _utc
+    from trader.us.portfolio_guard_original_ledger import (
+        fill_key, legacy_economic_row, load_legacy_epoch_proof,
+        prepare_legacy_management_position,
+    )
     from trader.us.strategy_ownership import owner_for_symbol, STANDARD_OWNER
     from trader.us.symbols import resolve_quote_exchange
     from trader.marketdata.us_ws_collector import get_quote
@@ -723,22 +732,57 @@ def build_authorized_portfolio_guard_intents(
                        client_order_key,account_id,trading_epoch_id,
                        portfolio_epoch_id,position_cycle_id,meta
                 FROM public.us_fills
-                WHERE trading_epoch_id=:epoch
+                WHERE trading_epoch_id=:epoch AND trade_date<=:day
                   AND COALESCE(meta->>'accounting_active','true') <> 'false'
                 ORDER BY trade_date,id
-            """), {"epoch": epoch}).mappings().all()
+            """), {"epoch": epoch, "day": trade_date}).mappings().all()
+            native_fills = [
+                dict(row) for row in native_fills
+                if owner_for_symbol(str(row.get("symbol") or "")) == STANDARD_OWNER
+            ]
+            legacy_groups, legacy_fills = {}, {}
+            has_legacy = any(legacy_economic_row(row) for row in native_fills)
+            if has_legacy:
+                if (policy["accounting_method"] != TRADING_ACCOUNTING_METHOD
+                        or policy.get("legacy_accounting_scope") != LEGACY_ACCOUNTING_SCOPE):
+                    raise PortfolioGuardUnavailable("PORT_GUARD_LEGACY_HISTORY_NOT_SIGNED")
+                legacy_fills, legacy_groups = load_legacy_epoch_proof(
+                    conn, native_fills, raw_account=raw_account, epoch=epoch,
+                    portfolio=portfolio, trade_date=trade_date,
+                )
+            # Valuation includes every proven original economic group, even
+            # closed lots. A live legacy lot obtains only an ephemeral forward
+            # scope; the native router re-proves it before submitting.
+            prepared_positions = []
+            for position in current_positions:
+                sym = str(position.get("symbol") or "").upper()
+                pm = position.get("meta") if isinstance(position.get("meta"), dict) else {}
+                if (sym in legacy_groups
+                        and _decimal(position.get("qty") or position.get("holding_qty") or 0) > 0
+                        and not (position.get("portfolio_epoch_id") or pm.get("portfolio_epoch_id"))):
+                    position, unresolved = prepare_legacy_management_position(
+                        conn, position, legacy_groups[sym], raw_account=raw_account,
+                        epoch=epoch, portfolio=portfolio, trade_date=trade_date,
+                    )
+                    if unresolved:
+                        pending_standard_symbols.add(sym)
+                prepared_positions.append(position)
         fill_proof = []
         for fill in native_fills:
             meta = fill["meta"] if isinstance(fill["meta"], dict) else {}
-            symbol_owner = owner_for_symbol(str(fill.get("symbol") or ""))
-            if symbol_owner != STANDARD_OWNER:
-                continue
-            if (meta.get("strategy_owner") != "US_STANDARD"
-                    or str(fill.get("portfolio_epoch_id") or "") != portfolio
-                    or not fill.get("position_cycle_id")):
-                raise PortfolioGuardUnavailable("PORT_GUARD_FILL_OWNER_PORTFOLIO_CYCLE_UNVERIFIED")
-            if str(fill.get("account_id") or "") not in (raw_account, account_hash):
-                raise PortfolioGuardUnavailable("PORT_GUARD_FILL_ACCOUNT_MISMATCH")
+            original_group = legacy_fills.get(fill_key(fill))
+            if legacy_economic_row(fill):
+                if not original_group:
+                    raise PortfolioGuardUnavailable("PORT_GUARD_LEGACY_FILL_PROOF_MISSING")
+                economic_cycle = original_group["management_cycle"]
+            else:
+                if (meta.get("strategy_owner") != "US_STANDARD"
+                        or str(fill.get("portfolio_epoch_id") or "") != portfolio
+                        or not fill.get("position_cycle_id")):
+                    raise PortfolioGuardUnavailable("PORT_GUARD_FILL_OWNER_PORTFOLIO_CYCLE_UNVERIFIED")
+                if str(fill.get("account_id") or "") not in (raw_account, account_hash):
+                    raise PortfolioGuardUnavailable("PORT_GUARD_FILL_ACCOUNT_MISMATCH")
+                economic_cycle = str(fill["position_cycle_id"])
             fill_proof.append({
                 "symbol": str(fill["symbol"]).upper(),
                 "side": fill["side"], "qty": fill["qty"],
@@ -749,7 +793,10 @@ def build_authorized_portfolio_guard_intents(
                 "account_hash": account_hash, "trading_epoch_id": epoch,
                 "fill_evidence_type": meta.get("fill_evidence_type"),
                 "is_synthetic": meta.get("is_synthetic") or meta.get("synthetic"),
-                "position_cycle_id": str(fill["position_cycle_id"]),
+                # The legacy cycle here is for in-memory economic grouping,
+                # never a retroactive original BUY identity in the database.
+                "position_cycle_id": economic_cycle,
+                "original_runtime_lifecycle_id": original_group["original_cycle"] if original_group else None,
                 # Only broker-proven native charge records may contribute
                 # to net P&L; legacy fill metadata missing these fields
                 # cannot be silently assumed to have zero commission.
@@ -759,14 +806,24 @@ def build_authorized_portfolio_guard_intents(
             })
         # Original owner BUY/SELL cycle evidence, not order-intent guesses.
         sell_qty_by_cycle: dict[str, int] = {}
+        net_qty_by_cycle: dict[str, int] = {}
+        symbols_by_cycle: dict[str, str] = {}
         for proof in fill_proof:
             if proof["fill_evidence_type"] != "KIS_ORDER_CUMULATIVE_ACTUAL":
                 raise PortfolioGuardUnavailable("PORT_GUARD_NATIVE_FILL_NOT_PROVEN")
+            cycle = proof["position_cycle_id"]
+            qty = _decimal(proof["qty"])
+            if (qty <= 0 or qty != qty.to_integral_value()
+                    or proof["side"] not in ("BUY", "SELL")
+                    or symbols_by_cycle.setdefault(cycle, proof["symbol"]) != proof["symbol"]):
+                raise PortfolioGuardUnavailable("PORT_GUARD_ECONOMIC_CYCLE_FILL_INVALID")
+            net_qty_by_cycle[cycle] = net_qty_by_cycle.get(cycle, 0) + (
+                int(qty) if proof["side"] == "BUY" else -int(qty)
+            )
             if proof["side"] == "SELL":
-                cycle = proof["position_cycle_id"]
-                sell_qty_by_cycle[cycle] = (
-                    sell_qty_by_cycle.get(cycle, 0) + int(proof["qty"])
-                )
+                sell_qty_by_cycle[cycle] = sell_qty_by_cycle.get(cycle, 0) + int(qty)
+        if any(qty < 0 for qty in net_qty_by_cycle.values()):
+            raise PortfolioGuardUnavailable("PORT_GUARD_ECONOMIC_CYCLE_NEGATIVE_NET")
         # Profit-ranking cost basis is derived from verified original
         # native BUY fills, never a mutable position or provider average.
         # This changes no original BUY and never invents a new cost basis.
@@ -789,7 +846,8 @@ def build_authorized_portfolio_guard_intents(
         enriched_by_symbol: dict[str, dict] = {}
         native_valuations = []
         all_position_symbols = set()
-        for position in current_positions:
+        seen_open_cycles = set()
+        for position in prepared_positions:
             sym = str(position.get("symbol") or "").upper()
             if not sym or sym in all_position_symbols:
                 raise PortfolioGuardUnavailable("PORT_GUARD_NATIVE_POSITION_DUPLICATE")
@@ -839,6 +897,10 @@ def build_authorized_portfolio_guard_intents(
             else:
                 source_ts = _utc(raw_ts)
             pos_cycle = str(position.get("position_cycle_id") or meta.get("position_cycle_id") or "")
+            if (pos_cycle in seen_open_cycles or net_qty_by_cycle.get(pos_cycle) != raw_qty
+                    or symbols_by_cycle.get(pos_cycle) != sym):
+                raise PortfolioGuardUnavailable("PORT_GUARD_CURRENT_CYCLE_NET_MISMATCH")
+            seen_open_cycles.add(pos_cycle)
             orderable_qty = position.get("orderable_qty")
             if orderable_qty is None:
                 raise PortfolioGuardUnavailable("PORT_GUARD_KIS_ORDERABLE_MISSING")
@@ -861,6 +923,8 @@ def build_authorized_portfolio_guard_intents(
             }
             native_valuations.append(latest)
             enriched_by_symbol[sym] = position
+        if any(qty > 0 and cycle not in seen_open_cycles for cycle, qty in net_qty_by_cycle.items()):
+            raise PortfolioGuardUnavailable("PORT_GUARD_UNACCOUNTED_OPEN_ECONOMIC_CYCLE")
         snapshot_at = datetime.now(timezone.utc)
         pnl, economics = verified_sleeve_pnl(
             fill_proof, native_valuations,
@@ -876,6 +940,8 @@ def build_authorized_portfolio_guard_intents(
             broker_cash_ledger_complete=False,
             cash_events=None,
         )
+        economics["legacy_fill_count"] = len(legacy_fills)
+        economics["legacy_accounting_scope"] = LEGACY_ACCOUNTING_SCOPE if legacy_fills else None
         logger.info(
             "[US_PORT_GUARD][VALUATION] method=%s pnl_usd=%s confirmed_net_pnl_usd=%s fee_fill_count=%s",
             economics["method"], pnl, economics.get("confirmed_net_pnl_usd"),
@@ -889,6 +955,9 @@ def build_authorized_portfolio_guard_intents(
                 for p in sorted(native_valuations, key=lambda p: p["symbol"])
             ],
             "native_fill_count": len(fill_proof), "pnl_usd": str(pnl),
+            "legacy_originals": [[sym, g["original_cycle"], g["management_cycle"],
+                                  g["contract_sha"], g["net_qty"]]
+                                 for sym, g in sorted(legacy_groups.items())],
         })).hexdigest()
         with engine.begin() as conn:
             stage_plan = persist_guard_observation_and_reserve(
