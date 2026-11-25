@@ -341,3 +341,29 @@ def test_close_zero_pb1_recovery_does_not_hide_infinite_economic_debt():
     assert all(x["recovery_owner"] == "KR_INFINITE" for x in result["close_remaining_gaps"])
     assert merge_close_audit_debt(before, {"gap_count":0,"gaps":[]})["state"] == "BATCH_COMPLETE"
     assert merge_close_audit_debt(before, {"gap_count":2,"gaps":[]})["close_audit_verified"] is False
+
+
+def test_daily_execution_evidence_distinguishes_market_error_and_infinite_rejection(tmp_path):
+    from scripts.wsl.kr_mail_execution_evidence import _session_order_activity
+    raw = "runtime/logs/kr/2026-11-25/am/current.log"
+    file = tmp_path / raw
+    file.parent.mkdir(parents=True)
+    file.write_text(
+        "[KR][ORDER_ZERO_API][TIMING] status=RETRYABLE_MARKET_DATA_ERROR\n"
+        "[RUN_SUMMARY][RESULT] status=RETRYABLE_MARKET_DATA_ERROR\n"
+        "[KR_INF][TICK][AFTER_PROTECTIVE_SELL] decision=BLOCK reason=hashkey shared_balance=1 attempted=1 submission_state=REJECTED_EXPLICIT\n"
+        "[KR_INF][TICK][AFTER_PROTECTIVE_SELL] decision=WAIT reason=DUPLICATE_INTENT shared_balance=1 attempted=0 submission_state=NOT_ATTEMPTED\n",
+        encoding="utf-8")
+    report = _session_order_activity(tmp_path, "2026-11-25", "am", {"log_file":raw})
+    assert report["market_data_error_ticks"] == 1
+    assert report["infinite_order_attempts"] == 1
+    assert report["infinite_explicit_rejections"] == 1
+    assert report["infinite_unresolved_attempts"] == 0
+    assert _session_order_activity(tmp_path, "2026-11-25", "am", {})["infinite_order_attempts"] is None
+
+
+def test_independent_owner_attempt_requires_fresh_post_order_balance():
+    from types import SimpleNamespace
+    from trader.kr.broker_truth_hardening import _broker_crossed_this_tick
+    assert _broker_crossed_this_tick(SimpleNamespace(_kr_infinite_submit_attempted=True))
+    assert not _broker_crossed_this_tick(SimpleNamespace(_kr_infinite_submit_attempted=False))
