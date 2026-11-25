@@ -165,6 +165,7 @@ def verified_sleeve_pnl(
         raise ValueError("PORT_GUARD_NET_CASH_EVENTS_UNVERIFIED")
     book: dict[str, dict] = {}
     unique: set[tuple] = set()
+    from trader.us.utils.order_no import normalize_us_order_no
     points = []
     buy_total = sell_total = Decimal("0")
     commissions = taxes = distributions = Decimal("0")
@@ -178,7 +179,7 @@ def verified_sleeve_pnl(
             raise ValueError("PORT_GUARD_FILL_SCOPE_OR_SOURCE_INVALID")
         side = str(f.get("side") or "").upper()
         sym = str(f.get("symbol") or "").upper()
-        order = str(f.get("order_no") or "")
+        order = normalize_us_order_no(f.get("order_no"))
         client = str(f.get("client_order_key") or "")
         day = str(f.get("trade_date") or "")
         if side not in {"BUY", "SELL"} or not (sym and order and client and day):
@@ -195,7 +196,10 @@ def verified_sleeve_pnl(
             raise ValueError("PORT_GUARD_COST_NEGATIVE")
         commissions += fee
         taxes += tax
-        identity = (sym, side, day, order, client, qty, price)
+        # Each row is a cumulative native execution total, not an incremental
+        # fill. A changed quantity, average price, client alias or zero
+        # padding cannot turn a duplicate broker order into new economics.
+        identity = (sym, side, day, order)
         if identity in unique:
             raise ValueError("PORT_GUARD_DUPLICATE_NATIVE_FILL")
         unique.add(identity)

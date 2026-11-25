@@ -305,3 +305,13 @@ def test_missing_proven_costs_or_cash_ledger_cannot_authorize_guard_sell():
     broken.pop("native_fee_proof")
     with pytest.raises(ValueError, match="BROKER_FEES_UNVERIFIED"):
         _pnl([broken,rows[1]], [_position()])
+
+
+@pytest.mark.parametrize("qty,price,client", [(6, "111", "different-client"), (5, "112", "key-102"), (5, "110", "different-client")])
+def test_duplicate_cumulative_broker_order_is_not_an_incremental_fill(qty, price, client):
+    buy = _fill("KO", "BUY", 20, "100", "101")
+    sell = _fill("KO", "SELL", 5, "110", "102")
+    duplicate = {**sell, "qty": qty, "price_usd": price,
+                 "client_order_key": client, "order_no": "000000102"}
+    with pytest.raises(ValueError, match="DUPLICATE_NATIVE_FILL"):
+        _pnl([buy, sell, duplicate], [_position(qty=20-5-qty)])

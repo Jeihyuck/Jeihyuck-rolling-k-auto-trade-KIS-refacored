@@ -713,6 +713,7 @@ def build_authorized_portfolio_guard_intents(
                        portfolio_epoch_id,position_cycle_id,meta
                 FROM public.us_fills
                 WHERE trading_epoch_id=:epoch
+                  AND COALESCE(meta->>'accounting_active','true') <> 'false'
                 ORDER BY trade_date,id
             """), {"epoch": epoch}).mappings().all()
         fill_proof = []
