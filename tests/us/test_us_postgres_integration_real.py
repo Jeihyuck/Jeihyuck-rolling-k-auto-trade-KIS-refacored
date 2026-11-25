@@ -4506,6 +4506,13 @@ engine.dispose()
     sell = sells[0]
     assert sell["source_entry_contract_sha256"] == signed["sha256"]
     assert sell["position_lifecycle_id"] == cycle
+    # Do not repair the generated SELL in the test: canonical scope must
+    # survive the real DB -> resolver -> exit producer handoff.
+    for field, expected in (("position_cycle_id", cycle),
+                            ("portfolio_epoch_id", portfolio),
+                            ("trading_epoch_id", epoch)):
+        assert sell.get(field) == expected, (field, sell)
+        assert sell["meta"].get(field) == expected, (field, sell)
     sell["trade_date"] = "2026-11-11"
     sell.setdefault("exchange", "NASDAQ")
     sell.setdefault("holding_qty", 6)
