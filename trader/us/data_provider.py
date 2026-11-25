@@ -191,6 +191,22 @@ def normalize_daily_row(row: dict) -> dict:
     return result
 
 
+def _copy_completed_daily_result(result: dict) -> dict:
+    """Fast defensive copy for flat OHLCV rows; preserve nested data isolation."""
+    from copy import deepcopy
+    scalar_types = {str, int, float, bool, type(None), date, datetime, Decimal}
+    rows = result.get("rows")
+    if type(rows) is not list:
+        return deepcopy(result)
+    if any(type(value) not in scalar_types
+           for key, value in result.items() if key != "rows"):
+        return deepcopy(result)
+    if any(type(row) is not dict or any(type(value) not in scalar_types
+                                      for value in row.values()) for row in rows):
+        return deepcopy(result)
+    return {**result, "rows": [row.copy() for row in rows]}
+
+
 def normalize_daily_rows(symbol: str, rows: list[dict]) -> list[dict]:
     """일봉 row list를 정규화하고 필수 로그를 남긴다."""
     rows_raw = len(rows)
@@ -1168,7 +1184,6 @@ class USDataProvider:
     ) -> dict:
         # Completed bars are immutable for this tick's trade date. Live quotes,
         # balances, claims and pre-HTTP SELL checks never use this cache.
-        from copy import deepcopy
         ctx = self._tick_context
         if ctx is None or self._stage_cancelled():
             return self._get_completed_daily_prices_result_uncached(
@@ -1181,12 +1196,12 @@ class USDataProvider:
         key = (str(symbol).upper(), str(exchange).upper(), str(trade_date), int(required_bars))
         if key in cache:
             ctx.count("completed_daily_cache_hits")
-            return deepcopy(cache[key])
+            return _copy_completed_daily_result(cache[key])
         result = self._get_completed_daily_prices_result_uncached(
             symbol, exchange, trade_date=trade_date,
             required_bars=required_bars, allow_http_sync=allow_http_sync)
         if result.get("quality") == "OK" and not self._stage_cancelled():
-            cache[key] = deepcopy(result)
+            cache[key] = _copy_completed_daily_result(result)
         return result
 
     def _get_completed_daily_prices_result_uncached(
