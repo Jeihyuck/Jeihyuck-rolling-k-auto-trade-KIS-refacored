@@ -345,6 +345,11 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
             remaining = kr_tick_remaining_sec()
             if remaining != float("inf") and remaining < min_remaining:
                 return RunResult(Decision(Action.WAIT, "KR_INF_RETRY_DEADLINE"), state)
+            if not executor.verify_retry_balance(config.symbol, position):
+                return RunResult(Decision(Action.WAIT, "KR_INF_RETRY_FRESH_BALANCE_UNVERIFIED"), state)
+            remaining = kr_tick_remaining_sec()
+            if remaining != float("inf") and remaining < min_remaining:
+                return RunResult(Decision(Action.WAIT, "KR_INF_RETRY_DEADLINE"), state)
             retry = repository.retry_add_submit(
                 state=state, decision=decision, day=day, env=env, position=position,
                 broker_no_order_proven=True,
