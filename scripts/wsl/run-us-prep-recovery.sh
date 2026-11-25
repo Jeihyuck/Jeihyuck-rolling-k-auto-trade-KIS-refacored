@@ -35,6 +35,9 @@ from trader.us.prep_effective import check_effective_prep_sources
 try:
     result = check_effective_prep_sources(trade_date)
     print('[US_PREP_RECOVERY][SOURCE_CHECK]', result)
+    if result['ok'] and result.get('benchmark_recovery_required'):
+        print(f"[US_PREP_RECOVERY][RETRY_BENCHMARK_DATA] trade_date={trade_date}")
+        raise SystemExit(1)
     if result['ok']:
         print(f"[US_PREP_RECOVERY][SKIP_EFFECTIVE_PREP] trade_date={trade_date}")
         raise SystemExit(0)
@@ -47,7 +50,8 @@ PY
 # A completed same-day PREP is the effective contract. Never create a newer
 # STARTED recovery row over an already valid contract merely because a caller
 # asks recovery to run again. Entry-blocked OK_WITH_WARNINGS_* contracts are
-# still effective because exit/close liveness remains valid. Do not clear an
+# still effective because exit/close liveness remains valid, except a proven
+# recoverable benchmark data failure. Do not clear an
 # existing preflight EXIT_ONLY marker here; only the full artifact+DB provenance
 # check may remove that fail-closed decision.
 if is_effective_prep; then

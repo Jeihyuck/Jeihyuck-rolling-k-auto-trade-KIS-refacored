@@ -273,6 +273,18 @@ def check_effective_prep_sources(trade_date: str, *, min_rows: int = 10) -> dict
         and locked_rows_match_prep_run(prep, locked_rows)
     )
     return {**result, "ok": bool(ok), "reason": "ok" if ok else "db_live_contract_invalid",
+            "benchmark_recovery_required": benchmark_recovery_required(contract),
             "run_id": run_id if ok else None,
             "status": contract.get("status"), "artifact_count": len(artifact_rows),
             "locked_count": len(locked_rows), "provenance_ok": provenance.get("ok") is True}
+
+
+def benchmark_recovery_required(contract: dict[str, Any]) -> bool:
+    """Recover a data failure, not a valid strategy/risk-off BUY prohibition."""
+    return (
+        contract.get("recoverable_contract") is True
+        and (
+            contract.get("benchmark_daily_failed") is True
+            or contract.get("trade_block_reason") == "BENCHMARK_DAILY_DATA_UNAVAILABLE"
+        )
+    )

@@ -418,6 +418,10 @@ class KisUSClient:
         self._assert_not_offline("get_us_daily_price")
         tr = get_tr_info("us_daily_price")
         headers = self._build_headers(tr["tr_id"])
+        # Symbol-level ETF metadata overrides the canonical/listing venue for quotes only.
+        from trader.us.symbols import ETF_EXCHANGE_METADATA, resolve_quote_exchange
+        if str(symbol).strip().upper() in ETF_EXCHANGE_METADATA:
+            exchange = resolve_quote_exchange(symbol)
         bymd = resolve_us_dailyprice_bymd(as_of_date)
         logger.info(
             "[US_DATA_PROVIDER][DAILYPRICE] symbol=%s exchange=%s bymd=%s",
@@ -435,12 +439,18 @@ class KisUSClient:
         }
         cache_key = ("dailyprice", symbol.upper(), self._resolve_quote_excd(exchange), bymd)
         cached = self._response_cache.get(cache_key)
-        if cached:
+        # Only cache nonempty responses briefly; a recovery run must refetch.
+        ttl = max(0.0, float(os.getenv("US_KIS_DAILY_CACHE_TTL_SEC", "60") or 60))
+        recovery = os.getenv("US_PREP_RECOVERY_RUN", "0") == "1"
+        if cached and not recovery and time.time() - cached[0] < ttl and cached[1].get("output2"):
             logger.debug("[US_KIS][CACHE_HIT] endpoint=GET_dailyprice symbol=%s bymd=%s", symbol, bymd)
             return (cached[1].get("output2") or [])[:count]
+        self._response_cache.pop(cache_key, None)
         result = self._get(tr["path"], headers=headers, params=params)
-        self._response_cache[cache_key] = (time.time(), result)
-        return (result.get("output2") or [])[:count]
+        rows = result.get("output2") or []
+        if rows:
+            self._response_cache[cache_key] = (time.time(), result)
+        return rows[:count]
 
 
     def get_us_daily_price_history(
