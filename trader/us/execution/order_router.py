@@ -1015,6 +1015,25 @@ def _semantic_action_instance(
         return sha
     if (
         side == "SELL" and owner == "US_STANDARD"
+        and action.strip().upper().startswith("US_PORTFOLIO_GIVEBACK_STAGE_")
+    ):
+        # Unlike a once-only discretionary trim, two independently signed
+        # episodes must have distinct native economic action identities.
+        # PnL prose, tick timestamp, transient requested_qty never enter key.
+        guard_key = str(meta.get("portfolio_guard_action_key") or "")
+        episode = str(meta.get("portfolio_guard_episode_id") or "")
+        policy_digest = str(meta.get("portfolio_guard_policy_digest") or "")
+        cycle = str(intent.get("position_cycle_id") or meta.get("position_cycle_id") or "")
+        if (
+            not guard_key.startswith("US_PPG_")
+            or guard_key != str(intent.get("client_order_key") or "")
+            or not episode or not cycle
+            or len(policy_digest) != 64
+        ):
+            raise ValueError("US_PORT_GUARD_NATIVE_ACTION_IDENTITY_MISSING")
+        return "PORT_GUARD_ACTION:" + guard_key
+    if (
+        side == "SELL" and owner == "US_STANDARD"
         and action.strip().upper() == "US_LEGACY_SOFT_STOP_FIRST_PARTIAL"
     ):
         # A V2 soft-stop first trim is repeatable on a NEW trade date only.
@@ -3149,6 +3168,70 @@ def route_order(
                 "[US_ORDER][TIMING_PRE_HTTP_PASS] symbol=%s order_limit=%s",
                 symbol_upper, intent.get("limit_price"),
             )
+        # The portfolio giveback SELL must not be undone by an immediate
+        # momentum/pullback/BREAKOUT BUY. Treat the signed episode as a shared
+        # US_STANDARD buying-power reduction, NOT a replacement for individual
+        # strategy eligibility. The guard is checked at native POST, so earlier
+        # decision/claim latency cannot bypass a newly triggered episode.
+        if (
+            side == "BUY"
+            and str(
+                intent.get("strategy_owner")
+                or (
+                    intent.get("meta", {}).get("strategy_owner")
+                    if isinstance(intent.get("meta"), dict) else ""
+                )
+                or ""
+            ).upper() == "US_STANDARD"
+            and (
+                os.getenv("US_PORTFOLIO_GUARD_ACTIVE", "0") == "1"
+                or os.getenv("US_PORTFOLIO_GUARD_REENTRY_GUARD_ENABLED", "0") == "1"
+            )
+        ):
+            try:
+                from datetime import datetime as _guard_dt, timezone as _guard_tz
+                from decimal import Decimal as _GuardDecimal
+                from trader.us.portfolio_profit_guard_store import (
+                    assert_portfolio_guard_reentry_budget,
+                )
+                assert_portfolio_guard_reentry_budget(
+                    intent,
+                    order_notional_usd=(_GuardDecimal(str(price)) * qty),
+                    now=_guard_dt.now(_guard_tz.utc),
+                )
+            except Exception as _reentry_exc:
+                logger.error(
+                    "[US_PORT_GUARD][BUY_REENTRY_FENCED] symbol=%s reason_type=%s",
+                    symbol_upper, type(_reentry_exc).__name__,
+                )
+                raise KisUSPreSubmitError(
+                    "US_PORT_GUARD_REENTRY_UNVERIFIED_BEFORE_HTTP"
+                ) from _reentry_exc
+
+        # A portfolio-level SELL has its own authorization contract, separate
+        # from every original BUY V2/V3 and the discretionary TP path.
+        # Re-prove this EXACT policy/action/native quote at the real KIS
+        # pre-HTTP callback (after rate-limiter / Stage4 / claim latency).
+        if side == "SELL" and str(intent.get("exit_type") or "") == "portfolio_profit_guard":
+            try:
+                from datetime import datetime as _dt_now, timezone as _tz_now
+                from decimal import Decimal as _Decimal
+                from trader.us.portfolio_profit_guard_store import (
+                    assert_portfolio_guard_native_pre_http,
+                )
+                assert_portfolio_guard_native_pre_http(
+                    intent, now=_dt_now.now(_tz_now.utc),
+                    actual_qty=qty, actual_limit_price=_Decimal(str(price)),
+                    kis_client=kis_client,
+                )
+            except Exception as _guard_exc:
+                logger.error(
+                    "[US_PORT_GUARD][NATIVE_POST_FENCED] symbol=%s reason_type=%s",
+                    symbol_upper, type(_guard_exc).__name__,
+                )
+                raise KisUSPreSubmitError(
+                    "US_PORT_GUARD_POLICY_OR_STAGE_UNVERIFIED_BEFORE_HTTP"
+                ) from _guard_exc
         observation_error = _record_claim_observation(
             "SUBMITTED", None, authoritative=False,
         )
