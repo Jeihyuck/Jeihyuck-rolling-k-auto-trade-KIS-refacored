@@ -5958,6 +5958,7 @@ class PB1Engine:
             )
         if _timing_eligible:
             _timing_now = now_kst()
+            _timing_started = time.monotonic()
             _timing = evaluate_proof_for_candidate(
                 env=self.env,
                 account_scope=get_account_key(env=self.env),
@@ -5991,6 +5992,11 @@ class PB1Engine:
                 _timing = {**_timing, "live_quote_validation": _quote_check}
                 if _quote_check["state"] != "READY":
                     _timing.update(state=_quote_check["state"], reason=_quote_check["reason"])
+            logger.info(
+                "[KR][ENTRY][DECISION_LATENCY] code=%s style=%s decision_at=%s latest_bar_ts=%s eval_elapsed_ms=%.1f state=%s reason=%s",
+                cf.code, _timing_style, now_kst().isoformat(), _timing.get("latest_bar_ts"),
+                1000.0 * (time.monotonic() - _timing_started), _timing.get("state"), _timing.get("reason"),
+            )
             # Preserve the actual pre-submit timing verdict in the existing
             # candidate evaluation/ORDER_SKIP payload for later read-only audits.
             # This does not authorize trades or alter owner strategy thresholds.
