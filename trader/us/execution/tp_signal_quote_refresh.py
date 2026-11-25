@@ -72,7 +72,9 @@ def refresh_tp_source_quotes(
     never touched. A bounded overall deadline is shared across the batch.
     """
     rows = list(positions or [])
-    reader = getattr(provider, "get_isolated_exit_quote", None)
+    reader = getattr(provider, "get_isolated_tp_quote", None)
+    if not callable(reader):
+        reader = getattr(provider, "get_isolated_exit_quote", None)
     if (
         os.getenv("KIS_ENV", "practice").lower() != "practice"
         or os.getenv("US_SHARED_KIS_LIMITER_ENABLED", "0") != "1"

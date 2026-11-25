@@ -758,6 +758,7 @@ class USDataProvider:
 
     def get_isolated_exit_quote(
         self, symbol: str, exchange: str, *, stage_deadline: float,
+        max_quote_age_sec: float | None = None,
     ) -> dict:
         """Price-only I/O for concurrent protective-exit snapshot preparation.
 
@@ -784,7 +785,16 @@ class USDataProvider:
         client = isolate._get_client()
         client._stage_deadline = float(stage_deadline)
         client._stage_max_attempts = 1
-        return isolate.get_current_price(symbol, exchange)
+        if max_quote_age_sec is None:
+            return isolate.get_current_price(symbol, exchange)
+        return isolate.get_current_price(symbol, exchange, max_quote_age_sec=max_quote_age_sec)
+
+    def get_isolated_tp_quote(self, symbol: str, exchange: str, *, stage_deadline: float) -> dict:
+        from trader.us.execution.tp_signal_quote_refresh import SOURCE_TTL_SEC
+        return self.get_isolated_exit_quote(
+            symbol, exchange, stage_deadline=stage_deadline,
+            max_quote_age_sec=SOURCE_TTL_SEC,
+        )
 
     def _load_daily_prices_from_db(
         self, symbol: str, market: str = "US", days: int = 120
@@ -873,7 +883,7 @@ class USDataProvider:
             )
             return None
 
-    def get_current_price(self, symbol: str, exchange: str) -> dict:
+    def get_current_price(self, symbol: str, exchange: str, *, max_quote_age_sec: float | None = None) -> dict:
         """현재가 조회 (KIS → DB stale fallback)."""
         if self._stage_cancelled():
             from trader.us.execution.kis_us_client import KisUSTemporaryError
@@ -921,6 +931,20 @@ class USDataProvider:
                     ctx.count("quote_cache_hits")
                     return cached
         started = __import__("time").monotonic()
+        ws_age_limit = float(os.getenv("KIS_WS_FRESH_MAX_AGE_SEC_US", "15") or 15)
+        if max_quote_age_sec is not None:
+            ws_age_limit = min(ws_age_limit, max(0.0, float(max_quote_age_sec)))
+
+        def _ws_fresh_enough(quote):
+            if not quote:
+                return False
+            if max_quote_age_sec is None:
+                return True
+            try:
+                age = __import__("time").time() - float(quote.get("received_at") or 0)
+                return 0 <= age <= ws_age_limit
+            except (TypeError, ValueError, OverflowError):
+                return False
 
         # Opt-in session-owned collector avoids forking an active WS thread.
         # The collector has no trading/order capability. Its socket may be
@@ -936,9 +960,9 @@ class USDataProvider:
                 from trader.marketdata.us_ws_collector import get_quote
                 fresh = get_quote(
                     symbol, exchange, env=self._env,
-                    max_age_sec=float(os.getenv("KIS_WS_FRESH_MAX_AGE_SEC_US", "15") or 15),
+                    max_age_sec=ws_age_limit,
                 )
-                if fresh:
+                if _ws_fresh_enough(fresh):
                     data = {
                         "last": str(fresh.get("last") or "0"),
                         "open": "0", "high": "0", "low": "0", "tvol": "0",
@@ -970,14 +994,14 @@ class USDataProvider:
                 from trader.marketdata.kis_ws_price import get_kis_ws_price_service
                 ws_service = get_kis_ws_price_service()
                 ws_service.subscribe_us(symbol, exchange)
-                ws_max_age = float(os.getenv("KIS_WS_FRESH_MAX_AGE_SEC_US", "15") or 15)
+                ws_max_age = ws_age_limit
                 ws_wait = float(os.getenv("KIS_WS_INITIAL_WAIT_SEC", "0.35") or 0.35)
                 ws_quote = ws_service.get_fresh_quote("US", symbol, max_age_sec=ws_max_age)
                 if ws_quote is None and ws_wait > 0:
                     ws_quote = ws_service.wait_for_fresh_quote(
                         "US", symbol, max_age_sec=ws_max_age, wait_sec=ws_wait
                     )
-                if ws_quote:
+                if _ws_fresh_enough(ws_quote):
                     if self._stage_cancelled():
                         from trader.us.execution.kis_us_client import KisUSTemporaryError
                         raise KisUSTemporaryError("entry stage cancelled after websocket quote")
