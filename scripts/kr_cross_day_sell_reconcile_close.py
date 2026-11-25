@@ -13,6 +13,24 @@ from uuid import uuid4
 from trader.time_utils import now_kst
 
 
+def merge_close_audit_debt(outcome: dict, audit: dict) -> dict:
+    """Preserve exact unresolved order identity across owner boundaries."""
+    gaps = audit.get("gaps")
+    count = audit.get("gap_count")
+    if not isinstance(gaps, list) or type(count) is not int or count != len(gaps):
+        return {**outcome, "state": "BATCH_WITH_PENDING", "close_audit_verified": False}
+    routes = []
+    for row in gaps:
+        if not isinstance(row, dict) or not row.get("order_id"):
+            return {**outcome, "state": "BATCH_WITH_PENDING", "close_audit_verified": False}
+        routes.append({**row, "recovery_owner": (
+            "KR_INFINITE" if str(row.get("code")) == "122630" else "PB1"
+        ), "recovery_status": "ORIGINAL_NATIVE_ECONOMICS_REQUIRED"})
+    return {**outcome, "state": "BATCH_WITH_PENDING" if routes else outcome.get("state"),
+            "close_audit_verified": True, "close_remaining_gap_count": count,
+            "close_remaining_gaps": routes}
+
+
 def main() -> int:
     if not (
         os.getenv("KIS_ENV", "").lower() == "practice"
@@ -71,6 +89,16 @@ def main() -> int:
                 notes="HISTORICAL_SELL_RECOVERY_INTERRUPTED",
             )
             raise
+        # A PB1 queue with zero entries is not account-wide settlement
+        # completion. Re-read the authoritative CLOSE audit after the batch.
+        # Foreign sleeve debt is reported separately and never replayed as PB1.
+        try:
+            from trader.kr.close_settlement_state_258 import audit_close_priced_sell_evidence
+            audit = audit_close_priced_sell_evidence(engine=engine, env=ctx.env, day=now_kst().date())
+            outcome = merge_close_audit_debt(outcome, audit)
+        except Exception as exc:
+            outcome = {**outcome, "state": "BATCH_WITH_PENDING",
+                       "close_audit_verified": False, "close_audit_error": type(exc).__name__}
         runs.finish_run(
             ctx.run_id,
             status=("OK" if outcome.get("state") in
