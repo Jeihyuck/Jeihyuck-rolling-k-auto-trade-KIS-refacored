@@ -178,7 +178,30 @@ def collect(*, engine, kis, now, code=None, trade_date=None):
             exact = [p for p in positions if str(p["position_cycle_id"]) == str(order["position_cycle_id"])]
             evidence = summarize_native_order(order, native)
             if len(exact) == 1 and evidence.get("proven_filled_qty") == order["qty"]:
-                continue
+                # A full BUY and a closed source position do not prove a SELL
+                # belongs to the same lifecycle (e.g. duplicate imported close).
+                cycle_sells = [dict(row) for row in conn.execute(sa.select(orders).where(
+                    orders.c.env == scope.env,
+                    orders.c.trading_epoch_id == scope.trading_epoch_id,
+                    orders.c.portfolio_epoch_id == order["portfolio_epoch_id"],
+                    orders.c.position_cycle_id == order["position_cycle_id"],
+                    orders.c.strategy == "pb1_pullback_close",
+                    orders.c.code == symbol, orders.c.side == "SELL",
+                )).mappings()]
+                proven_sell_qty = 0
+                for sell in cycle_sells:
+                    sell_fills = [dict(row) for row in conn.execute(sa.select(fills).where(
+                        fills.c.order_id == sell["order_id"], fills.c.env == scope.env,
+                        fills.c.trading_epoch_id == scope.trading_epoch_id,
+                        fills.c.side == "SELL",
+                    )).mappings()]
+                    proven_sell_qty += int(summarize_native_order(sell, sell_fills).get("proven_filled_qty") or 0)
+                if (exact[0]["status"] == "OPEN" and int(exact[0]["qty"]) > 0
+                        and proven_sell_qty + int(exact[0]["qty"]) == int(order["qty"])):
+                    continue
+                if (exact[0]["status"] == "CLOSED" and int(exact[0]["qty"]) == 0
+                        and proven_sell_qty == int(order["qty"])):
+                    continue
             targets.append({"claim": {"trade_date": day, "action_key": None},
                             "order": order, "db_fill_qty": sum(int(f.get("qty") or 0) for f in native),
                             "positions": positions})
