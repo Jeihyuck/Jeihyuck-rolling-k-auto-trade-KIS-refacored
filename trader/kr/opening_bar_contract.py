@@ -788,15 +788,17 @@ def evaluate_proof_for_candidate(*, env: str, account_scope: str, code: str,
                                  now: datetime, style: str, setup_ok: bool,
                                  trigger_ok: bool, pivot: float | None,
                                  order_price: float) -> dict:
+    policy = active_entry_policy(env)
+    family = STYLES.get(str(style or "").strip().upper())
+    if policy not in {"LEGACY_V1", "US_ALIGNED_V2"}:
+        return _result("UNKNOWN", "ENTRY_OPPORTUNITY_POLICY_INVALID",
+                       entry_policy=policy)
     payload = load_opening_proof(
         env=env, account_scope=account_scope, code=code, now=now,
     )
     if not payload:
-        return _result("UNKNOWN", "NO_FRESH_VERIFIED_KIS_MINUTE_BAR_PROOF")
-    family = STYLES.get(str(style or "").strip().upper())
-    policy = active_entry_policy(env)
-    if policy not in {"LEGACY_V1", "US_ALIGNED_V2"}:
-        return _result("UNKNOWN", "ENTRY_OPPORTUNITY_POLICY_INVALID")
+        return _result("UNKNOWN", "NO_FRESH_VERIFIED_KIS_MINUTE_BAR_PROOF",
+                       entry_policy=policy if family in {"PULLBACK", "MOMENTUM"} else "LEGACY_V1")
     if policy == "US_ALIGNED_V2" and family in {"PULLBACK", "MOMENTUM"}:
         # An owner-confirmed momentum breakout remains on its separate V1
         # opening/pivot contract, not an easier reclaim substitution.
@@ -805,7 +807,9 @@ def evaluate_proof_for_candidate(*, env: str, account_scope: str, code: str,
             trigger_ok=trigger_ok, order_price=order_price,
         )
         if result.get("reason") != "MOMENTUM_BREAKOUT_REQUIRES_OWNER_PATH":
-            return result
+            # Early UNKNOWN/WAIT returns must not be mislabeled as legacy.
+            # Preserve the owner breakout fallback below.
+            return {**result, "entry_policy": policy}
     conflicts = payload.get("source_conflicts") or []
     if conflicts:
         family = STYLES.get(str(style or "").strip().upper())
