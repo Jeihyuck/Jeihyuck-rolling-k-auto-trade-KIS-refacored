@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 from dataclasses import asdict
-from datetime import date
+from datetime import date, datetime, timezone
 from uuid import uuid4
 
 from sqlalchemy import text
@@ -212,6 +212,131 @@ class InfiniteRepository:
             else:
                 rows = conn.execute(text("SELECT idempotency_key FROM kr_infinite_order_intents")).all()
         return frozenset(row[0] for row in rows)
+
+    @staticmethod
+    def _prehash_retry_proven(row, attempts, state, position, now):
+        """Narrow same-day zero-fill ADD retry; never infer nonacceptance from balance."""
+        if not row or not attempts or len(attempts) >= 3:
+            return False
+        try:
+            meta = row["metadata"]
+            if isinstance(meta, str):
+                meta = json.loads(meta)
+            rejection = str(meta.get("rejection") or "")
+            return (
+                row["status"] == "REJECTED" and not row["broker_order_id"]
+                and row["filled_qty"] == 0 and row["action_state"] == "RETRYABLE"
+                and row["active_attempt_id"] is None and row["claim_conflicts"] == 0
+                and row["cumulative_filled_qty"] == 0
+                and row["requested_qty"] == row["target_qty"] == row["remaining_target_qty"]
+                and row["requested_qty"] > 0
+                and meta.get("strategy_owner") == "KR_INFINITE"
+                and meta.get("reconcile_required") is not True
+                and "request failed after retries:" in rejection
+                and "/uapi/hashkey" in rejection and "HTTP 500" in rejection
+                and int(meta["pre_order_holding_qty"]) == position.qty > 0
+                and abs(float(meta["pre_order_avg_price"])-position.average_price) < 0.01
+                and int(meta["pre_order_orderable_qty"]) == position.orderable_qty
+                and row["unit_sequence"] == state.units_used+1
+                and (now-row["updated_at"]).total_seconds() >= 60
+                and all(a["attempt_state"] == "REJECTED_EXPLICIT"
+                        and a["authoritative"] is True and a["cumulative_filled_qty"] == 0
+                        and a["client_order_key"] == row["idempotency_key"]
+                        for a in attempts)
+            )
+        except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
+            return False
+
+    def _retry_add_row(self, conn, state, day, env, position, *, lock=False):
+        if env != "practice" or not state.cycle_id or state.symbol != "122630":
+            return None, None, None
+        epoch = self._epoch_id(conn, required=True)
+        identity = execution_action_identity(
+            env=env, account_key=get_account_key(env=env), market="KR",
+            trading_epoch_id=str(epoch), symbol=state.symbol, cycle_id=state.cycle_id,
+            side="BUY", reason="ADAPTIVE_ADD_BUY", unit_sequence=state.units_used+1,
+            trade_date=day,
+        )
+        row = conn.execute(text("""
+            SELECT i.*, c.action_state, c.active_attempt_id, c.claim_conflicts,
+                   c.target_qty, c.remaining_target_qty, c.cumulative_filled_qty
+            FROM kr_infinite_order_intents i JOIN execution_claims c
+              ON c.action_key=:action AND c.trading_epoch_id=i.trading_epoch_id
+            WHERE i.trading_epoch_id=:epoch AND i.cycle_id=:cycle
+              AND i.symbol='122630' AND i.strategy_id='KR_INFINITE_V1'
+              AND i.trade_date=:day AND i.side='BUY' AND i.reason='ADAPTIVE_ADD_BUY'
+              AND i.unit_sequence=:seq
+            """ + (" FOR UPDATE OF i" if lock else "")),
+            {"action": identity.action_key, "epoch": epoch, "cycle": state.cycle_id,
+             "day": day, "seq": state.units_used+1}).mappings().one_or_none()
+        if not row:
+            return None, None, None
+        attempts = conn.execute(text("""
+            SELECT attempt_id, attempt_state, authoritative, cumulative_filled_qty, client_order_key
+            FROM execution_attempts WHERE action_key=:action ORDER BY attempt_no
+            """), {"action": identity.action_key}).mappings().all()
+        if not self._prehash_retry_proven(row, attempts, state, position, datetime.now(timezone.utc)):
+            return None, None, None
+        return row, identity, attempts
+
+    def retryable_add_key(self, state, day, env, position):
+        """Eligibility only; the caller must obtain independent broker history."""
+        with self.engine.connect() as conn:
+            row, _, _ = self._retry_add_row(conn, state, day, env, position)
+            return str(row["idempotency_key"]) if row else None
+
+    def retry_add_submit(self, *, state, decision, day, env, position,
+                         broker_no_order_proven=False):
+        """Atomically reclaim existing zero-fill intent and journal a new attempt.
+
+        Never delete an intent or change semantic unit/cycle. No real-account
+        or ambiguous-outcome retry. Only an unchanged quantity and non-higher
+        native LIMIT are eligible. A crash after acquisition remains fenced.
+        """
+        if not broker_no_order_proven or decision.action.value != "BUY" or decision.reason != "ADAPTIVE_ADD_BUY":
+            return None
+        with self.engine.begin() as conn:
+            row, identity, attempts = self._retry_add_row(conn, state, day, env, position, lock=True)
+            if not row or decision.idempotency_key != row["idempotency_key"]:
+                return None
+            if int(decision.qty) != int(row["requested_qty"]):
+                return None
+            price, tick = normalize_kr_etf_order_price(float(decision.notional)/decision.qty, side="BUY")
+            old_price, _ = normalize_kr_etf_order_price(float(row["limit_price"]), side="BUY")
+            if not 0 < price <= old_price:
+                return None
+            schema = schema_for_engine(self.engine)
+            repo = DurableExecutionClaimRepo(self.engine, schema.execution_claims, schema.execution_attempts)
+            attempt_id = str(uuid4())
+            claim = repo.acquire(identity, attempt_id=attempt_id, requested_qty=int(decision.qty),
+                                 client_order_key=decision.idempotency_key,
+                                 fresh_validation=True, _conn=conn)
+            if not claim.acquired:
+                return None
+            prior = row["metadata"]
+            if isinstance(prior, str):
+                prior = json.loads(prior)
+            history = list(prior.get("prehash_retry_history") or [])
+            history.append({"attempt_id": str(attempts[-1]["attempt_id"]),
+                            "rejection": prior["rejection"], "prior_limit": float(row["limit_price"]),
+                            "prior_notional": float(row["requested_notional_krw"])})
+            patch = {"prehash_retry_history": history, "execution_claim_action_key": claim.action_key,
+                     "execution_submit_attempt_id": attempt_id, "rejection": None,
+                     "owner_decision_price_krw": float(decision.notional)/decision.qty,
+                     "kis_submit_limit_price_krw": price, "kis_submit_tick_size_krw": tick,
+                     "retry_basis": "PRE_HASHKEY_HTTP500_AND_NATIVE_NO_ORDER"}
+            changed = conn.execute(text("""
+                UPDATE kr_infinite_order_intents
+                SET status='INTENT_CREATED', limit_price=:price, requested_notional_krw=:notional,
+                    metadata=metadata || CAST(:patch AS jsonb), updated_at=NOW()
+                WHERE id=:id AND trading_epoch_id=:epoch AND status='REJECTED'
+                RETURNING id
+                """), {"id": row["id"], "epoch": row["trading_epoch_id"],
+                         "price": float(decision.notional)/decision.qty,
+                         "notional": decision.notional, "patch": json.dumps(patch)}).first()
+            if changed is None:
+                raise RuntimeError("KR_INF_RETRY_INTENT_RACE")
+            return identity, claim
 
     def pending_intents(self) -> list[OrderIntent]:
         with self.engine.connect() as conn:
