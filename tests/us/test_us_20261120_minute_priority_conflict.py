@@ -166,3 +166,43 @@ def test_request_clock_excludes_in_progress_minute(tmp_path):
         assert len(load_bars(db, trade_date=DAY, symbol="CL")) == 1
     finally:
         db.close()
+
+
+def test_conflict_repair_requires_three_spaced_distinct_native_observations(tmp_path):
+    db = open_store(store_path(env="practice", account_scope="scope", trade_date=DAY, base=tmp_path))
+    now = datetime(2026, 10, 28, 10, 5, tzinfo=NY)
+    def save(row, oid=None, epoch=None):
+        return persist_bars(db, trade_date=DAY, symbol="CL", owner="US_STANDARD",
+                            native_rows=[row], now_et=now, observation_id=oid, observed_epoch=epoch)
+    try:
+        assert save(_row()) == 1
+        assert save(_row("100.6"), "http-1", 1000.0) == 0
+        assert load_bars(db, trade_date=DAY, symbol="CL") == []
+        assert save(_row("100.6"), "http-1", 1060.0) == 0
+        assert save(_row("100.6"), "http-too-soon", 1030.0) == 0
+        assert save(_row("100.6"), "http-2", 1060.0) == 0
+        assert load_bars(db, trade_date=DAY, symbol="CL") == []
+        assert save(_row("100.6"), "http-3", 1120.0) == 1
+        assert load_bars(db, trade_date=DAY, symbol="CL")[0]["close"] == 100.6
+        assert db.execute("SELECT status FROM bar_conflicts").fetchone()[0] == "RESOLVED"
+        assert db.execute("SELECT count(*) FROM bar_conflict_resolution_history").fetchone()[0] == 1
+        # A new conflicting native value reopens quarantine without erasing history.
+        assert save(_row("100.5"), "http-4", 1180.0) == 0
+        assert load_bars(db, trade_date=DAY, symbol="CL") == []
+        assert db.execute("SELECT count(*) FROM bar_conflict_resolution_history").fetchone()[0] == 1
+    finally:
+        db.close()
+
+
+def test_conflict_repair_resets_on_a_different_candidate(tmp_path):
+    db = open_store(store_path(env="practice", account_scope="scope", trade_date=DAY, base=tmp_path))
+    now = datetime(2026, 10, 28, 10, 5, tzinfo=NY)
+    try:
+        for i, value in enumerate(["100.5", "100.6", "100.6", "100.7", "100.6"]):
+            persist_bars(db, trade_date=DAY, symbol="CL", owner="US_STANDARD",
+                         native_rows=[_row(value)], now_et=now,
+                         observation_id=f"http-{i}", observed_epoch=1000.0+i*60)
+        assert load_bars(db, trade_date=DAY, symbol="CL") == []
+        assert db.execute("SELECT count(*) FROM bar_conflict_resolution_history").fetchone()[0] == 0
+    finally:
+        db.close()
