@@ -1794,9 +1794,21 @@ class KisAPI:
                 logger.info("[KR_SHARED_HTTP][ADMISSION] endpoint=%s attempt=%s granted=%s reason=%s wait_sec=%.3f priority=%s",
                             endpoint_name, i, int(granted), admission_reason, waited, int(critical))
                 if not granted:
-                    if is_order_endpoint(url):
-                        raise KisOrderPreSubmitBlocked("KR_SHARED_HTTP_PRE_SUBMIT_" + admission_reason)
-                    raise KisTemporaryError("KR_SHARED_HTTP_PRE_REQUEST_" + admission_reason)
+                    if (admission_reason == "STATE_OR_CONFIG_UNAVAILABLE"
+                            and str(os.getenv("KR_PB1_OBSERVER_ONLY") or "") != "1"):
+                        # Optional shared admission infrastructure failed.
+                        # The original local/global endpoint gate above is
+                        # still mandatory. Never strand an otherwise eligible
+                        # protective SELL due solely to an IPC state-file error.
+                        # Actual quota waits/cooldowns NEVER take this fallback.
+                        logger.error(
+                            "[KR_SHARED_HTTP][DEGRADED_LOCAL_GATE] endpoint=%s attempt=%s reason=%s",
+                            endpoint_name, i, admission_reason,
+                        )
+                    else:
+                        if is_order_endpoint(url):
+                            raise KisOrderPreSubmitBlocked("KR_SHARED_HTTP_PRE_SUBMIT_" + admission_reason)
+                        raise KisTemporaryError("KR_SHARED_HTTP_PRE_REQUEST_" + admission_reason)
             try:
                 stage_deadline = getattr(self, "_kr_stage_deadline", None)
                 request_timeout = _kr_bounded_timeout(
