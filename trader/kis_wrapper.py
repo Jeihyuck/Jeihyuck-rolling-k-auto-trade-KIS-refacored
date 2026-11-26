@@ -1547,7 +1547,7 @@ class KisAPI:
         except Exception as e:
             logger.warning("[NET] session reset failed: %s", e)
 
-    def _safe_request(self, method: str, url: str, *, reset_on_error: bool = True, endpoint: str | None = None, **kwargs) -> requests.Response:
+    def _safe_request(self, method: str, url: str, *, reset_on_error: bool = True, endpoint: str | None = None, kr_read_attempt_cap: int | None = None, **kwargs) -> requests.Response:
         """
         공통 안전요청 래퍼:
         - DIAG 모드: 주문 차단, 데이터는 ALLOW_KIS_DATA_HTTP_IN_DIAG=1이면 허용
@@ -1672,6 +1672,8 @@ class KisAPI:
             attempts = max(self._safe_attempts, 1)
         if no_retry_inquire_investor:
             attempts = 1
+        if kr_read_attempt_cap is not None and method.upper() == "GET":
+            attempts = min(attempts, max(1, int(kr_read_attempt_cap)))
         # The independent KR minute observer must never hold KIS's quota
         # with nested retries. All non-observer callers preserve their
         # original retries and broker submission semantics.
@@ -2817,11 +2819,23 @@ class KisAPI:
         # inquire-price response. Never enable this in the BUY/SELL hot path.
         if not native_rest_only:
             ws_service = get_kis_ws_price_service()
-            ws_service.subscribe_kr(c)
+            from trader.marketdata import kr_ws_shared
+
             ws_max_age = _env_float("KIS_WS_FRESH_MAX_AGE_SEC_KR", 5.0)
             ws_wait = _env_float("KIS_WS_INITIAL_WAIT_SEC", 0.35)
+            shared_owner = False
             ws_quote = ws_service.get_fresh_quote("KR", c, max_age_sec=ws_max_age)
-            if ws_quote is None and ws_wait > 0:
+            if ws_quote is None and self.env == "practice" and kr_ws_shared.enabled():
+                remaining = kr_tick_remaining_sec(getattr(self, "_kr_stage_deadline", None))
+                if remaining > 0.02:
+                    shared_owner, ws_quote = kr_ws_shared.read_owner_quote(
+                        ws_service, c, max_age_sec=ws_max_age,
+                        timeout_sec=min(0.12, remaining - 0.01),
+                    )
+            if ws_quote is None and not shared_owner:
+                ws_service.subscribe_kr(c)
+                ws_quote = ws_service.get_fresh_quote("KR", c, max_age_sec=ws_max_age)
+            if ws_quote is None and not shared_owner and ws_wait > 0:
                 ws_quote = ws_service.wait_for_fresh_quote(
                     "KR", c, max_age_sec=ws_max_age, wait_sec=ws_wait
                 )
@@ -3223,7 +3237,50 @@ class KisAPI:
             logger.warning("[HOGA][FAIL] status=%s rt_cd=%s msg_cd=%s msg1=%s resp_text=%s",
                            resp.status_code, data.get("rt_cd"), data.get("msg_cd"), data.get("msg1"), resp.text[:300])
             raise RuntimeError("Hoga API failed")
-        return data.get("output", {})
+        # FHKST01010200 returns top-of-book in output1, not output2
+        # (expected auction price) or necessarily the legacy output key.
+        # Keep the old output shape for legacy adapters.
+        book = data.get("output1")
+        if not isinstance(book, dict):
+            book = data.get("output")
+        return dict(book) if isinstance(book, dict) else {}
+
+    def get_kr_entry_executable_quote(self, code: str) -> dict:
+        """One bounded orderbook supplement, with separate price/book evidence.
+
+        Only called for a selected PB1 practice entry, never for each Final30
+        symbol or the observer. The existing price timestamp is immutable.
+        """
+        from trader.kr.executable_quote import (
+            verified_price, compose_orderbook, complete_book,
+        )
+        c = str(code or "").removeprefix("A")
+        price = self.get_price_snapshot(c, market="J")
+        if complete_book(price):
+            return price
+        if (str(self.env).lower() != "practice" or c == "122630"
+                or not verified_price(price, c, now=time.time())
+                or kr_tick_remaining_sec(getattr(self, "_kr_stage_deadline", None)) < 2.5):
+            return price or {}
+        try:
+            # Fresh KIS request, not the legacy cached get_quote path.
+            started = time.time()
+            url = f"{normalize_base_url(API_BASE_URL)}/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn"
+            resp = self._safe_request(
+                "GET", url, headers=self._headers(_pick_tr(self.env, "ORDERBOOK")[0]),
+                params={"fid_cond_mrkt_div_code": "J", "fid_input_iscd": c},
+                timeout=(0.8, 1.2), endpoint="inquire-asking-price-exp-ccn",
+                kr_read_attempt_cap=1,
+            )
+            received = time.time()
+            result = compose_orderbook(price, resp, code=c, started=started, received=received)
+            if result:
+                logger.info("[KR][EXECUTABLE_QUOTE][BOOK_SUPPLEMENT] code=%s price_age_sec=%.3f book_age_sec=%.3f",
+                            c, received-float(price["received_at"]), time.time()-received)
+                return result
+        except Exception as exc:
+            logger.warning("[KR][EXECUTABLE_QUOTE][BOOK_UNAVAILABLE] code=%s type=%s", c, type(exc).__name__)
+        return price or {}
 
     def get_current_price(self, code: str) -> float:
         """기존 경량 버전(호환용). 내부적으로 get_last_price 사용."""
