@@ -3868,31 +3868,59 @@ class KisAPI:
 
         # leader does the call
         try:
-            # 4) global rate limit
-            sleep_s = _price_rl.acquire()
-            if sleep_s > 0:
-                _price_cache.record_retry_wait()
-                logger.debug("[PRICE][RATE_WAIT] code=%s sleep=%.2fs", code, sleep_s)
-                if not _kr_sleep_with_budget(sleep_s):
-                    return {}
-            if _PRICE_JITTER_MAX_SEC > 0:
-                if not _kr_sleep_with_budget(random.uniform(0.0, _PRICE_JITTER_MAX_SEC)):
-                    return {}
+            def fetch_native_or_ws():
+                # 4) global rate limit
+                sleep_s = _price_rl.acquire()
+                if sleep_s > 0:
+                    _price_cache.record_retry_wait()
+                    logger.debug("[PRICE][RATE_WAIT] code=%s sleep=%.2fs", code, sleep_s)
+                    if not _kr_sleep_with_budget(sleep_s):
+                        return {}
+                if _PRICE_JITTER_MAX_SEC > 0:
+                    if not _kr_sleep_with_budget(random.uniform(0.0, _PRICE_JITTER_MAX_SEC)):
+                        return {}
 
-            # 5) Canonical KR six-digit quotes must never fan out to the
-            # generic legacy U-market / A-prefixed alternatives. The latter
-            # generated OPSQ2001 invalid market-code replies during native
-            # minute observation, wasting the shared KIS API budget.
+                # 5) Canonical KR six-digit quotes must never fan out to the
+                # generic legacy U-market / A-prefixed alternatives. The latter
+                # generated OPSQ2001 invalid market-code replies during native
+                # minute observation, wasting the shared KIS API budget.
+                domestic_code = str(code or "").strip().removeprefix("A")
+                canonical_kr = (
+                    str(market or "").upper() == "J"
+                    and len(domestic_code) == 6 and domestic_code.isdigit()
+                )
+                return self.get_price_quote(
+                    domestic_code if canonical_kr else code,
+                    diag_mode=False, attempts=2,
+                    retry_cap=2 if canonical_kr else None,
+                )
+
+            from trader.marketdata import kr_rest_shared
             domestic_code = str(code or "").strip().removeprefix("A")
             canonical_kr = (
                 str(market or "").upper() == "J"
                 and len(domestic_code) == 6 and domestic_code.isdigit()
             )
-            data = self.get_price_quote(
-                domestic_code if canonical_kr else code,
-                diag_mode=False, attempts=2,
-                retry_cap=2 if canonical_kr else None,
-            )
+            if (canonical_kr and domestic_code != "122630"
+                    and kr_rest_shared.enabled(getattr(self, "env", None))):
+                remaining = kr_tick_remaining_sec(getattr(self, "_kr_stage_deadline", None))
+                observer = os.getenv("KR_PB1_OBSERVER_ONLY") == "1"
+                shared_status, data = kr_rest_shared.read_or_fetch(
+                    appkey=str(APP_KEY or ""), code=domestic_code,
+                    fetch=fetch_native_or_ws,
+                    max_join_sec=max(0.0, min(0.15, remaining - 0.05)),
+                    defer_on_busy=observer,
+                )
+                logger.info("[KR_REST_SHARED][PRICE] code=%s status=%s observer=%s",
+                            domestic_code, shared_status, int(observer))
+                if shared_status in {"BUSY", "UNAVAILABLE"}:
+                    # Collector defers; never prevent a protective exit from
+                    # obtaining a quote just because a collector owns a read.
+                    if observer:
+                        return {}
+                    data = fetch_native_or_ws()
+            else:
+                data = fetch_native_or_ws()
 
             # 6) EGW002 guard (초당 제한)
             msg_cd = str(data.get("msg_cd", ""))
