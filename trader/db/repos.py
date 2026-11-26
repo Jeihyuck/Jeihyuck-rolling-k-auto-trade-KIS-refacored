@@ -179,6 +179,44 @@ def _assert_kr_buy_entry_contract(request_json: Any) -> None:
         raise RuntimeError(f"KR_BUY_ENTRY_CONTRACT_INVALID:{','.join(missing)}")
 
 
+
+def _assert_kr_buy_intent_readback(persisted: Any, expected: dict[str, Any]) -> None:
+    """Verify a BUY intent inside its insert transaction, before broker submission.
+
+    PostgreSQL deployments may expose request_json as TEXT; JSON/JSONB
+    drivers may instead return a mapping. Decode exactly once and use the
+    same object for all contract, parity and hash checks. No repair or
+    mutation of the persisted contract is permitted at this boundary.
+    """
+    from collections.abc import Mapping
+
+    if isinstance(persisted, str):
+        try:
+            persisted = json.loads(persisted)
+        except (ValueError, TypeError) as exc:
+            raise RuntimeError("KR_BUY_ENTRY_CONTRACT_NOT_JSON") from exc
+    if not isinstance(persisted, Mapping):
+        raise RuntimeError("KR_BUY_ENTRY_CONTRACT_NOT_JSON")
+    persisted = dict(persisted)
+    _assert_kr_buy_entry_contract(persisted)
+
+    if expected.get("kr_us_profit_contract"):
+        from trader.kr.us_standard_profit_parity import verified_contract
+
+        frozen_parity = persisted.get("kr_us_profit_contract")
+        entry_meta = persisted.get("entry_meta")
+        if (
+            not isinstance(frozen_parity, dict)
+            or not isinstance(entry_meta, dict)
+            or not verified_contract(frozen_parity)
+            or frozen_parity != expected["kr_us_profit_contract"]
+            or entry_meta.get("kr_us_profit_contract") != frozen_parity
+        ):
+            raise RuntimeError("KR_PROFIT_PARITY_BUY_PERSISTENCE_MISMATCH")
+    if _kr_buy_entry_contract_hash(persisted) != _kr_buy_entry_contract_hash(expected):
+        raise RuntimeError("KR_BUY_ENTRY_CONTRACT_PERSISTENCE_MISMATCH")
+
+
 def _is_transient_db_connection_exception(exc: BaseException) -> bool:
     text = f"{type(exc).__module__}.{type(exc).__name__}: {exc}".lower()
     return any(
@@ -3745,18 +3783,7 @@ class OrdersRepo:
                         and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key)
                     )
                 ).scalar()
-                _assert_kr_buy_entry_contract(persisted)
-                if safe_request_json.get("kr_us_profit_contract"):
-                    from trader.kr.us_standard_profit_parity import verified_contract
-                    frozen_parity = (persisted or {}).get("kr_us_profit_contract")
-                    if (
-                        not verified_contract(frozen_parity)
-                        or frozen_parity != safe_request_json["kr_us_profit_contract"]
-                        or (persisted.get("entry_meta") or {}).get("kr_us_profit_contract") != frozen_parity
-                    ):
-                        raise RuntimeError("KR_PROFIT_PARITY_BUY_PERSISTENCE_MISMATCH")
-                if _kr_buy_entry_contract_hash(persisted) != _kr_buy_entry_contract_hash(safe_request_json):
-                    raise RuntimeError("KR_BUY_ENTRY_CONTRACT_PERSISTENCE_MISMATCH")
+                _assert_kr_buy_intent_readback(persisted, safe_request_json)
             return inserted_id, True
 
     def mark_submitted(
