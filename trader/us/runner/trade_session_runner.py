@@ -766,8 +766,14 @@ def _session_end_dt(session: str, now: datetime) -> datetime:
     """당일 session 종료 시각 (NY timezone datetime)."""
     from zoneinfo import ZoneInfo
     NY_TZ = ZoneInfo("America/New_York")
+    from trader.us.market_calendar import regular_close_time_for_date
+    local = now.astimezone(NY_TZ)
     h, m = _SESSION_END_TIMES.get(session, (16, 0))
-    return now.replace(hour=h, minute=m, second=0, microsecond=0).astimezone(NY_TZ)
+    end = local.replace(hour=h, minute=m, second=0, microsecond=0)
+    if session in {"am", "afternoon"}:
+        close = regular_close_time_for_date(local.date())
+        end = min(end, local.replace(hour=close.hour, minute=close.minute, second=0, microsecond=0))
+    return end
 
 
 _TICK_LATENCY_STAGE_KEYS = (
@@ -1461,11 +1467,11 @@ def run_trade_session(
                         sys.executable, "-m", "trader.us.entry_timing.opening_observer",
                         "--env", "practice", "--trade-date", trade_date,
                         "--scope", _obs_scope, "--parent-pid", str(os.getpid()),
-                        "--watchlist-file", str(_obs_file),
+                        "--watchlist-file", str(_obs_file), "--continuous",
                     ],
                     env=_obs_env, stdin=subprocess.DEVNULL,
                     stdout=_opening_observer_log_stream,
-                    stderr=_opening_observer_log_stream, close_fds=True,
+                    stderr=_opening_observer_log_stream, close_fds=True, start_new_session=True,
                 )
                 logger.info(
                     "[US_OPENING_OBSERVER][START] pid=%s session=%s symbols=%d mode=%s "
@@ -3326,23 +3332,12 @@ def run_trade_session(
     # ---------------------------------------------------------------------------
 
     finally:
-        # Market-data observer is isolated from the SELL execution authority.
+        # Day-scoped read-only observer owns a process lock and exits at
+        # exchange close / epoch change. Do not terminate at the AM/PM handoff.
         if _opening_observer_child is not None:
-            try:
-                if _opening_observer_child.poll() is None:
-                    _opening_observer_child.terminate()
-                _opening_observer_child.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                _opening_observer_child.kill()
-                _opening_observer_child.wait(timeout=2)
-            except Exception as _obs_stop_exc:
-                logger.warning(
-                    "[US_OPENING_OBSERVER][STOP_UNAVAILABLE] type=%s",
-                    type(_obs_stop_exc).__name__,
-                )
-            else:
-                logger.info("[US_OPENING_OBSERVER][STOPPED] pid=%s",
-                            _opening_observer_child.pid)
+            logger.info("[US_OPENING_OBSERVER][SESSION_HANDOFF] pid=%s status=%s",
+                        _opening_observer_child.pid,
+                        "RUNNING" if _opening_observer_child.poll() is None else "EXITED")
         if _opening_observer_log_stream is not None:
             _opening_observer_log_stream.close()
         os.environ.pop("US_ENTRY_WINDOW_SCOPE", None)
