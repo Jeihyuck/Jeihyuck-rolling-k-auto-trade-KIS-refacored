@@ -200,7 +200,8 @@ def _assert_kr_buy_intent_readback(persisted: Any, expected: dict[str, Any]) -> 
     persisted = dict(persisted)
     _assert_kr_buy_entry_contract(persisted)
 
-    if expected.get("kr_us_profit_contract"):
+    if (expected.get("kr_us_profit_contract") is not None
+            or persisted.get("kr_us_profit_contract") is not None):
         from trader.kr.us_standard_profit_parity import verified_contract
 
         frozen_parity = persisted.get("kr_us_profit_contract")
@@ -209,7 +210,7 @@ def _assert_kr_buy_intent_readback(persisted: Any, expected: dict[str, Any]) -> 
             not isinstance(frozen_parity, dict)
             or not isinstance(entry_meta, dict)
             or not verified_contract(frozen_parity)
-            or frozen_parity != expected["kr_us_profit_contract"]
+            or frozen_parity != expected.get("kr_us_profit_contract")
             or entry_meta.get("kr_us_profit_contract") != frozen_parity
         ):
             raise RuntimeError("KR_PROFIT_PARITY_BUY_PERSISTENCE_MISMATCH")
@@ -3741,6 +3742,7 @@ class OrdersRepo:
                     self._schema.orders.c.trading_epoch_id,
                     self._schema.orders.c.portfolio_epoch_id,
                     self._schema.orders.c.position_cycle_id,
+                    self._schema.orders.c.request_json,
                 ).where(
                     and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key)
                 )
@@ -3753,6 +3755,12 @@ class OrdersRepo:
                 if position_cycle_id and str(existing_row.get("position_cycle_id") or "") != str(position_cycle_id):
                     raise RuntimeError("KR_ORDER_POSITION_CYCLE_COLLISION")
                 existing = existing_row["order_id"]
+                if enforce_buy_contract:
+                    # A retry cannot replace the root BUY evidence or its
+                    # signed exit contract. Verify the original intent before
+                    # returning the existing identity; do not rewrite metadata.
+                    _assert_kr_buy_intent_readback(existing_row.get("request_json"), safe_request_json)
+                    return str(existing), False
                 if entry_meta_json:
                     conn.execute(
                         sa.update(self._schema.orders)
