@@ -365,3 +365,22 @@ def test_20261119_broken_manifest_reports_precise_reason(seed_prep):
     )
     assert expired["state"] == "PREP_FALLBACK"
     assert expired["reason"] == "STALE_OR_UNTRUSTED_MANIFEST"
+
+
+def test_short_planner_wake_keeps_per_symbol_budget_and_hot_due_bound():
+    from datetime import timedelta
+    schedule = pq.CandidateSchedule(max_batch=6, hot_sec=45, warm_sec=180)
+    snapshot = {"hot": [f"{30000+i:06}" for i in range(5)],
+                "warm": [f"{40000+i:06}" for i in range(5)], "cold": []}
+    start = moment(9, 30)
+    observed = {c: [] for c in snapshot["hot"]+snapshot["warm"]}
+    # Zero HTTP latency simulation only; production cannot claim this SLA
+    # without measured KIS request durations, queue and native-proof age.
+    for slot in range(120):
+        at = start + timedelta(seconds=slot*15)
+        for code in schedule.select(snapshot, at):
+            observed[code].append(slot*15)
+    for tier, minimum, maximum in (("hot",45,60), ("warm",180,210)):
+        for code in snapshot[tier]:
+            gaps = [b-a for a,b in zip(observed[code], observed[code][1:])]
+            assert gaps and min(gaps) >= minimum and max(gaps) <= maximum
