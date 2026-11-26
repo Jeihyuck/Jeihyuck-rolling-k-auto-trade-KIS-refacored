@@ -2081,6 +2081,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
             )
         if strict_sell_targets is not None and cumulative_sell_evidence is None:
             raise RuntimeError("KR_CUMULATIVE_REPAIR_ECONOMIC_PROOF_MISSING")
+        tp_cancel_proof = None
         if cumulative_sell_evidence is not None:
             if _kr_source_has_individual_sell_fills(
                 fills_repo=fills_repo, source_order=source_order, env=env,
@@ -2093,6 +2094,23 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
             else:
                 status = ("FILLED" if cumulative_sell_evidence["qty"] == int(source_order.get("qty") or 0)
                           else "PARTIAL_FILLED")
+                # Only a uniquely attributed original PB1 TP order, with
+                # exact terminal cancellation and cumulative native amounts,
+                # may reopen a remaining-stage attempt.
+                if (env == "practice" and source_order.get("strategy") == "pb1_pullback_close"
+                        and request_json.get("kr_us_tp_stage") in {"TP1", "TP2", "TP3"}
+                        and cumulative_sell_evidence["qty"] >= int(source_response.get("confirmed_fill_qty") or 0)):
+                    from trader.kr.us_profit_stage_journal import verified_native_tp_cancellation
+                    from trader.kr.us_standard_profit_parity import verified_contract
+                    if verified_contract(request_json.get("kr_us_tp_contract")):
+                        tp_cancel_proof = verified_native_tp_cancellation(
+                            broker_row, code=code, broker_odno=kis_odno,
+                            trade_date=order_time.date(),
+                            requested_qty=int(source_order["qty"]),
+                            filled_qty=int(cumulative_sell_evidence["qty"]),
+                        )
+                        if tp_cancel_proof is not None:
+                            status = "CANCELLED"
                 logger.info(
                     "[RECONCILE][KIS_CUMULATIVE][VERIFIED] code=%s qty=%s "
                     "notional=%s price_from=tot_ccld_amt_div_tot_ccld_qty",
@@ -2278,6 +2296,8 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                     requested_qty=_to_int(source_order.get("qty")) or qty,
                     cumulative_qty=next_confirmed_qty,
                     evidence_digest=(
+                        f"daily_ccld_cumulative:{trade_id}:cancelled:{tp_cancel_proof['cancelled_qty']}"
+                        if tp_cancel_proof is not None else
                         f"daily_ccld_cumulative:{trade_id}" if (cumulative_sell_evidence or cumulative_buy_evidence)
                         else f"daily_ccld:{trade_id}"
                     ),
@@ -2940,6 +2960,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                             broker_order_accepted=True,
                             broker_fill_source="KIS_DAILY_CCLD_VERIFIED",
                             source_trade_date=original_trade_date,
+                            **({"cancellation_row": broker_row} if tp_cancel_proof is not None else {}),
                             _conn=conn,
                         )
                         if not tp_update.accepted:
@@ -3056,6 +3077,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                         claim_snapshot = orders_repo.record_execution_claim_for_order(
                             str(source_order.get("client_order_key") or ""),
                             state=(
+                                "CANCELLED" if tp_cancel_proof is not None else
                                 "FILLED"
                                 if next_confirmed_qty >= int(source_order.get("qty") or qty or 0)
                                 else "PARTIALLY_FILLED"
@@ -3204,6 +3226,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                         broker_order_accepted=True,
                         broker_fill_source="KIS_DAILY_CCLD_VERIFIED",
                         source_trade_date=original_trade_date,
+                        **({"cancellation_row": broker_row} if tp_cancel_proof is not None else {}),
                     )
                     if not tp_update.accepted:
                         raise RuntimeError("KR_TP_STAGE_BROKER_PROOF_NOT_STORED:" + tp_update.reason)
