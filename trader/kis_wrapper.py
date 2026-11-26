@@ -2831,7 +2831,7 @@ class KisAPI:
             ws_wait = _env_float("KIS_WS_INITIAL_WAIT_SEC", 0.35)
             shared_owner = False
             ws_quote = ws_service.get_fresh_quote("KR", c, max_age_sec=ws_max_age)
-            if ws_quote is None and self.env == "practice" and kr_ws_shared.enabled():
+            if ws_quote is None and kr_ws_shared.enabled() and getattr(self, "env", None) == "practice":
                 remaining = kr_tick_remaining_sec(getattr(self, "_kr_stage_deadline", None))
                 if remaining > 0.02:
                     shared_owner, ws_quote = kr_ws_shared.read_owner_quote(
@@ -3782,8 +3782,8 @@ class KisAPI:
         max_age_sec = _env_float("KIS_WS_FRESH_MAX_AGE_SEC_KR", 5.0)
         shared_owner = False
         ws_quote = None
-        if (self.env == "practice" and str(market).upper() == "J"
-                and kr_ws_shared.enabled()):
+        if (kr_ws_shared.enabled() and getattr(self, "env", None) == "practice"
+                and str(market).upper() == "J"):
             ws_quote = ws_service.get_fresh_quote("KR", code, max_age_sec=max_age_sec)
             if ws_quote is None:
                 # One bounded IPC read within the caller's existing tick
