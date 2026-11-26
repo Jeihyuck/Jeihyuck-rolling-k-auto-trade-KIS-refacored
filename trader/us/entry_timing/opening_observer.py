@@ -309,7 +309,7 @@ def priority_manifest_path(*, env: str, scope: str, trade_date: str,
 
 def publish_preminute_candidates(
     *, env: str, scope: str, trade_date: str, candidates: list[tuple],
-    now_epoch: float | None = None, hot_limit: int = 4, warm_limit: int = 8,
+    now_epoch: float | None = None, hot_limit: int = 5, warm_limit: int = 5,
     base: str | Path = "runtime/private",
 ) -> dict:
     """Publish a non-authorizing, pre-1m shortlist without KIS network I/O.
@@ -351,8 +351,8 @@ def publish_preminute_candidates(
     # First prioritize new candidates; retained/add BUY candidates are still
     # eligible for WARM collection and are not treated as global excludes.
     ranked.sort(key=lambda row: row["position_state"] == "HELD")
-    hot = ranked[:max(0, min(30, int(hot_limit)))]
-    warm = ranked[len(hot):len(hot) + max(0, min(30, int(warm_limit)))]
+    hot = ranked[:max(0, min(5, int(hot_limit)))]
+    warm = ranked[len(hot):len(hot) + max(0, min(5, int(warm_limit)))]
     payload = {
         "schema": "US_PREMINUTE_PRIORITY_V1", "env": env,
         "owner": "US_STANDARD", "trade_date": trade_date,
@@ -419,7 +419,7 @@ def load_preminute_priority(
             return fallback, "STALE"
         lanes: dict[str, list[tuple[str, str]]] = {"HOT": [], "WARM": [], "COLD": []}
         selected = set()
-        for lane, cap in (("HOT", 4), ("WARM", 8)):
+        for lane, cap in (("HOT", 5), ("WARM", 5)):
             rows = payload.get(lane.lower())
             if not isinstance(rows, list) or len(rows) > cap:
                 return fallback, "INVALID"
@@ -442,16 +442,13 @@ def next_priority_pair(
     lanes: dict[str, list[tuple[str, str]]],
     *, slot: int, offsets: dict[str, int],
 ) -> tuple[tuple[str, str], str] | None:
-    """Fixed 4:1:1 request budget, with non-starving low-priority discovery."""
-    schedule = ("HOT", "HOT", "HOT", "HOT", "WARM", "COLD")
-    preferred = schedule[slot % len(schedule)]
-    for tier in (preferred, "HOT", "WARM", "COLD"):
-        lane = lanes.get(tier) or []
-        if lane:
-            pos = offsets.get(tier, 0)
-            offsets[tier] = pos + 1
-            return lane[pos % len(lane)], tier
-    return None
+    """Native minute REST is HOT-only; WARM/COLD are discovery, not polling."""
+    lane = lanes.get("HOT") or []
+    if not lane or len(lane) > 5:
+        return None
+    pos = offsets.get("HOT", 0)
+    offsets["HOT"] = pos + 1
+    return lane[pos % len(lane)], "HOT"
 
 
 def run_observer(*, env: str, trade_date: str, scope: str,
@@ -528,13 +525,15 @@ def run_observer(*, env: str, trade_date: str, scope: str,
             except (OSError, ValueError, RuntimeError) as exc:
                 LOG.warning("[US_OPENING_OBSERVER][WS_MISS] symbol=%s error=%s",
                             symbol, type(exc).__name__)
-            if not fetch_enabled:
+            if not fetch_enabled or tier != "HOT":
                 continue
             try:
+                # Freeze the completion boundary BEFORE network I/O.
+                requested_at = datetime.now(NY)
                 native = client.get_us_intraday_1m_bars(symbol, exchange, count=120)
                 rows = persist_bars(db, trade_date=trade_date, symbol=symbol,
                                     owner="US_STANDARD", native_rows=native,
-                                    now_et=datetime.now(NY))
+                                    now_et=requested_at)
                 LOG.info("[US_OPENING_OBSERVER][BAR_UPDATE] symbol=%s new_rows=%d "
                          "source=KIS_OVERSEAS_1M action=NO_ORDER", symbol, rows)
             except Exception as exc:
