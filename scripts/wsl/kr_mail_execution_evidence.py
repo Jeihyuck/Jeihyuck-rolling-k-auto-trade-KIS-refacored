@@ -150,8 +150,12 @@ def _session_order_activity(stage: Path, trade: str, purpose: str, attempt: dict
     for line in lines:
         match_result = re.search(r"\[RUN_SUMMARY\]\[RESULT\] status=([A-Z_]+) reason=([^\s]+)", line)
         if match_result:
-            summary_count += 1
             status, reason = match_result.groups()
+            # The outer session footer is not another completed engine tick.
+            # 11/26 AM and PM each contain exactly one PB1_SESSION_DONE line.
+            if reason == "PB1_SESSION_DONE":
+                continue
+            summary_count += 1
             key = {
                 "RETRYABLE_MARKET_DATA_ERROR": "market_data_error_ticks",
                 "RETRYABLE_ORDER_BUILD_ERROR": "order_build_error_ticks",
