@@ -206,3 +206,50 @@ def test_conflict_repair_resets_on_a_different_candidate(tmp_path):
         assert db.execute("SELECT count(*) FROM bar_conflict_resolution_history").fetchone()[0] == 0
     finally:
         db.close()
+
+
+def test_holiday_observer_never_opens_store_or_broker(monkeypatch):
+    from trader.us.entry_timing import opening_observer as observer
+    def unexpected(*args, **kwargs):
+        raise AssertionError("holiday must not open store")
+    monkeypatch.setattr(observer, "open_store", unexpected)
+    assert observer.run_observer(env="practice", trade_date="2026-11-26",
+        scope="scope:epoch", parent_pid=1, watchlist=[{"symbol":"CL","exchange":"NYSE"}],
+        continuous=True) == 0
+
+
+def test_continuous_observer_singleton_does_not_start_second_collector(tmp_path, monkeypatch):
+    import fcntl
+    import json
+    import os
+    import sys
+    from trader.us.entry_timing import opening_observer as observer
+    monkeypatch.chdir(tmp_path)
+    watchlist = tmp_path / "watchlist.json"
+    watchlist.write_text(json.dumps([{"symbol":"CL","exchange":"NYSE"}]))
+    monkeypatch.setattr(sys, "argv", ["observer", "--env", "practice", "--trade-date", DAY,
+        "--scope", "scope:epoch", "--parent-pid", "123", "--watchlist-file", str(watchlist), "--continuous"])
+    lock = observer.store_path(env="practice", account_scope="scope:epoch", trade_date=DAY).with_suffix(".observer.lock")
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    calls = []
+    monkeypatch.setattr(observer, "run_observer", lambda **kwargs: calls.append(kwargs) or 0)
+    try:
+        assert observer.main() == 0
+        assert calls == []
+    finally:
+        os.close(fd)
+    assert observer.main() == 0
+    assert len(calls) == 1 and calls[0]["continuous"] is True
+    assert calls[0]["max_runtime_sec"] == 8 * 3600
+
+
+def test_early_close_caps_us_trading_sessions_but_not_close_reconciliation():
+    from trader.us.runner.trade_session_runner import _session_end_dt
+    from trader.us.market_calendar import regular_close_time_for_date
+    early = datetime(2026, 11, 27, 10, 0, tzinfo=NY)
+    regular = datetime(2026, 11, 25, 10, 0, tzinfo=NY)
+    assert _session_end_dt("afternoon", early).time() <= regular_close_time_for_date(early.date())
+    assert _session_end_dt("am", early).time() <= regular_close_time_for_date(early.date())
+    assert _session_end_dt("afternoon", regular).time() > _session_end_dt("afternoon", early).time()
+    assert _session_end_dt("close", early).time() == _session_end_dt("close", regular).time()
