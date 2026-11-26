@@ -3629,10 +3629,30 @@ class KisAPI:
         # WebSocket is independent of the REST circuit. A prior EGW002 on this
         # symbol must not hide a newly-arrived fresh streaming quote.
         ws_service = get_kis_ws_price_service()
-        ws_service.subscribe_kr(code)
-        ws_quote = ws_service.get_fresh_quote(
-            "KR", code, max_age_sec=_env_float("KIS_WS_FRESH_MAX_AGE_SEC_KR", 5.0)
-        )
+        from trader.marketdata import kr_ws_shared
+
+        max_age_sec = _env_float("KIS_WS_FRESH_MAX_AGE_SEC_KR", 5.0)
+        shared_owner = False
+        ws_quote = None
+        if (self.env == "practice" and str(market).upper() == "J"
+                and kr_ws_shared.enabled()):
+            ws_quote = ws_service.get_fresh_quote("KR", code, max_age_sec=max_age_sec)
+            if ws_quote is None:
+                # One bounded IPC read within the caller's existing tick
+                # budget. An IPC miss is not a valid price or order permit.
+                remaining = kr_tick_remaining_sec()
+                if remaining > 0.02:
+                    shared_owner, ws_quote = kr_ws_shared.read_owner_quote(
+                        ws_service, code, max_age_sec=max_age_sec,
+                        timeout_sec=min(0.12, remaining - 0.01),
+                    )
+                    if ws_quote:
+                        logger.info("[KR_WS_SHARED][HIT] code=%s age_sec=%.3f generation=%s owner_pid=%s",
+                                    code, ws_quote["age_sec"], ws_quote["shared_generation"],
+                                    ws_quote["shared_owner_pid"])
+        if not ws_quote and not shared_owner:
+            ws_service.subscribe_kr(code)
+            ws_quote = ws_service.get_fresh_quote("KR", code, max_age_sec=max_age_sec)
         if ws_quote:
             logger.debug(
                 "[KIS_WS][SNAPSHOT_HIT] code=%s age_sec=%.3f",
