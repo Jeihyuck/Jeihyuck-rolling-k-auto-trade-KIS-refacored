@@ -152,3 +152,19 @@ def test_shared_budget_denial_never_crosses_order_http_boundary(monkeypatch):
         api._safe_request("POST", url, json={"PDNO": "003490"})
     assert not kw.is_kr_order_submit_outcome_ambiguous(caught.value)
     assert api.session.request.call_count == 0
+
+
+def test_shared_state_failure_preserves_existing_local_gate_for_trading_only(monkeypatch, caplog):
+    from trader.kr import kis_shared_http_budget as shared
+    api = _api(monkeypatch, body={"rt_cd":"0"})
+    monkeypatch.setenv("KR_SHARED_HTTP_BUDGET_ENABLED", "1")
+    monkeypatch.delenv("KR_PB1_OBSERVER_ONLY", raising=False)
+    monkeypatch.setattr(shared, "acquire", lambda **kw_: (False, "STATE_OR_CONFIG_UNAVAILABLE", 0.0))
+    url = "https://example.invalid/uapi/domestic-stock/v1/quotations/inquire-price"
+    assert api._safe_request("GET", url).status_code == 200
+    assert api.session.request.call_count == 1
+    assert "DEGRADED_LOCAL_GATE" in caplog.text
+    monkeypatch.setenv("KR_PB1_OBSERVER_ONLY", "1")
+    with pytest.raises(kw.KisTemporaryError):
+        api._safe_request("GET", url)
+    assert api.session.request.call_count == 1
