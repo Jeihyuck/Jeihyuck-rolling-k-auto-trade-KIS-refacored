@@ -197,3 +197,38 @@ def test_kis_native_bad_response_does_not_claim_provenance(monkeypatch):
     native._NATIVE_CACHE.clear()
     kis = FakeBroker(FakeResponse({"rt_cd": "-1", "output2": bars()}))
     assert native.load_kr_kis_native_completed_daily(kis=kis, code="005930", today=DAY) == (None, None)
+
+
+def _cancelled_runner(stage, target, filled):
+    return {"status": "RETRY_READY", "stage": stage, "target_qty": target,
+            "cumulative_filled_qty": filled,
+            "cancelled_attempts": [{"client_order_key": "old", "trade_date": DAY.isoformat(),
+                                    "broker_odno": "0000005001", "requested_qty": target,
+                                    "filled_qty": filled, "cancelled_qty": target-filled,
+                                    "open_qty": 0, "source": "KIS_DAILY_CCLD_CANCEL_VERIFIED"}]}
+
+
+@pytest.mark.parametrize("stage,target,filled,price,qty,expected", [
+    ("PROFIT_DEFENSE_PARTIAL",23,10,115,36,13),
+    ("RUNNER_FINAL",46,10,108,36,36),
+])
+def test_runner_cancellation_retries_only_original_remainder(monkeypatch, stage, target, filled, price, qty, expected):
+    states = completed()
+    states[stage] = _cancelled_runner(stage, target, filled)
+    result = run(monkeypatch, states=states, price=price, qty=qty)
+    assert result["action"] == "ACTIVE_RUNNER"
+    assert result["stage"] == stage and result["qty"] == expected
+    assert result["cancel_retry"] is True and result["order_authorized"] is False
+    assert run(monkeypatch, states=states, price=129, qty=qty)["action"] == "HOLD"
+    states[stage]["cancelled_attempts"][0]["open_qty"] = 1
+    assert run(monkeypatch, states=states, price=price, qty=qty)["action"] == "HOLD"
+
+
+def test_cancelled_runner_partial_cannot_unlock_different_final_stage(monkeypatch):
+    states = completed()
+    states["PROFIT_DEFENSE_PARTIAL"] = _cancelled_runner("PROFIT_DEFENSE_PARTIAL", 23, 10)
+    assert run(monkeypatch, states=states, price=108, qty=36)["reason"] == "V3_CANCEL_RETRY_REQUIRES_SAME_FRESH_SIGNAL"
+    states = completed()
+    states["RUNNER_FINAL"] = _cancelled_runner("RUNNER_FINAL",46,10)
+    assert run(monkeypatch, states=states, price=108, qty=35)["reason"] == "V3_CANCEL_RETRY_REMAINING_QTY_UNAVAILABLE"
+    assert run(monkeypatch, states=states, price=108, qty=37)["reason"] == "V3_CANCEL_RETRY_REMAINING_QTY_UNAVAILABLE"
