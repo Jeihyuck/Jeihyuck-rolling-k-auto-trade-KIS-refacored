@@ -3306,11 +3306,12 @@ class KisAPI:
                     return remote
         return self.get_price_snapshot(c, market="J")
 
-    def get_kr_entry_executable_quote(self, code: str) -> dict:
+    def get_kr_entry_executable_quote(self, code: str, *, max_age_sec: float = 15.0) -> dict:
         """One bounded orderbook supplement, with separate price/book evidence.
 
-        Only called for a selected PB1 practice entry, never for each Final30
-        symbol or the observer. The existing price timestamp is immutable.
+        Only called for a selected PB1 practice entry or verified cancellation
+        retry, never for each Final30 symbol or the observer. The original
+        price timestamp is immutable; retries may require a stricter TTL.
         """
         from trader.kr.executable_quote import (
             verified_price, compose_orderbook, complete_book, valid_book_supplement,
@@ -3319,7 +3320,7 @@ class KisAPI:
         price = self.get_price_snapshot(c, market="J")
         if str(self.env).lower() != "practice" or c == "122630":
             return price or {}
-        if complete_book(price) and verified_price(price, c, now=time.time(), max_age_sec=15):
+        if complete_book(price) and verified_price(price, c, now=time.time(), max_age_sec=min(15.0, max_age_sec)):
             return price
         cached_book = getattr(self, "_kr_entry_book_cache", {})
         previous = cached_book.get(c)
