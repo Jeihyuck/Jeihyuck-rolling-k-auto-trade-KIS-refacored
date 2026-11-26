@@ -47,3 +47,49 @@ def test_single_runner_remains_serial_and_timeout_recovery_fence_untouched():
     assert "_sleep_until_start_aligned_tick(" in source
     assert "except TickTimeoutError" in source
     assert "set_kr_tick_deadline(tick_deadline_monotonic)" in source
+
+
+def test_clean_policy_wait_can_resume_after_bounded_idle_without_catchup():
+    for elapsed in (60, 80, 130, 300):
+        sleep = _sleep_until_start_aligned_tick(
+            tick_started_monotonic=1000, current_monotonic=1000+elapsed,
+            current_kst=NOW+timedelta(seconds=elapsed),
+            session_end_dt=NOW+timedelta(seconds=600),
+            loop_interval=60, fresh_policy_wait_resume=True,
+        )
+        assert sleep == 5
+    assert _sleep_until_start_aligned_tick(
+        tick_started_monotonic=1000, current_monotonic=1040,
+        current_kst=NOW+timedelta(seconds=40),
+        session_end_dt=NOW+timedelta(seconds=600),
+        loop_interval=60, fresh_policy_wait_resume=True,
+    ) == 20
+    assert _sleep_until_start_aligned_tick(
+        tick_started_monotonic=1000, current_monotonic=1100,
+        current_kst=NOW+timedelta(seconds=100),
+        session_end_dt=NOW+timedelta(seconds=100),
+        loop_interval=60, fresh_policy_wait_resume=True,
+    ) == 0
+
+
+def test_fast_resume_only_clean_owner_wait(monkeypatch):
+    from trader.pb1_runner import _kr_fresh_policy_wait_resume
+    monkeypatch.delenv("PB1_PENDING_RECONCILE_ONLY", raising=False)
+    monkeypatch.setenv("KR_PB1_FRESH_POLICY_WAIT_RESUME", "1")
+    args = dict(env="practice", strategy="pb1_pullback_close",
+                session_kind="am", status="OK_NO_TRADE")
+    metrics = dict(tick_result_reason="KR_ENTRY_TIMING_POLICY_WAIT",
+                   api_submitted=0, buy_orders=0, sell_orders=0,
+                   kr_infinite_decision="WAIT", warning_counts={})
+    assert _kr_fresh_policy_wait_resume(**args, metrics=metrics)
+    for override in ({"env":"real"}, {"strategy":"KR_INFINITE"},
+                     {"session_kind":"close"}, {"status":"RETRYABLE_MARKET_DATA_ERROR"}):
+        assert not _kr_fresh_policy_wait_resume(**{**args, **override}, metrics=metrics)
+    for override in ({"api_submitted":1}, {"buy_orders":1}, {"sell_orders":1},
+                     {"kr_infinite_decision":"BUY"}, {"degraded":True},
+                     {"warning_counts":{"timeout_count":1}},
+                     {"tick_result_reason":"OPENING_30MIN_BUY_BLOCK"}):
+        assert not _kr_fresh_policy_wait_resume(**args, metrics={**metrics, **override})
+    assert not _kr_fresh_policy_wait_resume(**args, metrics={k:v for k,v in metrics.items() if k!="api_submitted"})
+    monkeypatch.setenv("PB1_PENDING_RECONCILE_ONLY", "1")
+    assert not _kr_fresh_policy_wait_resume(**args, metrics=metrics)

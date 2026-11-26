@@ -393,15 +393,28 @@ def test_observer_poll_period_is_start_to_start_and_below_proof_ttl():
     helper = Path("scripts/wsl/kr-entry-timing-activation.sh").read_text(encoding="utf-8")
     assert "cycle_started = time.monotonic()" in source
     assert "elapsed = time.monotonic() - cycle_started" in source
-    assert "float(args.interval_sec)) - elapsed" in source
+    assert "planner_wake_sec - elapsed" in source
+    assert "planner_wake_sec = min(15.0, configured_period)" in source
+    assert "hot_sec=max(45, int(configured_period))" in source
+    assert "warm_sec=max(180, int(configured_period))" in source
     assert 'default=45.0' in source
     assert "KR_PB1_OPENING_OBSERVER_INTERVAL_SEC:-45" in helper
-    # For an ordinary six-name batch, start-to-start remains T+45,
-    # rather than adding the full interval to the scan time.
-    scan_duration_sec, interval_sec, proof_ttl_sec = 20.0, 45.0, 180.0
-    subsequent_start = scan_duration_sec + max(1.0, interval_sec - scan_duration_sec)
-    assert subsequent_start == 45.0
-    assert subsequent_start < proof_ttl_sec
+    # Planner wake is now independent of the per-symbol native poll period.
+    # Reuse the actual scheduler: more frequent planning must not cause
+    # a new HTTP read for a symbol before its configured due time.
+    from trader.kr.entry_priority_queue import CandidateSchedule
+    from datetime import timedelta
+    from trader.kr.opening_bar_contract import KST
+    start = datetime(2026, 11, 26, 10, 0, tzinfo=KST)
+    schedule = CandidateSchedule(max_batch=6, hot_sec=45, warm_sec=180)
+    priority = {"hot": ["035760"], "warm": ["005930"], "cold": []}
+    assert set(schedule.select(priority, start)) == {"035760", "005930"}
+    assert schedule.select(priority, start+timedelta(seconds=15)) == []
+    assert schedule.select(priority, start+timedelta(seconds=30)) == []
+    assert schedule.select(priority, start+timedelta(seconds=45)) == ["035760"]
+    assert set(schedule.select(priority, start+timedelta(seconds=180))) == {"035760", "005930"}
+    # A 20s scan must not add a full 15s/45s sleep on top.
+    assert 20.0 + max(1.0, 15.0-20.0) == 21.0
 
 
 def test_20261110_actual_prep_contract_directory_and_actual_as_of(tmp_path):

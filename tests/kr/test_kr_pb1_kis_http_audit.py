@@ -119,3 +119,52 @@ def test_orderable_cash_provenance_accepts_only_native_kis_psbl_field():
     assert KISExecutor(api, "practice").verified_add_orderable_cash(
         "122630", 63000
     ) == 741311.0
+
+
+def test_500_egw002_publishes_shared_cooldown_and_retry_requires_new_admission(monkeypatch):
+    from trader.kr import kis_shared_http_budget as shared
+    api = _api(monkeypatch, body={"rt_cd": "0"})
+    api._safe_attempts = 2
+    monkeypatch.setenv("KR_SHARED_HTTP_BUDGET_ENABLED", "1")
+    monkeypatch.setenv("KIS_DATA_RETRY_MAX", "2")
+    admissions, penalties = [], []
+    monkeypatch.setattr(shared, "acquire", lambda **kw_: (
+        admissions.append(kw_) or (True, "GRANTED", 0.0)))
+    monkeypatch.setattr(shared, "penalize", lambda **kw_: penalties.append(kw_) or True)
+    monkeypatch.setattr(kw, "_kr_sleep_with_budget", lambda *a, **kw_: True)
+    denied = SimpleNamespace(status_code=500, text="EGW00201", json=lambda: {
+        "rt_cd": "1", "msg_cd": "EGW00201", "msg1": "초당 거래건수를 초과하였습니다."})
+    success = SimpleNamespace(status_code=200, text="", json=lambda: {"rt_cd": "0", "output": {}})
+    api.session.request.side_effect = [denied, success]
+    url = "https://example.invalid/uapi/domestic-stock/v1/quotations/inquire-price"
+    assert api._safe_request("GET", url) is success
+    assert api.session.request.call_count == len(admissions) == 2
+    assert len(penalties) == 1
+
+
+def test_shared_budget_denial_never_crosses_order_http_boundary(monkeypatch):
+    from trader.kr import kis_shared_http_budget as shared
+    api = _api(monkeypatch, body={"rt_cd": "0"})
+    monkeypatch.setenv("KR_SHARED_HTTP_BUDGET_ENABLED", "1")
+    monkeypatch.setattr(shared, "acquire", lambda **kw_: (False, "DEADLINE", 0.0))
+    url = "https://example.invalid/uapi/domestic-stock/v1/trading/order-cash"
+    with pytest.raises(kw.KisOrderPreSubmitBlocked) as caught:
+        api._safe_request("POST", url, json={"PDNO": "003490"})
+    assert not kw.is_kr_order_submit_outcome_ambiguous(caught.value)
+    assert api.session.request.call_count == 0
+
+
+def test_shared_state_failure_preserves_existing_local_gate_for_trading_only(monkeypatch, caplog):
+    from trader.kr import kis_shared_http_budget as shared
+    api = _api(monkeypatch, body={"rt_cd":"0"})
+    monkeypatch.setenv("KR_SHARED_HTTP_BUDGET_ENABLED", "1")
+    monkeypatch.delenv("KR_PB1_OBSERVER_ONLY", raising=False)
+    monkeypatch.setattr(shared, "acquire", lambda **kw_: (False, "STATE_OR_CONFIG_UNAVAILABLE", 0.0))
+    url = "https://example.invalid/uapi/domestic-stock/v1/quotations/inquire-price"
+    assert api._safe_request("GET", url).status_code == 200
+    assert api.session.request.call_count == 1
+    assert "DEGRADED_LOCAL_GATE" in caplog.text
+    monkeypatch.setenv("KR_PB1_OBSERVER_ONLY", "1")
+    with pytest.raises(kw.KisTemporaryError):
+        api._safe_request("GET", url)
+    assert api.session.request.call_count == 1

@@ -2081,6 +2081,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
             )
         if strict_sell_targets is not None and cumulative_sell_evidence is None:
             raise RuntimeError("KR_CUMULATIVE_REPAIR_ECONOMIC_PROOF_MISSING")
+        tp_cancel_proof = None
         if cumulative_sell_evidence is not None:
             if _kr_source_has_individual_sell_fills(
                 fills_repo=fills_repo, source_order=source_order, env=env,
@@ -2093,6 +2094,28 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
             else:
                 status = ("FILLED" if cumulative_sell_evidence["qty"] == int(source_order.get("qty") or 0)
                           else "PARTIAL_FILLED")
+                # Only a uniquely attributed original PB1 TP order, with
+                # exact terminal cancellation and cumulative native amounts,
+                # may reopen a remaining-stage attempt.
+                if (env == "practice" and source_order.get("strategy") == "pb1_pullback_close"
+                        and request_json.get("kr_us_tp_stage") in {
+                            "TP1", "TP2", "TP3", "PROFIT_DEFENSE_PARTIAL", "RUNNER_FINAL",
+                        }
+                        and cumulative_sell_evidence["qty"] >= int(source_response.get("confirmed_fill_qty") or 0)):
+                    from trader.kr.us_profit_stage_journal import verified_native_tp_cancellation
+                    from trader.kr.us_standard_profit_parity import verified_contract
+                    if (verified_contract(request_json.get("kr_us_tp_contract"))
+                            and request_json["kr_us_tp_contract"].get("activation_mode") == "ACTIVE_PRACTICE"
+                            and (request_json["kr_us_tp_stage"] in {"TP1", "TP2", "TP3"}
+                                 or request_json["kr_us_tp_contract"].get("runner_version") == "US_V3")):
+                        tp_cancel_proof = verified_native_tp_cancellation(
+                            broker_row, code=code, broker_odno=kis_odno,
+                            trade_date=order_time.date(),
+                            requested_qty=int(source_order["qty"]),
+                            filled_qty=int(cumulative_sell_evidence["qty"]),
+                        )
+                        if tp_cancel_proof is not None:
+                            status = "CANCELLED"
                 logger.info(
                     "[RECONCILE][KIS_CUMULATIVE][VERIFIED] code=%s qty=%s "
                     "notional=%s price_from=tot_ccld_amt_div_tot_ccld_qty",
@@ -2108,6 +2131,193 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                     scope=kr_scope,
                 ):
                     raise RuntimeError("KR_RECONCILE_SOURCE_SCOPE_PREWRITE_REJECTED")
+        # A cancellation and its last previously unseen individual fill can
+        # arrive in the same row. First settle only the exactly proven new
+        # execution using the existing atomic priced-fill lane. On replay,
+        # finalize the cancellation against that now-durable watermark.
+        terminal_new_individual = False
+        if (
+            cumulative_sell_evidence is None and side == "SELL" and source_order
+            and env == "practice" and kr_scope is not None and strict_sell_targets is None
+            and source_order.get("strategy") == "pb1_pullback_close"
+            and request_json.get("kr_us_tp_stage") in {
+                "TP1", "TP2", "TP3", "PROFIT_DEFENSE_PARTIAL", "RUNNER_FINAL",
+            }
+            and (status in {"CANCELLED", "CANCELED", "CANCEL"}
+                 or (_to_int(broker_row.get("cncl_cfrm_qty")) or 0) > 0)
+            and str(resp.get("rt_cd") or "") == "0" and not resp.get("_diag_stub")
+            and str(ccld_status).lower() == "ok"
+        ):
+            from decimal import Decimal, InvalidOperation
+            from trader.kr.us_profit_stage_journal import verified_native_tp_cancellation
+            from trader.kr.us_standard_profit_parity import verified_contract
+            try:
+                c = request_json.get("kr_us_tp_contract")
+                native_qty = _to_int(broker_row.get("tot_ccld_qty"))
+                previous = int(source_response.get("confirmed_fill_qty") or 0)
+                fill_id = str(broker_row.get("ccld_no") or "").strip()
+                execution_qty = _to_int(broker_row.get("ccld_qty"))
+                execution_price = Decimal(str(broker_row.get("ccld_prc")))
+                native_amount = Decimal(str(broker_row.get("tot_ccld_amt")))
+                previous_amount = Decimal(str(source_response.get("confirmed_fill_notional") or 0))
+                terminal_new_individual = bool(
+                    verified_contract(c) and c.get("activation_mode") == "ACTIVE_PRACTICE"
+                    and (request_json["kr_us_tp_stage"] in {"TP1", "TP2", "TP3"}
+                         or c.get("runner_version") == "US_V3")
+                    and request_json.get("kr_us_tp_trade_date") == order_time.date().isoformat()
+                    and str(source_order.get("position_cycle_id") or "") == c.get("position_cycle_id")
+                    and str(source_order.get("trading_epoch_id") or "") == c.get("trading_epoch_id")
+                    and verified_native_tp_cancellation(
+                        broker_row, code=code,
+                        broker_odno=str(source_order.get("kis_odno") or source_order.get("broker_order_id") or ""),
+                        trade_date=order_time.date(), requested_qty=source_order["qty"],
+                        filled_qty=native_qty,
+                    )
+                    and native_qty is not None and native_qty > previous >= 0
+                    and execution_qty == native_qty-previous
+                    and fill_id and fill_id not in (source_response.get("applied_broker_fill_ids") or [])
+                    and execution_price.is_finite() and execution_price > 0
+                    and native_amount.is_finite() and previous_amount.is_finite()
+                    and previous_amount >= 0
+                    and native_amount == previous_amount + execution_qty*execution_price
+                )
+            except (ValueError, TypeError, KeyError, InvalidOperation, OverflowError):
+                terminal_new_individual = False
+            if terminal_new_individual:
+                status = "PARTIAL_FILLED"  # cancellation is NOT released yet
+        # A terminal cancellation with no new economic delta must not enter
+        # the priced-fill path: zero fills have no execution price, and an
+        # already applied individual execution must never be counted twice.
+        # Keep order, durable claim and stage transition in one transaction.
+        if (
+            not terminal_new_individual and cumulative_sell_evidence is None and side == "SELL" and source_order
+            and env == "practice" and strict_sell_targets is None
+            and source_order.get("strategy") == "pb1_pullback_close"
+            and request_json.get("kr_us_tp_stage") in {
+                "TP1", "TP2", "TP3", "PROFIT_DEFENSE_PARTIAL", "RUNNER_FINAL",
+            }
+            and (status in {"CANCELLED", "CANCELED", "CANCEL"}
+                 or (_to_int(broker_row.get("cncl_cfrm_qty")) or 0) > 0)
+        ):
+            from decimal import Decimal
+            from trader.kr.us_profit_stage_journal import (
+                observe_broker_stage, verified_native_tp_cancellation,
+            )
+            from trader.kr.us_standard_profit_parity import verified_contract
+            contract = request_json.get("kr_us_tp_contract")
+            tp_stage = request_json["kr_us_tp_stage"]
+            try:
+                if not (
+                    isinstance(engine, sa.engine.Engine)
+                    and kr_scope is not None
+                    and str(resp.get("rt_cd") or "") == "0"
+                    and not resp.get("_diag_stub")
+                    and str(ccld_status).lower() == "ok"
+                    and verified_contract(contract)
+                    and contract.get("activation_mode") == "ACTIVE_PRACTICE"
+                    and (tp_stage in {"TP1", "TP2", "TP3"}
+                         or contract.get("runner_version") == "US_V3")
+                    and request_json.get("kr_us_tp_trade_date") == order_time.date().isoformat()
+                    and str(source_order.get("position_cycle_id") or "") == contract.get("position_cycle_id")
+                    and str(source_order.get("trading_epoch_id") or "") == contract.get("trading_epoch_id")
+                ):
+                    raise ValueError("KR_TP_TERMINAL_CANCEL_SCOPE_UNVERIFIED")
+                native_qty = _to_int(broker_row.get("tot_ccld_qty"))
+                proof = verified_native_tp_cancellation(
+                    broker_row, code=code,
+                    broker_odno=str(source_order.get("kis_odno") or source_order.get("broker_order_id") or ""),
+                    trade_date=order_time.date(), requested_qty=source_order["qty"],
+                    filled_qty=native_qty,
+                )
+                if proof is None:
+                    raise ValueError("KR_TP_TERMINAL_CANCEL_NATIVE_PROOF_INVALID")
+                schema = schema_for_engine(engine)
+                with engine.begin() as conn:
+                    current = conn.execute(sa.select(schema.orders).where(
+                        schema.orders.c.order_id == uuid_value_for_url(
+                            str(engine.url), str(source_order["order_id"]))
+                    ).with_for_update()).mappings().one()
+                    current_response = _json_dict(current["response_json"])
+                    if (str(current.get("status")) != str(source_order.get("status"))
+                            or any(current_response.get(k) != source_response.get(k)
+                                   for k in ("confirmed_fill_qty", "confirmed_fill_notional",
+                                             "applied_broker_fill_ids"))
+                            or not order_matches_recovery_scope(
+                                conn=conn, schema=schema, order=dict(current),
+                                strategy="pb1_pullback_close", scope=kr_scope)):
+                        raise ValueError("KR_TP_TERMINAL_CANCEL_STALE_SCOPE")
+                    if int(current_response.get("confirmed_fill_qty") or 0) != native_qty:
+                        raise ValueError("KR_TP_TERMINAL_CANCEL_UNAPPLIED_EXECUTION")
+                    native_amount = Decimal(str(broker_row["tot_ccld_amt"]))
+                    stored_amount = Decimal(str(current_response.get("confirmed_fill_notional") or 0))
+                    fills = conn.execute(sa.select(schema.fills).where(sa.and_(
+                        schema.fills.c.env == env,
+                        schema.fills.c.order_id == current["order_id"],
+                    ))).mappings().all()
+                    # All stored rows must be individually proven executions,
+                    # with unique native ids and the same original cycle.
+                    fill_ids, fill_qty, fill_amount = set(), 0, Decimal(0)
+                    for item in fills:
+                        meta = _json_dict(item.get("fill_meta_json"))
+                        execution_id = str(item.get("broker_fill_id") or item.get("trade_id") or "")
+                        q = int(item.get("qty") or 0)
+                        px = Decimal(str(item.get("price")))
+                        if (meta.get("fill_source") != "daily_ccld"
+                                or item.get("side") != "SELL"
+                                or str(item.get("position_cycle_id") or "") != contract["position_cycle_id"]
+                                or not execution_id or execution_id in fill_ids
+                                or q <= 0 or not px.is_finite() or px <= 0):
+                            raise ValueError("KR_TP_TERMINAL_CANCEL_INDIVIDUAL_FILL_INVALID")
+                        fill_ids.add(execution_id)
+                        fill_qty += q
+                        fill_amount += q * px
+                    if (fill_qty != native_qty or not stored_amount.is_finite()
+                            or stored_amount != native_amount or fill_amount != native_amount
+                            or fill_ids != set(current_response.get("applied_broker_fill_ids") or [])):
+                        raise ValueError("KR_TP_TERMINAL_CANCEL_ECONOMICS_UNVERIFIED")
+                    result = observe_broker_stage(
+                        engine=engine, contract=contract,
+                        account_id=get_account_key(env=env, kis=kis),
+                        trading_epoch_id=str(current["trading_epoch_id"]),
+                        position_cycle_id=str(current["position_cycle_id"]),
+                        code=code, stage=tp_stage, client_order_key=client_order_key,
+                        broker_odno=str(broker_row["odno"]), cumulative_filled_qty=native_qty,
+                        broker_order_accepted=True, broker_fill_source="KIS_DAILY_CCLD_VERIFIED",
+                        source_trade_date=order_time.date(), cancellation_row=broker_row, _conn=conn,
+                    )
+                    if not result.accepted:
+                        raise ValueError("KR_TP_TERMINAL_CANCEL_JOURNAL:" + result.reason)
+                    orders_repo.record_execution_claim_for_order(
+                        client_order_key, state="CANCELLED", cumulative_filled_qty=native_qty,
+                        authoritative=True, _conn=conn,
+                    )
+                    orders_repo.upsert_reconciled_order(
+                        env=env, run_id=reconcile_run_id, strategy="pb1_pullback_close",
+                        sid=int(current.get("sid") or 1), mode=int(current.get("mode") or 1),
+                        code=code, market=current.get("market") or market, side="SELL",
+                        ord_type=str(current.get("ord_type") or "RECONCILED"),
+                        qty=int(current["qty"]), limit_price=current.get("limit_price"),
+                        stage=current.get("stage"), client_order_key=client_order_key,
+                        kis_odno=kis_odno, status="CANCELLED", request_json=request_json,
+                        response_json={**current_response, **broker_row,
+                                       "confirmed_fill_qty": native_qty,
+                                       "confirmed_fill_notional": float(native_amount),
+                                       "tp_terminal_cancellation_proof": proof},
+                        submitted_at=current.get("submitted_at") or order_time,
+                        acked_at=current.get("acked_at") or order_time, _conn=conn,
+                    )
+                order_count += 1
+                logger.info("[KR_PROFIT_PARITY][TERMINAL_CANCEL_NO_NEW_FILL] code=%s stage=%s qty=%s",
+                            code, tp_stage, native_qty)
+            except Exception as exc:
+                # Do not fall through to generic CANCELLED claim release
+                # when economic or native proof has not been established.
+                logger.exception("[KR_PROFIT_PARITY][TERMINAL_CANCEL_BLOCK] code=%s stage=%s", code, tp_stage)
+                execution_claim_observation_failures.append({
+                    "client_order_key": client_order_key,
+                    "error": "kr_tp_terminal_cancel:" + type(exc).__name__,
+                })
+            continue
         # Exact priced SELLs commit the broker status with their economic projection.
         preview_qty = (_to_int(_first_value(row, ["ccld_qty", "tot_ccld_qty", "filled_qty"]))
                        if cumulative_sell_evidence is None else int(cumulative_sell_evidence["qty"]))
@@ -2278,6 +2488,8 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                     requested_qty=_to_int(source_order.get("qty")) or qty,
                     cumulative_qty=next_confirmed_qty,
                     evidence_digest=(
+                        f"daily_ccld_cumulative:{trade_id}:cancelled:{tp_cancel_proof['cancelled_qty']}"
+                        if tp_cancel_proof is not None else
                         f"daily_ccld_cumulative:{trade_id}" if (cumulative_sell_evidence or cumulative_buy_evidence)
                         else f"daily_ccld:{trade_id}"
                     ),
@@ -2940,6 +3152,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                             broker_order_accepted=True,
                             broker_fill_source="KIS_DAILY_CCLD_VERIFIED",
                             source_trade_date=original_trade_date,
+                            **({"cancellation_row": broker_row} if tp_cancel_proof is not None else {}),
                             _conn=conn,
                         )
                         if not tp_update.accepted:
@@ -3056,6 +3269,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                         claim_snapshot = orders_repo.record_execution_claim_for_order(
                             str(source_order.get("client_order_key") or ""),
                             state=(
+                                "CANCELLED" if tp_cancel_proof is not None else
                                 "FILLED"
                                 if next_confirmed_qty >= int(source_order.get("qty") or qty or 0)
                                 else "PARTIALLY_FILLED"
@@ -3204,6 +3418,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                         broker_order_accepted=True,
                         broker_fill_source="KIS_DAILY_CCLD_VERIFIED",
                         source_trade_date=original_trade_date,
+                        **({"cancellation_row": broker_row} if tp_cancel_proof is not None else {}),
                     )
                     if not tp_update.accepted:
                         raise RuntimeError("KR_TP_STAGE_BROKER_PROOF_NOT_STORED:" + tp_update.reason)

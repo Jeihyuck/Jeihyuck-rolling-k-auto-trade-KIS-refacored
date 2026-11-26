@@ -319,6 +319,38 @@ def evaluate_active_kr_tp(
             engine=engine, env=env, code=code,
             trading_epoch_id=str(epoch),
         )
+        retry_pending = any(
+            state.get("status") == "RETRY_READY"
+            for state in states.values() if isinstance(state, Mapping)
+        )
+
+        def fresh_retry_bid():
+            # A cancelled attempt can only become a fresh order proposal
+            # from native executable bid evidence. A last-price-only cache
+            # hit is not an executable bid, and a daily chart may take time.
+            import time
+            from trader.kr.executable_quote import (
+                verified_price, complete_book, valid_book_supplement,
+            )
+            def checked(row):
+                now = time.time()
+                if (verified_price(row, str(code).zfill(6), now=now)
+                        and complete_book(row)
+                        and valid_book_supplement(row, str(code).zfill(6), now=now)):
+                    return float(row["bid"])
+                return None
+            refreshed = checked(snapshot)
+            if refreshed is not None:
+                return refreshed
+            fetch = getattr(kis, "get_kr_entry_executable_quote", None)
+            return checked(fetch(str(code).zfill(6), max_age_sec=5.0)) if callable(fetch) else None
+
+        if retry_pending:
+            if unresolved_sell:
+                return block("KR_TP_RETRY_UNRESOLVED_SELL_OR_ACK")
+            price = fresh_retry_bid()
+            if price is None:
+                return block("KR_TP_RETRY_EXECUTABLE_BID_UNVERIFIED")
         d = calculate_next_tp_stage(
             contract=contract, stage_states=states,
             holding_qty=qty, orderable_qty=orderable,
@@ -335,6 +367,10 @@ def evaluate_active_kr_tp(
             native_daily, native_source = load_kr_kis_native_completed_daily(
                 kis=kis, code=code, today=today,
             )
+            if retry_pending:
+                price = fresh_retry_bid()
+                if price is None:
+                    return block("KR_V3_RETRY_EXECUTABLE_BID_UNVERIFIED")
             runner = evaluate_kr_v3_runner(
                 contract=contract, stage_states=states,
                 position=position, verified_entry_price=basis,

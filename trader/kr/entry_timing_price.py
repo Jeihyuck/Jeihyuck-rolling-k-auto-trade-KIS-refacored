@@ -89,6 +89,9 @@ def resolve_bounded_prpr_limit(
     quote_day = str(quote.get("stck_bsop_date") or "").replace("-", "")
     if quote_day and quote_day != now.strftime("%Y%m%d"):
         return block("QUOTE_STALE", quote_date_mismatch=True)
+    from trader.kr.executable_quote import valid_book_supplement
+    if not valid_book_supplement(quote, normalized_code, now=now.timestamp()):
+        return block("ORDERBOOK_PROOF_STALE_OR_UNVERIFIED")
     last = _pos(quote.get("last") or quote.get("prpr") or quote.get("stck_prpr"))
     if last is None:
         return block("QUOTE_LAST_UNVERIFIED")
@@ -226,7 +229,9 @@ def maybe_bound_pb1_prpr_fallback(
         if adaptive_ask:
             # A real ASK can only be lowered to another verified real ASK.
             api = getattr(engine, "kis", None) or getattr(engine, "kis_api", None)
-            quote = api.get_price_snapshot(symbol, market="J") if api else {}
+            executable = getattr(api, "get_kr_entry_executable_quote", None)
+            quote = (executable(symbol) if callable(executable)
+                     else api.get_price_snapshot(symbol, market="J") if api else {})
             if not isinstance(quote, dict) or not _pos(quote.get("ask")) or not _pos(quote.get("bid")):
                 return {"state": "BLOCK", "reason": "ADAPTIVE_ASK_QUOTE_UNVERIFIED"}
         else:

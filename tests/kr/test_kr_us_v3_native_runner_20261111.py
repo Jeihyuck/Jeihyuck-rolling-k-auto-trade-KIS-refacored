@@ -197,3 +197,84 @@ def test_kis_native_bad_response_does_not_claim_provenance(monkeypatch):
     native._NATIVE_CACHE.clear()
     kis = FakeBroker(FakeResponse({"rt_cd": "-1", "output2": bars()}))
     assert native.load_kr_kis_native_completed_daily(kis=kis, code="005930", today=DAY) == (None, None)
+
+
+def _cancelled_runner(stage, target, filled):
+    return {"status": "RETRY_READY", "stage": stage, "target_qty": target,
+            "cumulative_filled_qty": filled,
+            "cancelled_attempts": [{"client_order_key": "old", "trade_date": DAY.isoformat(),
+                                    "broker_odno": "0000005001", "requested_qty": target,
+                                    "filled_qty": filled, "cancelled_qty": target-filled,
+                                    "open_qty": 0, "source": "KIS_DAILY_CCLD_CANCEL_VERIFIED",
+                                    "native_row_sha256": "a" * 64}]}
+
+
+@pytest.mark.parametrize("stage,target,filled,price,qty,expected", [
+    ("PROFIT_DEFENSE_PARTIAL",23,10,115,36,13),
+    ("RUNNER_FINAL",46,10,108,36,36),
+])
+def test_runner_cancellation_retries_only_original_remainder(monkeypatch, stage, target, filled, price, qty, expected):
+    states = completed()
+    states[stage] = _cancelled_runner(stage, target, filled)
+    result = run(monkeypatch, states=states, price=price, qty=qty)
+    assert result["action"] == "ACTIVE_RUNNER"
+    assert result["stage"] == stage and result["qty"] == expected
+    assert result["cancel_retry"] is True and result["order_authorized"] is False
+    assert run(monkeypatch, states=states, price=129, qty=qty)["action"] == "HOLD"
+    states[stage]["cancelled_attempts"][0]["open_qty"] = 1
+    assert run(monkeypatch, states=states, price=price, qty=qty)["action"] == "HOLD"
+
+
+def test_cancelled_runner_partial_cannot_unlock_different_final_stage(monkeypatch):
+    states = completed()
+    states["PROFIT_DEFENSE_PARTIAL"] = _cancelled_runner("PROFIT_DEFENSE_PARTIAL", 23, 10)
+    assert run(monkeypatch, states=states, price=108, qty=36)["reason"] == "V3_CANCEL_RETRY_REQUIRES_SAME_FRESH_SIGNAL"
+    states = completed()
+    states["RUNNER_FINAL"] = _cancelled_runner("RUNNER_FINAL",46,10)
+    assert run(monkeypatch, states=states, price=108, qty=35)["reason"] == "V3_CANCEL_RETRY_REMAINING_QTY_UNAVAILABLE"
+    assert run(monkeypatch, states=states, price=108, qty=37)["reason"] == "V3_CANCEL_RETRY_REMAINING_QTY_UNAVAILABLE"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("native_row_sha256", None), ("native_row_sha256", "not-a-hash"),
+    ("broker_odno", "0"), ("broker_odno", "unverified"),
+    ("trade_date", "2026-02-30"), ("client_order_key", " "),
+])
+def test_kr401_retry_rejects_incomplete_native_history(field, value):
+    from trader.kr.us_standard_profit_parity import verified_tp_retry_remainder
+    state = _cancelled_runner("PROFIT_DEFENSE_PARTIAL", 23, 10)
+    assert verified_tp_retry_remainder(state) == 13
+    state["cancelled_attempts"][0][field] = value
+    assert verified_tp_retry_remainder(state) is None
+
+
+def test_kr401_retry_rejects_duplicate_native_order_with_different_padding():
+    from trader.kr.us_standard_profit_parity import verified_tp_retry_remainder
+    state = _cancelled_runner("PROFIT_DEFENSE_PARTIAL", 23, 10)
+    second = {**state["cancelled_attempts"][0], "client_order_key": "new",
+              "broker_odno": "5001", "requested_qty": 13,
+              "filled_qty": 2, "cancelled_qty": 11}
+    state["cancelled_attempts"].append(second)
+    state["cumulative_filled_qty"] = 12
+    assert verified_tp_retry_remainder(state) is None
+    second["broker_odno"] = "5002"
+    assert verified_tp_retry_remainder(state) == 11
+
+
+def test_kr401_zero_fill_native_cancel_proof_preserves_entire_stage_target():
+    from trader.kr.us_profit_stage_journal import verified_native_tp_cancellation
+    from trader.kr.us_standard_profit_parity import verified_tp_retry_remainder
+    row = {"pdno": "005930", "sll_buy_dvsn_cd": "01",
+           "ord_dt": DAY.strftime("%Y%m%d"), "odno": "0000005001",
+           "cncl_yn": "N", "ord_qty": "23", "tot_ccld_qty": "0",
+           "cncl_cfrm_qty": "23", "rjct_qty": "0", "rmn_qty": "0",
+           "tot_ccld_amt": "0"}
+    args = dict(code="005930", broker_odno="0000005001", trade_date=DAY,
+                requested_qty=23, filled_qty=0)
+    proof = verified_native_tp_cancellation(row, **args)
+    assert proof is not None
+    state = _cancelled_runner("PROFIT_DEFENSE_PARTIAL", 23, 0)
+    state["cancelled_attempts"] = [{**proof, "client_order_key": "old"}]
+    assert verified_tp_retry_remainder(state) == 23
+    assert verified_native_tp_cancellation({**row, "rmn_qty": "1"}, **args) is None
+    assert verified_native_tp_cancellation({**row, "tot_ccld_amt": "1"}, **args) is None

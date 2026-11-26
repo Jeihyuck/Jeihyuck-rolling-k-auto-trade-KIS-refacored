@@ -1547,7 +1547,7 @@ class KisAPI:
         except Exception as e:
             logger.warning("[NET] session reset failed: %s", e)
 
-    def _safe_request(self, method: str, url: str, *, reset_on_error: bool = True, endpoint: str | None = None, **kwargs) -> requests.Response:
+    def _safe_request(self, method: str, url: str, *, reset_on_error: bool = True, endpoint: str | None = None, kr_read_attempt_cap: int | None = None, **kwargs) -> requests.Response:
         """
         공통 안전요청 래퍼:
         - DIAG 모드: 주문 차단, 데이터는 ALLOW_KIS_DATA_HTTP_IN_DIAG=1이면 허용
@@ -1672,6 +1672,8 @@ class KisAPI:
             attempts = max(self._safe_attempts, 1)
         if no_retry_inquire_investor:
             attempts = 1
+        if kr_read_attempt_cap is not None and method.upper() == "GET":
+            attempts = min(attempts, max(1, int(kr_read_attempt_cap)))
         # The independent KR minute observer must never hold KIS's quota
         # with nested retries. All non-observer callers preserve their
         # original retries and broker submission semantics.
@@ -1763,7 +1765,50 @@ class KisAPI:
             raise KisTemporaryError(f"FAST_FAIL breaker open for {url}")
         last_err: Exception | None = None
         configured_timeout = kwargs.pop("timeout", (3.0, 7.0))
+        from trader.kr import kis_shared_http_budget
+        shared_http_enabled = kis_shared_http_budget.enabled(str(self.env or "practice"))
+
+        def _publish_shared_cooldown():
+            if shared_http_enabled and not kis_shared_http_budget.penalize(
+                environment=str(self.env), appkey=str(APP_KEY or ""),
+                seconds=float(os.getenv("KIS_RATE_LIMIT_COOLDOWN_SEC", "8.0") or "8.0"),
+            ):
+                logger.warning("[KR_SHARED_HTTP][COOLDOWN_NOT_PUBLISHED] endpoint=%s", endpoint_name)
+
         for i in range(1, attempts + 1):
+            if shared_http_enabled:
+                # Each actual HTTP retry needs its own admission. Failure is
+                # before the broker boundary, never a lost ACK or a fill.
+                # Do not queue behind a collector; preserve existing local
+                # endpoint limits and the observer's cooperative reservation.
+                critical = endpoint_category in {"order", "balance"} or "hashkey" in path_lower
+                remaining = kr_tick_remaining_sec(getattr(self, "_kr_stage_deadline", None))
+                safe_remaining = self._safe_max_seconds - (time.monotonic() - start_ts)
+                granted, admission_reason, waited = kis_shared_http_budget.acquire(
+                    environment=str(self.env), appkey=str(APP_KEY or ""),
+                    priority=critical,
+                    observer=str(os.getenv("KR_PB1_OBSERVER_ONLY") or "") == "1",
+                    max_wait_sec=max(0.0, min(8.0 if critical else 2.5,
+                                               remaining - 0.10, safe_remaining - 0.10)),
+                )
+                logger.info("[KR_SHARED_HTTP][ADMISSION] endpoint=%s attempt=%s granted=%s reason=%s wait_sec=%.3f priority=%s",
+                            endpoint_name, i, int(granted), admission_reason, waited, int(critical))
+                if not granted:
+                    if (admission_reason == "STATE_OR_CONFIG_UNAVAILABLE"
+                            and str(os.getenv("KR_PB1_OBSERVER_ONLY") or "") != "1"):
+                        # Optional shared admission infrastructure failed.
+                        # The original local/global endpoint gate above is
+                        # still mandatory. Never strand an otherwise eligible
+                        # protective SELL due solely to an IPC state-file error.
+                        # Actual quota waits/cooldowns NEVER take this fallback.
+                        logger.error(
+                            "[KR_SHARED_HTTP][DEGRADED_LOCAL_GATE] endpoint=%s attempt=%s reason=%s",
+                            endpoint_name, i, admission_reason,
+                        )
+                    else:
+                        if is_order_endpoint(url):
+                            raise KisOrderPreSubmitBlocked("KR_SHARED_HTTP_PRE_SUBMIT_" + admission_reason)
+                        raise KisTemporaryError("KR_SHARED_HTTP_PRE_REQUEST_" + admission_reason)
             try:
                 stage_deadline = getattr(self, "_kr_stage_deadline", None)
                 request_timeout = _kr_bounded_timeout(
@@ -1919,6 +1964,28 @@ class KisAPI:
                         continue
                     raise KisAuthError(f"HTTP {status} for {url}")
                 if status in (429, 500, 502, 503, 504):
+                    # KIS sends EGW00201 as HTTP 500 in the 11/26 practice
+                    # logs. The ordinary 5xx path previously never inspected
+                    # the body, so it missed account quota evidence.
+                    rate_limited_500 = False
+                    if status == 500:
+                        try:
+                            error_body = resp.json()
+                            if isinstance(error_body, dict):
+                                rate_limited_500 = _is_egw002_error(
+                                    error_body, str(error_body.get("msg_cd") or "")
+                                )
+                        except (ValueError, TypeError, AttributeError):
+                            pass
+                    if status == 429 or rate_limited_500:
+                        _publish_shared_cooldown()
+                    if rate_limited_500:
+                        gate.set_global_cooldown(
+                            str(self.env or "practice"), account_key,
+                            seconds=float(os.getenv("KIS_RATE_LIMIT_COOLDOWN_SEC", "8.0") or "8.0"),
+                        )
+                        logger.warning("[KR_SHARED_HTTP][EGW002_HTTP_500] endpoint=%s attempt=%s",
+                                       endpoint_name, i)
                     if status == 429:
                         gate.set_global_cooldown(
                             str(self.env or "practice"),
@@ -1970,6 +2037,7 @@ class KisAPI:
                     
                     # ✅ EGW002 (초당 거래건수 초과) 전용 처리: exponential backoff + circuit breaker
                     if _is_egw002_error(body, msg_cd):
+                        _publish_shared_cooldown()
                         if is_order_endpoint(url):
                             # A valid KIS JSON body with rt_cd != 0 is explicit
                             # rejection evidence, not a lost ACK. Preserve the
@@ -2746,7 +2814,7 @@ class KisAPI:
         
         raise RuntimeError(f"invalid last price 0 for {code}")
 
-    def get_price_quote(self, code: str, *, diag_mode: bool = False, attempts: int = 2, retry_cap: int | None = None, native_rest_only: bool = False) -> dict:
+    def get_price_quote(self, code: str, *, diag_mode: bool = False, attempts: int = 2, retry_cap: int | None = None, native_rest_only: bool = False, entry_refresh: bool = False) -> dict:
         """
         inquire-price 래퍼: 현재가와 최우선 호가를 dict로 반환.
 
@@ -2758,16 +2826,35 @@ class KisAPI:
         if not c:
             return {}
 
-        # Normal trading remains WS-first. A manual read-only source probe
-        # must bypass BOTH WS and stale REST cache to inspect one genuine KIS
-        # inquire-price response. Never enable this in the BUY/SELL hot path.
+        # Only a selected PB1 practice entry may request the bounded
+        # native refresh. Normal pricing remains WS-first.
+        if entry_refresh:
+            if str(self.env).lower() != "practice" or len(c) != 6 or not c.isdigit() or c == "122630":
+                return {}
+            native_rest_only = True
+            attempts = retry_cap = 1
+        # Manual source probes and selected native refreshes bypass cached
+        # price evidence; never relabel an old quote as newly received.
         if not native_rest_only:
             ws_service = get_kis_ws_price_service()
-            ws_service.subscribe_kr(c)
+            from trader.marketdata import kr_ws_shared
+
             ws_max_age = _env_float("KIS_WS_FRESH_MAX_AGE_SEC_KR", 5.0)
             ws_wait = _env_float("KIS_WS_INITIAL_WAIT_SEC", 0.35)
+            shared_owner = False
             ws_quote = ws_service.get_fresh_quote("KR", c, max_age_sec=ws_max_age)
-            if ws_quote is None and ws_wait > 0:
+            if ws_quote is None and kr_ws_shared.enabled() and getattr(self, "env", None) == "practice":
+                remaining = kr_tick_remaining_sec(getattr(self, "_kr_stage_deadline", None))
+                if remaining > 0.02:
+                    shared_owner, ws_quote = kr_ws_shared.read_owner_quote(
+                        ws_service, c, max_age_sec=ws_max_age,
+                        timeout_sec=min(0.12, remaining - 0.01),
+                        required_fields=("last",),
+                    )
+            if ws_quote is None and not shared_owner:
+                ws_service.subscribe_kr(c)
+                ws_quote = ws_service.get_fresh_quote("KR", c, max_age_sec=ws_max_age)
+            if ws_quote is None and not shared_owner and ws_wait > 0:
                 ws_quote = ws_service.wait_for_fresh_quote(
                     "KR", c, max_age_sec=ws_max_age, wait_sec=ws_wait
                 )
@@ -2836,10 +2923,17 @@ class KisAPI:
                         for code_fmt in code_variants:
                             params = {"fid_cond_mrkt_div_code": market_div, "fid_input_iscd": code_fmt}
                             try:
-                                resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 5.0), endpoint="inquire_price")
+                                if entry_refresh:
+                                    resp = self._safe_request("GET", url, headers=headers, params=params,
+                                                              timeout=(0.8, 1.2), endpoint="inquire_price",
+                                                              kr_read_attempt_cap=1)
+                                else:
+                                    resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 5.0), endpoint="inquire_price")
                                 data = resp.json()
                             except KisTemporaryError as exc:
                                 last_error = exc
+                                if entry_refresh:
+                                    return {}
                                 if diag_mode:
                                     logger.warning("[KIS][QUOTE][TEMP_ERROR] diag mode code=%s attempt=%s err=%s action=bounded_retry", code, attempt, repr(exc))
                                 sleep_time = min(base_sleep ** attempt, 10.0) * (1 + random.uniform(0, jitter))
@@ -2850,11 +2944,15 @@ class KisAPI:
                                 continue
                             except Exception as exc:
                                 last_error = exc
+                                if entry_refresh:
+                                    return {}
                                 if diag_mode:
                                     logger.warning("[KIS][QUOTE][WARN] diag mode code=%s attempt=%s err=%s", code, attempt, repr(exc))
                                     return {}
                                 continue
                             if "초당 거래건수" in (data.get("msg1") or ""):
+                                if entry_refresh:
+                                    return {}
                                 # Rate limit 초과 시 TEMP_ERROR로 처리
                                 last_error = KisTemporaryError("Rate limit exceeded")
                                 if diag_mode:
@@ -2869,6 +2967,8 @@ class KisAPI:
                                 raw_output = dict(data["output"])
                                 break
                             else:
+                                if entry_refresh:
+                                    return {}
                                 # Log failure
                                 logger.warning("[KIS][QUOTE][FAIL] code=%s status=%s rt_cd=%s msg_cd=%s msg1=%s resp_text=%s",
                                                code, resp.status_code, data.get("rt_cd"), data.get("msg_cd"), data.get("msg1"), resp.text[:300])
@@ -2879,7 +2979,7 @@ class KisAPI:
                         break
             if raw_output is not None:
                 break
-            if diag_mode:
+            if diag_mode or entry_refresh:
                 break
             sleep_time = min(base_sleep ** attempt, 10.0) * (1 + random.uniform(0, jitter))
             if not _kr_sleep_with_budget(
@@ -3169,7 +3269,98 @@ class KisAPI:
             logger.warning("[HOGA][FAIL] status=%s rt_cd=%s msg_cd=%s msg1=%s resp_text=%s",
                            resp.status_code, data.get("rt_cd"), data.get("msg_cd"), data.get("msg1"), resp.text[:300])
             raise RuntimeError("Hoga API failed")
-        return data.get("output", {})
+        # FHKST01010200 returns top-of-book in output1, not output2
+        # (expected auction price) or necessarily the legacy output key.
+        # Keep the old output shape for legacy adapters.
+        book = data.get("output1")
+        if not isinstance(book, dict):
+            book = data.get("output")
+        return dict(book) if isinstance(book, dict) else {}
+
+    def get_kr_observer_quote(self, code: str) -> dict:
+        """Read-only collector: request native VWAP and volume, not an orderbook.
+
+        Generic quote fallback still supplies bars/price diagnostics when KIS
+        does not expose complete native VWAP evidence. No synthetic fields.
+        """
+        from trader.marketdata import kr_ws_shared
+        c = str(code or "").removeprefix("A")
+        if kr_ws_shared.enabled() and getattr(self, "env", None) == "practice":
+            service = get_kis_ws_price_service()
+            max_age = _env_float("KIS_WS_FRESH_MAX_AGE_SEC_KR", 5.0)
+            fields = ("last", "acml_vol", "wghn_avrg_stck_prc")
+            local = kr_ws_shared._validated_quote(
+                service.get_fresh_quote("KR", c, max_age_sec=max_age),
+                symbol=c, max_age_sec=max_age, required_fields=fields,
+            )
+            if local:
+                return local
+            remaining = kr_tick_remaining_sec(getattr(self, "_kr_stage_deadline", None))
+            if remaining > 0.02:
+                _, remote = kr_ws_shared.read_owner_quote(
+                    service, c, max_age_sec=max_age,
+                    timeout_sec=min(0.12, remaining - 0.01),
+                    required_fields=fields,
+                )
+                if remote:
+                    return remote
+        return self.get_price_snapshot(c, market="J")
+
+    def get_kr_entry_executable_quote(self, code: str, *, max_age_sec: float = 15.0) -> dict:
+        """One bounded orderbook supplement, with separate price/book evidence.
+
+        Only called for a selected PB1 practice entry or verified cancellation
+        retry, never for each Final30 symbol or the observer. The original
+        price timestamp is immutable; retries may require a stricter TTL.
+        """
+        from trader.kr.executable_quote import (
+            verified_price, compose_orderbook, complete_book, valid_book_supplement,
+        )
+        c = str(code or "").removeprefix("A")
+        price = self.get_price_snapshot(c, market="J")
+        if str(self.env).lower() != "practice" or c == "122630":
+            return price or {}
+        if complete_book(price) and verified_price(price, c, now=time.time(), max_age_sec=min(15.0, max_age_sec)):
+            return price
+        cached_book = getattr(self, "_kr_entry_book_cache", {})
+        previous = cached_book.get(c)
+        if previous and valid_book_supplement(previous, c, now=time.time()):
+            # Reuse the same authenticated pair only inside both original TTLs.
+            return dict(previous)
+        if kr_tick_remaining_sec(getattr(self, "_kr_stage_deadline", None)) < 2.5:
+            return price or {}
+        try:
+            if not verified_price(price, c, now=time.time()):
+                # 11/26 stale planning cache: one native quote refresh,
+                # never a newly stamped copy of that same cached price.
+                price = self.get_price_quote(c, attempts=1, retry_cap=1, entry_refresh=True)
+                if not verified_price(price, c, now=time.time()):
+                    return {}
+                if complete_book(price):
+                    return price
+            if kr_tick_remaining_sec(getattr(self, "_kr_stage_deadline", None)) < 2.5:
+                return price or {}
+            # Fresh KIS request, not the legacy cached get_quote path.
+            started = time.time()
+            url = f"{normalize_base_url(API_BASE_URL)}/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn"
+            resp = self._safe_request(
+                "GET", url, headers=self._headers(_pick_tr(self.env, "ORDERBOOK")[0]),
+                params={"fid_cond_mrkt_div_code": "J", "fid_input_iscd": c},
+                timeout=(0.8, 1.2), endpoint="inquire-asking-price-exp-ccn",
+                kr_read_attempt_cap=1,
+            )
+            received = time.time()
+            result = compose_orderbook(price, resp, code=c, started=started, received=received)
+            if result:
+                logger.info("[KR][EXECUTABLE_QUOTE][BOOK_SUPPLEMENT] code=%s price_age_sec=%.3f book_age_sec=%.3f",
+                            c, received-float(price["received_at"]), time.time()-received)
+                if not hasattr(self, "_kr_entry_book_cache"):
+                    self._kr_entry_book_cache = {}
+                self._kr_entry_book_cache[c] = dict(result)
+                return result
+        except Exception as exc:
+            logger.warning("[KR][EXECUTABLE_QUOTE][BOOK_UNAVAILABLE] code=%s type=%s", c, type(exc).__name__)
+        return price or {}
 
     def get_current_price(self, code: str) -> float:
         """기존 경량 버전(호환용). 내부적으로 get_last_price 사용."""
@@ -3629,10 +3820,31 @@ class KisAPI:
         # WebSocket is independent of the REST circuit. A prior EGW002 on this
         # symbol must not hide a newly-arrived fresh streaming quote.
         ws_service = get_kis_ws_price_service()
-        ws_service.subscribe_kr(code)
-        ws_quote = ws_service.get_fresh_quote(
-            "KR", code, max_age_sec=_env_float("KIS_WS_FRESH_MAX_AGE_SEC_KR", 5.0)
-        )
+        from trader.marketdata import kr_ws_shared
+
+        max_age_sec = _env_float("KIS_WS_FRESH_MAX_AGE_SEC_KR", 5.0)
+        shared_owner = False
+        ws_quote = None
+        if (kr_ws_shared.enabled() and getattr(self, "env", None) == "practice"
+                and str(market).upper() == "J"):
+            ws_quote = ws_service.get_fresh_quote("KR", code, max_age_sec=max_age_sec)
+            if ws_quote is None:
+                # One bounded IPC read within the caller's existing tick
+                # budget. An IPC miss is not a valid price or order permit.
+                remaining = kr_tick_remaining_sec()
+                if remaining > 0.02:
+                    shared_owner, ws_quote = kr_ws_shared.read_owner_quote(
+                        ws_service, code, max_age_sec=max_age_sec,
+                        timeout_sec=min(0.12, remaining - 0.01),
+                        required_fields=("last",),
+                    )
+                    if ws_quote:
+                        logger.info("[KR_WS_SHARED][HIT] code=%s age_sec=%.3f generation=%s owner_pid=%s",
+                                    code, ws_quote["age_sec"], ws_quote["shared_generation"],
+                                    ws_quote["shared_owner_pid"])
+        if not ws_quote and not shared_owner:
+            ws_service.subscribe_kr(code)
+            ws_quote = ws_service.get_fresh_quote("KR", code, max_age_sec=max_age_sec)
         if ws_quote:
             logger.debug(
                 "[KIS_WS][SNAPSHOT_HIT] code=%s age_sec=%.3f",
@@ -3669,31 +3881,59 @@ class KisAPI:
 
         # leader does the call
         try:
-            # 4) global rate limit
-            sleep_s = _price_rl.acquire()
-            if sleep_s > 0:
-                _price_cache.record_retry_wait()
-                logger.debug("[PRICE][RATE_WAIT] code=%s sleep=%.2fs", code, sleep_s)
-                if not _kr_sleep_with_budget(sleep_s):
-                    return {}
-            if _PRICE_JITTER_MAX_SEC > 0:
-                if not _kr_sleep_with_budget(random.uniform(0.0, _PRICE_JITTER_MAX_SEC)):
-                    return {}
+            def fetch_native_or_ws():
+                # 4) global rate limit
+                sleep_s = _price_rl.acquire()
+                if sleep_s > 0:
+                    _price_cache.record_retry_wait()
+                    logger.debug("[PRICE][RATE_WAIT] code=%s sleep=%.2fs", code, sleep_s)
+                    if not _kr_sleep_with_budget(sleep_s):
+                        return {}
+                if _PRICE_JITTER_MAX_SEC > 0:
+                    if not _kr_sleep_with_budget(random.uniform(0.0, _PRICE_JITTER_MAX_SEC)):
+                        return {}
 
-            # 5) Canonical KR six-digit quotes must never fan out to the
-            # generic legacy U-market / A-prefixed alternatives. The latter
-            # generated OPSQ2001 invalid market-code replies during native
-            # minute observation, wasting the shared KIS API budget.
+                # 5) Canonical KR six-digit quotes must never fan out to the
+                # generic legacy U-market / A-prefixed alternatives. The latter
+                # generated OPSQ2001 invalid market-code replies during native
+                # minute observation, wasting the shared KIS API budget.
+                domestic_code = str(code or "").strip().removeprefix("A")
+                canonical_kr = (
+                    str(market or "").upper() == "J"
+                    and len(domestic_code) == 6 and domestic_code.isdigit()
+                )
+                return self.get_price_quote(
+                    domestic_code if canonical_kr else code,
+                    diag_mode=False, attempts=2,
+                    retry_cap=2 if canonical_kr else None,
+                )
+
+            from trader.marketdata import kr_rest_shared
             domestic_code = str(code or "").strip().removeprefix("A")
             canonical_kr = (
                 str(market or "").upper() == "J"
                 and len(domestic_code) == 6 and domestic_code.isdigit()
             )
-            data = self.get_price_quote(
-                domestic_code if canonical_kr else code,
-                diag_mode=False, attempts=2,
-                retry_cap=2 if canonical_kr else None,
-            )
+            if (canonical_kr and domestic_code != "122630"
+                    and kr_rest_shared.enabled(getattr(self, "env", None))):
+                remaining = kr_tick_remaining_sec(getattr(self, "_kr_stage_deadline", None))
+                observer = os.getenv("KR_PB1_OBSERVER_ONLY") == "1"
+                shared_status, data = kr_rest_shared.read_or_fetch(
+                    appkey=str(APP_KEY or ""), code=domestic_code,
+                    fetch=fetch_native_or_ws,
+                    max_join_sec=max(0.0, min(0.15, remaining - 0.05)),
+                    defer_on_busy=observer,
+                )
+                logger.info("[KR_REST_SHARED][PRICE] code=%s status=%s observer=%s",
+                            domestic_code, shared_status, int(observer))
+                if shared_status in {"BUSY", "UNAVAILABLE"}:
+                    # Collector defers; never prevent a protective exit from
+                    # obtaining a quote just because a collector owns a read.
+                    if observer:
+                        return {}
+                    data = fetch_native_or_ws()
+            else:
+                data = fetch_native_or_ws()
 
             # 6) EGW002 guard (초당 제한)
             msg_cd = str(data.get("msg_cd", ""))

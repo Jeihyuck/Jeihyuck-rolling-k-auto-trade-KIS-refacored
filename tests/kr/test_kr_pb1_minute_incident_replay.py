@@ -281,3 +281,31 @@ def test_quote_failure_keeps_native_minute_proof_but_never_fabricates_vwap(
     assert persisted and len(persisted["bars"]) >= 30
     assert persisted["vwap"] is None
     assert persisted["vwap_source"] == "UNKNOWN"
+
+
+def test_new_native_5plus3_skips_redundant_opening_repair(setup_readonly, monkeypatch):
+    now = at(9, 39)
+    monkeypatch.setattr(observer, "now_kst", lambda: now)
+    proof.save_opening_proof(
+        env="practice", account_scope="replay-only", code="093320",
+        now=at(9, 32), raw_bars=native_mins(0, 18),
+        vwap=None, vwap_source="UNKNOWN")
+    calls = []
+    result = observer.run_once(
+        kis=fake_client(calls, lambda code, anchor: native_mins(30, 39)),
+        codes=["093320"], observed_at=now, sleep_between=0)
+    assert calls == [("093320", "093900")]
+    assert result["coverage_ok"] == 1
+    assert result["native_minute_request_attempts"] == 1
+    persisted = proof.load_opening_proof(env="practice", account_scope="replay-only",
+                                        code="093320", now=now)
+    coverage = proof.inspect_completed_bar_coverage(rows=persisted["bars"], now=now)
+    assert coverage["native_post_open_window_ready"]
+    assert coverage["opening_count"] == 18  # no fabricated opening bars
+
+
+def test_provisional_coverage_does_not_hide_contradictory_native_rows():
+    now = at(9, 39)
+    older = native_mins(30, 39)
+    changed = {**older[-1], "close": older[-1]["close"] + 10}
+    assert observer._current_batch_coverage({"bars": older}, [changed], now) == {}

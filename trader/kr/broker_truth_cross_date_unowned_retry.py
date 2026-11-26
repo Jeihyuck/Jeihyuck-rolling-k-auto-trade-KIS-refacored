@@ -71,6 +71,26 @@ def _find_exact_order_for_unowned_fill(
     if not code or side not in {"BUY", "SELL"} or not kis_odno or fill_day is None:
         return None
 
+    # Scoped orders use the same original broker trading day as OrdersRepo
+    # and migration 0061. SQLite strips UTC offsets on readback; comparing
+    # its raw calendar date to an aware KST fill is wrong near midnight.
+    # Keep the legacy unscoped fixture path unchanged.
+    order_day_predicates = ()
+    if scope is not None:
+        stamp = sa.func.coalesce(
+            schema.orders.c.submitted_at,
+            schema.orders.c.acked_at,
+            schema.orders.c.created_at,
+        )
+        if conn.dialect.name == "postgresql":
+            order_day = sa.cast(sa.func.timezone("Asia/Seoul", stamp), sa.Date)
+            order_day_predicates = (order_day == fill_day,)
+        elif conn.dialect.name == "sqlite":
+            order_day = sa.func.date(stamp, "+9 hours")
+            order_day_predicates = (order_day == fill_day.isoformat(),)
+        else:
+            raise RuntimeError("KR_CROSS_DATE_SCOPED_DIALECT_UNSUPPORTED")
+
     rows = [
         dict(row)
         for row in conn.execute(
@@ -83,6 +103,7 @@ def _find_exact_order_for_unowned_fill(
                     schema.orders.c.strategy == strategy,
                     schema.orders.c.code == code,
                     schema.orders.c.side == side,
+                    *order_day_predicates,
                     *(scoped_portfolio_predicates(schema, scope) if scope else ()),
                     *((schema.orders.c.trading_epoch_id == scope.trading_epoch_id,)
                       if scope else ()),
@@ -94,7 +115,7 @@ def _find_exact_order_for_unowned_fill(
             )
         ).mappings().all()
     ]
-    exact = [row for row in rows if _order_trade_date(row) == fill_day]
+    exact = rows if scope is not None else [row for row in rows if _order_trade_date(row) == fill_day]
     if len(exact) != 1:
         logger.error(
             "[KR_BROKER_TRUTH][CROSS_DATE_UNOWNED][BLOCK] code=%s side=%s kis_odno=%s fill_day=%s candidates=%s exact_date_candidates=%s reason=ORDER_MATCH_NOT_UNIQUE",

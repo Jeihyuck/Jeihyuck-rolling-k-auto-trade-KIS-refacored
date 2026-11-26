@@ -7,9 +7,19 @@ on:
       - "trader/kr/entry_opportunity_v2.py"
       - "trader/kr/entry_opportunity_v3.py"
       - "trader/kr/entry_timing_price.py"
+      - "trader/kr/executable_quote.py"
+      - "tests/kr/test_kr_executable_quote_20261126.py"
+      - "tests/kr/test_kr_354_repository_lifecycle.py"
       - "tests/kr/test_kr_20261113_pb1_native_volume_rescue.py"
       - "trader/kr/entry_priority_queue.py"
       - "trader/kr/kis_observer_budget.py"
+      - "trader/kr/kis_shared_http_budget.py"
+      - "trader/marketdata/kr_ws_shared.py"
+      - "trader/marketdata/kr_rest_shared.py"
+      - "tests/kr/test_kr_rest_shared_20261126.py"
+      - "trader/marketdata/kis_ws_price.py"
+      - "tests/kr/test_kr_ws_shared_20261126.py"
+      - "tests/kr/test_kr_shared_http_budget_20261126.py"
       - "trader/kis_wrapper.py"
       - "trader/pb1_engine.py"
       - "trader/pb1_runner.py"
@@ -27,6 +37,7 @@ on:
       - "tests/kr/test_kr_pb1_current_only_original_balance_proof.py"
       - "tests/kr/test_kr_pb1_kis_http_audit.py"
       - "tests/kr/test_kr_session_metrics_accumulator.py"
+      - "tests/kr/test_kr_20261013_start_aligned_cadence.py"
       - "scripts/kr_opening_observer.py"
       - "scripts/kr_historical_buy_native_evidence.py"
       - "scripts/wsl/check-nullim-day-health.sh"
@@ -79,6 +90,11 @@ jobs:
             tests/kr/test_kr_pb1_minute_priority_queue.py \
             tests/kr/test_kr_pb1_minute_native_conflicts.py \
             tests/kr/test_kr_pb1_kis_observer_budget.py \
+            tests/kr/test_kr_ws_shared_20261126.py \
+            tests/kr/test_kr_rest_shared_20261126.py \
+            tests/kr/test_kr_shared_http_budget_20261126.py \
+            tests/kr/test_kr_executable_quote_20261126.py \
+            tests/kr/test_kr_354_repository_lifecycle.py \
             tests/kr/test_kr_pb1_minute_incident_replay.py \
             tests/kr/test_kr_pb1_minute_egw_final_retry.py \
             tests/kr/test_kr_pb1_current_only_original_balance_proof.py \
@@ -91,6 +107,7 @@ jobs:
             tests/test_kr_order_price_guardrails.py \
             tests/kr/test_kr_pb1_kis_http_audit.py \
             tests/kr/test_kr_session_metrics_accumulator.py \
+            tests/kr/test_kr_20261013_start_aligned_cadence.py \
             tests/kr/test_kr_balance_freshness_provenance_20261106.py \
             tests/kr/test_kr_20261116_integrated_recovery.py \
             tests/kr/test_kr_runtime_integrity_p0_20260922.py \

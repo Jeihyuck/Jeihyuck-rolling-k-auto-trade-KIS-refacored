@@ -588,9 +588,11 @@ class KisWebSocketPriceService:
             logger.error("[KIS_WS][DISABLED] reason=dependency_missing")
             return
 
+        from trader.marketdata import kr_ws_shared
         backoff = 1.0
         while not self._stop.is_set():
             owner_stream = None
+            shared_server = None
             try:
                 owner_stream = await asyncio.to_thread(self._acquire_owner_lock)
                 if owner_stream is None:
@@ -618,6 +620,14 @@ class KisWebSocketPriceService:
                     self._connected.set()
                     self._last_error = None
                     logger.info("[KIS_WS][CONNECTED] url=%s connection=%d", self._ws_url(), self._connection_count)
+                    if kr_ws_shared.enabled() and not self._us_process() and self.network_allowed("KR"):
+                        try:
+                            shared_server = await kr_ws_shared.start_owner_server(self)
+                            logger.info("[KR_WS_SHARED][OWNER_READY] pid=%d generation=%s",
+                                        os.getpid(), shared_server[3])
+                        except (OSError, ValueError, RuntimeError) as exc:
+                            # Local native WS and existing REST remain usable.
+                            logger.warning("[KR_WS_SHARED][OWNER_START_FAIL] type=%s", type(exc).__name__)
                     sent: set[tuple[str, str]] = set()
                     backoff = 1.0
                     last_subscribe_at = 0.0
@@ -742,7 +752,14 @@ class KisWebSocketPriceService:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2.0, _env_float("KIS_WS_RECONNECT_MAX_SEC", 15.0))
             finally:
-                self._release_owner_lock(owner_stream)
+                try:
+                    # The owner socket is closed before releasing the existing
+                    # credential flock. A dead generation must not serve quotes.
+                    if shared_server is not None:
+                        self._connected.clear()
+                        await kr_ws_shared.close_owner_server(shared_server)
+                finally:
+                    self._release_owner_lock(owner_stream)
 
     async def _handle_message(self, ws: Any, message: Any) -> None:
         if isinstance(message, bytes):

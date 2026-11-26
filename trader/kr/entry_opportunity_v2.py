@@ -184,6 +184,9 @@ def validate_live_quote(*, code, timing, quote, now, order_price, allow_passive=
         return verdict("WAIT", "ORDER_PRICE_MOVED_FROM_CONFIRMED_BAR", **facts)
     if price > cap:
         return verdict("WAIT", "ORDER_PRICE_ABOVE_CONFIRMED_CAP", **facts)
+    from trader.kr.executable_quote import valid_book_supplement
+    if not valid_book_supplement(quote, expected, now=now.timestamp()):
+        return verdict("UNKNOWN", "V2_EXECUTABLE_BID_ASK_UNVERIFIED", **facts)
     ask, bid = positive(quote.get("ask")), positive(quote.get("bid"))
     facts.update(quote_ask=ask, quote_bid=bid)
     if ask is not None and ask > price:

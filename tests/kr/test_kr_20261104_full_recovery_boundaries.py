@@ -5,7 +5,7 @@ real-PostgreSQL integration check before MERGE READY.
 """
 from __future__ import annotations
 
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -27,13 +27,13 @@ CURRENT = "practice:22222222:01"
 PREVIOUS = "practice:11111111:01"
 
 
-def _accounts(monkeypatch, *, engine=None):
+def _accounts(monkeypatch, *, engine=None, day=None):
     engine = engine if engine is not None else sa.create_engine("sqlite:///:memory:")
     schema = schema_for_engine(engine)
     schema.metadata.create_all(engine)
     monkeypatch.setattr(scope, "trading_epoch_enforced", lambda: True)
     monkeypatch.setattr(scope, "get_account_key", lambda **_kw: CURRENT)
-    day = now_kst() - timedelta(days=1)
+    day = day if day is not None else now_kst() - timedelta(days=1)
     identities = {}
     with engine.begin() as conn:
         for account in (PREVIOUS, CURRENT):
@@ -114,8 +114,11 @@ def test_current_account_without_zero_baseline_is_blocked(monkeypatch, unsafe_re
     assert identities[PREVIOUS]["order"] not in groups
 
 
-def test_unowned_fill_lookup_uses_both_active_epoch_and_order_cycle(monkeypatch):
-    engine, schema, ids, day = _accounts(monkeypatch)
+@pytest.mark.parametrize("hour", [0, 8, 9, 15, 23])
+def test_unowned_fill_lookup_uses_both_active_epoch_and_order_cycle(monkeypatch, hour):
+    # Fixed local day: before 09:00 KST the UTC order date is yesterday.
+    ts = datetime(2026, 10, 22, hour, 30, tzinfo=timezone(timedelta(hours=9)))
+    engine, schema, ids, day = _accounts(monkeypatch, day=ts)
     active = scope.resolve_kr_recovery_scope(engine=engine, env="practice")
     assert active.trading_epoch_id == ids[CURRENT]["epoch"]
     evidence = {
@@ -129,6 +132,16 @@ def test_unowned_fill_lookup_uses_both_active_epoch_and_order_cycle(monkeypatch)
             fill=evidence, scope=active,
         )
         assert selected["order_id"] == ids[CURRENT]["order"]
+        assert _find_exact_order_for_unowned_fill(
+            conn=conn, schema=schema, env="practice", strategy=STRATEGY,
+            fill={**evidence, "filled_at": day - timedelta(days=1)},
+            scope=active,
+        ) is None
+        assert _find_exact_order_for_unowned_fill(
+            conn=conn, schema=schema, env="practice", strategy=STRATEGY,
+            fill={**evidence, "filled_at": day + timedelta(days=1)},
+            scope=active,
+        ) is None
         assert _find_exact_order_for_unowned_fill(
             conn=conn, schema=schema, env="practice", strategy=STRATEGY,
             fill={**evidence, "trading_epoch_id": ids[PREVIOUS]["epoch"]},

@@ -489,3 +489,32 @@ def test_historical_buy_balance_requires_original_complete_unique_rows():
         assert fresh_original_balance_quantities(Kis(invalid)) == (False,{})
     assert fresh_original_balance_quantities(Kis(empty, source="wrapper_cache")) == (False,{})
     assert fresh_original_balance_quantities(Kis(dict(empty,output1=None), normalized=empty)) == (False,{})
+
+
+@pytest.mark.parametrize("hold,expected_variant", [(False, "STRICT_RECLAIM"), (True, "RISE_AND_HOLD")])
+def test_unified_v3_preserves_strict_and_adaptive_signal_contract(hold, expected_variant):
+    from trader.kr.entry_opportunity_v3 import evaluate_entry
+    post = [bar(36, 76100, 76000, 200),
+            bar(37, 76300, 76000, 207),
+            bar(38, 76400, 76300, 250),
+            bar(39, 76400 if hold else 76500, 76400, 252)]
+    now = DAY+timedelta(minutes=40, seconds=57)
+    args = dict(family="MOMENTUM", opening=opening(), post=post, now=now,
+                order_price=76500, independent=False)
+    old = evaluate_reclaim(**args)
+    new = evaluate_entry(**args, payload={}, conflict_keys=set(), setup_ok=True, trigger_ok=False)
+    assert new["state"] == "READY_SHADOW"
+    assert new["entry_engine_revision"] == "V3"
+    assert new["signal_variant"] == expected_variant
+    assert new["entry_policy"] == "US_ALIGNED_V2"
+    assert new["not_order_authorization"]
+    if not hold:
+        assert old["state"] == "READY_SHADOW"
+        for key in ("state", "reason", "max_entry_price", "reference_price",
+                    "structural_stop_reference", "structural_target_reference",
+                    "risk_reward_reference"):
+            assert old[key] == new[key]
+    expensive = evaluate_entry(**{**args, "order_price": 90000}, payload={},
+                                conflict_keys=set(), setup_ok=True, trigger_ok=False)
+    assert expensive["state"] == "WAIT"
+    assert expensive["reason"] == "ORDER_PRICE_MOVED_FROM_CONFIRMED_BAR"
