@@ -331,7 +331,9 @@ def _current_batch_coverage(stored, fetched, observed_at):
                 return {}
             merged[key] = bar
     return inspect_completed_bar_coverage(
-        rows=list(merged.values()), now=observed_at,
+        rows=[{**bar, "date": observed_at.date().isoformat(),
+               "time": datetime.fromisoformat(bar["timestamp"]).strftime("%H%M%S")}
+              for bar in merged.values()], now=observed_at,
         source_conflicts=(stored or {}).get("source_conflicts"),
     )
 
