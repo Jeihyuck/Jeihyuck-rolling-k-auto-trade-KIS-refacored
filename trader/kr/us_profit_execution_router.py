@@ -343,7 +343,7 @@ def evaluate_active_kr_tp(
             if refreshed is not None:
                 return refreshed
             fetch = getattr(kis, "get_kr_entry_executable_quote", None)
-            return checked(fetch(str(code).zfill(6))) if callable(fetch) else None
+            return checked(fetch(str(code).zfill(6), max_age_sec=5.0)) if callable(fetch) else None
 
         if retry_pending:
             if unresolved_sell:
