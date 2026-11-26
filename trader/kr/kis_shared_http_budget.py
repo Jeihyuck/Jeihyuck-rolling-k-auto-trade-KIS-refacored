@@ -2,8 +2,9 @@
 
 Existing endpoint limits and observer budget remain in force. No lock is
 held during network I/O or sleep. This is not a broker quota certificate:
-the operator must supply an independently verified RPS and test it in WSL.
-It covers participating KR wrapper attempts, not arbitrary external clients.
+the KR launcher inherits the existing configured practice call-rate ceiling,
+unless an explicit lower shared cap is supplied. That is an internal policy,
+not a measured KIS quota. It covers participating KR wrapper attempts only.
 """
 from __future__ import annotations
 
@@ -140,3 +141,47 @@ def penalize(*, environment: str, appkey: str, seconds: float) -> bool:
         return True
     except (OSError, ValueError, TypeError, OverflowError):
         return False
+
+
+def preflight(*, environment: str, appkey: str) -> tuple[bool, str]:
+    """Check local admission state without KIS traffic or token acquisition.
+
+    Use the exact same credential/rate scope as acquire(). A configured
+    rate must not exceed the preexisting local practice gate. Never reset
+    another running process's lease or repair a corrupt file speculatively.
+    """
+    try:
+        if environment != "practice":
+            return False, "NOT_PRACTICE"
+        rate = _rate()
+        local_cap = float(os.getenv("KIS_GLOBAL_RPS_PRACTICE", "1.5") or "1.5")
+        if not math.isfinite(local_cap) or not 0.1 <= rate <= local_cap:
+            return False, "RATE_EXCEEDS_LOCAL_CAP_OR_INVALID"
+        path = _path(environment, appkey)
+        deadline = time.monotonic() + 0.5
+        while True:
+            with _locked_file(path) as file:
+                try:
+                    fcntl.flock(file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    pass
+                else:
+                    _read(file, time.monotonic(), rate)
+                    return True, "LOCAL_CONFIG_READY"
+            if time.monotonic() >= deadline:
+                return False, "STATE_LOCK_BUSY"
+            time.sleep(0.02)
+    except (OSError, ValueError, TypeError, OverflowError):
+        return False, "STATE_OR_CONFIG_UNAVAILABLE"
+
+
+if __name__ == "__main__":
+    import sys
+    # settings.APP_KEY reads KIS_APP_KEY. Avoid importing settings or any
+    # broker client in this read-only startup check; never print credentials.
+    ready, reason = preflight(
+        environment=os.getenv("KIS_ENV", ""),
+        appkey=str(os.getenv("KIS_APP_KEY") or "").strip(),
+    )
+    print("[KR_SHARED_HTTP][PREFLIGHT] ready=%s reason=%s" % (int(ready), reason))
+    sys.exit(0 if ready else 1)
