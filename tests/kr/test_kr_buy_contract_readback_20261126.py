@@ -205,6 +205,11 @@ def test_actual_repository_new_swing_intent_and_idempotency(monkeypatch, code, q
         assert frozen["position_cycle_id"] == cycle
         assert frozen["entry_contract_sha256"] == _kr_buy_entry_contract_hash(frozen)
         assert OrdersRepo(engine).create_intent_idempotent(**args) == (order_id, False)
+        changed = dict(args, qty=qty + 1, request_json={
+            **req, "requested_qty": qty + 1, "submitted_qty": qty + 1,
+        })
+        with pytest.raises(RuntimeError, match="KR_BUY_ENTRY_CONTRACT_PERSISTENCE_MISMATCH"):
+            OrdersRepo(engine).create_intent_idempotent(**changed)
         with engine.connect() as conn:
             assert conn.execute(sa.select(sa.func.count()).select_from(schema.orders).where(
                 schema.orders.c.client_order_key == key)).scalar_one() == 1
