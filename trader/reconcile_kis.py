@@ -2098,11 +2098,16 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                 # exact terminal cancellation and cumulative native amounts,
                 # may reopen a remaining-stage attempt.
                 if (env == "practice" and source_order.get("strategy") == "pb1_pullback_close"
-                        and request_json.get("kr_us_tp_stage") in {"TP1", "TP2", "TP3"}
+                        and request_json.get("kr_us_tp_stage") in {
+                            "TP1", "TP2", "TP3", "PROFIT_DEFENSE_PARTIAL", "RUNNER_FINAL",
+                        }
                         and cumulative_sell_evidence["qty"] >= int(source_response.get("confirmed_fill_qty") or 0)):
                     from trader.kr.us_profit_stage_journal import verified_native_tp_cancellation
                     from trader.kr.us_standard_profit_parity import verified_contract
-                    if verified_contract(request_json.get("kr_us_tp_contract")):
+                    if (verified_contract(request_json.get("kr_us_tp_contract"))
+                            and request_json["kr_us_tp_contract"].get("activation_mode") == "ACTIVE_PRACTICE"
+                            and (request_json["kr_us_tp_stage"] in {"TP1", "TP2", "TP3"}
+                                 or request_json["kr_us_tp_contract"].get("runner_version") == "US_V3")):
                         tp_cancel_proof = verified_native_tp_cancellation(
                             broker_row, code=code, broker_odno=kis_odno,
                             trade_date=order_time.date(),
