@@ -20,7 +20,10 @@ from trader.db.trading_epoch import active_trading_epoch_id
 from tests.kr.execution_claim_fixtures import create_schema_with_active_test_epoch
 
 
-def test_signed_buy_fill_crash_then_recovery_and_native_sell_once():
+@pytest.mark.parametrize('profit_mode', ['LEGACY', 'ACTIVE_PRACTICE'])
+def test_signed_buy_fill_crash_then_recovery_and_native_sell_once(monkeypatch, profit_mode):
+    monkeypatch.setenv('KIS_ENV', 'practice')
+    monkeypatch.setenv('KR_SWING_US_PROFIT_MODE', profit_mode)
     engine = sa.create_engine("sqlite:///:memory:")
     schema = create_schema_with_active_test_epoch(engine)
     env, owner, code, market = "practice", "pb1_pullback_close", "035760", "KOSDAQ"
@@ -103,7 +106,7 @@ def test_signed_buy_fill_crash_then_recovery_and_native_sell_once():
     positions.apply_fill(
         env=env, strategy=owner, sid=1, mode=1, code=code, market=market,
         side="BUY", qty=10, price=2000, fee=0, tax=0, filled_at=stamp,
-        entry_exit_plan=plan, portfolio_epoch_id=portfolio,
+        entry_exit_plan={} if profit_mode == "ACTIVE_PRACTICE" else plan, portfolio_epoch_id=portfolio,
         position_cycle_id=cycle, order_id=str(order_id),
         buy_application_cumulative_qty=10,
         buy_application_previous_confirmed_qty=0,
@@ -129,6 +132,10 @@ def test_signed_buy_fill_crash_then_recovery_and_native_sell_once():
     assert opened["entry_meta_json"]["entry_contract_sha256"] == frozen["entry_contract_sha256"]
     assert opened["entry_meta_json"]["source_buy_order_id"] == str(order_id)
     assert opened["entry_exit_plan_json"] == plan
+    if profit_mode == "ACTIVE_PRACTICE":
+        from trader.kr.us_standard_profit_parity import verified_contract
+        assert verified_contract(frozen["kr_us_profit_contract"])
+        assert opened["entry_meta_json"]["kr_us_profit_contract"] == frozen["kr_us_profit_contract"]
 
     sell_key = "pr354-sell-" + uuid4().hex
     sell_order_id, created = orders.create_intent_idempotent(
@@ -181,6 +188,8 @@ def test_signed_buy_fill_crash_then_recovery_and_native_sell_once():
     assert residual["qty"] == 6
     assert residual["entry_meta_json"]["entry_contract_sha256"] == frozen["entry_contract_sha256"]
     assert residual["entry_exit_plan_json"] == plan
+    if profit_mode == "ACTIVE_PRACTICE":
+        assert residual["entry_meta_json"]["kr_us_profit_contract"] == frozen["kr_us_profit_contract"]
     with engine.connect() as conn:
         rows = conn.execute(
             sa.select(schema.fills).where(schema.fills.c.trading_epoch_id == epoch)
