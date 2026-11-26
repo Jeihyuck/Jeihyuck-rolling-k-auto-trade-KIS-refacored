@@ -205,7 +205,8 @@ def _cancelled_runner(stage, target, filled):
             "cancelled_attempts": [{"client_order_key": "old", "trade_date": DAY.isoformat(),
                                     "broker_odno": "0000005001", "requested_qty": target,
                                     "filled_qty": filled, "cancelled_qty": target-filled,
-                                    "open_qty": 0, "source": "KIS_DAILY_CCLD_CANCEL_VERIFIED"}]}
+                                    "open_qty": 0, "source": "KIS_DAILY_CCLD_CANCEL_VERIFIED",
+                                    "native_row_sha256": "a" * 64}]}
 
 
 @pytest.mark.parametrize("stage,target,filled,price,qty,expected", [
