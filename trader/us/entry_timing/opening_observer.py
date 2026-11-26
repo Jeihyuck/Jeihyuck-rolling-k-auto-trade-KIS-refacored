@@ -576,8 +576,9 @@ def collect_hot_minutes(client, db, *, symbol, exchange, trade_date,
 def run_observer(*, env: str, trade_date: str, scope: str,
                  parent_pid: int, watchlist: list[dict],
                  min_interval_sec: float = 10.0,
-                 max_runtime_sec: float = 180.0 * 60.0) -> int:
-    if env != "practice" or parent_pid < 2:
+                 max_runtime_sec: float = 180.0 * 60.0,
+                 continuous: bool = False) -> int:
+    if env != "practice" or (not continuous and parent_pid < 2):
         return 2
     # The child cannot submit, cancel, or route orders. Existing KIS client
     # maintains its own practice-only guard; process permission also denies it.
@@ -585,6 +586,13 @@ def run_observer(*, env: str, trade_date: str, scope: str,
         "KIS_ENV": "practice", "DRY_RUN": "1", "ALLOW_REAL_ORDER": "0",
         "US_KIS_ORDER_ALLOWED": "0", "TRADING_REGION": "US",
     })
+    from trader.us.market_calendar import is_us_trading_day, regular_close_time_for_date
+    from datetime import date
+    day = date.fromisoformat(trade_date)
+    if not is_us_trading_day(day):
+        LOG.info("[US_OPENING_OBSERVER][HOLIDAY] date=%s action=NO_COLLECTION", trade_date)
+        return 0
+    close_time = regular_close_time_for_date(day)
     pairs = standard_entry_pairs(watchlist)
     if not pairs:
         LOG.warning("[US_OPENING_OBSERVER][NO_WATCHLIST] action=NO_ORDER")
@@ -602,12 +610,29 @@ def run_observer(*, env: str, trade_date: str, scope: str,
     priority_offsets = {"HOT": 0, "WARM": 0, "COLD": 0}
     last_priority_state = None
     next_repair_by_symbol = {}
+    next_epoch_check = 0.0
+    epoch_verified = not continuous
     fetch_enabled = os.getenv("US_OPENING_OBSERVER_BAR_FETCH_ENABLED", "1") == "1"
     try:
-        while os.getppid() == parent_pid and time.monotonic() - start <= max_runtime_sec:
+        while (continuous or os.getppid() == parent_pid) and time.monotonic() - start <= max_runtime_sec:
             now_et = datetime.now(NY)
-            if now_et.date().isoformat() != trade_date or now_et.hour >= 16:
+            if now_et.date().isoformat() != trade_date or now_et.time() >= close_time:
                 break
+            if continuous and time.monotonic() >= next_epoch_check:
+                next_epoch_check = time.monotonic() + 60.0
+                try:
+                    from trader.db.trading_epoch import active_trading_epoch_id
+                    active = active_trading_epoch_id(env="practice", required=True)
+                    epoch_verified = bool(active and scope.rsplit(":", 1)[-1] == str(active))
+                    if not epoch_verified:
+                        LOG.warning("[US_OPENING_OBSERVER][EPOCH_CHANGED] action=STOP_COLLECTION")
+                        break
+                except Exception as exc:
+                    epoch_verified = False
+                    LOG.warning("[US_OPENING_OBSERVER][EPOCH_UNVERIFIED] type=%s action=PAUSE_COLLECTION", type(exc).__name__)
+            if not epoch_verified:
+                time.sleep(2.0)
+                continue
             if (now_et.hour, now_et.minute) < (9, 30):
                 time.sleep(2.0)
                 continue
@@ -654,7 +679,10 @@ def run_observer(*, env: str, trade_date: str, scope: str,
                 def _still_hot():
                     current, state = load_preminute_priority(env=env, scope=scope,
                         trade_date=trade_date, pairs=pairs, now_epoch=time.time())
-                    return state == "VALID" and (symbol, exchange) in current["HOT"]
+                    live = datetime.now(NY)
+                    return (epoch_verified and live.date().isoformat() == trade_date
+                            and live.time() < close_time and state == "VALID"
+                            and (symbol, exchange) in current["HOT"])
                 repair_due = time.monotonic() >= next_repair_by_symbol.get(symbol, 0.0)
                 if repair_due:
                     next_repair_by_symbol[symbol] = time.monotonic() + 120.0
@@ -678,17 +706,34 @@ def main() -> int:
     parser.add_argument("--scope", required=True)
     parser.add_argument("--parent-pid", type=int, required=True)
     parser.add_argument("--watchlist-file", type=Path, required=True)
+    parser.add_argument("--continuous", action="store_true")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
     with args.watchlist_file.open(encoding="utf-8") as fh:
         rows = json.load(fh)
     if not isinstance(rows, list):
         return 2
-    return run_observer(
-        env=args.env, trade_date=args.trade_date, scope=args.scope,
-        parent_pid=args.parent_pid, watchlist=rows,
-        min_interval_sec=float(os.getenv("US_OPENING_OBSERVER_INTERVAL_SEC", "10")),
-    )
+    kwargs = dict(env=args.env, trade_date=args.trade_date, scope=args.scope,
+                  parent_pid=args.parent_pid, watchlist=rows,
+                  min_interval_sec=float(os.getenv("US_OPENING_OBSERVER_INTERVAL_SEC", "10")))
+    if not args.continuous:
+        return run_observer(**kwargs)
+    # Linux/WSL process-held advisory lock, not a PID file. A second AM/PM
+    # launcher exits without opening the DB or calling the broker. Never
+    # unlink the lock file (which could allow separate locked inodes).
+    import fcntl
+    lock = store_path(env=args.env, account_scope=args.scope,
+                      trade_date=args.trade_date).with_suffix(".observer.lock")
+    fd = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            LOG.info("[US_OPENING_OBSERVER][ALREADY_RUNNING] action=NO_COLLECTION")
+            return 0
+        return run_observer(**kwargs, continuous=True, max_runtime_sec=8*3600)
+    finally:
+        os.close(fd)
 
 
 if __name__ == "__main__":
