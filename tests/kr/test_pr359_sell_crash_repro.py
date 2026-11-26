@@ -1,6 +1,7 @@
 """Reproduce a crash between native SELL fill and position application."""
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
+from pathlib import Path
 import os
 from threading import Barrier, local
 from types import SimpleNamespace
@@ -410,6 +411,17 @@ def test_kr401_terminal_cancel_releases_real_claim_without_new_fill(monkeypatch,
     monkeypatch.setenv("KR_SWING_US_PROFIT_MODE", "ACTIVE_PRACTICE")
     monkeypatch.setenv("NULLIM_KR_SETTLEMENT_ACTIVATE", "0")
     create_schema_with_active_test_epoch(engine)
+    # The scoped reconcile path checks the other sleeve's durable owner
+    # journal even for PB1 rows. Use the real KR migration and its epoch
+    # upgrade in this disposable schema; never mock/bypass owner proof.
+    migrations = Path(__file__).resolve().parents[2] / "migrations"
+    infinite_ddl = (migrations / "0049_add_kr_infinite_state.sql").read_text()
+    epoch_ddl = (migrations / "0052_unified_trading_epoch.sql").read_text()
+    kr_epoch_start = epoch_ddl.index("ALTER TABLE kr_infinite_state ADD COLUMN")
+    kr_epoch_end = epoch_ddl.index("CREATE INDEX IF NOT EXISTS ix_us_tqqq_inf_trading_epoch", kr_epoch_start)
+    with engine.begin() as conn:
+        conn.exec_driver_sql(infinite_ddl)
+        conn.exec_driver_sql(epoch_ddl[kr_epoch_start:kr_epoch_end])
     code, odno, key = "251970", "0000040226", "kr401-terminal-cancel"
     pos, order_id = _accepted_sell(engine, code=code, ordered_qty=17, pre_qty=68,
                                     avg_price=68400.0, odno=odno, order_key=key)
