@@ -11,6 +11,7 @@ import json
 import math
 import os
 from dataclasses import dataclass
+from datetime import date
 from typing import Any, Mapping
 
 from trader.us.market_state_overlay import resolve_profit_capture_stage_quantity
@@ -190,9 +191,22 @@ def verified_tp_retry_remainder(state: Mapping[str, Any]) -> int | None:
             return None
         total, keys, odnos = 0, set(), set()
         for row in history:
-            key = str(row["client_order_key"])
-            odno = (str(row["trade_date"]), str(row["broker_odno"]))
-            if not key or not odno[1] or key in keys or odno in odnos:
+            key = row["client_order_key"]
+            raw_odno = row["broker_odno"]
+            trade_day = row["trade_date"]
+            digest = row.get("native_row_sha256")
+            if (not isinstance(key, str) or not key.strip() or key != key.strip()
+                    or not isinstance(raw_odno, str) or not raw_odno.isascii()
+                    or not raw_odno.isdecimal() or int(raw_odno) <= 0
+                    or not isinstance(trade_day, str)
+                    or date.fromisoformat(trade_day).isoformat() != trade_day
+                    or not isinstance(digest, str) or len(digest) != 64
+                    or any(c not in "0123456789abcdef" for c in digest)):
+                return None
+            # KIS ODNO may be padded differently on subsequent observations.
+            # A different spelling of the same native order is not a new attempt.
+            odno = (trade_day, int(raw_odno))
+            if key in keys or odno in odnos:
                 return None
             ordered, filled, cancelled = (exact(row[k]) for k in (
                 "requested_qty", "filled_qty", "cancelled_qty"))
