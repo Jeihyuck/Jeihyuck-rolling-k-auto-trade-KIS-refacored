@@ -2802,7 +2802,7 @@ class KisAPI:
         
         raise RuntimeError(f"invalid last price 0 for {code}")
 
-    def get_price_quote(self, code: str, *, diag_mode: bool = False, attempts: int = 2, retry_cap: int | None = None, native_rest_only: bool = False) -> dict:
+    def get_price_quote(self, code: str, *, diag_mode: bool = False, attempts: int = 2, retry_cap: int | None = None, native_rest_only: bool = False, entry_refresh: bool = False) -> dict:
         """
         inquire-price 래퍼: 현재가와 최우선 호가를 dict로 반환.
 
@@ -2814,9 +2814,15 @@ class KisAPI:
         if not c:
             return {}
 
-        # Normal trading remains WS-first. A manual read-only source probe
-        # must bypass BOTH WS and stale REST cache to inspect one genuine KIS
-        # inquire-price response. Never enable this in the BUY/SELL hot path.
+        # Only a selected PB1 practice entry may request the bounded
+        # native refresh. Normal pricing remains WS-first.
+        if entry_refresh:
+            if str(self.env).lower() != "practice" or len(c) != 6 or not c.isdigit() or c == "122630":
+                return {}
+            native_rest_only = True
+            attempts = retry_cap = 1
+        # Manual source probes and selected native refreshes bypass cached
+        # price evidence; never relabel an old quote as newly received.
         if not native_rest_only:
             ws_service = get_kis_ws_price_service()
             from trader.marketdata import kr_ws_shared
@@ -2904,10 +2910,17 @@ class KisAPI:
                         for code_fmt in code_variants:
                             params = {"fid_cond_mrkt_div_code": market_div, "fid_input_iscd": code_fmt}
                             try:
-                                resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 5.0), endpoint="inquire_price")
+                                if entry_refresh:
+                                    resp = self._safe_request("GET", url, headers=headers, params=params,
+                                                              timeout=(0.8, 1.2), endpoint="inquire_price",
+                                                              kr_read_attempt_cap=1)
+                                else:
+                                    resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 5.0), endpoint="inquire_price")
                                 data = resp.json()
                             except KisTemporaryError as exc:
                                 last_error = exc
+                                if entry_refresh:
+                                    return {}
                                 if diag_mode:
                                     logger.warning("[KIS][QUOTE][TEMP_ERROR] diag mode code=%s attempt=%s err=%s action=bounded_retry", code, attempt, repr(exc))
                                 sleep_time = min(base_sleep ** attempt, 10.0) * (1 + random.uniform(0, jitter))
@@ -2918,11 +2931,15 @@ class KisAPI:
                                 continue
                             except Exception as exc:
                                 last_error = exc
+                                if entry_refresh:
+                                    return {}
                                 if diag_mode:
                                     logger.warning("[KIS][QUOTE][WARN] diag mode code=%s attempt=%s err=%s", code, attempt, repr(exc))
                                     return {}
                                 continue
                             if "초당 거래건수" in (data.get("msg1") or ""):
+                                if entry_refresh:
+                                    return {}
                                 # Rate limit 초과 시 TEMP_ERROR로 처리
                                 last_error = KisTemporaryError("Rate limit exceeded")
                                 if diag_mode:
@@ -2937,6 +2954,8 @@ class KisAPI:
                                 raw_output = dict(data["output"])
                                 break
                             else:
+                                if entry_refresh:
+                                    return {}
                                 # Log failure
                                 logger.warning("[KIS][QUOTE][FAIL] code=%s status=%s rt_cd=%s msg_cd=%s msg1=%s resp_text=%s",
                                                code, resp.status_code, data.get("rt_cd"), data.get("msg_cd"), data.get("msg1"), resp.text[:300])
@@ -2947,7 +2966,7 @@ class KisAPI:
                         break
             if raw_output is not None:
                 break
-            if diag_mode:
+            if diag_mode or entry_refresh:
                 break
             sleep_time = min(base_sleep ** attempt, 10.0) * (1 + random.uniform(0, jitter))
             if not _kr_sleep_with_budget(
@@ -3252,17 +3271,32 @@ class KisAPI:
         symbol or the observer. The existing price timestamp is immutable.
         """
         from trader.kr.executable_quote import (
-            verified_price, compose_orderbook, complete_book,
+            verified_price, compose_orderbook, complete_book, valid_book_supplement,
         )
         c = str(code or "").removeprefix("A")
         price = self.get_price_snapshot(c, market="J")
-        if complete_book(price):
+        if str(self.env).lower() != "practice" or c == "122630":
+            return price or {}
+        if complete_book(price) and verified_price(price, c, now=time.time(), max_age_sec=15):
             return price
-        if (str(self.env).lower() != "practice" or c == "122630"
-                or not verified_price(price, c, now=time.time())
-                or kr_tick_remaining_sec(getattr(self, "_kr_stage_deadline", None)) < 2.5):
+        cached_book = getattr(self, "_kr_entry_book_cache", {})
+        previous = cached_book.get(c)
+        if previous and valid_book_supplement(previous, c, now=time.time()):
+            # Reuse the same authenticated pair only inside both original TTLs.
+            return dict(previous)
+        if kr_tick_remaining_sec(getattr(self, "_kr_stage_deadline", None)) < 2.5:
             return price or {}
         try:
+            if not verified_price(price, c, now=time.time()):
+                # 11/26 stale planning cache: one native quote refresh,
+                # never a newly stamped copy of that same cached price.
+                price = self.get_price_quote(c, attempts=1, retry_cap=1, entry_refresh=True)
+                if not verified_price(price, c, now=time.time()):
+                    return {}
+                if complete_book(price):
+                    return price
+            if kr_tick_remaining_sec(getattr(self, "_kr_stage_deadline", None)) < 2.5:
+                return price or {}
             # Fresh KIS request, not the legacy cached get_quote path.
             started = time.time()
             url = f"{normalize_base_url(API_BASE_URL)}/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn"
@@ -3277,6 +3311,9 @@ class KisAPI:
             if result:
                 logger.info("[KR][EXECUTABLE_QUOTE][BOOK_SUPPLEMENT] code=%s price_age_sec=%.3f book_age_sec=%.3f",
                             c, received-float(price["received_at"]), time.time()-received)
+                if not hasattr(self, "_kr_entry_book_cache"):
+                    self._kr_entry_book_cache = {}
+                self._kr_entry_book_cache[c] = dict(result)
                 return result
         except Exception as exc:
             logger.warning("[KR][EXECUTABLE_QUOTE][BOOK_UNAVAILABLE] code=%s type=%s", c, type(exc).__name__)
