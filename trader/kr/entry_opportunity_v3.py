@@ -111,3 +111,91 @@ def candidate_geometry(*, family, opening, post, now, independent=False,
                       latest_bar_ts=stamps[-1].isoformat())
     except (KeyError, TypeError, ValueError, OverflowError, ZeroDivisionError):
         return result("UNKNOWN", "INVALID_NATIVE_BAR_INPUT")
+
+
+def _finite_positive(value):
+    try:
+        number = float(value)
+        return number if isfinite(number) and number > 0 else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def evaluate_entry(*, family, opening, post, now, order_price, independent,
+                   payload, conflict_keys, setup_ok, trigger_ok):
+    """Single V3 verdict: retain strict reclaim as an internal signal variant.
+
+    The old public US_ALIGNED_V2 proof schema/reason strings stay unchanged
+    for quote verification, telemetry and persisted order compatibility.
+    Neither variant submits an order or bypasses a hard veto.
+    """
+    from trader.kr.entry_opportunity_v2 import evaluate_reclaim
+    baseline = evaluate_reclaim(
+        family=family, opening=opening, post=post, now=now,
+        order_price=order_price, independent=independent,
+        vwap=payload.get("vwap"),
+        vwap_verified=payload.get("vwap_source") == "KIS_NATIVE_WEIGHTED_AVG",
+        trigger_ok=trigger_ok,
+    )
+    baseline = {**baseline, "entry_engine_revision": "V3", "signal_variant": "STRICT_RECLAIM"}
+    # Preserve strict-reclaim success and all hard vetoes within the one
+    # V3 decision engine. The public V2 proof contract remains compatible.
+    if baseline.get("state") != "WAIT" or baseline.get("reason") not in {
+        "NO_CONFIRMED_MOMENTUM_RECLAIM", "PULLBACK_SUPPORT_REBOUND_NOT_CONFIRMED",
+        "INSUFFICIENT_ROOM_VS_STOP", "PULLBACK_NO_ROOM_VS_STOP",
+    }:
+        return baseline
+    if family == "MOMENTUM" and trigger_ok:
+        return baseline
+    # Use a contiguous, unquarantined suffix; never introduce a 30-bar
+    # universal blocker or consume a conflicting historical local peak.
+    suffix = []
+    for bar in reversed(post[-(8 if independent else 30):]):
+        stamp = datetime.fromisoformat(bar["timestamp"])
+        if bar["timestamp"] in conflict_keys:
+            break
+        if suffix and (datetime.fromisoformat(suffix[-1]["timestamp"])-stamp).total_seconds() != 60:
+            break
+        suffix.append(bar)
+    suffix.reverse()
+    proposal = candidate_geometry(
+        family=family, opening=opening, post=suffix, now=now,
+        independent=independent, original_setup_ok=setup_ok,
+    )
+    if proposal.get("state") != "SIGNAL":
+        return baseline
+    price = _finite_positive(order_price)
+    floor, cap = proposal["price_floor"], proposal["price_ceiling"]
+    stop, high = proposal["stop"], proposal["target"]
+    facts = {
+        **baseline,
+        "entry_policy": "US_ALIGNED_V2",
+        "adaptive_revision": "V3",
+        "signal_variant": proposal["pattern"],
+        "reference_source": "KIS_NATIVE_ADAPTIVE_V3_" + proposal["reference_source"],
+        "rebound_pattern": proposal["pattern"],
+        "intraday_pullback_depth": proposal["depth"],
+        "structural_stop_reference": stop,
+        "structural_target_reference": high,
+        "diagnostic_entry_ceiling": cap,
+        "reference_price": proposal["reference_close"],
+        "latest_bar_ts": proposal["latest_bar_ts"],
+        "max_entry_price": None,
+        "risk_reference_is_live_stop_order": False,
+        "not_order_authorization": True,
+    }
+    if price is None or not floor <= price <= cap:
+        return {**facts, "state": "WAIT", "reason": "ADAPTIVE_V3_PRICE_OUTSIDE_INTERVAL"}
+    # The tick cap is a necessary, not sufficient, condition. Recompute
+    # the risk geometry at the actual proposed price, never at a fake ask.
+    from trader.kr.entry_opportunity_v2 import MIN_RR, MAX_RISK, MAX_DEVIATION
+    risk = price-stop
+    rr = (high-price)/risk if risk > 0 else 0
+    if (risk <= 0 or rr < MIN_RR or risk/price > MAX_RISK
+            or abs(price/proposal["reference_close"]-1) > MAX_DEVIATION):
+        return {**facts, "state": "WAIT", "reason": "ADAPTIVE_V3_PRICE_OUTSIDE_INTERVAL"}
+    return {**facts, "state": "READY_SHADOW",
+            "reason": "ADAPTIVE_V3_" + proposal["pattern"] + "_CONFIRMED",
+            "max_entry_price": cap, "risk_reward_reference": rr,
+            "stop_distance_pct": risk/price*100}
+
