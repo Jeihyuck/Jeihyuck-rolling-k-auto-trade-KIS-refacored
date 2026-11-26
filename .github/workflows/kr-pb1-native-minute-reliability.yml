@@ -15,6 +15,8 @@ on:
       - "trader/kr/kis_observer_budget.py"
       - "trader/kr/kis_shared_http_budget.py"
       - "trader/marketdata/kr_ws_shared.py"
+      - "trader/marketdata/kr_rest_shared.py"
+      - "tests/kr/test_kr_rest_shared_20261126.py"
       - "trader/marketdata/kis_ws_price.py"
       - "tests/kr/test_kr_ws_shared_20261126.py"
       - "tests/kr/test_kr_shared_http_budget_20261126.py"
@@ -89,6 +91,7 @@ jobs:
             tests/kr/test_kr_pb1_minute_native_conflicts.py \
             tests/kr/test_kr_pb1_kis_observer_budget.py \
             tests/kr/test_kr_ws_shared_20261126.py \
+            tests/kr/test_kr_rest_shared_20261126.py \
             tests/kr/test_kr_shared_http_budget_20261126.py \
             tests/kr/test_kr_executable_quote_20261126.py \
             tests/kr/test_kr_354_repository_lifecycle.py \
