@@ -765,6 +765,11 @@ def main() -> None:
             last_capacity_warning_key = warning_key
             selected = schedule.select(native_priority, now)
             if not selected:
+                if priority["state"] == "PB1_ACTIVE" and (priority["hot"] or priority["warm"]):
+                    # A nonempty verified shortlist with nothing due is not
+                    # a collection-target outage. Keep per-symbol due periods.
+                    time.sleep(min(5.0, planner_wake_sec))
+                    continue
                 # A missing/mismatched priority manifest means zero broker
                 # 1m requests. Distinguish this P0 fault from a legitimate
                 # owner-selected empty shortlist, without adding COLD I/O.
