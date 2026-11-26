@@ -4040,7 +4040,8 @@ def release_us_profit_capture_pre_http_abort(
         if not epoch_id:
             return False
         events = conn.execute(text("""
-            SELECT event_type, submit_attempt_id
+            SELECT event_type, submit_attempt_id, canonical_broker_order_no,
+                   raw_broker_order_no, cumulative_filled_qty, payload
               FROM us_order_events
              WHERE trade_date=:td AND client_order_key=:key
                AND symbol=:sym AND side='SELL' AND profit_capture_stage=:stage
@@ -4057,24 +4058,34 @@ def release_us_profit_capture_pre_http_abort(
         if (not events or "" in abort_ids or len(abort_ids) != 1):
             return False
         attempt_id = next(iter(abort_ids))
-        # A started attempt without its own durable abort, or ANY broker
-        # ACK/possible/terminal event, disproves safe pre-HTTP release.
-        if any(
-            not str(e.get("submit_attempt_id") or "").strip()
-            or (
-                str(e.get("event_type") or "") not in
-                (abort_types | {"BROKER_SUBMIT_STARTED", "BROKER_CLAIM_PREPARED"})
-            )
-            or (
-                str(e.get("submit_attempt_id") or "") != attempt_id
-            )
-            for e in events
-        ):
+        # 11/25 incident: the reconcile worker can record local replay
+        # STARTED/NO_MATCH while the native router records a durable no-POST
+        # abort. These two local diagnostics alone are not broker evidence.
+        # All other replay outcomes, broker numbers, positive fills, or
+        # another attempt still fence this stage.
+        replay_no_match = False
+        for e in events:
+            if str(e.get("submit_attempt_id") or "").strip() != attempt_id:
+                return False
+            if (str(e.get("canonical_broker_order_no") or "").strip()
+                    or str(e.get("raw_broker_order_no") or "").strip()
+                    or int(e.get("cumulative_filled_qty") or 0) != 0):
+                return False
+            event_type = str(e.get("event_type") or "")
+            if event_type in abort_types | {"BROKER_SUBMIT_STARTED", "BROKER_CLAIM_PREPARED"}:
+                continue
+            payload = _parse_json_meta(e.get("payload"))
+            if event_type == "JOURNAL_REPLAY_STARTED" and not payload.get("broker_status"):
+                continue
+            if event_type == "JOURNAL_REPLAY_UNRESOLVED" and payload.get("broker_status") == "NO_MATCH":
+                replay_no_match = True
+                continue
             return False
         attempt = conn.execute(text("""
             SELECT a.attempt_state, a.authoritative, a.requested_qty,
                    c.action_key,c.action,c.target_qty,c.filled_qty_before_attempt,
-                   c.lifecycle_id,c.account_id,c.action_state,c.active_attempt_id
+                   c.lifecycle_id,c.account_id,c.action_state,c.active_attempt_id,
+                   c.claim_conflicts,c.portfolio_epoch_id,c.position_cycle_id
               FROM us_execution_attempts a
               JOIN us_execution_claims c ON c.action_key=a.action_key
              WHERE a.attempt_id=:attempt AND a.client_order_key=:key
@@ -4087,15 +4098,18 @@ def release_us_profit_capture_pre_http_abort(
                 or str(attempt[0].get("attempt_state") or "") != "ABANDONED_PRE_SUBMIT"
                 or attempt[0].get("authoritative") is not True
                 or str(attempt[0].get("action_state") or "") != "OPEN"
-                or attempt[0].get("active_attempt_id")):
+                or attempt[0].get("active_attempt_id")
+                or int(attempt[0].get("claim_conflicts") or 0) != 0):
             return False
         # Even a terminal order row requires independent broker evidence;
         # an order row with this key contradicts the PRE_IO-only certificate.
         if conn.execute(text("""
             SELECT 1 FROM us_orders
-             WHERE trade_date=:td AND client_order_key=:key
-               AND symbol=:sym AND side='SELL'
-               AND trading_epoch_id=:epoch LIMIT 1
+             WHERE client_order_key=:key LIMIT 1
+        """), params).scalar_one_or_none() is not None:
+            return False
+        if conn.execute(text("""
+            SELECT 1 FROM us_fills WHERE client_order_key=:key LIMIT 1
         """), params).scalar_one_or_none() is not None:
             return False
         partial_stage = int(row.get("cumulative_filled_qty") or 0) > 0
@@ -4125,7 +4139,9 @@ def release_us_profit_capture_pre_http_abort(
         if (str(current.get(f"{stg}_order_key") or "") != order_key
                 or not current.get(f"{stg}_pending")
                 or current.get(f"{stg}_done")
-                or str((current.get("meta") or {}).get("last_status") or "") not in {"PENDING", "SUBMITTED"}
+                or str((current.get("meta") or {}).get("last_status") or "") not in (
+                    {"PENDING", "SUBMITTED", "AMBIGUOUS_ACK"} if replay_no_match and not partial_stage
+                    else {"PENDING", "SUBMITTED"})
                 or (current.get(f"{stg}_broker_order_no") and not partial_stage)):
             return False
         if close_intent:
@@ -4142,7 +4158,6 @@ def release_us_profit_capture_pre_http_abort(
                     or str(scope.get("trading_epoch_id") or "") != str(epoch_id)
                     or not scope.get("account_id")
                     or str(attempt_scope.get("account_id") or "") != str(scope["account_id"])
-                    or str(attempt_scope.get("lifecycle_id") or "") != lifecycle
                     or str(attempt_scope.get("action") or "").lower() != stg):
                 return False
             intent_row = conn.execute(text("""
@@ -4156,12 +4171,34 @@ def release_us_profit_capture_pre_http_abort(
             if not intent_row or str(intent_row.get("status") or "") != "PENDING":
                 return False
             intent_meta = _parse_json_meta(intent_row.get("meta"))
+            claim_cycle = str(attempt_scope.get("lifecycle_id") or "")
             if (str(intent_meta.get("submit_attempt_id") or "") != attempt_id
                     or str(intent_meta.get("profit_capture_stage") or "").lower() != stg
                     or str(intent_meta.get("strategy_owner") or "US_STANDARD").upper() != "US_STANDARD"
                     or (intent_meta.get("position_lifecycle_id")
-                        and str(intent_meta["position_lifecycle_id"]) != lifecycle)):
+                        and str(intent_meta["position_lifecycle_id"]) != claim_cycle)):
                 return False
+            if claim_cycle != lifecycle:
+                # Adopted legacy V2 (e.g. PG): the TP ledger stays on the
+                # original BUY lifecycle, the execution claim is a distinct
+                # management cycle. Verify the exact preexisting forward
+                # attribution contract; never guess or rewrite either ID.
+                from trader.us.profit_capture import tp_stage_lifecycle_from_order_proof
+                if (partial_stage
+                        or not claim_cycle
+                        or str(attempt_scope.get("position_cycle_id") or "") != claim_cycle
+                        or str(intent_meta.get("broker_account_hash") or "") != str(scope["account_id"])
+                        or str(intent_meta.get("trading_epoch_id") or "") != str(epoch_id)
+                        or not attempt_scope.get("portfolio_epoch_id")
+                        or str(intent_meta.get("portfolio_epoch_id") or "") != str(attempt_scope["portfolio_epoch_id"])):
+                    return False
+                try:
+                    source_cycle = tp_stage_lifecycle_from_order_proof(
+                        claim_cycle, intent_meta, client_order_key=order_key)
+                except ValueError:
+                    return False
+                if source_cycle != lifecycle:
+                    return False
             updated = conn.execute(text("""
                 UPDATE us_order_intents
                    SET status='BLOCKED',
