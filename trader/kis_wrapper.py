@@ -1763,7 +1763,38 @@ class KisAPI:
             raise KisTemporaryError(f"FAST_FAIL breaker open for {url}")
         last_err: Exception | None = None
         configured_timeout = kwargs.pop("timeout", (3.0, 7.0))
+        from trader.kr import kis_shared_http_budget
+        shared_http_enabled = kis_shared_http_budget.enabled(str(self.env or "practice"))
+
+        def _publish_shared_cooldown():
+            if shared_http_enabled and not kis_shared_http_budget.penalize(
+                environment=str(self.env), appkey=str(APP_KEY or ""),
+                seconds=float(os.getenv("KIS_RATE_LIMIT_COOLDOWN_SEC", "8.0") or "8.0"),
+            ):
+                logger.warning("[KR_SHARED_HTTP][COOLDOWN_NOT_PUBLISHED] endpoint=%s", endpoint_name)
+
         for i in range(1, attempts + 1):
+            if shared_http_enabled:
+                # Each actual HTTP retry needs its own admission. Failure is
+                # before the broker boundary, never a lost ACK or a fill.
+                # Do not queue behind a collector; preserve existing local
+                # endpoint limits and the observer's cooperative reservation.
+                critical = endpoint_category in {"order", "balance"} or "hashkey" in path_lower
+                remaining = kr_tick_remaining_sec(getattr(self, "_kr_stage_deadline", None))
+                safe_remaining = self._safe_max_seconds - (time.monotonic() - start_ts)
+                granted, admission_reason, waited = kis_shared_http_budget.acquire(
+                    environment=str(self.env), appkey=str(APP_KEY or ""),
+                    priority=critical,
+                    observer=str(os.getenv("KR_PB1_OBSERVER_ONLY") or "") == "1",
+                    max_wait_sec=max(0.0, min(8.0 if critical else 2.5,
+                                               remaining - 0.10, safe_remaining - 0.10)),
+                )
+                logger.info("[KR_SHARED_HTTP][ADMISSION] endpoint=%s attempt=%s granted=%s reason=%s wait_sec=%.3f priority=%s",
+                            endpoint_name, i, int(granted), admission_reason, waited, int(critical))
+                if not granted:
+                    if is_order_endpoint(url):
+                        raise KisOrderPreSubmitBlocked("KR_SHARED_HTTP_PRE_SUBMIT_" + admission_reason)
+                    raise KisTemporaryError("KR_SHARED_HTTP_PRE_REQUEST_" + admission_reason)
             try:
                 stage_deadline = getattr(self, "_kr_stage_deadline", None)
                 request_timeout = _kr_bounded_timeout(
@@ -1919,6 +1950,28 @@ class KisAPI:
                         continue
                     raise KisAuthError(f"HTTP {status} for {url}")
                 if status in (429, 500, 502, 503, 504):
+                    # KIS sends EGW00201 as HTTP 500 in the 11/26 practice
+                    # logs. The ordinary 5xx path previously never inspected
+                    # the body, so it missed account quota evidence.
+                    rate_limited_500 = False
+                    if status == 500:
+                        try:
+                            error_body = resp.json()
+                            if isinstance(error_body, dict):
+                                rate_limited_500 = _is_egw002_error(
+                                    error_body, str(error_body.get("msg_cd") or "")
+                                )
+                        except (ValueError, TypeError, AttributeError):
+                            pass
+                    if status == 429 or rate_limited_500:
+                        _publish_shared_cooldown()
+                    if rate_limited_500:
+                        gate.set_global_cooldown(
+                            str(self.env or "practice"), account_key,
+                            seconds=float(os.getenv("KIS_RATE_LIMIT_COOLDOWN_SEC", "8.0") or "8.0"),
+                        )
+                        logger.warning("[KR_SHARED_HTTP][EGW002_HTTP_500] endpoint=%s attempt=%s",
+                                       endpoint_name, i)
                     if status == 429:
                         gate.set_global_cooldown(
                             str(self.env or "practice"),
@@ -1970,6 +2023,7 @@ class KisAPI:
                     
                     # ✅ EGW002 (초당 거래건수 초과) 전용 처리: exponential backoff + circuit breaker
                     if _is_egw002_error(body, msg_cd):
+                        _publish_shared_cooldown()
                         if is_order_endpoint(url):
                             # A valid KIS JSON body with rt_cd != 0 is explicit
                             # rejection evidence, not a lost ACK. Preserve the
