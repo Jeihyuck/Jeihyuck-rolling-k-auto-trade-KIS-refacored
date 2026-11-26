@@ -394,8 +394,8 @@ def test_kr401_native_partial_cancel_preserves_position_and_releases_stage(monke
     assert len(fills) == 1
 
 
-@pytest.mark.parametrize("filled", [0, 10])
-def test_kr401_terminal_cancel_releases_real_claim_without_new_fill(monkeypatch, isolated_engine, filled):
+@pytest.mark.parametrize("filled,simultaneous", [(0, False), (10, False), (10, True)])
+def test_kr401_terminal_cancel_releases_real_claim_without_new_fill(monkeypatch, isolated_engine, filled, simultaneous):
     """Native zero-fill or already stored individual-fill terminal proof."""
     engine = isolated_engine
     if engine.dialect.name != "postgresql":
@@ -456,7 +456,7 @@ def test_kr401_terminal_cancel_releases_real_claim_without_new_fill(monkeypatch,
     ctx = RunContext(run_id=None, env="practice", strategy="pb1_pullback_close",
                      started_at=datetime(2026,10,22,15,18,tzinfo=ZoneInfo("Asia/Seoul")),
                      dry_run=True)
-    if filled:
+    if filled and not simultaneous:
         rk.reconcile_today(engine=engine, kis=kis, ctx=ctx, trade_date=day)
         assert load_frozen_stage_states(**args)["TP1"]["status"] == "PARTIAL_FILLED"
     # An explicit CANCELLED label alone is insufficient.
@@ -465,6 +465,9 @@ def test_kr401_terminal_cancel_releases_real_claim_without_new_fill(monkeypatch,
     assert not rejected["ok"]
     assert load_frozen_stage_states(**args)["TP1"]["status"] != "RETRY_READY"
     kis.row.update(rmn_qty="0")
+    if simultaneous:
+        rk.reconcile_today(engine=engine, kis=kis, ctx=ctx, trade_date=day)
+        assert load_frozen_stage_states(**args)["TP1"]["status"] == "PARTIAL_FILLED"
     for _ in range(2):
         rk.reconcile_today(engine=engine, kis=kis, ctx=ctx, trade_date=day)
     state = load_frozen_stage_states(**args)["TP1"]
