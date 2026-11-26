@@ -466,7 +466,9 @@ def run_once(*, kis, codes: list[str], observed_at: datetime,
             # a verified VWAP remain fail-closed at their original gate.
             try:
                 quote_requests += 1
-                quote = kis.get_price_snapshot(code, market="J")
+                native_observer_quote = getattr(kis, "get_kr_observer_quote", None)
+                quote = (native_observer_quote(code) if callable(native_observer_quote)
+                         else kis.get_price_snapshot(code, market="J"))
                 if not isinstance(quote, dict):
                     quote = {}
             except Exception as quote_exc:
