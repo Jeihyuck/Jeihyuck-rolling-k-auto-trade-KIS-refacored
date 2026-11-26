@@ -15,7 +15,7 @@ from typing import Any, Mapping
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from trader.db.schema import schema_for_engine
-from trader.kr.us_standard_profit_parity import STAGES, verified_contract
+from trader.kr.us_standard_profit_parity import STAGES, verified_contract, verified_tp_retry_remainder
 
 STAGE_VERSION = "kr_pb1_tp_durable_stage_v1"
 # The US V3 runner uses two independently claimable native SELL stages.
@@ -58,6 +58,53 @@ def _exact_qty(value: Any) -> int:
     if isinstance(value, str) and value.isascii() and value.isdecimal():
         return int(value)
     raise ValueError("unverified shares")
+
+
+def verified_native_tp_cancellation(row: Mapping[str, Any], *, code: str,
+                                   broker_odno: str, trade_date: date,
+                                   requested_qty: int, filled_qty: int) -> dict | None:
+    """Only original KIS daily-ccld rows with exact terminal quantity proof."""
+    from decimal import Decimal, InvalidOperation
+    try:
+        if (not isinstance(row, Mapping)
+                or str(row.get("pdno") or "").zfill(6) != str(code).zfill(6)
+                or str(row.get("sll_buy_dvsn_cd") or "") != "01"
+                or str(row.get("ord_dt") or "") != trade_date.strftime("%Y%m%d")
+                or str(row.get("cncl_yn") or "").upper() != "N"):
+            return None
+        odno = str(row.get("odno") or "").strip()
+        expected = str(broker_odno or "").strip()
+        if (not odno.isascii() or not odno.isdecimal()
+                or not expected.isascii() or not expected.isdecimal()
+                or int(odno) <= 0 or int(odno) != int(expected)):
+            return None
+        ordered, executed, cancelled, rejected, remaining = (
+            _exact_qty(row[key]) for key in
+            ("ord_qty", "tot_ccld_qty", "cncl_cfrm_qty", "rjct_qty", "rmn_qty")
+        )
+        if (ordered != _exact_qty(requested_qty) or executed != _exact_qty(filled_qty)
+                or ordered <= 0 or cancelled <= 0 or remaining != 0
+                or rejected != 0 or executed+cancelled != ordered):
+            return None
+        notional = Decimal(str(row["tot_ccld_amt"]))
+        if not notional.is_finite() or notional < 0:
+            return None
+        if executed:
+            avg = Decimal(str(row["avg_prvs"]))
+            if (not avg.is_finite() or avg <= 0 or notional <= 0
+                    or abs(notional/Decimal(executed)-avg) > max(Decimal("1"), avg*Decimal("0.001"))):
+                return None
+        elif notional != 0:
+            return None
+        return {"broker_odno": expected, "trade_date": trade_date.isoformat(),
+                "requested_qty": ordered, "filled_qty": executed,
+                "cancelled_qty": cancelled, "open_qty": remaining,
+                "source": "KIS_DAILY_CCLD_CANCEL_VERIFIED",
+                "native_row_sha256": hashlib.sha256(
+                    json.dumps(dict(row), sort_keys=True, default=str).encode()
+                ).hexdigest()}
+    except (KeyError, TypeError, ValueError, AttributeError, InvalidOperation):
+        return None
 
 
 def _assert_scope(
@@ -252,11 +299,36 @@ def reserve_tp_stage(
                     "owner_claimed_once": False,
                     "broker_rejection_proven": False,
                 })
+            if state.get("status") == "RETRY_READY":
+                remaining = verified_tp_retry_remainder(state)
+                retired_keys = {
+                    str(item.get("client_order_key") or "")
+                    for item in (state.get("cancelled_attempts") or [])
+                } | {
+                    str(item.get("client_order_key") or "")
+                    for item in (state.get("explicit_rejected_attempts") or [])
+                }
+                if (remaining != quantity or client_order_key in retired_keys
+                        or client_order_key == state.get("client_order_key")
+                        or trade_date.isoformat() < str(state.get("trade_date") or "")):
+                    return StageJournalResult(False, "BLOCK", "TP_CANCEL_RETRY_SCOPE_OR_QTY_MISMATCH")
+                state.update({
+                    "status": "PENDING",
+                    "attempt_base_filled_qty": _exact_qty(state["cumulative_filled_qty"]),
+                    "attempt_target_qty": quantity,
+                    "attempt_filled_qty": 0,
+                    "client_order_key": client_order_key,
+                    "trade_date": trade_date.isoformat(),
+                    "owner_claimed_once": False,
+                    "broker_odno": None,
+                    "broker_fill_proven": False,
+                    "broker_rejection_proven": False,
+                })
             if state.get("client_order_key") != client_order_key:
                 return StageJournalResult(False, "BLOCK", "DUPLICATE_OR_OTHER_CLIENT_ORDER_KEY")
             if state.get("status") != "PENDING":
                 return StageJournalResult(False, "BLOCK", "STAGE_ALREADY_ACTIVE_OR_COMPLETE")
-            if state.get("target_qty") != quantity:
+            if _exact_qty(state.get("attempt_target_qty", state.get("target_qty"))) != quantity:
                 return StageJournalResult(False, "BLOCK", "STAGE_TARGET_MISMATCH")
             # Existing PENDING is NOT permission for a retry after WSL crash.
             if state.get("owner_claimed_once") is True:
@@ -362,11 +434,16 @@ def release_explicitly_rejected_tp_stage(
                 or state.get("contract_sha256") != contract["sha256"]
                 or state.get("client_order_key") != client_order_key
                 or state.get("trade_date") != trade_date.isoformat()
-                or _exact_qty(state.get("cumulative_filled_qty")) != 0
+                or _exact_qty(state.get("attempt_filled_qty", state.get("cumulative_filled_qty"))) != 0
                 or state.get("broker_odno") or state.get("broker_fill_proven")
             ):
                 return StageJournalResult(False, "BLOCK", "REJECTION_STAGE_NOT_EXACT_PENDING")
-            target = _exact_qty(state.get("target_qty"))
+            target = _exact_qty(state.get("attempt_target_qty", state.get("target_qty")))
+            retrying = bool(state.get("cancelled_attempts"))
+            if retrying:
+                preview = {**state, "status": "RETRY_READY"}
+                if verified_tp_retry_remainder(preview) != target:
+                    return StageJournalResult(False, "BLOCK", "REJECTION_RETRY_TARGET_UNVERIFIED")
             order_row = conn.execute(sa.select(orders).where(sa.and_(
                 orders.c.env == "practice",
                 orders.c.client_order_key == client_order_key,
@@ -411,10 +488,10 @@ def release_explicitly_rejected_tp_stage(
                 "order_id": str(row.get("order_id") or ""),
             })
             state.update({
-                "status": "NOT_TRIGGERED",
+                "status": "RETRY_READY" if retrying else "NOT_TRIGGERED",
                 "owner_claimed_once": False,
-                "target_qty": 0,
-                "cumulative_filled_qty": 0,
+                "target_qty": state["target_qty"] if retrying else 0,
+                "cumulative_filled_qty": state["cumulative_filled_qty"] if retrying else 0,
                 "broker_rejection_proven": True,
                 "explicit_rejected_attempts": attempts,
                 "rejected_client_order_key": client_order_key,
@@ -422,7 +499,7 @@ def release_explicitly_rejected_tp_stage(
             conn.execute(sa.update(table).where(table.c.job_key == key).values(
                 updated_ts=datetime.now(timezone.utc), payload=state,
             ))
-        return StageJournalResult(True, "NOT_TRIGGERED", "KIS_EXPLICIT_PREACK_REJECTION_PROVEN")
+        return StageJournalResult(True, state["status"], "KIS_EXPLICIT_PREACK_REJECTION_PROVEN")
     except Exception as exc:
         return StageJournalResult(False, "BLOCK", "REJECTION_RELEASE_UNAVAILABLE:" + type(exc).__name__)
 
@@ -433,6 +510,7 @@ def observe_broker_stage(
     stage: str, client_order_key: str, broker_odno: str,
     cumulative_filled_qty: int, broker_order_accepted: bool,
     broker_fill_source: str, source_trade_date: date,
+    cancellation_row: Mapping[str, Any] | None = None,
     _conn: Any = None,
 ) -> StageJournalResult:
     """Idempotent cumulative KIS fill update for an exact claimed TP order.
@@ -474,10 +552,27 @@ def observe_broker_stage(
                 .with_for_update()
             ).scalar_one_or_none()
             payload = dict(raw or {})
+            if (payload.get("version") != STAGE_VERSION
+                    or payload.get("contract_sha256") != contract["sha256"]
+                    or payload.get("stage") != stage):
+                return StageJournalResult(False, "BLOCK", "STAGE_CONTRACT_CONFLICT")
+            # Daily-ccld repeatedly returns earlier cancelled attempts. Exact
+            # re-observation is idempotent and cannot mutate the active attempt.
+            for retired in payload.get("cancelled_attempts") or []:
+                if retired.get("client_order_key") != client_order_key:
+                    continue
+                proof = verified_native_tp_cancellation(
+                    cancellation_row, code=code, broker_odno=broker_odno,
+                    trade_date=source_trade_date,
+                    requested_qty=retired["requested_qty"], filled_qty=filled,
+                ) if cancellation_row is not None and broker_order_accepted else None
+                comparable = ("broker_odno", "trade_date", "requested_qty", "filled_qty",
+                              "cancelled_qty", "open_qty", "source")
+                if proof and all(proof[k] == retired.get(k) for k in comparable):
+                    return StageJournalResult(True, payload["status"], "CANCELLED_ATTEMPT_ALREADY_PROVEN")
+                return StageJournalResult(False, "BLOCK", "RETIRED_ATTEMPT_PROOF_CONFLICT")
             if (
-                payload.get("version") != STAGE_VERSION
-                or payload.get("contract_sha256") != contract["sha256"]
-                or payload.get("client_order_key") != client_order_key
+                payload.get("client_order_key") != client_order_key
                 or payload.get("trade_date") != source_trade_date.isoformat()
                 or payload.get("status") not in {"PENDING", "ACK", "PARTIAL_FILLED", "FILLED"}
                 or (
@@ -487,18 +582,43 @@ def observe_broker_stage(
             ):
                 return StageJournalResult(False, "BLOCK", "ORDER_OR_TRADE_DATE_MISMATCH")
             target = _exact_qty(payload.get("target_qty"))
+            base = _exact_qty(payload.get("attempt_base_filled_qty", 0))
+            attempt_target = _exact_qty(payload.get("attempt_target_qty", target))
             prev = _exact_qty(payload.get("cumulative_filled_qty"))
-            if filled > target or filled < prev:
+            if (base+attempt_target != target or base+filled < prev
+                    or filled > attempt_target or base > prev):
                 return StageJournalResult(False, "BLOCK", "CUMULATIVE_FILL_NON_MONOTONIC")
             if not broker_order_accepted:
                 return StageJournalResult(False, "BLOCK", "BROKER_ACCEPTANCE_UNVERIFIED")
+            proof = None
+            if cancellation_row is not None:
+                if stage not in TP_STAGE_NAMES or contract.get("activation_mode") != "ACTIVE_PRACTICE":
+                    return StageJournalResult(False, "BLOCK", "CANCEL_RETRY_SCOPE_INVALID")
+                proof = verified_native_tp_cancellation(
+                    cancellation_row, code=code, broker_odno=broker_odno,
+                    trade_date=source_trade_date, requested_qty=attempt_target, filled_qty=filled,
+                )
+                if proof is None:
+                    return StageJournalResult(False, "BLOCK", "KIS_CANCEL_REMAINDER_UNVERIFIED")
             payload["broker_odno"] = str(broker_odno)
-            payload["cumulative_filled_qty"] = filled
-            payload["broker_fill_proven"] = filled == target and target > 0
+            payload["attempt_filled_qty"] = filled
+            payload["cumulative_filled_qty"] = base+filled
+            payload["broker_fill_proven"] = base+filled == target and target > 0
             payload["status"] = (
-                "FILLED" if filled == target else
+                "FILLED" if base+filled == target else
                 "PARTIAL_FILLED" if filled > 0 else "ACK"
             )
+            if proof is not None:
+                history = list(payload.get("cancelled_attempts") or [])
+                history.append({**proof, "client_order_key": client_order_key})
+                payload.update({
+                    "cancelled_attempts": history,
+                    "status": "RETRY_READY",
+                    "owner_claimed_once": False,
+                    "broker_fill_proven": False,
+                })
+                if verified_tp_retry_remainder(payload) != target-base-filled:
+                    return StageJournalResult(False, "BLOCK", "KIS_CANCEL_RETRY_HISTORY_INVALID")
             conn.execute(sa.update(table).where(table.c.job_key == key).values(
                 updated_ts=datetime.now(timezone.utc), payload=payload,
             ))
