@@ -175,8 +175,23 @@ def evaluate_price_opportunity(
 
     coverage = opening_coverage(verified_bars, trade_date)
     facts["opening"] = coverage
+    independent_window = []
+    facts["reference_path"] = "OPENING_RANGE"
     if coverage["observed_1m"] < min_opening_bars:
-        return _decision("WAIT", "opening_minute_bars_insufficient", style=style, facts=facts)
+        # KR #367/#395 pattern: independent post-opening native reference,
+        # never present a partial opening range as a complete one. Breakout
+        # retains its original opening dependency.
+        post = [b for b in verified_bars if b["time_et"][11:19] >= "10:00:00"]
+        candidate = post[-8:]
+        stamps = [datetime.fromisoformat(b["time_et"]) for b in candidate]
+        if (style not in {"ENTRY_PULLBACK", "ENTRY_MOMENTUM"}
+                or len(candidate) != 8
+                or any((b-a).total_seconds() != 60 for a,b in zip(stamps, stamps[1:]))
+                or not 0 <= (now_et-stamps[-1]).total_seconds() <= 180):
+            return _decision("WAIT", "opening_minute_bars_insufficient", style=style, facts=facts)
+        independent_window = candidate
+        facts["reference_path"] = "POST_OPENING_5_PLUS_3"
+        facts["reference_minutes"] = [b["time_et"] for b in candidate]
 
     # Native KIS minute turnover/volume only. Sparse last-price samples,
     # missing turnover, or anomalous value units do not produce fake VWAP.
@@ -245,7 +260,22 @@ def evaluate_price_opportunity(
     opening_high = coverage["opening_high"]
     opening_low = coverage["opening_low"]
     # The high/low are from actual broker bars; NOT tick-sample extrema.
-    local_trough = min(b["low"] for b in verified_bars[-15:])
+    if independent_window:
+        # Establish a causal high in the five reference bars followed by a
+        # trough; the last three are the rebound confirmation. No same-bar
+        # high/low ordering assumption or use of an unverified earlier high.
+        reference = independent_window[:5]
+        high_index = max(range(len(reference)), key=lambda i: reference[i]["high"])
+        if high_index >= len(reference) - 1:
+            return _decision("WAIT", "independent_reference_peak_trough_unverified",
+                             style=style, facts=facts, price=fresh_price)
+        opening_high = reference[high_index]["high"]
+        local_trough = min(b["low"] for b in reference[high_index+1:])
+        facts["independent_reference_high"] = opening_high
+        facts["independent_reference_high_at"] = reference[high_index]["time_et"]
+        facts["independent_reference_trough"] = local_trough
+    else:
+        local_trough = min(b["low"] for b in verified_bars[-15:])
     facts["local_trough"] = local_trough
 
     if style == "ENTRY_BREAKOUT":
