@@ -26,17 +26,17 @@ def _symbol(value):
     return c if len(c) == 6 and c.isascii() and c.isdigit() else ""
 
 
-def verified_price(quote, code, *, now):
+def verified_price(quote, code, *, now, max_age_sec=MAX_AGE):
     if not isinstance(quote, dict) or not _symbol(code):
         return False
-    source = SOURCES.get(quote.get("source"))
+    source = SOURCES.get(str(quote.get("source") or ""))
     ids = [_symbol(quote[k]) for k in ("symbol", "requested_symbol") if quote.get(k)]
     receipt = _positive(quote.get("received_at"))
     day = str(quote.get("stck_bsop_date") or "").replace("-", "")
     return bool(source and quote.get("source_identity") == source
                 and quote.get("market") == "KR" and ids
                 and all(c == code for c in ids) and not quote.get("stale")
-                and receipt is not None and 0 <= now-receipt <= MAX_AGE
+                and receipt is not None and 0 <= now-receipt <= max_age_sec
                 and (not day or day == datetime.fromtimestamp(now, KST).strftime("%Y%m%d"))
                 and _positive(quote.get("last") or quote.get("prpr") or quote.get("stck_prpr")))
 
