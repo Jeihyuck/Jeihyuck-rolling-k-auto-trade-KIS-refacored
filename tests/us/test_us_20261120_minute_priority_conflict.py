@@ -87,8 +87,8 @@ def test_manifest_candidate_pub_consume_fairness_and_ttl(tmp_path):
         candidates=_candidates(pairs), now_epoch=1000.0,
         base=tmp_path,
     )
-    assert published["hot"] == 4
-    assert published["warm"] == 8
+    assert published["hot"] == 5
+    assert published["warm"] == 5
     assert priority_manifest_path(
         env="practice", scope="scope:epoch", trade_date=DAY,
         base=tmp_path,
@@ -98,20 +98,21 @@ def test_manifest_candidate_pub_consume_fairness_and_ttl(tmp_path):
         pairs=pairs, now_epoch=1002.0, base=tmp_path,
     )
     assert state == "VALID"
-    assert tuple(map(len, (lanes["HOT"], lanes["WARM"], lanes["COLD"]))) == (4, 8, 6)
+    assert tuple(map(len, (lanes["HOT"], lanes["WARM"], lanes["COLD"]))) == (5, 5, 8)
     offsets = {"HOT": 0, "WARM": 0, "COLD": 0}
     counts = {"HOT": 0, "WARM": 0, "COLD": 0}
     for slot in range(60):
         pair, tier = next_priority_pair(lanes, slot=slot, offsets=offsets)
         assert pair in pairs
         counts[tier] += 1
-    assert counts == {"HOT": 40, "WARM": 10, "COLD": 10}
-    assert len({p[0] for p in lanes["HOT"]}) == 4
-    _, stale = load_preminute_priority(
+    assert counts == {"HOT": 60, "WARM": 0, "COLD": 0}
+    assert len({p[0] for p in lanes["HOT"]}) == 5
+    stale_lanes, stale = load_preminute_priority(
         env="practice", scope="scope:epoch", trade_date=DAY,
         pairs=pairs, now_epoch=1181, base=tmp_path,
     )
     assert stale == "STALE"
+    assert next_priority_pair(stale_lanes, slot=0, offsets={}) is None
     _, cross_scope = load_preminute_priority(
         env="practice", scope="other:epoch", trade_date=DAY,
         pairs=pairs, now_epoch=1002, base=tmp_path,
@@ -131,6 +132,7 @@ def test_malformed_manifest_falls_back_without_buy_authority(tmp_path):
     assert status == "INVALID"
     assert lanes["HOT"] == [] and lanes["WARM"] == []
     assert lanes["COLD"] == pairs
+    assert next_priority_pair(lanes, slot=0, offsets={}) is None
 
 
 def test_zero_candidates_does_not_publish_fake_coverage_or_cross_owner(tmp_path):
@@ -148,3 +150,19 @@ def test_zero_candidates_does_not_publish_fake_coverage_or_cross_owner(tmp_path)
     )
     assert state == "VALID"
     assert lanes["COLD"] == pairs
+    assert next_priority_pair(lanes, slot=0, offsets={}) is None
+
+
+def test_native_priority_never_fetches_warm_cold_or_overcap():
+    assert next_priority_pair({"HOT": [], "WARM": _pairs(5), "COLD": _pairs(30)}, slot=0, offsets={}) is None
+    assert next_priority_pair({"HOT": _pairs(6)}, slot=0, offsets={}) is None
+
+
+def test_request_clock_excludes_in_progress_minute(tmp_path):
+    db = open_store(store_path(env="practice", account_scope="scope", trade_date=DAY, base=tmp_path))
+    request_time = datetime(2026, 10, 28, 9, 31, 59, tzinfo=NY)
+    try:
+        assert persist_bars(db, trade_date=DAY, symbol="CL", owner="US_STANDARD", native_rows=[_row(minute="093000"), _row(minute="093100")], now_et=request_time) == 1
+        assert len(load_bars(db, trade_date=DAY, symbol="CL")) == 1
+    finally:
+        db.close()
