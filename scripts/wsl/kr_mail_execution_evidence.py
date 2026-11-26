@@ -128,6 +128,8 @@ def _session_order_activity(stage: Path, trade: str, purpose: str, attempt: dict
     raw = attempt.get("log_file")
     prefix = f"runtime/logs/kr/{trade}/{purpose}/"
     unknown = {"evidence": "MISSING_OR_UNVERIFIED", "market_data_error_ticks": None,
+               "order_build_error_ticks": None, "entry_policy_wait_ticks": None,
+               "opening_buy_block_ticks": None,
                "infinite_order_attempts": None, "infinite_explicit_rejections": None,
                "infinite_unresolved_attempts": None, "infinite_acknowledged_attempts": None}
     if not isinstance(raw, str) or not raw.startswith(prefix) or "\\" in raw:
@@ -140,17 +142,36 @@ def _session_order_activity(stage: Path, trade: str, purpose: str, attempt: dict
         return unknown
     states = []
     legacy_block = 0
-    data_errors = 0
+    outcomes = {
+        "market_data_error_ticks": 0, "order_build_error_ticks": 0,
+        "entry_policy_wait_ticks": 0, "opening_buy_block_ticks": 0,
+    }
+    summary_count = 0
     for line in lines:
-        if "[RUN_SUMMARY][RESULT]" in line and "status=RETRYABLE_MARKET_DATA_ERROR" in line:
-            data_errors += 1
+        match_result = re.search(r"\[RUN_SUMMARY\]\[RESULT\] status=([A-Z_]+) reason=([^\s]+)", line)
+        if match_result:
+            summary_count += 1
+            status, reason = match_result.groups()
+            key = {
+                "RETRYABLE_MARKET_DATA_ERROR": "market_data_error_ticks",
+                "RETRYABLE_ORDER_BUILD_ERROR": "order_build_error_ticks",
+            }.get(status)
+            if status == "OK_NO_TRADE":
+                key = {
+                    "KR_ENTRY_TIMING_POLICY_WAIT": "entry_policy_wait_ticks",
+                    "OPENING_30MIN_BUY_BLOCK": "opening_buy_block_ticks",
+                }.get(reason)
+            if key:
+                outcomes[key] += 1
         if "[KR_INF][TICK][AFTER_PROTECTIVE_SELL]" in line:
             match = re.search(r" attempted=([01]) submission_state=([A-Z_]+)(?:\s|$)", line)
             if match:
                 states.append((match.group(1) == "1", match.group(2)))
             elif "decision=BLOCK" in line:
                 legacy_block += 1
-    return {"evidence": "LOG_READ", "market_data_error_ticks": data_errors,
+    return {"evidence": "LOG_READ",
+            "tick_summary_records": summary_count,
+            **{key: value if summary_count else None for key, value in outcomes.items()},
             "entry_timing": _entry_timing_observations(lines, trade),
             "infinite_order_attempts": sum(attempted for attempted, _ in states) if states else None,
             "infinite_explicit_rejections": sum(s == "REJECTED_EXPLICIT" for _, s in states) if states else None,
@@ -237,7 +258,7 @@ def collect_kr_execution_status(stage: Path, trade: str) -> dict[str, Any]:
     if pb1.get("economic_settlement_pending") in (True, 1) or (native_gap is not None and native_gap > 0):
         economic = "ECONOMIC_SETTLEMENT_PENDING"
     activity_degraded = any(
-        any((row.get(key) or 0) > 0 for key in ("market_data_error_ticks",
+        any((row.get(key) or 0) > 0 for key in ("market_data_error_ticks", "order_build_error_ticks",
             "infinite_explicit_rejections", "infinite_unresolved_attempts", "infinite_legacy_block_decisions"))
         for row in order_activity.values()
     )
@@ -261,6 +282,9 @@ def collect_kr_execution_status(stage: Path, trade: str) -> dict[str, Any]:
         summary_tokens.append(f"{purpose.upper()}_WATCHDOG=" + ",".join(alerts))
     for purpose, row in order_activity.items():
         summary_tokens.append(f"{purpose.upper()}_MARKET_DATA_ERROR_TICKS={row.get('market_data_error_ticks')}")
+        summary_tokens.append(f"{purpose.upper()}_ORDER_BUILD_ERROR_TICKS={row.get('order_build_error_ticks')}")
+        summary_tokens.append(f"{purpose.upper()}_ENTRY_POLICY_WAIT_TICKS={row.get('entry_policy_wait_ticks')}")
+        summary_tokens.append(f"{purpose.upper()}_OPENING_BUY_BLOCK_TICKS={row.get('opening_buy_block_ticks')}")
         summary_tokens.append(f"{purpose.upper()}_INFINITE_ATTEMPTS={row.get('infinite_order_attempts')}")
         summary_tokens.append(f"{purpose.upper()}_INFINITE_REJECTED={row.get('infinite_explicit_rejections')}")
         summary_tokens.append(f"{purpose.upper()}_INFINITE_UNRESOLVED={row.get('infinite_unresolved_attempts')}")
