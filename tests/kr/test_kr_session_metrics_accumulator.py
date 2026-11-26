@@ -171,7 +171,7 @@ def test_1126_mail_log_records_distinguish_policy_and_errors(tmp_path):
     path.write_text("\n".join(
         f"[RUN_SUMMARY][RESULT] status={status} reason={reason} session=morning"
         for status, reason, count in groups for _ in range(count)
-    ))
+    ) + "\n[RUN_SUMMARY][RESULT] status=OK reason=PB1_SESSION_DONE session=morning")
     evidence = _session_order_activity(tmp_path, "2026-11-26", "am", {"log_file": rel})
     assert evidence["tick_summary_records"] == 113
     assert evidence["market_data_error_ticks"] == 21
