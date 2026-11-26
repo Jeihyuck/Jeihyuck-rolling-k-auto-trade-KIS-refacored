@@ -62,10 +62,15 @@ def _valid(row, code, now):
 def _read(path, code):
     try:
         with os.fdopen(_open_private(path, os.O_RDONLY), "r", encoding="utf-8") as file:
-            data = json.loads(file.read(_MAX_BYTES + 1))
-        if not _valid(data, code, time.time()):
+            raw = file.read(_MAX_BYTES + 1)
+        if len(raw) > _MAX_BYTES:
             return None
-        return data
+        data = json.loads(raw)
+        now = time.time()
+        if not _valid(data, code, now):
+            return None
+        # Receipt identity is immutable; only its derived age changes.
+        return {**data, "age_sec": now - float(data["received_at"])}
     except (OSError, ValueError, TypeError, OverflowError):
         return None
 
@@ -90,7 +95,10 @@ def _publish(path, row, code):
         log.warning("[KR_REST_SHARED][PUBLISH_FAIL] code=%s", code)
     finally:
         if tmp is not None:
-            tmp.unlink(missing_ok=True)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                log.warning("[KR_REST_SHARED][CLEANUP_FAIL] code=%s", code)
 
 
 def read_or_fetch(*, appkey, code, fetch, max_join_sec=0.15, defer_on_busy=False):
