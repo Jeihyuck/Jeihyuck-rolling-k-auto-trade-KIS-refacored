@@ -2131,12 +2131,66 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                     scope=kr_scope,
                 ):
                     raise RuntimeError("KR_RECONCILE_SOURCE_SCOPE_PREWRITE_REJECTED")
+        # A cancellation and its last previously unseen individual fill can
+        # arrive in the same row. First settle only the exactly proven new
+        # execution using the existing atomic priced-fill lane. On replay,
+        # finalize the cancellation against that now-durable watermark.
+        terminal_new_individual = False
+        if (
+            cumulative_sell_evidence is None and side == "SELL" and source_order
+            and env == "practice" and kr_scope is not None and strict_sell_targets is None
+            and source_order.get("strategy") == "pb1_pullback_close"
+            and request_json.get("kr_us_tp_stage") in {
+                "TP1", "TP2", "TP3", "PROFIT_DEFENSE_PARTIAL", "RUNNER_FINAL",
+            }
+            and (status in {"CANCELLED", "CANCELED", "CANCEL"}
+                 or (_to_int(broker_row.get("cncl_cfrm_qty")) or 0) > 0)
+            and str(resp.get("rt_cd") or "") == "0" and not resp.get("_diag_stub")
+            and str(ccld_status).lower() == "ok"
+        ):
+            from decimal import Decimal, InvalidOperation
+            from trader.kr.us_profit_stage_journal import verified_native_tp_cancellation
+            from trader.kr.us_standard_profit_parity import verified_contract
+            try:
+                c = request_json.get("kr_us_tp_contract")
+                native_qty = _to_int(broker_row.get("tot_ccld_qty"))
+                previous = int(source_response.get("confirmed_fill_qty") or 0)
+                fill_id = str(broker_row.get("ccld_no") or "").strip()
+                execution_qty = _to_int(broker_row.get("ccld_qty"))
+                execution_price = Decimal(str(broker_row.get("ccld_prc")))
+                native_amount = Decimal(str(broker_row.get("tot_ccld_amt")))
+                previous_amount = Decimal(str(source_response.get("confirmed_fill_notional") or 0))
+                terminal_new_individual = bool(
+                    verified_contract(c) and c.get("activation_mode") == "ACTIVE_PRACTICE"
+                    and (request_json["kr_us_tp_stage"] in {"TP1", "TP2", "TP3"}
+                         or c.get("runner_version") == "US_V3")
+                    and request_json.get("kr_us_tp_trade_date") == order_time.date().isoformat()
+                    and str(source_order.get("position_cycle_id") or "") == c.get("position_cycle_id")
+                    and str(source_order.get("trading_epoch_id") or "") == c.get("trading_epoch_id")
+                    and verified_native_tp_cancellation(
+                        broker_row, code=code,
+                        broker_odno=str(source_order.get("kis_odno") or source_order.get("broker_order_id") or ""),
+                        trade_date=order_time.date(), requested_qty=source_order["qty"],
+                        filled_qty=native_qty,
+                    )
+                    and native_qty is not None and native_qty > previous >= 0
+                    and execution_qty == native_qty-previous
+                    and fill_id and fill_id not in (source_response.get("applied_broker_fill_ids") or [])
+                    and execution_price.is_finite() and execution_price > 0
+                    and native_amount.is_finite() and previous_amount.is_finite()
+                    and previous_amount >= 0
+                    and native_amount == previous_amount + execution_qty*execution_price
+                )
+            except (ValueError, TypeError, KeyError, InvalidOperation, OverflowError):
+                terminal_new_individual = False
+            if terminal_new_individual:
+                status = "PARTIAL_FILLED"  # cancellation is NOT released yet
         # A terminal cancellation with no new economic delta must not enter
         # the priced-fill path: zero fills have no execution price, and an
         # already applied individual execution must never be counted twice.
         # Keep order, durable claim and stage transition in one transaction.
         if (
-            cumulative_sell_evidence is None and side == "SELL" and source_order
+            not terminal_new_individual and cumulative_sell_evidence is None and side == "SELL" and source_order
             and env == "practice" and strict_sell_targets is None
             and source_order.get("strategy") == "pb1_pullback_close"
             and request_json.get("kr_us_tp_stage") in {
@@ -2145,7 +2199,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
             and (status in {"CANCELLED", "CANCELED", "CANCEL"}
                  or (_to_int(broker_row.get("cncl_cfrm_qty")) or 0) > 0)
         ):
-            from decimal import Decimal, InvalidOperation
+            from decimal import Decimal
             from trader.kr.us_profit_stage_journal import (
                 observe_broker_stage, verified_native_tp_cancellation,
             )
