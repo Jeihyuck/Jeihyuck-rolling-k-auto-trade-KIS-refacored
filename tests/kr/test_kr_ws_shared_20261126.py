@@ -36,6 +36,10 @@ class FakeOwner:
         pass
 
     def get_fresh_quote(self, market, symbol, *, max_age_sec):
+        if symbol == "012750":
+            return None
+        if symbol == "251970":
+            return {**_quote(symbol), "bid": None, "ask": None}
         if symbol != "003490":
             return None
         return _quote(symbol)
@@ -83,6 +87,16 @@ def test_two_process_read_and_owner_teardown(monkeypatch):
         assert quote["source"] == "KIS_WEBSOCKET"
         assert quote["source_identity"] == "KIS_WS_PARSED_SYMBOL"
         assert shared.read_owner_quote(service, "012750", max_age_sec=5) == (True, None)
+        assert shared.read_owner_quote(service, "251970", max_age_sec=5) == (True, None)
+        owner, trade = shared.read_owner_quote(
+            service, "251970", max_age_sec=5,
+            required_fields=("last", "acml_vol", "wghn_avrg_stck_prc"),
+        )
+        assert owner and trade
+        assert trade["bid"] is None and trade["ask"] is None
+        assert trade["acml_vol"] == 123456
+        assert trade["wghn_avrg_stck_prc"] == 29100
+        assert set(trade["shared_valid_fields"]) == {"last", "acml_vol", "wghn_avrg_stck_prc"}
         assert shared.read_owner_quote(FakeOwner(key + "other"), "003490", max_age_sec=5) == (False, None)
     finally:
         stop.set()
@@ -134,3 +148,18 @@ def test_feature_flag_and_real_environment(monkeypatch):
     assert shared.enabled()
     monkeypatch.delenv("KR_WS_SHARED_QUOTE_ENABLED")
     assert not shared.enabled()
+
+
+def test_field_selection_does_not_invent_executable_book():
+    now = time.time()
+    row = _quote(now=now)
+    row.update(bid=None, ask=None)
+    trade = shared._validated_quote(row, symbol="003490", max_age_sec=5, now=now,
+                                   required_fields=("last", "acml_vol"))
+    assert trade and trade["bid"] is None and trade["ask"] is None
+    assert shared._validated_quote(row, symbol="003490", max_age_sec=5, now=now) is None
+    assert shared._validated_quote(row, symbol="003490", max_age_sec=5, now=now,
+                                   required_fields=("last", "invalid")) is None
+    row.pop("acml_vol")
+    assert shared._validated_quote(row, symbol="003490", max_age_sec=5, now=now,
+                                   required_fields=("last", "acml_vol")) is None
