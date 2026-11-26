@@ -5981,7 +5981,10 @@ class PB1Engine:
                 # Existing KIS request budgets and timeout fences still apply.
                 try:
                     _quote_api = getattr(self, "kis", None) or getattr(self, "kis_api", None)
-                    _live_quote = _quote_api.get_price_snapshot(str(cf.code).zfill(6), market="J") if _quote_api else {}
+                    _entry_code = str(cf.code).zfill(6)
+                    _executable = getattr(_quote_api, "get_kr_entry_executable_quote", None)
+                    _live_quote = (_executable(_entry_code) if callable(_executable)
+                                   else _quote_api.get_price_snapshot(_entry_code, market="J") if _quote_api else {})
                 except Exception:
                     _live_quote = {}
                 _quote_check = validate_live_quote(
