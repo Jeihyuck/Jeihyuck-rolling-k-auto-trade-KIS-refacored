@@ -413,6 +413,66 @@ class KisUSClient:
                     params["SYMB"], len(rows))
         return rows
 
+    def get_us_intraday_1m_page(self, symbol: str, exchange: str, *,
+                                before_key: str = "", count: int = 120) -> dict:
+        """Bounded authenticated native minute read, with continuation evidence.
+
+        KIS official overseas-stock 030 specifies PINC=1/NEXT=1 and KEYB
+        equal to one minute before the preceding page's last minute.
+        https://github.com/koreainvestment/open-trading-api/tree/main/examples_llm/overseas_stock/inquire_time_itemchartprice
+        Never synthesize missing trades; only the observer's scoped store
+        determines whether an actual returned row is admissible.
+        """
+        from datetime import datetime, timedelta, timezone
+        from uuid import uuid4
+        self._assert_not_offline("get_us_intraday_1m_page")
+        symbol = str(symbol or "").strip().upper()
+        if not symbol:
+            raise ValueError("missing_intraday_symbol")
+        cursor = str(before_key or "")
+        if cursor:
+            if len(cursor) != 14 or not cursor.isdigit():
+                raise ValueError("invalid_native_minute_cursor")
+            datetime.strptime(cursor, "%Y%m%d%H%M%S")
+        headers = self._build_headers("HHDFS76950200")
+        if cursor:
+            headers["tr_cont"] = "N"
+        params = {
+            "AUTH": "", "EXCD": self._resolve_quote_excd(exchange), "SYMB": symbol,
+            "NMIN": "1", "PINC": "1" if cursor else "0", "NEXT": "1" if cursor else "",
+            "NREC": str(max(1, min(120, int(count)))), "FILL": "", "KEYB": cursor,
+        }
+        requested_at = datetime.now(timezone.utc)
+        response = self._get("/uapi/overseas-price/v1/quotations/inquire-time-itemchartprice",
+                             headers=headers, params=params, max_attempts_override=1)
+        observed_at = datetime.now(timezone.utc)
+        if not isinstance(response, dict) or str(response.get("rt_cd")) != "0":
+            raise KisUSClientError("KIS_US_1M_BAR_RESPONSE_UNVERIFIED")
+        rows = response.get("output2")
+        if not isinstance(rows, list):
+            raise KisUSClientError("KIS_US_1M_BAR_ROWS_MISSING")
+        stamps = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            stamp = str(row.get("xymd") or "").replace("-", "") + str(row.get("xhms") or "").replace(":", "").zfill(6)
+            try:
+                if len(stamp) == 14 and stamp.isdigit():
+                    stamps.append(datetime.strptime(stamp, "%Y%m%d%H%M%S"))
+            except ValueError:
+                continue
+        response_meta = response.get("_response_meta") or {}
+        cont = str(response_meta.get("tr_cont") or "").upper() if isinstance(response_meta, dict) else ""
+        next_key = ""
+        if stamps and cont in {"M", "F"}:
+            next_key = (min(stamps) - timedelta(minutes=1)).strftime("%Y%m%d%H%M%S")
+            if cursor and next_key >= cursor:
+                next_key = ""
+        logger.info("[US_ENTRY][MINUTE_PAGE] symbol=%s rows=%d cursor=%s next=%s tr_cont=%s",
+                    symbol, len(rows), cursor or "LATEST", next_key or "END", cont or "UNKNOWN")
+        return {"rows": rows, "next_key": next_key, "requested_at": requested_at,
+                "observed_epoch": observed_at.timestamp(), "observation_id": str(uuid4())}
+
     def get_us_daily_price(self, symbol: str, exchange: str, count: int = 120, as_of_date: str | None = None) -> list[dict]:
         """해외주식 기간별 시세 (일봉)."""
         self._assert_not_offline("get_us_daily_price")
