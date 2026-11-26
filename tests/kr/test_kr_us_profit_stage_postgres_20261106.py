@@ -481,3 +481,29 @@ def test_kr401_partial_cancel_retry_keeps_stage_target_and_original_attempt(stag
     assert observe_broker_stage(**common, cancellation_row=_native_partial_cancel_row()).accepted
     assert load_frozen_stage_states(**args)["TP1"] == final
     assert reserve(args, "TP2", 18, "new-tp2").accepted
+
+
+@pytest.mark.parametrize("stage", ["PROFIT_DEFENSE_PARTIAL", "RUNNER_FINAL"])
+def test_kr401_native_runner_cancellation_retains_original_target(stage_db, stage):
+    from trader.kr.us_standard_profit_parity import _canonical_sha
+    args = dict(stage_db)
+    contract = {**args["contract"], "activation_mode": "ACTIVE_PRACTICE"}
+    contract["sha256"] = _canonical_sha({k:v for k,v in contract.items() if k!="sha256"})
+    args["contract"] = contract
+    _prove_three_tp_stages(args)
+    old, new = "kr401-runner-original", "kr401-runner-residual"
+    assert reserve(args, stage, 25, old).accepted
+    assert observe(args, stage, old, "0000012345", 12).status == "PARTIAL_FILLED"
+    common = dict(**args, stage=stage, client_order_key=old, broker_odno="0000012345",
+                  cumulative_filled_qty=12, broker_order_accepted=True,
+                  broker_fill_source="KIS_DAILY_CCLD_VERIFIED", source_trade_date=DAY)
+    assert not observe_broker_stage(**common, cancellation_row=_native_partial_cancel_row(rmn_qty="1")).accepted
+    assert observe_broker_stage(**common, cancellation_row=_native_partial_cancel_row()).status == "RETRY_READY"
+    assert not reserve(args, stage, 12, new).accepted
+    assert not reserve(args, stage, 13, old).accepted
+    assert reserve(args, stage, 13, new).accepted
+    assert observe_broker_stage(**common, cancellation_row=_native_partial_cancel_row()).accepted
+    assert observe(args, stage, new, "0000012346", 13).status == "FILLED"
+    result = load_frozen_stage_states(**args)[stage]
+    assert result["target_qty"] == result["cumulative_filled_qty"] == 25
+    assert result["broker_fill_proven"] is True
