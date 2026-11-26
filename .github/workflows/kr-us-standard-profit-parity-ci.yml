@@ -30,6 +30,7 @@ on:
       - "tests/kr/test_kr_us_profit_stage_postgres_20261106.py"
       - "tests/kr/test_kr_buy_contract_readback_20261126.py"
       - "tests/kr/test_kr_354_repository_lifecycle.py"
+      - "tests/kr/test_pr359_sell_crash_repro.py"
       - "tests/kr/test_kr_us_profit_active_router_20261111.py"
       - "tests/kr/test_kr_samsung_ea_explicit_amendment_20261111.py"
       - "tests/kr/test_kr_us_v3_native_runner_20261111.py"
@@ -88,6 +89,7 @@ jobs:
             tests/kr/test_kr_us_profit_stage_postgres_20261106.py \
             tests/kr/test_kr_buy_contract_readback_20261126.py \
             tests/kr/test_kr_354_repository_lifecycle.py \
+            tests/kr/test_pr359_sell_crash_repro.py::test_kr401_native_partial_cancel_preserves_position_and_releases_stage \
             tests/kr/test_kr_us_profit_active_router_20261111.py \
             tests/kr/test_kr_samsung_ea_explicit_amendment_20261111.py \
             tests/kr/test_kr_us_v3_native_runner_20261111.py \
