@@ -360,3 +360,49 @@ def test_stale_and_missing_opening_bars_report_native_evidence_without_relaxing_
     assert sparse["facts"]["opening"]["observed_1m"] < 30
     assert sparse["facts"]["last_completed_bar"] is not None
     assert sparse["facts"]["last_completed_bar_age_sec"] is not None
+
+
+def _independent_native_window():
+    # Synthetic complete native-shaped rows, not original Kroger replay.
+    start = datetime(2026, 10, 28, 10, 0, tzinfo=NY)
+    values = [102, 101, 100, 99, 98.5, 98.6, 98.8, 99.0]
+    rows = []
+    for i, price in enumerate(values):
+        rows.append({"xymd": "20261028", "xhms": (start + timedelta(minutes=i)).strftime("%H%M%S"),
+                     "open": str(price), "high": str(price + .1), "low": str(price - .2),
+                     "last": str(price), "evol": "200", "eamt": str(price * 200)})
+    return normalize_bars(rows, trade_date=DAY, now_et=start + timedelta(minutes=8))
+
+
+@pytest.mark.parametrize("family", ["ENTRY_PULLBACK", "ENTRY_MOMENTUM"])
+def test_independent_5_plus_3_allows_verified_reclaim_without_opening(family):
+    bars = _independent_native_window()
+    result = evaluate_price_opportunity(style=family, trade_date=DAY,
+        now_et=datetime(2026, 10, 28, 10, 8, tzinfo=NY), verified_bars=bars,
+        quote=sample_quote(99, 98.98, 99))
+    assert result["state"] == "READY", result
+    assert result["facts"]["reference_path"] == "POST_OPENING_5_PLUS_3"
+    assert result["facts"]["opening"]["observed_1m"] == 0
+    assert result["facts"]["opening_vwap"] is None
+    assert result["risk_reward_reference"] >= 1.5
+    assert result["broker_authorized"] is False
+
+
+@pytest.mark.parametrize("case", ["gap", "stale", "breakout", "no_rebound", "late_peak"])
+def test_independent_window_never_bypasses_missing_dependencies(case):
+    bars = _independent_native_window()
+    now = datetime(2026, 10, 28, 10, 8, tzinfo=NY)
+    family = "ENTRY_PULLBACK"
+    if case == "gap":
+        bars.pop(2)
+    elif case == "stale":
+        now += timedelta(minutes=4)
+    elif case == "breakout":
+        family = "ENTRY_BREAKOUT"
+    elif case == "no_rebound":
+        bars[-1]["close"] = 98.7
+    elif case == "late_peak":
+        bars[4]["high"] = 103
+    result = evaluate_price_opportunity(style=family, trade_date=DAY, now_et=now,
+        verified_bars=bars, quote=sample_quote(99, 98.98, 99))
+    assert result["state"] == "WAIT", result
