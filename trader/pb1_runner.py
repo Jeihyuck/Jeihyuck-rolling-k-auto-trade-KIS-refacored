@@ -4045,6 +4045,7 @@ def _kr_fresh_policy_wait_resume(*, env: str, strategy: str, session_kind: str,
             or status != "OK_NO_TRADE"
             or metrics.get("tick_result_reason") != "KR_ENTRY_TIMING_POLICY_WAIT"
             or metrics.get("degraded")
+            or metrics.get("kr_infinite_decision") != "WAIT"
             or str(os.getenv("PB1_PENDING_RECONCILE_ONLY") or "0") == "1"
             or os.getenv("KR_PB1_FRESH_POLICY_WAIT_RESUME", "1") != "1"):
         return False
@@ -8709,6 +8710,7 @@ def run_once(
         "api_submitted": int((getattr(engine_runner, "_run_summary_payload", {}) or {}).get("api_submitted", (getattr(engine_runner, "_run_summary_payload", {}) or {}).get("submitted", 0))),
         "degraded": bool(getattr(result, "status", "") == "DEGRADED_POSTPROCESS"),
         "tick_result_reason": str(getattr(result, "notes", None) or ""),
+        "strategy_owner": str(getattr(engine_runner, "STRATEGY_NAME", "") or ""),
         # A terminal tick skip is NOT the number of skipped *order intents*.
         # Carry both evidence types separately; absent order-skip count is
         # unknown, not a verified zero.
@@ -9315,7 +9317,8 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                         session_end_dt=session_end_dt,
                         loop_interval=loop_interval,
                         fresh_policy_wait_resume=_kr_fresh_policy_wait_resume(
-                            env=ctx.env, strategy=ctx.strategy, session_kind=session_kind,
+                            env=ctx.env, strategy=last_tick_metrics.get("strategy_owner", ""),
+                            session_kind=session_kind,
                             status=result_status, metrics=last_tick_metrics,
                         ),
                     )
