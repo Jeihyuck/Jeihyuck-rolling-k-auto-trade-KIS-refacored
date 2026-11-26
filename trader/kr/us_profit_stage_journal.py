@@ -592,7 +592,8 @@ def observe_broker_stage(
                 return StageJournalResult(False, "BLOCK", "BROKER_ACCEPTANCE_UNVERIFIED")
             proof = None
             if cancellation_row is not None:
-                if stage not in TP_STAGE_NAMES or contract.get("activation_mode") != "ACTIVE_PRACTICE":
+                if (contract.get("activation_mode") != "ACTIVE_PRACTICE"
+                        or (stage in RUNNER_STAGE_NAMES and contract.get("runner_version") != "US_V3")):
                     return StageJournalResult(False, "BLOCK", "CANCEL_RETRY_SCOPE_INVALID")
                 proof = verified_native_tp_cancellation(
                     cancellation_row, code=code, broker_odno=broker_odno,
