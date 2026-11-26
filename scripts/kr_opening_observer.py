@@ -700,15 +700,21 @@ def main() -> None:
     # PREP contract is actually verified.  No stale prior-day fallback.
     codes: list[str] = []
     kis = None
-    schedule = CandidateSchedule(max_batch=6)
+    # Wake frequently to pick up newly HOT symbols and the next due
+    # subset. Per-symbol periods still bound REST demand; no all-Final30
+    # scan, and an explicit slower interval continues to slow polling.
+    configured_period = max(15.0, float(args.interval_sec))
+    planner_wake_sec = min(15.0, configured_period)
+    schedule = CandidateSchedule(max_batch=6, hot_sec=max(45, int(configured_period)),
+                                 warm_sec=max(180, int(configured_period)))
     last_capacity_warning_key = None
     last_idle_key = None
     last_idle_logged_at = 0.0
     scope = get_account_key(env="practice")
     logger.info(
-        "[KR][OPENING_OBSERVER][COLLECTOR_BOOT] date=%s module=%s interval_sec=%s "
+        "[KR][OPENING_OBSERVER][COLLECTOR_BOOT] date=%s module=%s interval_sec=%s planner_wake_sec=%.1f hot_period_sec=%s warm_period_sec=%s "
         "collection_scope=VERIFIED_PB1_HOT_WARM_ONLY",
-        today, __file__, args.interval_sec,
+        today, __file__, args.interval_sec, planner_wake_sec, schedule.periods["hot"], schedule.periods["warm"],
     )
     while True:
         now = now_kst()
@@ -739,12 +745,12 @@ def main() -> None:
             # are eligible for high-frequency native collection.
             native_priority = {**priority, "cold": []}
             health = schedule.diagnostics(
-                native_priority, now, interval_sec=float(args.interval_sec),
+                native_priority, now, interval_sec=planner_wake_sec,
             )
             warning_key = (
                 priority["state"], tuple(health["tiers"][tier]["count"]
                                          for tier in ("hot", "warm", "cold")),
-                round(float(args.interval_sec), 3),
+                round(configured_period, 3),
             )
             if health["overcommitted"] and warning_key != last_capacity_warning_key:
                 logger.warning(
@@ -828,7 +834,7 @@ def main() -> None:
             result["native_quote_request_attempts"],
             result["native_request_failures"],
         )
-        time.sleep(max(1.0, max(15.0, float(args.interval_sec)) - elapsed))
+        time.sleep(max(1.0, planner_wake_sec - elapsed))
 
 
 if __name__ == "__main__":
