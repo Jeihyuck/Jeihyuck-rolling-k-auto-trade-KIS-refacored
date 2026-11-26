@@ -59,6 +59,20 @@ def open_store(path: Path) -> sqlite3.Connection:
     );
     CREATE INDEX IF NOT EXISTS ix_us_minute_unresolved
     ON bar_conflicts(trade_date,symbol,owner,minute_et,status);
+    CREATE TABLE IF NOT EXISTS bar_repair_candidate (
+        trade_date TEXT NOT NULL, symbol TEXT NOT NULL, owner TEXT NOT NULL,
+        minute_et TEXT NOT NULL, candidate_json TEXT NOT NULL,
+        first_epoch REAL NOT NULL, last_epoch REAL NOT NULL,
+        response_ids_json TEXT NOT NULL,
+        PRIMARY KEY (trade_date,symbol,owner,minute_et)
+    );
+    CREATE TABLE IF NOT EXISTS bar_conflict_resolution_history (
+        trade_date TEXT NOT NULL, symbol TEXT NOT NULL, owner TEXT NOT NULL,
+        minute_et TEXT NOT NULL, resolved_epoch REAL NOT NULL,
+        original_row_json TEXT, accepted_row_json TEXT NOT NULL,
+        response_ids_json TEXT NOT NULL,
+        PRIMARY KEY (trade_date,symbol,owner,minute_et,resolved_epoch)
+    );
     CREATE TABLE IF NOT EXISTS quote_samples (
         trade_date TEXT NOT NULL, symbol TEXT NOT NULL, owner TEXT NOT NULL,
         received_epoch REAL NOT NULL, last REAL NOT NULL, source TEXT NOT NULL,
@@ -76,8 +90,51 @@ def open_store(path: Path) -> sqlite3.Connection:
     return db
 
 
+def _observe_conflict_candidate(db, *, key, payload, prior_payload,
+                                observation_id, observed_epoch, timestamp):
+    """Resolve only three separately received, spaced native HTTP observations.
+
+    Replaying the same rows or local quote data can never increment proof.
+    A different candidate resets the sequence. Original conflict and
+    correction history remain durable.
+    """
+    prev = db.execute(
+        "SELECT candidate_json,first_epoch,last_epoch,response_ids_json FROM bar_repair_candidate "
+        "WHERE trade_date=? AND symbol=? AND owner=? AND minute_et=?", key).fetchone()
+    if prev and prev[0] != payload:
+        db.execute("DELETE FROM bar_repair_candidate WHERE trade_date=? AND symbol=? AND owner=? AND minute_et=?", key)
+        prev = None
+    if not observation_id or observed_epoch is None or not math.isfinite(observed_epoch):
+        return False
+    first, last, ids = (prev[1], prev[2], json.loads(prev[3])) if prev else (observed_epoch, observed_epoch, [])
+    if observation_id in ids or (ids and observed_epoch-last < 60.0):
+        return False
+    ids.append(observation_id)
+    last = observed_epoch
+    db.execute("INSERT INTO bar_repair_candidate VALUES(?,?,?,?,?,?,?,?) "
+               "ON CONFLICT(trade_date,symbol,owner,minute_et) DO UPDATE SET "
+               "candidate_json=excluded.candidate_json,first_epoch=excluded.first_epoch,"
+               "last_epoch=excluded.last_epoch,response_ids_json=excluded.response_ids_json",
+               (*key, payload, first, last, json.dumps(ids)))
+    if len(ids) < 3 or last-first < 120.0:
+        return False
+    db.execute("INSERT INTO bar_conflict_resolution_history VALUES(?,?,?,?,?,?,?,?)",
+               (*key, last, prior_payload, payload, json.dumps(ids)))
+    db.execute("INSERT INTO verified_bars VALUES(?,?,?,?,?,?,?) "
+               "ON CONFLICT(trade_date,symbol,owner,minute_et,source) DO UPDATE SET "
+               "row_json=excluded.row_json,observed_utc=excluded.observed_utc",
+               (*key, "KIS_OVERSEAS_1M", payload, timestamp))
+    db.execute("UPDATE bar_conflicts SET status='RESOLVED' WHERE trade_date=? AND symbol=? "
+               "AND owner=? AND minute_et=? AND source='KIS_OVERSEAS_1M' AND status='UNRESOLVED'", key)
+    db.execute("DELETE FROM bar_repair_candidate WHERE trade_date=? AND symbol=? AND owner=? AND minute_et=?", key)
+    LOG.info("[US_OPENING_OBSERVER][CONFLICT_RESOLVED] symbol=%s minute=%s independent_reads=%d span_sec=%.1f",
+             key[1], key[3], len(ids), last-first)
+    return True
+
+
 def persist_bars(db: sqlite3.Connection, *, trade_date: str, symbol: str,
-                 owner: str, native_rows: list[dict], now_et: datetime) -> int:
+                 owner: str, native_rows: list[dict], now_et: datetime,
+                 observation_id: str | None = None, observed_epoch: float | None = None) -> int:
     """Idempotent native-bar persistence; no partial current minute."""
     if owner != "US_STANDARD" or symbol.upper() == "TQQQ":
         return 0
@@ -121,6 +178,13 @@ def persist_bars(db: sqlite3.Connection, *, trade_date: str, symbol: str,
                         original, new_payload, timestamp,
                     ),
                 )
+            # A formerly resolved variant may recur; reopen quarantine
+            # without erasing the earlier resolution history.
+            db.execute("UPDATE bar_conflicts SET status='UNRESOLVED' WHERE trade_date=? AND symbol=? "
+                       "AND owner=? AND minute_et=? AND source='KIS_OVERSEAS_1M'",
+                       (trade_date, symbol.upper(), owner, minute))
+            db.execute("DELETE FROM bar_repair_candidate WHERE trade_date=? AND symbol=? AND owner=? AND minute_et=?",
+                       (trade_date, symbol.upper(), owner, minute))
             LOG.warning(
                 "[US_OPENING_OBSERVER][SAME_BATCH_NATIVE_BAR_CONFLICT] "
                 "symbol=%s minute=%s variants=%d action=QUARANTINE_NO_REWRITE",
@@ -138,9 +202,8 @@ def persist_bars(db: sqlite3.Connection, *, trade_date: str, symbol: str,
                 (trade_date, symbol.upper(), owner, row["time_et"]),
             ).fetchone()
             payload = json.dumps(row, sort_keys=True, separators=(",", ":"), allow_nan=False)
-            if prior:
-                if prior[0] == payload:
-                    continue
+            key = (trade_date, symbol.upper(), owner, row["time_et"])
+            if prior and prior[0] != payload:
                 # Completed native minutes may be corrected or conflict. A
                 # second observation is *not* automatically authoritative.
                 # Preserve both payloads, quarantine only this minute, and
@@ -155,11 +218,24 @@ def persist_bars(db: sqlite3.Connection, *, trade_date: str, symbol: str,
                      hashlib.sha256(payload.encode("utf-8")).hexdigest(),
                      prior[0], payload, timestamp),
                 )
+                db.execute("UPDATE bar_conflicts SET status='UNRESOLVED' WHERE trade_date=? AND symbol=? "
+                           "AND owner=? AND minute_et=? AND source='KIS_OVERSEAS_1M' AND incoming_sha256=?",
+                           (*key, hashlib.sha256(payload.encode("utf-8")).hexdigest()))
                 LOG.warning(
                     "[US_OPENING_OBSERVER][COMPLETED_BAR_CONFLICT] "
                     "symbol=%s minute=%s action=QUARANTINE_NO_REWRITE",
                     symbol.upper(), row["time_et"],
                 )
+            unresolved = db.execute(
+                "SELECT 1 FROM bar_conflicts WHERE trade_date=? AND symbol=? AND owner=? "
+                "AND minute_et=? AND source='KIS_OVERSEAS_1M' AND status='UNRESOLVED' LIMIT 1", key
+            ).fetchone()
+            if unresolved:
+                changed += int(_observe_conflict_candidate(
+                    db, key=key, payload=payload, prior_payload=prior[0] if prior else None,
+                    observation_id=observation_id, observed_epoch=observed_epoch, timestamp=timestamp))
+                continue
+            if prior:
                 continue
             db.execute(
                 "INSERT INTO verified_bars VALUES(?,?,?,?,?,?,?)",
@@ -451,6 +527,52 @@ def next_priority_pair(
     return lane[pos % len(lane)], "HOT"
 
 
+def collect_hot_minutes(client, db, *, symbol, exchange, trade_date,
+                        repair_due: bool, still_hot, max_pages: int = 4) -> dict:
+    """Latest first, then bounded native historical pages only for a HOT symbol."""
+    from datetime import timedelta
+    if not still_hot():
+        return {"requests": 0, "changed": 0}
+    cursor = ""
+    seen = set()
+    requests = changed = 0
+    started = time.monotonic()
+    while requests < max(1, min(4, int(max_pages))) and still_hot():
+        page = client.get_us_intraday_1m_page(symbol, exchange, before_key=cursor)
+        requests += 1
+        requested_at = page["requested_at"].astimezone(NY)
+        if requested_at.date().isoformat() != trade_date:
+            break
+        changed += persist_bars(db, trade_date=trade_date, symbol=symbol,
+                                owner="US_STANDARD", native_rows=page["rows"],
+                                now_et=requested_at, observation_id=page["observation_id"],
+                                observed_epoch=page["observed_epoch"])
+        if not repair_due or time.monotonic() - started > 8.0:
+            break
+        stored = load_bars(db, trade_date=trade_date, symbol=symbol)
+        present = {b["time_et"] for b in stored}
+        targets = [row[0] for row in db.execute(
+            "SELECT DISTINCT minute_et FROM bar_conflicts WHERE trade_date=? AND symbol=? "
+            "AND owner='US_STANDARD' AND status='UNRESOLVED'", (trade_date, symbol.upper()))]
+        if (requested_at.hour, requested_at.minute) >= (10, 0):
+            opening = requested_at.replace(hour=9, minute=30, second=0, microsecond=0)
+            targets.extend((opening + timedelta(minutes=i)).isoformat() for i in range(30)
+                           if (opening + timedelta(minutes=i)).isoformat() not in present)
+        next_key = str(page.get("next_key") or "")
+        # KEYB is derived from the actual preceding response, never a
+        # fabricated anchor. Only continue if unresolved evidence is older.
+        if (not targets or not next_key or next_key in seen
+                or next_key[:8] != trade_date.replace("-", "")
+                or (cursor and next_key >= cursor)
+                or min(datetime.fromisoformat(t).strftime("%Y%m%d%H%M%S") for t in targets) > next_key):
+            break
+        seen.add(next_key)
+        cursor = next_key
+        LOG.info("[US_OPENING_OBSERVER][HISTORICAL_REPAIR] symbol=%s cursor=%s targets=%d",
+                 symbol, cursor, len(targets))
+    return {"requests": requests, "changed": changed}
+
+
 def run_observer(*, env: str, trade_date: str, scope: str,
                  parent_pid: int, watchlist: list[dict],
                  min_interval_sec: float = 10.0,
@@ -479,6 +601,7 @@ def run_observer(*, env: str, trade_date: str, scope: str,
     pointer = 0
     priority_offsets = {"HOT": 0, "WARM": 0, "COLD": 0}
     last_priority_state = None
+    next_repair_by_symbol = {}
     fetch_enabled = os.getenv("US_OPENING_OBSERVER_BAR_FETCH_ENABLED", "1") == "1"
     try:
         while os.getppid() == parent_pid and time.monotonic() - start <= max_runtime_sec:
@@ -528,14 +651,17 @@ def run_observer(*, env: str, trade_date: str, scope: str,
             if not fetch_enabled or tier != "HOT":
                 continue
             try:
-                # Freeze the completion boundary BEFORE network I/O.
-                requested_at = datetime.now(NY)
-                native = client.get_us_intraday_1m_bars(symbol, exchange, count=120)
-                rows = persist_bars(db, trade_date=trade_date, symbol=symbol,
-                                    owner="US_STANDARD", native_rows=native,
-                                    now_et=requested_at)
-                LOG.info("[US_OPENING_OBSERVER][BAR_UPDATE] symbol=%s new_rows=%d "
-                         "source=KIS_OVERSEAS_1M action=NO_ORDER", symbol, rows)
+                def _still_hot():
+                    current, state = load_preminute_priority(env=env, scope=scope,
+                        trade_date=trade_date, pairs=pairs, now_epoch=time.time())
+                    return state == "VALID" and (symbol, exchange) in current["HOT"]
+                repair_due = time.monotonic() >= next_repair_by_symbol.get(symbol, 0.0)
+                if repair_due:
+                    next_repair_by_symbol[symbol] = time.monotonic() + 120.0
+                result = collect_hot_minutes(client, db, symbol=symbol, exchange=exchange,
+                    trade_date=trade_date, repair_due=repair_due, still_hot=_still_hot)
+                LOG.info("[US_OPENING_OBSERVER][BAR_UPDATE] symbol=%s new_rows=%d requests=%d "
+                         "source=KIS_OVERSEAS_1M action=NO_ORDER", symbol, result["changed"], result["requests"])
             except Exception as exc:
                 # Missing bars must remain WAIT. Never block an unrelated SELL.
                 LOG.warning("[US_OPENING_OBSERVER][BAR_UNAVAILABLE] symbol=%s error=%s",
