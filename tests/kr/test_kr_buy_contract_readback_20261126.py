@@ -14,7 +14,7 @@ from trader.db.repos import (
 from trader.kr.us_standard_profit_parity import build_new_swing_parity_contract
 
 
-@pytest.fixture(params=[("003490", 66, 29250, "PULLBACK"), ("012750", 18, 102300, "MOMENTUM")])
+@pytest.fixture(params=[("003490", 66, 29250, "PULLBACK"), ("012750", 19, 102300, "MOMENTUM")])
 def contract(monkeypatch, request):
     code, qty, price, style = request.param
     monkeypatch.setenv("KIS_ENV", "practice")
@@ -157,12 +157,32 @@ def test_postgres_driver_readback_and_rollback(contract, storage, tampered):
         engine.dispose()
 
 
-@pytest.mark.parametrize("code,qty,price,style", [
-    ("003490", 66, 29250, "ENTRY_PULLBACK"),
-    ("012750", 18, 102300, "ENTRY_MOMENTUM"),
-])
-def test_actual_repository_new_swing_intent_and_idempotency(monkeypatch, code, qty, price, style):
-    """Real repository calls, isolated SQLite only; no broker transport."""
+# Extracted from 11/26 AM DECISION_LATENCY, ENTRY_PLAN_CHECK and BASELINE.
+# These are independent past evaluations, NOT 14 economic orders. Raw full
+# minute/quote/DB inputs were not archived; this tests only the repository edge.
+INCIDENT_INTENTS = [
+    ("10:18:37", "003490", 66, 29250, 29500, "ENTRY_PULLBACK"),
+    ("10:24:15", "003490", 66, 29400, 29650, "ENTRY_PULLBACK"),
+    ("10:30:01", "003490", 66, 29550, 29750, "ENTRY_PULLBACK"),
+    ("10:38:33", "012750", 19, 102300, 102500, "ENTRY_MOMENTUM"),
+    ("10:40:37", "003490", 66, 29550, 29750, "ENTRY_PULLBACK"),
+    ("10:42:23", "003490", 65, 29650, 29800, "ENTRY_PULLBACK"),
+    ("10:44:13", "012750", 19, 102300, 102500, "ENTRY_MOMENTUM"),
+    ("10:52:50", "003490", 65, 29700, 29950, "ENTRY_PULLBACK"),
+    ("11:07:03", "003490", 65, 29700, 29950, "ENTRY_PULLBACK"),
+    ("11:20:43", "012750", 19, 102100, 102500, "ENTRY_MOMENTUM"),
+    ("11:37:36", "003490", 65, 29700, 29900, "ENTRY_PULLBACK"),
+    ("11:51:58", "003490", 66, 29550, 29800, "ENTRY_PULLBACK"),
+    ("11:58:27", "003490", 66, 29500, 29750, "ENTRY_PULLBACK"),
+    ("12:25:58", "003490", 66, 29550, 29800, "ENTRY_PULLBACK"),
+]
+
+
+@pytest.mark.parametrize("clock,code,qty,price,cap,style", INCIDENT_INTENTS,
+                         ids=[row[0]+"-"+row[1] for row in INCIDENT_INTENTS])
+def test_actual_repository_new_swing_intent_and_idempotency(monkeypatch, clock, code, qty, price, cap, style):
+    """Reconstructed 14 incident contract edges, not full native signal replay."""
+    assert price <= cap
     from uuid import uuid4
     from trader.account_state import get_account_key
     from trader.db.repos import OrdersRepo, PortfolioEpochsRepo
