@@ -438,7 +438,7 @@ def _kis_env() -> str:
 
 
 def _tp_decision_fresh_for_native_http(
-    intent: dict, *, now_utc=None, max_age_sec: float = 30.0,
+    intent: dict, *, now_utc=None, max_age_sec: float = 90.0,
 ) -> tuple[bool, str]:
     """Do not POST a queued old TP based on a prior Tick's executable price.
 
@@ -3295,7 +3295,7 @@ def route_order(
         ):
             try:
                 _tp_max_age = float(os.getenv(
-                    "US_TP_PRE_HTTP_MAX_DECISION_AGE_SEC", "30"
+                    "US_TP_PRE_HTTP_MAX_DECISION_AGE_SEC", "90"
                 ))
                 if not (5.0 <= _tp_max_age <= 120.0):
                     raise ValueError("max age outside safe bound")
