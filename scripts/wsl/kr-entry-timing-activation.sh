@@ -54,6 +54,26 @@ kr_pb1_entry_timing_defaults() {
     # Shared *observer-only* KIS quota and critical-traffic notice are KR
     # practice-scoped. Real order logic never waits on the read-only collector.
     export KR_PB1_KIS_OBSERVER_BUDGET_ENABLED="${KR_PB1_KIS_OBSERVER_BUDGET_ENABLED:-1}"
+    # User-approved practice cutover: AM/PM and the child observer inherit
+    # the SAME read-only quote-sharing and native REST admission settings.
+    # Explicit 0 remains a rollback switch. These are not broker order gates.
+    export KR_WS_SHARED_QUOTE_ENABLED="${KR_WS_SHARED_QUOTE_ENABLED:-1}"
+    if [[ "$KR_WS_SHARED_QUOTE_ENABLED" != "0" && "$KR_WS_SHARED_QUOTE_ENABLED" != "1" ]]; then
+      echo "[KR][MARKET_DATA][CONFIG_ERROR] invalid shared quote flag; action=LEGACY_NATIVE_READ" >&2
+      export KR_WS_SHARED_QUOTE_ENABLED=0
+    fi
+    export KR_SHARED_HTTP_BUDGET_ENABLED="${KR_SHARED_HTTP_BUDGET_ENABLED:-1}"
+    export KR_SHARED_HTTP_RPS_PRACTICE="${KR_SHARED_HTTP_RPS_PRACTICE:-${KIS_GLOBAL_RPS_PRACTICE:-1.5}}"
+    case "$KR_SHARED_HTTP_BUDGET_ENABLED" in
+      1)
+        if ! python -m trader.kr.kis_shared_http_budget; then
+          echo "[KR][MARKET_DATA][DEGRADED] shared HTTP preflight failed; action=EXISTING_LOCAL_LIMITERS_ONLY" >&2
+          export KR_SHARED_HTTP_BUDGET_ENABLED=0
+        fi ;;
+      0) ;;
+      *) echo "[KR][MARKET_DATA][CONFIG_ERROR] invalid shared HTTP flag; action=EXISTING_LOCAL_LIMITERS_ONLY" >&2
+         export KR_SHARED_HTTP_BUDGET_ENABLED=0 ;;
+    esac
   else
     export KR_PB1_ENTRY_OPPORTUNITY_POLICY=LEGACY_V1
     export KR_PB1_ADAPTIVE_ENTRY_V3_ENABLED=0
@@ -62,6 +82,13 @@ kr_pb1_entry_timing_defaults() {
     export KR_PB1_ENTRY_TIMING_SHADOW_ENABLED="${KR_PB1_ENTRY_TIMING_SHADOW_ENABLED:-0}"
     export KR_PB1_OPENING_OBSERVER_ENABLED=0
     export KR_PB1_KIS_OBSERVER_BUDGET_ENABLED=0
+    export KR_WS_SHARED_QUOTE_ENABLED=0
+    export KR_SHARED_HTTP_BUDGET_ENABLED=0
+  fi
+  echo "[KR][MARKET_DATA][EFFECTIVE_CONFIG] shared_quote=$KR_WS_SHARED_QUOTE_ENABLED shared_http=$KR_SHARED_HTTP_BUDGET_ENABLED configured_rps=${KR_SHARED_HTTP_RPS_PRACTICE:-n/a} broker_quota_certified=0"
+  if [[ "${STRATEGY_ENV:-}" == "practice" && "${KIS_ENV:-}" == "practice" ]] &&
+     { [[ "$KR_WS_SHARED_QUOTE_ENABLED" != "1" ]] || [[ "$KR_SHARED_HTTP_BUDGET_ENABLED" != "1" ]]; }; then
+    echo "[KR][MARKET_DATA][CONFIG_OVERRIDE][WARN] shared data path not fully active; inspect preflight or explicit rollback" >&2
   fi
   echo "[KR][ENTRY_TIMING][EFFECTIVE_CONFIG] strategy_env=${STRATEGY_ENV:-unknown} kis_env=${KIS_ENV:-unknown} mode=$KR_PB1_ENTRY_TIMING_MODE approved=$KR_PB1_ENTRY_TIMING_APPROVED policy=$KR_PB1_ENTRY_OPPORTUNITY_POLICY adaptive_v3=$KR_PB1_ADAPTIVE_ENTRY_V3_ENABLED legacy_quote_shadow=DISABLED opening_observer=$KR_PB1_OPENING_OBSERVER_ENABLED interval_sec=${KR_PB1_OPENING_OBSERVER_INTERVAL_SEC:-n/a}"
   if [[ "${STRATEGY_ENV:-}" == "practice" && "${KIS_ENV:-}" == "practice" ]] &&
