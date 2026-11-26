@@ -15188,7 +15188,7 @@ class PB1Engine:
                     _tp_claim_ok = (
                         _saved.get("status") == "PENDING"
                         and _saved.get("client_order_key") == client_key
-                        and int(_saved.get("target_qty") or 0) == orderable_qty
+                        and int(_saved.get("attempt_target_qty", _saved.get("target_qty")) or 0) == orderable_qty
                     )
                 except Exception:
                     _tp_claim_ok = False
