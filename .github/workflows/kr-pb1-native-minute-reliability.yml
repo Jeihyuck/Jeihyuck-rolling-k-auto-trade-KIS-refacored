@@ -10,6 +10,11 @@ on:
       - "tests/kr/test_kr_20261113_pb1_native_volume_rescue.py"
       - "trader/kr/entry_priority_queue.py"
       - "trader/kr/kis_observer_budget.py"
+      - "trader/kr/kis_shared_http_budget.py"
+      - "trader/marketdata/kr_ws_shared.py"
+      - "trader/marketdata/kis_ws_price.py"
+      - "tests/kr/test_kr_ws_shared_20261126.py"
+      - "tests/kr/test_kr_shared_http_budget_20261126.py"
       - "trader/kis_wrapper.py"
       - "trader/pb1_engine.py"
       - "trader/pb1_runner.py"
@@ -79,6 +84,8 @@ jobs:
             tests/kr/test_kr_pb1_minute_priority_queue.py \
             tests/kr/test_kr_pb1_minute_native_conflicts.py \
             tests/kr/test_kr_pb1_kis_observer_budget.py \
+            tests/kr/test_kr_ws_shared_20261126.py \
+            tests/kr/test_kr_shared_http_budget_20261126.py \
             tests/kr/test_kr_pb1_minute_incident_replay.py \
             tests/kr/test_kr_pb1_minute_egw_final_retry.py \
             tests/kr/test_kr_pb1_current_only_original_balance_proof.py \
