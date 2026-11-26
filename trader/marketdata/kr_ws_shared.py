@@ -22,6 +22,8 @@ import uuid
 _KST = timezone(timedelta(hours=9))
 _MAX_REQUEST = 1024
 _MAX_REPLY = 8192
+_QUOTE_FIELDS = frozenset({"last", "bid", "ask", "acml_vol", "wghn_avrg_stck_prc"})
+_DEFAULT_FIELDS = ("last", "bid", "ask")
 
 
 def enabled() -> bool:
@@ -67,7 +69,8 @@ def _positive(value):
 
 
 def _validated_quote(quote, *, symbol: str, max_age_sec: float,
-                     now: float | None = None) -> dict | None:
+                     now: float | None = None,
+                     required_fields=_DEFAULT_FIELDS) -> dict | None:
     """Preserve source proof; reject wrong day/symbol, stale or future events."""
     if not isinstance(quote, dict):
         return None
@@ -98,13 +101,28 @@ def _validated_quote(quote, *, symbol: str, max_age_sec: float,
     # of rounding, not a different day or fabricated local timestamp.
     if not -1 <= native_age <= max_age_sec + 1:
         return None
+    if not isinstance(required_fields, (list, tuple)) or not required_fields:
+        return None
+    if any(not isinstance(k, str) or k not in _QUOTE_FIELDS for k in required_fields):
+        return None
     last, bid, ask = (_positive(quote.get(k)) for k in ("last", "bid", "ask"))
-    if last is None or bid is None or ask is None or ask < bid:
+    if last is None or (bid is not None and ask is not None and ask < bid):
         return None
     fields = [k for k in ("last", "bid", "ask", "acml_vol", "wghn_avrg_stck_prc")
               if _positive(quote.get(k)) is not None]
-    return {**quote, "age_sec": now - receipt,
-            "shared_native_age_sec": native_age, "shared_valid_fields": fields}
+    if not set(required_fields).issubset(fields):
+        return None
+    # A consumer may request trade/volume without executable top of book.
+    # Explicitly mark missing/invalid optional fields, never synthesize them.
+    result = {**quote, "age_sec": now - receipt,
+              "shared_native_age_sec": native_age, "shared_valid_fields": fields}
+    for key in ("bid", "ask"):
+        if key not in fields:
+            result[key] = None
+    for key in ("acml_vol", "wghn_avrg_stck_prc"):
+        if key not in fields:
+            result.pop(key, None)
+    return result
 
 
 async def start_owner_server(service):
@@ -125,7 +143,10 @@ async def start_owner_server(service):
                 return
             symbol = _symbol(req.get("symbol"))
             age = _positive(req.get("max_age_sec"))
-            if not symbol or age is None or age > 30:
+            fields = req.get("required_fields", list(_DEFAULT_FIELDS))
+            if (not symbol or age is None or age > 30
+                    or not isinstance(fields, list) or not fields
+                    or any(not isinstance(k, str) or k not in _QUOTE_FIELDS for k in fields)):
                 return
             if not service._connected.is_set() or not service.network_allowed("KR"):
                 return
@@ -134,7 +155,7 @@ async def start_owner_server(service):
             # are not replaced by an IPC client.
             service.subscribe_kr(symbol)
             q = _validated_quote(service.get_fresh_quote("KR", symbol, max_age_sec=age),
-                                 symbol=symbol, max_age_sec=age)
+                                 symbol=symbol, max_age_sec=age, required_fields=fields)
             if not service._connected.is_set():
                 return
             result = {"status": "OK" if q else "MISS", "generation": generation,
@@ -175,7 +196,7 @@ async def close_owner_server(handle):
 
 
 def read_owner_quote(service, symbol: str, *, max_age_sec: float,
-                     timeout_sec: float = 0.12) -> tuple[bool, dict | None]:
+                     timeout_sec: float = 0.12, required_fields=_DEFAULT_FIELDS) -> tuple[bool, dict | None]:
     """A bounded, synchronous local read. False means normal local/REST fallback.
 
     A MISS with a verified live owner avoids a second WS connection attempt.
@@ -186,7 +207,9 @@ def read_owner_quote(service, symbol: str, *, max_age_sec: float,
     symbol = _symbol(symbol)
     age = _positive(max_age_sec)
     timeout = _positive(timeout_sec)
-    if not symbol or age is None or timeout is None:
+    if (not symbol or age is None or timeout is None
+            or not isinstance(required_fields, (list, tuple)) or not required_fields
+            or any(not isinstance(k, str) or k not in _QUOTE_FIELDS for k in required_fields)):
         return False, None
     try:
         path = socket_path(service)
@@ -207,7 +230,8 @@ def read_owner_quote(service, symbol: str, *, max_age_sec: float,
             conn.settimeout(remaining())
             conn.connect(str(path))
             data = json.dumps({"cmd": "QUOTE", "scope": scope, "symbol": symbol,
-                               "max_age_sec": min(age, 30.0)}).encode() + b"\n"
+                               "max_age_sec": min(age, 30.0),
+                               "required_fields": list(required_fields)}).encode() + b"\n"
             conn.settimeout(remaining())
             conn.sendall(data)
             reply = bytearray()
@@ -224,7 +248,8 @@ def read_owner_quote(service, symbol: str, *, max_age_sec: float,
                 or result.get("symbol") != symbol or not result.get("generation")
                 or result.get("status") not in {"OK", "MISS"}):
             return False, None
-        q = _validated_quote(result.get("quote"), symbol=symbol, max_age_sec=age)
+        q = _validated_quote(result.get("quote"), symbol=symbol, max_age_sec=age,
+                             required_fields=required_fields)
         if q and result["status"] == "OK":
             q["shared_generation"] = result["generation"]
             q["shared_owner_pid"] = result.get("owner_pid")
