@@ -4002,6 +4002,7 @@ def _sleep_until_start_aligned_tick(
     loop_interval: int,
     current_monotonic: float | None = None,
     current_kst: datetime | None = None,
+    fresh_policy_wait_resume: bool = False,
 ) -> float:
     """Wait for the next *start-aligned* slot, not tick-finish + interval.
 
@@ -4017,12 +4018,44 @@ def _sleep_until_start_aligned_tick(
     if remaining_session <= 0:
         return 0.0
     skipped = max(0, int(elapsed // period))
+    if skipped and fresh_policy_wait_resume:
+        # A completed, clean policy WAIT has no broker side effect to replay.
+        # Start one NEW full tick after a short rest, never run catch-up ticks
+        # or overlap writers. Keep the original alignment for error/reconcile
+        # paths. This removes only the idle tail, not the tick workload.
+        delay = min(5.0, period, remaining_session)
+        logger.info(
+            "[PB1][LOOP][POLICY_WAIT_RESUME] skipped=%d elapsed_sec=%.3f sleep=%.3f action=FRESH_SERIAL_TICK",
+            skipped, elapsed, delay,
+        )
+        return delay
     if skipped:
         logger.warning(
             "[PB1][LOOP][MISSED_START_SLOT] skipped=%d elapsed_sec=%.3f interval_sec=%.1f action=SKIP_NO_CATCHUP",
             skipped, elapsed, period,
         )
     return max(0.0, min(next_slot - elapsed, remaining_session))
+
+
+def _kr_fresh_policy_wait_resume(*, env: str, strategy: str, session_kind: str,
+                                 status: str, metrics: dict[str, Any]) -> bool:
+    """Only verified clean PB1 practice timing WAITs may shorten overrun idle."""
+    if (env != "practice" or strategy != "pb1_pullback_close"
+            or session_kind not in {"am", "afternoon", "pm"}
+            or status != "OK_NO_TRADE"
+            or metrics.get("tick_result_reason") != "KR_ENTRY_TIMING_POLICY_WAIT"
+            or metrics.get("degraded")
+            or str(os.getenv("PB1_PENDING_RECONCILE_ONLY") or "0") == "1"
+            or os.getenv("KR_PB1_FRESH_POLICY_WAIT_RESUME", "1") != "1"):
+        return False
+    # Missing transport counters are not proof of a clean no-order tick.
+    for key in ("api_submitted", "buy_orders", "sell_orders"):
+        if key not in metrics or metrics[key] != 0:
+            return False
+    for key in ("accepted", "rejected", "filled", "buy_orders_ack", "sell_orders_ack"):
+        if metrics.get(key, 0) != 0:
+            return False
+    return not any((metrics.get("warning_counts") or {}).values())
 
 
 _WINDOW_MISMATCH_LOGGED = False
@@ -9281,6 +9314,10 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                         tick_started_monotonic=tick_started_monotonic,
                         session_end_dt=session_end_dt,
                         loop_interval=loop_interval,
+                        fresh_policy_wait_resume=_kr_fresh_policy_wait_resume(
+                            env=ctx.env, strategy=ctx.strategy, session_kind=session_kind,
+                            status=result_status, metrics=last_tick_metrics,
+                        ),
                     )
                     logger.info(
                         "[PB1][LOOP] no-trade tick only -> continue result_status=%s sleep=%.0fs session_end=%s",
