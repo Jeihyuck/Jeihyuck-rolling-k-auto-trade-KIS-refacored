@@ -321,3 +321,74 @@ def test_tp_stage_journal_database_failure_isolated_by_nested_savepoint(monkeypa
         # enclosing broker-settlement transaction remains usable.
         assert conn.execute(sa.text("SELECT 1")).scalar_one() == 1
         outer_savepoint.rollback()
+
+
+def test_kr401_native_partial_cancel_preserves_position_and_releases_stage(monkeypatch, isolated_engine):
+    """Real PG repos/reconcile_today with a synthetic native KIS GET response."""
+    engine = isolated_engine
+    if engine.dialect.name != "postgresql":
+        pytest.skip("TP durable journal requires PostgreSQL")
+    from trader.account_state import get_account_key
+    from trader.kr.us_standard_profit_parity import build_new_swing_parity_contract
+    from trader.kr.us_profit_stage_journal import reserve_tp_stage, load_frozen_stage_states
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("KR_SWING_US_PROFIT_MODE", "ACTIVE_PRACTICE")
+    monkeypatch.setenv("NULLIM_KR_SETTLEMENT_ACTIVATE", "0")
+    code, odno, key = "251970", "0000040226", "kr401-native-cancel"
+    pos, order_id = _accepted_sell(
+        engine, code=code, ordered_qty=17, pre_qty=68,
+        avg_price=68400.0, odno=odno, order_key=key,
+    )
+    schema = schema_for_engine(engine)
+    with engine.begin() as conn:
+        order = conn.execute(sa.select(schema.orders).where(
+            schema.orders.c.order_id == order_id)).mappings().one()
+        args = dict(engine=engine, account_id=get_account_key(env="practice"),
+                    trading_epoch_id=str(order["trading_epoch_id"]),
+                    position_cycle_id=str(order["position_cycle_id"]), code=code)
+        contract = build_new_swing_parity_contract(
+            strategy_owner="PB1", exit_policy_family="SWING_STAGED_EXIT",
+            trade_horizon="SWING", position_action="NEW_POSITION_BUY",
+            runner_version="US_V3",
+            **{k:v for k,v in args.items() if k!="engine"},
+        )
+        request = dict(order["request_json"])
+        request.update(kr_us_tp_contract=contract, kr_us_tp_stage="TP1",
+                       kr_us_tp_trade_date="2026-10-22")
+        conn.execute(sa.update(schema.orders).where(
+            schema.orders.c.order_id == order_id).values(request_json=request))
+    args["contract"] = contract
+    day = date(2026, 10, 22)
+    assert reserve_tp_stage(**args, stage="TP1", target_qty=17,
+                            client_order_key=key, trade_date=day).accepted
+    row = {"pdno":code, "sll_buy_dvsn_cd":"01", "ord_qty":"17",
+           "tot_ccld_qty":"10", "tot_ccld_amt":"685000", "avg_prvs":"68500",
+           "odno":odno, "ord_dt":"20261022", "ord_tmd":"151810",
+           "ord_stat_cd":"PARTIAL_FILLED", "market":"J", "cncl_yn":"N",
+           "cncl_cfrm_qty":"0", "rjct_qty":"0", "rmn_qty":"7"}
+    kis = KISDailyReplay(row)
+    ctx = RunContext(run_id=None, env="practice", strategy="pb1_pullback_close",
+                     started_at=datetime(2026,10,22,15,18,tzinfo=ZoneInfo("Asia/Seoul")),
+                     dry_run=True)
+    monkeypatch.setattr(rk, "_execution_claim_integrity_reason", lambda *a, **k: None)
+    rk.reconcile_today(engine=engine, kis=kis, ctx=ctx, trade_date=day)
+    assert load_frozen_stage_states(**args)["TP1"]["status"] == "PARTIAL_FILLED"
+    kis.row.update(ord_stat_cd="CANCELLED", cncl_cfrm_qty="7", rmn_qty="0")
+    for _ in range(2):
+        rk.reconcile_today(engine=engine, kis=kis, ctx=ctx, trade_date=day)
+    state = load_frozen_stage_states(**args)["TP1"]
+    assert state["status"] == "RETRY_READY"
+    assert state["target_qty"] == 17 and state["cumulative_filled_qty"] == 10
+    assert state["cancelled_attempts"][0]["cancelled_qty"] == 7
+    assert len(state["cancelled_attempts"]) == 1
+    with engine.connect() as conn:
+        stored = conn.execute(sa.select(schema.orders).where(
+            schema.orders.c.order_id == order_id)).mappings().one()
+        position = conn.execute(sa.select(schema.positions).where(
+            schema.positions.c.position_cycle_id == str(pos["position_cycle_id"]))).mappings().one()
+        fills = conn.execute(sa.select(schema.fills).where(
+            schema.fills.c.order_id == order_id)).mappings().all()
+    assert stored["status"] == "CANCELLED"
+    assert position["qty"] == 58
+    assert float(position["realized_pnl"]) == pytest.approx(1000)
+    assert len(fills) == 1
