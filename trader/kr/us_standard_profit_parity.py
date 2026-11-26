@@ -182,7 +182,7 @@ def verified_tp_retry_remainder(state: Mapping[str, Any]) -> int | None:
             return int(value)
         raise ValueError("unverified quantity")
     try:
-        if state.get("status") != "RETRY_READY" or state.get("stage") not in {"TP1", "TP2", "TP3"}:
+        if state.get("status") != "RETRY_READY" or state.get("stage") not in {"TP1", "TP2", "TP3", "PROFIT_DEFENSE_PARTIAL", "RUNNER_FINAL"}:
             return None
         target = exact(state["target_qty"])
         history = state.get("cancelled_attempts")
