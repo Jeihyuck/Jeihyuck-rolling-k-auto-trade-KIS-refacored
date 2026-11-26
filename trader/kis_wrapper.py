@@ -2837,6 +2837,7 @@ class KisAPI:
                     shared_owner, ws_quote = kr_ws_shared.read_owner_quote(
                         ws_service, c, max_age_sec=ws_max_age,
                         timeout_sec=min(0.12, remaining - 0.01),
+                        required_fields=("last",),
                     )
             if ws_quote is None and not shared_owner:
                 ws_service.subscribe_kr(c)
@@ -3263,6 +3264,35 @@ class KisAPI:
         if not isinstance(book, dict):
             book = data.get("output")
         return dict(book) if isinstance(book, dict) else {}
+
+    def get_kr_observer_quote(self, code: str) -> dict:
+        """Read-only collector: request native VWAP and volume, not an orderbook.
+
+        Generic quote fallback still supplies bars/price diagnostics when KIS
+        does not expose complete native VWAP evidence. No synthetic fields.
+        """
+        from trader.marketdata import kr_ws_shared
+        c = str(code or "").removeprefix("A")
+        if kr_ws_shared.enabled() and getattr(self, "env", None) == "practice":
+            service = get_kis_ws_price_service()
+            max_age = _env_float("KIS_WS_FRESH_MAX_AGE_SEC_KR", 5.0)
+            fields = ("last", "acml_vol", "wghn_avrg_stck_prc")
+            local = kr_ws_shared._validated_quote(
+                service.get_fresh_quote("KR", c, max_age_sec=max_age),
+                symbol=c, max_age_sec=max_age, required_fields=fields,
+            )
+            if local:
+                return local
+            remaining = kr_tick_remaining_sec(getattr(self, "_kr_stage_deadline", None))
+            if remaining > 0.02:
+                _, remote = kr_ws_shared.read_owner_quote(
+                    service, c, max_age_sec=max_age,
+                    timeout_sec=min(0.12, remaining - 0.01),
+                    required_fields=fields,
+                )
+                if remote:
+                    return remote
+        return self.get_price_snapshot(c, market="J")
 
     def get_kr_entry_executable_quote(self, code: str) -> dict:
         """One bounded orderbook supplement, with separate price/book evidence.
@@ -3793,6 +3823,7 @@ class KisAPI:
                     shared_owner, ws_quote = kr_ws_shared.read_owner_quote(
                         ws_service, code, max_age_sec=max_age_sec,
                         timeout_sec=min(0.12, remaining - 0.01),
+                        required_fields=("last",),
                     )
                     if ws_quote:
                         logger.info("[KR_WS_SHARED][HIT] code=%s age_sec=%.3f generation=%s owner_pid=%s",
