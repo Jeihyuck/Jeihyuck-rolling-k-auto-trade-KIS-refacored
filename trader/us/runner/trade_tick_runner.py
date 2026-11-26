@@ -1600,6 +1600,49 @@ def _routed_sell_notional(orders: list[dict]) -> float:
     return _routed_order_notional(sell_orders)
 
 
+def _refresh_selected_native_tp(candidate: dict, revalidate) -> dict | None:
+    """Candidate is advisory only; re-run selected TP before any claim/POST.
+
+    Do not fall back to the old decision, copy its evidence or raise quantity.
+    A changed stage/owner/cycle/contract is a new candidate, not this order.
+    """
+    meta = candidate.get("meta") or {}
+    if not callable(revalidate) or not (
+        meta.get("tp_pending_deferred_to_claim") is True
+        or meta.get("legacy_nine_tp_pending_deferred") is True
+    ):
+        return candidate
+    fresh = revalidate(candidate)
+    if not isinstance(fresh, dict):
+        return None
+    fm = fresh.get("meta") or {}
+    if not candidate.get("position_lifecycle_id"):
+        return None
+    for field in ("symbol", "side", "strategy_owner", "position_lifecycle_id",
+                  "position_cycle_id", "broker_account_hash", "trading_epoch_id",
+                  "portfolio_epoch_id"):
+        if candidate.get(field) != fresh.get(field):
+            return None
+    for field in ("profit_capture_stage", "source_entry_contract_sha256",
+                  "tp_threshold_fraction", "tp_pending_deferred_to_claim",
+                  "legacy_nine_tp_pending_deferred"):
+        if meta.get(field) != fm.get(field):
+            return None
+    if not (0 < int(fresh.get("qty") or 0) <= int(candidate.get("qty") or 0)):
+        return None
+    # Only arbitration annotations survive; the new decision's economics,
+    # evidence, key and Attempt remain its own. No old proof is re-signed.
+    for field in ("merged_exit_intent", "absorbed_exit_reasons",
+                  "selected_exit_reason", "selected_exit_family",
+                  "original_intent_count", "merge_policy_version"):
+        if field in candidate:
+            fresh[field] = candidate[field]
+            fm[field] = candidate[field]
+    fresh["final_qty"] = fm["final_qty"] = int(fresh["qty"])
+    fm["exit_family"] = "TAKE_PROFIT"
+    return fresh
+
+
 def route_exit_orders_immediately(
     exit_intents: list[dict],
     *,
@@ -1611,6 +1654,7 @@ def route_exit_orders_immediately(
     current_position_symbols: set[str],
     context=None,
     kis_client=None,
+    tp_revalidate=None,
 ) -> dict:
     """Route SELL intents before any entry watchlist/evaluation work.
 
@@ -1648,6 +1692,24 @@ def route_exit_orders_immediately(
     decisions: list[dict] = []
     for intent in sell_intents:
         try:
+            _candidate = intent
+            _fresh = _refresh_selected_native_tp(intent, tp_revalidate)
+            if _fresh is None:
+                logger.info("[US_PROFIT_CAPTURE][JIT_REVALIDATION_WAIT] symbol=%s action=NO_CLAIM_NO_POST", intent.get("symbol"))
+                decisions.append({"symbol": str(intent.get("symbol") or "").upper(),
+                                  "side": "SELL", "qty": 0, "action": "SKIPPED",
+                                  "reason": intent.get("reason"),
+                                  "skip_reason": "TP_JIT_REVALIDATION_WAIT"})
+                continue
+            intent = _fresh
+            if intent is not _candidate:
+                _symbol = str(intent.get("symbol") or "").upper()
+                for _attr in ("_sell_selected_ready_by_symbol", "_sell_selected_trace_id_by_symbol"):
+                    _mapping = getattr(context, _attr, None)
+                    if isinstance(_mapping, dict):
+                        _mapping.pop(_symbol, None)
+                logger.info("[US_PROFIT_CAPTURE][JIT_READY] symbol=%s stage=%s action=ROUTE_NOW",
+                            _symbol, (intent.get("meta") or {}).get("profit_capture_stage"))
             _individual_route_start = time.monotonic()
             logger.info(
                 "[US_EXIT][ROUTER_ENTER] symbol=%s qty=%s reason=%s",
@@ -3575,6 +3637,47 @@ def run_trade_tick(
         logger.warning("[US_EXIT][5W1H][UNAVAILABLE] error=%s action=SELL_CONTINUES",
                        type(_audit_module_exc).__name__)
 
+    # Only the actual arbitration winner is re-evaluated at its turn.
+    # The earlier profit-capture list is advisory and native stage claims
+    # are deferred. Offline/forced-clock paths retain replay semantics.
+    _tp_jit_callback = None
+    if real_order_mode and not offline and not force_now and env == "practice":
+        def _tp_jit_callback(candidate):
+            from trader.us.market_state_overlay import build_profit_capture_intents
+            from trader.us.execution.tp_signal_quote_refresh import refresh_tp_source_quotes
+            from trader.us.decision_evidence_5w1h import attach_standard_sell_evidence
+            symbol = str(candidate.get("symbol") or "").upper()
+            matching = [p for p in current_positions
+                        if str(p.get("symbol") or "").upper() == symbol]
+            if len(matching) != 1 or not tick_context.broker_submit_allowed():
+                return None
+            def _refresh_one(p):
+                return refresh_tp_source_quotes(
+                    [p], provider, budget_sec=min(3.0, tick_context.remaining_sec()),
+                    max_reads=1,
+                )[0]
+            fresh = build_profit_capture_intents(
+                matching, market_state_overlay, set(), now=now, trade_date=trade_date,
+                defer_pending_until_claim=True, decision_clock=lambda: datetime.now(timezone.utc),
+                quote_refresh=_refresh_one,
+            )
+            if len(fresh) != 1:
+                return None
+            fresh_meta = fresh[0].get("meta") or {}
+            if not fresh_meta.get("decision_quote_source_at"):
+                return None
+            fresh = _suppress_pending_sell_exit_intents(fresh, trade_date, env=env, strict=True)
+            if len(fresh) != 1:
+                return None
+            try:
+                attach_standard_sell_evidence(
+                    fresh[0], matching[0], decision_at=fresh_meta["last_profit_capture_at"],
+                    code_sha=str(os.getenv("US_PINNED_CODE_SHA") or os.getenv("GITHUB_SHA") or "UNKNOWN"),
+                )
+            except Exception as exc:
+                logger.warning("[US_EXIT][JIT_5W1H_UNAVAILABLE] symbol=%s type=%s", symbol, type(exc).__name__)
+            return fresh[0]
+
     exit_route_result = route_exit_orders_immediately(
         _late_exit_intents,
         buy_daily_notional=0.0,  # SELL-only risk path; BUY value loaded after routing.
@@ -3585,6 +3688,7 @@ def run_trade_tick(
         current_position_symbols=current_position_symbols,
         context=tick_context,
         kis_client=routing_kis_client,
+        tp_revalidate=_tp_jit_callback,
     )
 
     if _early_pilot_results:
