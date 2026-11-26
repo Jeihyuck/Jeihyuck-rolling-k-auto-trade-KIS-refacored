@@ -16,7 +16,7 @@ from datetime import date, datetime, timedelta
 from typing import Any, Mapping
 
 from trader.kr.us_standard_profit_parity import (
-    STAGES, evaluate_v3_runner_shadow, verified_contract,
+    STAGES, evaluate_v3_runner_shadow, verified_contract, verified_tp_retry_remainder,
 )
 from trader.us.pb1.swing_runner_exit_v3 import (
     chandelier_from_verified_completed_bars,
@@ -165,7 +165,34 @@ def evaluate_kr_v3_runner(
         ):
             return hold("V3_PARTIAL_KIS_FILL_INTEGRITY_UNVERIFIED")
         partial = "DONE"
-    final = str((stage_states.get("RUNNER_FINAL") or {}).get("status") or "NOT_TRIGGERED").upper()
+    final_state = dict(stage_states.get("RUNNER_FINAL") or {})
+    final = str(final_state.get("status") or "NOT_TRIGGERED").upper()
+    # A confirmed cancellation releases only the original stage remainder.
+    # Re-evaluate the *same* US V3 signal with current evidence, never treat
+    # cancellation as an independent SELL signal or open another stage.
+    retry_stage, retry_qty = None, None
+    if partial == "RETRY_READY" or final == "RETRY_READY":
+        if partial == "RETRY_READY" and final != "NOT_TRIGGERED":
+            return hold("V3_RETRY_STAGE_CONFLICT")
+        if final == "RETRY_READY" and partial not in {"NOT_TRIGGERED", "DONE"}:
+            return hold("V3_RETRY_STAGE_CONFLICT")
+        retry_stage = "PROFIT_DEFENSE_PARTIAL" if partial == "RETRY_READY" else "RUNNER_FINAL"
+        retry_state = partial_state if retry_stage == "PROFIT_DEFENSE_PARTIAL" else final_state
+        retry_qty = verified_tp_retry_remainder(retry_state)
+        if retry_qty is None or retry_state.get("stage") != retry_stage:
+            return hold("V3_CANCEL_RETRY_PROOF_INVALID")
+        # Quantities here are authoritative current broker shares, already
+        # reconciled by the enclosing router; never reconstruct inventory.
+        if (isinstance(holding_qty, bool) or not isinstance(holding_qty, int)
+                or isinstance(orderable_qty, bool) or not isinstance(orderable_qty, int)
+                or orderable_qty != holding_qty or retry_qty > orderable_qty
+                or (retry_stage == "RUNNER_FINAL" and retry_qty != holding_qty)
+                or (retry_stage == "PROFIT_DEFENSE_PARTIAL" and retry_qty >= holding_qty)):
+            return hold("V3_CANCEL_RETRY_REMAINING_QTY_UNAVAILABLE")
+        if retry_stage == "PROFIT_DEFENSE_PARTIAL":
+            partial = "NOT_TRIGGERED"
+        else:
+            final = "NOT_TRIGGERED"
     # The original US evaluator performs all R1-R4 priority and quantity
     # calculations. Unknown KR trend is never manufactured as verified.
     result = evaluate_v3_runner_shadow(
@@ -185,8 +212,15 @@ def evaluate_kr_v3_runner(
     if stage not in _RUNNER or isinstance(quantity, bool) or not isinstance(quantity, int) or quantity <= 0:
         return {"action": "BLOCK", "reason": "V3_ORDER_STAGE_OR_QTY_INVALID",
                 "order_authorized": False}
+    if retry_stage is not None:
+        if stage != retry_stage:
+            return hold("V3_CANCEL_RETRY_REQUIRES_SAME_FRESH_SIGNAL")
+        # Preserve the original signed stage's remaining quantity, not the
+        # new percentage computed on the already reduced holding.
+        quantity = retry_qty
     return {**result, "action": "ACTIVE_RUNNER", "stage": stage,
-            "qty": quantity, "native_source": "KIS_COMPLETED_DAILY_VERIFIED",
+            "qty": quantity, "cancel_retry": retry_stage is not None,
+            "native_source": "KIS_COMPLETED_DAILY_VERIFIED",
             "verified_high": verified_high, "atr_evidence": atr,
             "order_authorized": False}
 
