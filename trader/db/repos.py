@@ -8207,7 +8207,7 @@ class PositionsRepo:
                         # approved amendment has its own dedicated path.
                         if "kr_us_profit_contract" in existing_entry_meta:
                             merged_entry_meta["kr_us_profit_contract"] = existing_entry_meta["kr_us_profit_contract"]
-                        elif request_json.get("parent_entry_contract_sha256"):
+                        elif isinstance(request_json, dict) and request_json.get("parent_entry_contract_sha256"):
                             merged_entry_meta.pop("kr_us_profit_contract", None)
                     for key in (
                         "entry_contract_sha256",
