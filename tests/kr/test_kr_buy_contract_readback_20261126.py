@@ -112,3 +112,101 @@ def test_sqlalchemy_readback_inside_transaction(contract, storage, tampered):
     with engine.connect() as conn:
         assert conn.execute(sa.select(sa.func.count()).select_from(table)).scalar_one() == (0 if tampered else 1)
     engine.dispose()
+
+
+@pytest.mark.parametrize("storage", ["text", "json", "jsonb"])
+@pytest.mark.parametrize("tampered", [False, True])
+def test_postgres_driver_readback_and_rollback(contract, storage, tampered):
+    """Use only the disposable CI PostgreSQL URL, with a connection-local table."""
+    import os
+    from sqlalchemy.dialects.postgresql import JSONB
+
+    url = os.getenv("PBCORE_TEST_POSTGRES_URL")
+    if not url:
+        pytest.skip("Disposable PostgreSQL service not configured")
+    engine = sa.create_engine(url)
+    if engine.dialect.name != "postgresql":
+        engine.dispose()
+        pytest.fail("PBCORE_TEST_POSTGRES_URL must be PostgreSQL")
+    types = {"text": sa.Text(), "json": sa.JSON(), "jsonb": JSONB()}
+    table = sa.Table("kr401_readback_fixture", sa.MetaData(),
+                     sa.Column("request_json", types[storage]),
+                     prefixes=["TEMPORARY"])
+    stored = copy.deepcopy(contract)
+    if tampered:
+        stored["entry_meta"] = "invalid"
+    value = json.dumps(stored) if storage == "text" else stored
+    try:
+        with engine.connect() as conn:
+            with conn.begin():
+                table.create(conn)
+            def transaction():
+                with conn.begin():
+                    conn.execute(table.insert().values(request_json=value))
+                    persisted = conn.execute(sa.select(table.c.request_json)).scalar_one()
+                    assert isinstance(persisted, str if storage == "text" else dict)
+                    _assert_kr_buy_intent_readback(persisted, contract)
+            if tampered:
+                with pytest.raises(RuntimeError, match="KR_PROFIT_PARITY_BUY_PERSISTENCE_MISMATCH"):
+                    transaction()
+            else:
+                transaction()
+            with conn.begin():
+                assert conn.execute(sa.select(sa.func.count()).select_from(table)).scalar_one() == (0 if tampered else 1)
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize("code,qty,price,style", [
+    ("003490", 66, 29250, "ENTRY_PULLBACK"),
+    ("012750", 18, 102300, "ENTRY_MOMENTUM"),
+])
+def test_actual_repository_new_swing_intent_and_idempotency(monkeypatch, code, qty, price, style):
+    """Real repository calls, isolated SQLite only; no broker transport."""
+    from uuid import uuid4
+    from trader.account_state import get_account_key
+    from trader.db.repos import OrdersRepo, PortfolioEpochsRepo
+    from tests.kr.execution_claim_fixtures import create_schema_with_active_test_epoch
+    from trader.kr.us_standard_profit_parity import verified_contract
+
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("KR_SWING_US_PROFIT_MODE", "ACTIVE_PRACTICE")
+    engine = sa.create_engine("sqlite:///:memory:")
+    try:
+        schema = create_schema_with_active_test_epoch(engine)
+        account = get_account_key(env="practice")
+        portfolio = PortfolioEpochsRepo(engine).get_or_create_active(
+            env="practice", account_id=account, strategy="pb1_pullback_close", sid=1, mode=1,
+        )
+        cycle = str(uuid4())
+        key = "kr401-" + uuid4().hex
+        plan = {"entry_style_selected": style, "entry_reason": style,
+                "exit_policy_family": "SWING_STAGED_EXIT", "trade_horizon": "SWING"}
+        req = dict(enforce_entry_contract=True, pre_order_holding_qty=0,
+                   requested_qty=qty, submitted_qty=qty, balance_snapshot_id="test-snapshot",
+                   entry_exit_plan=plan)
+        args = dict(env="practice", run_id=None, strategy="pb1_pullback_close",
+                    sid=1, mode=1, code=code, market="KOSPI", side="BUY",
+                    ord_type="LIMIT", qty=qty, limit_price=price, stage="PB1-AM",
+                    client_order_key=key, request_json=req, account_id=account,
+                    portfolio_epoch_id=portfolio, position_cycle_id=cycle)
+        orders = OrdersRepo(engine)
+        order_id, created = orders.create_intent_idempotent(**args)
+        assert created
+        with engine.connect() as conn:
+            frozen = conn.execute(sa.select(schema.orders.c.request_json).where(
+                schema.orders.c.client_order_key == key)).scalar_one()
+        if isinstance(frozen, str):
+            frozen = json.loads(frozen)
+        parity = frozen["kr_us_profit_contract"]
+        assert verified_contract(parity)
+        assert frozen["entry_meta"]["kr_us_profit_contract"] == parity
+        assert parity["code"] == code
+        assert frozen["position_cycle_id"] == cycle
+        assert frozen["entry_contract_sha256"] == _kr_buy_entry_contract_hash(frozen)
+        assert OrdersRepo(engine).create_intent_idempotent(**args) == (order_id, False)
+        with engine.connect() as conn:
+            assert conn.execute(sa.select(sa.func.count()).select_from(schema.orders).where(
+                schema.orders.c.client_order_key == key)).scalar_one() == 1
+    finally:
+        engine.dispose()
