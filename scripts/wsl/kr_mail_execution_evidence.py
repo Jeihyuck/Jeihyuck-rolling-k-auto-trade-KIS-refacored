@@ -148,7 +148,7 @@ def _session_order_activity(stage: Path, trade: str, purpose: str, attempt: dict
     }
     summary_count = 0
     for line in lines:
-        match_result = re.search(r"\[RUN_SUMMARY\]\[RESULT\] status=([A-Z_]+) reason=([^\s]+)", line)
+        match_result = re.search(r"\[RUN_SUMMARY\]\[RESULT\] status=([A-Z_]+)(?: reason=([^\s]+))?", line)
         if match_result:
             status, reason = match_result.groups()
             # The outer session footer is not another completed engine tick.
