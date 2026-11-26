@@ -19,7 +19,7 @@ import time
 from trader.account_state import get_account_key
 from trader.kr.opening_bar_contract import (
     KST, save_opening_proof, load_opening_proof, inspect_completed_bar_coverage,
-    diagnose_native_bar_rows, _source_time,
+    diagnose_native_bar_rows, _source_time, clean_completed_bars,
 )
 from trader.runtime_paths import repo_root
 from trader.time_utils import now_kst
@@ -317,6 +317,25 @@ def _stale_minute_anchor(coverage, observed_at):
     return observed_at.astimezone(KST).replace(second=0, microsecond=0).strftime("%H%M%S")
 
 
+def _current_batch_coverage(stored, fetched, observed_at):
+    """Skip redundant repair only if the latest native response supplies it.
+
+    A contradictory OHLCV row is never treated as coverage improvement:
+    persistence still performs the original three-observation quarantine.
+    """
+    merged = {}
+    for row in list((stored or {}).get("bars") or []) + list(fetched):
+        for bar in clean_completed_bars([row], observed_at):
+            key = bar["timestamp"]
+            if key in merged and merged[key] != bar:
+                return {}
+            merged[key] = bar
+    return inspect_completed_bar_coverage(
+        rows=list(merged.values()), now=observed_at,
+        source_conflicts=(stored or {}).get("source_conflicts"),
+    )
+
+
 def run_once(*, kis, codes: list[str], observed_at: datetime,
              sleep_between: float = 0.8, refresh_clock=None) -> dict:
     """No order methods are called; all I/O is read-only KIS and local proofs."""
@@ -386,8 +405,8 @@ def run_once(*, kis, codes: list[str], observed_at: datetime,
             # The original value and conflict quarantine remain intact until
             # the normal multi-read proof resolves it. Maximum two targeted
             # reads per repair cycle to preserve the observer-only KIS budget.
-            if conflict_due:
-                anchors.extend(_conflict_repair_anchors(code, unresolved, observed_at))
+            conflict_anchors = _conflict_repair_anchors(code, unresolved, observed_at) if conflict_due else []
+            anchors.extend(conflict_anchors)
             anchors = list(dict.fromkeys(anchors))
             if repair_due or conflict_due:
                 logger.info(
@@ -396,11 +415,23 @@ def run_once(*, kis, codes: list[str], observed_at: datetime,
                     code, opening_coverage.get("opening_count"), anchors,
                 )
             data: list[dict] = []
-            for anchor in dict.fromkeys(anchors):
+            for index, anchor in enumerate(anchors):
                 try:
                     request_at = (refresh_clock().astimezone(KST) if refresh_clock else observed_at)
-                    if request_at.date() != session_date:
+                    if request_at.date() != session_date or request_at.time() > dtime(15, 5):
                         break
+                    if index and data and anchor not in conflict_anchors:
+                        # Most KIS latest-window responses contain multiple
+                        # completed minutes. Reassess before issuing an old
+                        # repair request; don't query a hole that is now filled.
+                        current = _current_batch_coverage(stored, data, request_at)
+                        if (current.get("state") == "COVERED"
+                                or current.get("native_post_open_window_ready")):
+                            logger.info(
+                                "[KR][OPENING_OBSERVER][REPAIR_SUPERSEDED] code=%s anchor=%s action=SKIP_REDUNDANT_NATIVE_READ",
+                                code, anchor,
+                            )
+                            continue
                     minute_requests += 1
                     try:
                         rows = kis.get_intraday_candles_today(
@@ -487,6 +518,7 @@ def run_once(*, kis, codes: list[str], observed_at: datetime,
             # request the 09:15 repair anchor if that first replay still left
             # unobserved original minutes. A full proof needs no extra read.
             if (coverage["reason"] == "OPENING_BARS_MISSING_OR_INCOMPLETE"
+                    and not coverage.get("native_post_open_window_ready")
                     and repair_due):
                 try:
                     repair_at = (refresh_clock().astimezone(KST) if refresh_clock else observed_at)
