@@ -468,6 +468,19 @@ def test_kr401_terminal_cancel_releases_real_claim_without_new_fill(monkeypatch,
     if simultaneous:
         rk.reconcile_today(engine=engine, kis=kis, ctx=ctx, trade_date=day)
         assert load_frozen_stage_states(**args)["TP1"]["status"] == "PARTIAL_FILLED"
+    # A failure between stage journal and semantic claim must roll back
+    # the terminal state and leave the same cancellation replayable.
+    before_failure = load_frozen_stage_states(**args)["TP1"]
+    def fail_claim(*a, **k):
+        raise RuntimeError("INJECTED_TERMINAL_CLAIM_FAILURE")
+    with monkeypatch.context() as failure:
+        failure.setattr(OrdersRepo, "record_execution_claim_for_order", fail_claim)
+        result = rk.reconcile_today(engine=engine, kis=kis, ctx=ctx, trade_date=day)
+        assert not result["ok"]
+    assert load_frozen_stage_states(**args)["TP1"] == before_failure
+    with engine.connect() as conn:
+        assert conn.execute(sa.select(schema.orders.c.status).where(
+            schema.orders.c.order_id == order_id)).scalar_one() != "CANCELLED"
     for _ in range(2):
         rk.reconcile_today(engine=engine, kis=kis, ctx=ctx, trade_date=day)
     state = load_frozen_stage_states(**args)["TP1"]
