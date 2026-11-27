@@ -1511,6 +1511,8 @@ def run_trade_session(
         _protective_wakeup = None
         _protective_slot_deadline = None
         _remaining_protective_watch = []
+        _hot_idle_wait=None
+        _hot_not_before=0.0
         _protective_tick_count = 0
         warn_count = 0
         consecutive_errors = 0
@@ -2196,6 +2198,7 @@ def run_trade_session(
                     _normal_tick_count += 1
                     _protective_slot_deadline = None
                     _remaining_protective_watch = []
+                    _hot_idle_wait=None
                 else:
                     _protective_tick_count += 1
                 tick_count += 1
@@ -2350,9 +2353,14 @@ def run_trade_session(
                         tick_result.setdefault("child_pid", process_result.child_pid)
                         tick_result.setdefault("total_tick_sec", process_result.duration_sec)
                     _idle_watch = tick_result.pop("_protective_idle_watch", [])
+                    _returned_hot_wait=tick_result.pop("_hot_idle_wait",None)
                     if _wakeup_for_tick is None:
                         _remaining_protective_watch = _idle_watch
+                        _hot_idle_wait=_returned_hot_wait
                     else:
+                        # A protective event takes precedence over old BUY advice.
+                        _hot_idle_wait=None
+                    if _wakeup_for_tick is not None:
                         from trader.us.runner.protective_entry_interrupt import (
                             remaining_idle_watch, remaining_profit_idle_watch,
                         )
@@ -2707,10 +2715,32 @@ def run_trade_session(
                             and os.getenv("US_ENTRY_PROTECTIVE_INTERRUPT_ENABLED","1")=="1"):
                         from trader.us.runner.protective_entry_interrupt import make_idle_hard_stop_poll
                         _idle_poll=make_idle_hard_stop_poll(_remaining_protective_watch,trade_date=trade_date,env=env)
+                    _hot_poll=None
+                    if (sleep_sec>5 and _hot_idle_wait and not offline and max_ticks==0
+                            and not resolved_signal_only and kis_order_allowed and env=="practice"
+                            and _reconcile_mode=="WORKER" and not _unreaped_child_seen
+                            and session_execution_mode=="NORMAL" and not timeout_entry_block
+                            and bool(prep_guard_result.get("entry_can_proceed",False))
+                            and bool(prep_guard_result.get("exit_can_proceed",True))
+                            and os.getenv("US_DISABLE_TICK_PROCESS_ISOLATION")!="1"
+                            and os.getenv("WSL_RUN_MARKET","").upper()=="US"
+                            and os.getenv("US_HOT_EVENT_RETRY_ENABLED","1")=="1"):
+                        from trader.us.entry_timing.hot_event_evaluator import make_hot_slot_poll,combine_idle_polls
+                        _hot_poll=make_hot_slot_poll(_hot_idle_wait,env=env,
+                            scope=str(os.getenv("US_ENTRY_WINDOW_SCOPE") or "").strip(),
+                            trade_date=trade_date,not_before_monotonic=_hot_not_before)
+                        _idle_poll=combine_idle_polls(_idle_poll,_hot_poll)
                     if _idle_poll is not None:
                         if _protective_slot_deadline is None:
                             _protective_slot_deadline=time_mod.monotonic()+sleep_sec
                         _protective_wakeup=sleep_with_heartbeat(session,run_id,tick_count,int(sleep_sec),protective_poll=_idle_poll)
+                        if isinstance(_protective_wakeup,dict) and _protective_wakeup.get("kind")=="hot_slot":
+                            # Consume the already scheduled normal slot, not an extra
+                            # BUY tick. No chain advance before its original boundary.
+                            _hot_not_before=_protective_slot_deadline
+                            logger.info("[US_HOT_EVENT][NORMAL_SLOT_ADVANCED] pairs=%s action=CANONICAL_TICK",_protective_wakeup.get("pairs"))
+                            _protective_wakeup=None
+                            _hot_idle_wait=None
                         if _protective_wakeup is None:
                             _protective_slot_deadline=None
                     else:
