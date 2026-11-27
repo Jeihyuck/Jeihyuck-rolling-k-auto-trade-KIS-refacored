@@ -109,6 +109,11 @@ def run_entry_eval_with_timeout(fn, *, timeout_sec: float, cancel_event: Any,
                 snapshot = protective_poll()
                 if snapshot is not None:
                     raise ProtectiveEntryInterrupted(snapshot)
+                # The protective IPC/DB poll consumes the same stage wall
+                # budget. Never return preflight BUY results after expiry,
+                # even when the entry worker completed before the poll.
+                if time.monotonic() >= deadline:
+                    raise concurrent.futures.TimeoutError()
                 if done:
                     result = future.result()
                     break
