@@ -293,3 +293,27 @@ def test_profit_wakeup_reports_all_outcomes_without_buy(case):
     result=profit_wakeup_result(orders,intents,trade_date="2026-11-25",session="am",position_count=2,decisions=[])
     assert (result["status"] in {"OK_NO_TRADE","OK_EXIT_ORDERS_SENT"})==(case in {"empty","two_ack"})
     assert result["buy_orders"]==result["entry_intents"]==0 and not result["entry_can_proceed"]
+
+
+def test_tp_advisory_survives_missing_peak(monkeypatch):
+    from trader.us.runner.protective_entry_interrupt import profit_watch_levels
+    from trader.us import entry_exit_contract,profit_capture
+    monkeypatch.setattr(entry_exit_contract,"contract_profit_capture",lambda p:dict(enabled=True,
+        partial_exit_allowed=True,stages=[dict(flag="tp1_done",threshold_fraction=.03)]))
+    monkeypatch.setattr(profit_capture,"authoritative_broker_avg",lambda p:(100,{}))
+    result=profit_watch_levels({"resolved_current_price":101},100)
+    assert result=={"reference":101.0,"up":[103.0],"down":[]}
+
+
+def test_profit_wakeup_keeps_verified_forward_contract_without_soft_confirmation(monkeypatch):
+    from trader.us.runner import protective_entry_interrupt as guard
+    monkeypatch.setattr(guard,"_confirmed_soft_snapshot",lambda *a,**kw:None)
+    row={"soft_stop_breach_count":1,"state":{"lifecycle":{"lifecycle_id":"l"},
+         "us_v2_v3_forward_handoff":{"signed":True},"soft_stop_execution":{"old":True}}}
+    monkeypatch.setattr(guard,"_verified_risk_row",lambda *a,**kw:row)
+    p={}
+    guard.preserve_confirmed_soft_state(p,"2026-11-25")
+    assert p["risk_state"]["state"]["us_v2_v3_forward_handoff"]=={"signed":True}
+    assert p["risk_state"]["state"]["lifecycle"]=={"lifecycle_id":"l"}
+    assert p["soft_stop_breach_count"]==0 and "soft_stop_execution" not in p["risk_state"]["state"]
+    assert row["soft_stop_breach_count"]==1 and row["state"]["soft_stop_execution"]=={"old":True}

@@ -52,15 +52,11 @@ def holding_identity(position):
     return identity
 
 
-def _confirmed_soft_snapshot(position, trade_date, *, fresh_resolver=False):
-    """Reuse already confirmed state, never manufacture another confirmation."""
-    import os
+def _verified_risk_row(position, trade_date, *, fresh_resolver=False):
+    """Exact same-day, open account/owner/epoch/portfolio/cycle evidence."""
     from hashlib import sha256
     from trader.us.db.repos import CommittedUSRiskState
     from trader.us.pb1.us_exit_position_resolver import _position_identity,_lifecycle_matches_identity
-    from trader.us.entry_exit_contract import contract_exit_config
-    if os.getenv("US_EARLY_SOFT_STOP_PILOT_ENABLED","0")!="1":
-        return None
     try:
         scope=holding_identity(position)
         if scope is None:
@@ -83,6 +79,23 @@ def _confirmed_soft_snapshot(position, trade_date, *, fresh_resolver=False):
                 or str(life.get("position_cycle_id") or "")!=scope["position_cycle_id"]
                 or not _lifecycle_matches_identity(row,life,identity)):
             return None
+        return row
+    except (ValueError,TypeError,KeyError,AttributeError,OverflowError):
+        return None
+
+
+def _confirmed_soft_snapshot(position, trade_date, *, fresh_resolver=False):
+    """Reuse already confirmed state, never manufacture another confirmation."""
+    import os
+    from trader.us.entry_exit_contract import contract_exit_config
+    if os.getenv("US_EARLY_SOFT_STOP_PILOT_ENABLED","0")!="1":
+        return None
+    try:
+        row=_verified_risk_row(position,trade_date,fresh_resolver=fresh_resolver)
+        if row is None:
+            return None
+        scope=holding_identity(position)
+        state=row.get("state") or {}
         if position.get("_verified_pb1_stop_revision") and state.get("soft_stop_policy_revision")!="PB1_STOP_3_6_V1":
             return None
         cfg=contract_exit_config(position)
@@ -277,12 +290,16 @@ def profit_watch_levels(position, entry):
             except (ValueError,TypeError,KeyError,OverflowError):
                 pass
         scope=holding_identity(position)
-        high=float(position.get("high_watermark") or 0)
-        at=datetime.fromisoformat(str(position.get("high_watermark_at") or "").replace("Z","+00:00"))
-        high_ok=(scope and position.get("high_watermark_source")=="us_position_risk_state"
-                 and position.get("high_watermark_lifecycle_id")==scope["position_lifecycle_id"]
-                 and at.tzinfo is not None and at<=datetime.now(timezone.utc)
-                 and math.isfinite(high) and high>entry>0)
+        try:
+            high=float(position.get("high_watermark") or 0)
+            at=datetime.fromisoformat(str(position.get("high_watermark_at") or "").replace("Z","+00:00"))
+            high_ok=(scope and position.get("high_watermark_source")=="us_position_risk_state"
+                     and position.get("high_watermark_lifecycle_id")==scope["position_lifecycle_id"]
+                     and at.tzinfo is not None and at<=datetime.now(timezone.utc)
+                     and math.isfinite(high) and high>entry>0)
+        except (ValueError,TypeError,OverflowError):
+            # An unavailable peak must not suppress an independent TP hint.
+            high_ok=False
         if high_ok:
             contract=extract_us_entry_exit_contract(position,position.get("meta"))
             if contract.get("version")!=US_SWING_V3_CONTRACT_VERSION:
@@ -475,7 +492,15 @@ def preserve_confirmed_soft_state(position,trade_date):
     else:
         # No stale or inferred soft-stop proof. Other verified HWM/trend
         # fields retain their existing independent evidence.
-        position.update(risk_state={},soft_stop_breach_count=0,
+        row=deepcopy(_verified_risk_row(position,trade_date,fresh_resolver=True) or {})
+        if row:
+            # Preserve independent, verified lifecycle, trend and forward V3
+            # handoff evidence even when no soft stop has been confirmed.
+            row["soft_stop_breach_count"]=0
+            state=dict(row.get("state") or {})
+            state.pop("soft_stop_execution",None)
+            row["state"]=state
+        position.update(risk_state=row,soft_stop_breach_count=0,
                         soft_stop_triggered_today=False,soft_stop_partial_done=False,
                         first_soft_stop_at=None,first_soft_stop_price=None)
     return position

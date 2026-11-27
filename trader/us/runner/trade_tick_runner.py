@@ -2049,6 +2049,10 @@ def run_trade_tick(
     """
     tick_started_at = time.monotonic()
     _profit_wakeup=protective_wakeup_identity is not None and protective_wakeup_kind=="profit"
+    _profit_eval_incomplete=False
+    if protective_wakeup_identity is None and protective_wakeup_kind!="stop":
+        return {"status":"WARN_RECONCILE_PENDING","reason":"protective_wakeup_identity_missing",
+                "protective_wakeup":True,"orders":[],"entry_can_proceed":False}
     if protective_wakeup_identity is not None:
         from trader.us.runner.protective_entry_interrupt import holding_identity
         if (holding_identity(protective_wakeup_identity) != protective_wakeup_identity
@@ -3453,6 +3457,7 @@ def run_trade_tick(
                     **({"advance_soft_confirmation":False} if _profit_wakeup else {}),
                 )
             except Exception as _snapshot_exc:
+                _profit_eval_incomplete=True
                 logger.warning("[US_EXIT][SNAPSHOT][WARN] err=%s", _snapshot_exc)
                 if _early_pilot_enabled:
                     _early_pilot_stream_incomplete = True
@@ -3474,6 +3479,7 @@ def run_trade_tick(
                     )
                 )
             except Exception as _safety_eval_exc:
+                _profit_eval_incomplete=True
                 logger.warning("[US_EXIT][SAFETY][EVAL_WARN] err=%s", _safety_eval_exc)
                 safety_exit_intents = []
             safety_sell_symbols = {str(i.get("symbol") or "").upper() for i in safety_exit_intents or [] if str(i.get("side") or "").upper() == "SELL"}
@@ -3488,6 +3494,7 @@ def run_trade_tick(
                     watchlist_cache_source=watchlist_cache_source,
                 )
             except Exception as _trend_exc:
+                _profit_eval_incomplete=True
                 logger.warning("[US_POSITION][TREND_STATE][TICK_WARN] err=%s", _trend_exc)
             if trend_targets:
                 try:
@@ -3495,6 +3502,7 @@ def run_trade_tick(
                         trend_targets, include_trend_time=True, phase="trend",
                     )
                 except Exception as _trend_eval_exc:
+                    _profit_eval_incomplete=True
                     logger.warning("[US_EXIT][TREND_TIME][EVAL_WARN] err=%s", _trend_eval_exc)
                     trend_exit_intents = []
             else:
@@ -3509,6 +3517,7 @@ def run_trade_tick(
                     seen_sell_symbols.add(sym)
                 exit_intents.append(intent)
     except Exception as exc:
+        _profit_eval_incomplete=True
         if str(exc) == "exit_can_proceed_false":
             logger.error("[US_EXIT][EVAL][DISABLED] session=%s tick=%s positions_evaluated=0", session, tick_index)
         else:
@@ -3647,6 +3656,7 @@ def run_trade_tick(
         if profit_capture_intents:
             exit_intents.extend(profit_capture_intents)
     except Exception as _market_state_exc:
+        _profit_eval_incomplete=True
         logger.warning("[US_MARKET_STATE][WARN] type=%s", type(_market_state_exc).__name__)
         if not offline:
             # Do not promote a failed market-state evaluation to live NORMAL.
@@ -3721,8 +3731,10 @@ def run_trade_tick(
             if defense_trim_intents:
                 exit_intents.extend(defense_trim_intents)
         except Exception as _def_trim_exc:
+            _profit_eval_incomplete=True
             logger.warning("[US_DEFENSE][TRIM][WARN] error=%s", _def_trim_exc)
     except Exception as _cluster_guard_exc:
+        _profit_eval_incomplete=True
         logger.warning("[US_CLUSTER_GUARD][PORTFOLIO][WARN] error=%s", _cluster_guard_exc)
 
     # Restore previously CONFIRMED hard/persistent stop debt even after a
@@ -4015,6 +4027,7 @@ def run_trade_tick(
                     ),
                 }
         except Exception as _guard_exc:
+            _profit_eval_incomplete=True
             logger.error(
                 "[US_PORT_GUARD][TICK_SKIPPED] exception_type=%s "
                 "action=retain_completed_protective_sells",
@@ -4028,7 +4041,10 @@ def run_trade_tick(
             list(exit_intents)+list(locals().get("_guard_intents",[]) or []),
             trade_date=trade_date,session=session,position_count=position_count,
             decisions=list(exit_route_result.get("decisions",[])),
-            incomplete=(_early_pilot_stream_incomplete or not locals().get("is_default_pb1_engine",False)
+            incomplete=(_profit_eval_incomplete or _early_pilot_stream_incomplete
+                        or not locals().get("is_default_pb1_engine",False)
+                        or len(locals().get("exit_snapshots",[]))!=len(locals().get("_pb1_positions",[]))
+                        or market_state_overlay.get("intraday_market_overlay")=="INTRADAY_DATA_UNKNOWN"
                         or not tick_context.broker_submit_allowed()),
         )
 

@@ -628,6 +628,8 @@ def _enrich_single_position(
             pos.get("pnl_rate"),
         )
 
+    # Never accept a prior caller's private resolver marker as fresh DB proof.
+    enriched.pop("_protective_verified_risk_state",None)
     # Persisted lifecycle timing and high-watermark are independent authorities.
     # Restore timing even when a historical row lacks a high-watermark value.
     lifecycle: dict = {}
