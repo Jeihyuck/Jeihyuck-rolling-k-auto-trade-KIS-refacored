@@ -123,7 +123,12 @@ def wait_for_quote_wake(*, targets, state, seconds, session_end, now, monotonic,
                 return None
             try:
                 result = probe(target, now())
-                if result and state.accept(target, result["latest_bar_ts"]):
+                # Native proof evaluation can consume the remainder of the idle
+                # interval. Never accept or consume dedupe for a late wake.
+                if monotonic() >= deadline or now() >= session_end:
+                    return None
+                if (result and result.get("code") == target["code"]
+                        and state.accept(target, result["latest_bar_ts"])):
                     return result
             except Exception:
                 # Optional wake must never interrupt normal safe schedule.
