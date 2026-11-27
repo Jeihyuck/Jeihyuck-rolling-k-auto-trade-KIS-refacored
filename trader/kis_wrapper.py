@@ -1968,6 +1968,7 @@ class KisAPI:
                     # logs. The ordinary 5xx path previously never inspected
                     # the body, so it missed account quota evidence.
                     rate_limited_500 = False
+                    error_body = None
                     if status == 500:
                         try:
                             error_body = resp.json()
@@ -1986,6 +1987,29 @@ class KisAPI:
                         )
                         logger.warning("[KR_SHARED_HTTP][EGW002_HTTP_500] endpoint=%s attempt=%s",
                                        endpoint_name, i)
+                    # An authenticated domestic practice response with an
+                    # exact gateway reject code and no order output is the
+                    # same explicit rejection as the HTTP-200 EGW002 path.
+                    # Generic/malformed 500, contradictory success and any
+                    # possible broker order identity stay UNCERTAIN.
+                    if (status == 500 and self.env == "practice"
+                            and method.upper() == "POST"
+                            and path_lower.endswith("/trading/order-cash")
+                            and isinstance(error_body, dict)
+                            and error_body.get("rt_cd") == "1"
+                            and error_body.get("msg_cd") == "EGW00201"
+                            and rate_limited_500
+                            and error_body.get("output") in (None, {})
+                            and not any(error_body.get(k) for k in
+                                        ("odno", "ODNO", "broker_order_id", "output1", "output2"))
+                            and not any(error_body.get(k) for k in
+                                        ("_diag_stub", "_stub", "_kis_disabled"))):
+                        logger.warning(
+                            "[KR][ORDER][HTTP_500_EXPLICIT_QUOTA_REJECT] "
+                            "endpoint=%s rid=%s action=RETURN_NO_RESUBMIT",
+                            endpoint_name, native_request_id,
+                        )
+                        return resp
                     if status == 429:
                         gate.set_global_cooldown(
                             str(self.env or "practice"),
