@@ -395,3 +395,29 @@ def test_independent_collection_refresh_uses_canonical_native_evidence_without_w
         assert rank.apply(lanes,manifest["generation"],epoch+7)==lanes
     finally:
         db.close()
+
+
+def test_hot_idle_poll_advances_only_once_after_slot_boundary_and_protective_priority(monkeypatch):
+    from trader.us.entry_timing import hot_event_evaluator as hot,opportunity
+    from trader.us import market_calendar
+    now=datetime(2026,11,25,10,10,tzinfo=ZoneInfo("America/New_York"))
+    monkeypatch.setattr(market_calendar,"now_ny",lambda:now)
+    monkeypatch.setattr(opportunity,"effective_mode",lambda:"ENFORCE")
+    clock=[5.0]
+    reads=[]
+    def read(**kw):
+        reads.append(kw)
+        return {("AAA","NYSE")}
+    monkeypatch.setattr(hot,"read_hot_retry_hints",read)
+    waiting={"generation":"g","pairs":[["AAA","NYSE"]]}
+    poll=hot.make_hot_slot_poll(waiting,env="practice",scope="scope:epoch",
+        trade_date="2026-11-25",not_before_monotonic=10,epoch_clock=lambda:now.timestamp(),
+        monotonic=lambda:clock[0])
+    assert poll() is None and not reads
+    clock[0]=10
+    stop={"symbol":"DEF"}
+    assert hot.combine_idle_polls(lambda:stop,poll)()==stop and not reads
+    assert hot.combine_idle_polls(lambda:None,poll)()=={"kind":"hot_slot","pairs":[["AAA","NYSE"]]}
+    assert poll() is None and len(reads)==1
+    assert hot.make_hot_slot_poll({"generation":"g","pairs":[["TQQQ","NASDAQ"]]},
+        env="practice",scope="scope:epoch",trade_date="2026-11-25") is None

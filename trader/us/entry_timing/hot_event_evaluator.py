@@ -415,3 +415,60 @@ def iter_candidates_with_hot_retries(candidates, *, waiting, ready_reader):
         yield from ready_retries()
         yield rank,candidate
     yield from ready_retries()
+
+
+def make_hot_slot_poll(waiting, *, env, scope, trade_date, not_before_monotonic=0,
+                       base="runtime/private", epoch_clock=None, monotonic=None):
+    """A fresh prior-WAIT hint may advance ONE existing normal session slot.
+
+    No order or engine runs here. The caller owns the slot and protective
+    priority; a subsequent normal child must re-evaluate all canonical gates.
+    """
+    import time
+    from trader.us.entry_timing.opportunity import effective_mode
+    from trader.us.market_calendar import now_ny,is_us_regular_market_open
+    if (env!="practice" or not scope or not isinstance(waiting,dict)
+            or set(waiting)!={"generation","pairs"} or not isinstance(waiting["generation"],str)
+            or not waiting["generation"] or not isinstance(waiting["pairs"],list)
+            or not 1<=len(waiting["pairs"])<=4):
+        return None
+    pairs=set()
+    for item in waiting["pairs"]:
+        if (not isinstance(item,(tuple,list)) or len(item)!=2
+                or not isinstance(item[0],str) or not item[0] or item[0]=="TQQQ"
+                or item[1] not in ("NASDAQ","NYSE","AMEX")):
+            return None
+        pairs.add(tuple(item))
+    if len(pairs)!=len(waiting["pairs"]):
+        return None
+    generation=waiting["generation"]
+    clock=epoch_clock or time.time
+    mono=monotonic or time.monotonic
+    consumed=False
+    def poll():
+        nonlocal consumed
+        if consumed or mono()<not_before_monotonic or effective_mode()!="ENFORCE":
+            return None
+        now=now_ny()
+        if (now.date().isoformat()!=trade_date or (now.hour,now.minute)<(10,0)
+                or not is_us_regular_market_open(now)):
+            return None
+        hints=read_hot_retry_hints(env=env,scope=scope,trade_date=trade_date,
+            generation=generation,waiting=pairs,now_epoch=clock(),base=base)
+        if not hints:
+            return None
+        consumed=True
+        return {"kind":"hot_slot","pairs":[list(p) for p in sorted(hints)]}
+    return poll
+
+
+def combine_idle_polls(protective,hot):
+    """Always service protective SELL alerts first; no parallel writer."""
+    if protective is None:
+        return hot
+    if hot is None:
+        return protective
+    def poll():
+        result=protective()
+        return result if result is not None else hot()
+    return poll

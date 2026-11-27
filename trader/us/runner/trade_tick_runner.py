@@ -5949,9 +5949,19 @@ def run_trade_tick(
                                for o in orders)
         _protective_idle_watch=export_idle_watch(exit_snapshots,excluded_symbols=_watch_excluded,env=env,
             trade_date=trade_date,allow_confirmed_soft=True)
+    _hot_wait=None
+    if (_stage4_mode and env=="practice" and not offline and not force_now and not signal_only
+            and kis_order_allowed and session in {"am","afternoon"} and entry_can_proceed
+            and not entry_degraded and entry_eval_error_count==0 and not orders
+            and not entry_intents and not exit_intents
+            and status=="OK_NO_TRADE" and runtime_integrity_status=="OK"
+            and os.getenv("WSL_RUN_MARKET","").upper()=="US"
+            and os.getenv("US_HOT_EVENT_RETRY_ENABLED","1")=="1"):
+        _hot_wait=locals().get("entry_generation_diagnostics",{}).get("hot_wait")
     return {
         **latency_metrics,
         "_protective_idle_watch":_protective_idle_watch,
+        "_hot_idle_wait":_hot_wait,
         "status": status,
         "runtime_integrity_status": runtime_integrity_status,
         "completed_market_context": market_state_overlay.get("_completed_market_context") or None,
