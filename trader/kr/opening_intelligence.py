@@ -30,12 +30,13 @@ def _opening_features(bars: tuple[Bar, ...]) -> tuple:
     return peak, trough, support
 
 
-def analyze_opening(*, proof: dict, now: datetime) -> dict:
+def analyze_opening(*, proof: dict, now: datetime, prep_style: str | None = None) -> dict:
     """Caller supplies a checksum-validated native proof from load_opening_proof."""
     now = now.astimezone(KST)
     result = {"is_order_authorization": False, "state": "INSUFFICIENT_DATA",
               "provisional_entry_ceiling": None, "opening_count": 0,
-              "observed_at": now.isoformat(), "proof_sha": proof.get("sha256")}
+              "observed_at": now.isoformat(), "proof_sha": proof.get("sha256"),
+              "prep_style": prep_style, "strategy_is_provisional": True}
     if proof.get("source") != "KIS_FHKST03010200" or proof.get("trade_date") != now.date().isoformat():
         return {**result, "reason": "UNVERIFIED_SCOPE"}
     if proof.get("source_conflicts"):
@@ -63,6 +64,9 @@ def analyze_opening(*, proof: dict, now: datetime) -> dict:
                   latest_bar_age_sec=(now-bars[-1].stamp-timedelta(minutes=1)).total_seconds(),
                   observed_close=bars[-1].close,
                   vwap=proof.get("vwap") if proof.get("vwap_source") == "KIS_NATIVE_WEIGHTED_AVG" else None)
+    style = str(prep_style or "").upper().removeprefix("ENTRY_")
+    if not any(style == f or style.startswith(f + "_") for f in ("PULLBACK", "MOMENTUM")):
+        return {**result, "state": "OBSERVING", "reason": "OWNER_SPECIFIC_GEOMETRY_REQUIRED"}
     # Require an actual later minute, not the unknowable high/low sequence in one bar.
     if opening_support is None:
         return {**result, "state": "OBSERVING", "reason": "NO_LATER_OPENING_SUPPORT"}

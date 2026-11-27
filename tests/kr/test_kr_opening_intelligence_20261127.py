@@ -15,17 +15,18 @@ def test_opening_geometry_is_observation_and_conflicts_invalidate():
                      "open":cl,"high":hi,"low":lo,"close":cl,"volume":100})
     proof = {"source":"KIS_FHKST03010200","trade_date":"2026-11-27",
              "as_of":now.isoformat(),"bars":rows,"sha256":"fixture"}
-    result = analyze_opening(proof=proof,now=now)
+    result = analyze_opening(proof=proof,now=now,prep_style="MOMENTUM")
     assert result["state"] == "PROVISIONAL_RANGE"
     assert result["opening_high"] == 10000 and result["opening_low"] == 9700
     assert result["opening_count"] == 5 and not result["opening_range_complete"]
     assert result["provisional_entry_ceiling"] > result["structural_support"]
     assert result["is_order_authorization"] is False
+    assert analyze_opening(proof=proof,now=now,prep_style="BREAKOUT")["provisional_entry_ceiling"] is None
     assert analyze_opening(proof={**proof,"source_conflicts":["x"]},now=now)["state"] == "INVALIDATED"
     assert analyze_opening(proof=proof,now=now+timedelta(minutes=4))["state"] == "EXPIRED"
     # A future or incomplete native bar must not enlarge the opening target.
     proof["bars"].append({**rows[-1],"time":"090500","high":50000})
-    assert analyze_opening(proof=proof,now=now)["opening_high"] == 10000
+    assert analyze_opening(proof=proof,now=now,prep_style="MOMENTUM")["opening_high"] == 10000
 
 
 def test_dynamic_promotion_only_observation_and_bounded():

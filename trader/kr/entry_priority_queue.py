@@ -280,7 +280,8 @@ def collection_priorities(*, date: str, account_scope: str,
             raise ValueError("STALE_OR_UNTRUSTED_MANIFEST")
         return {"state": "PB1_ACTIVE", "hot": list(raw["hot"]),
                 "warm": list(raw["warm"]), "cold": list(raw["cold"]),
-                "code_sha": observed_sha}
+                "code_sha": observed_sha, "final30_digest": prep["final30_digest"],
+                "observation_styles": _observation_styles(prep["rows"])}
     except (FileNotFoundError, ValueError, TypeError, KeyError, OSError, AttributeError) as exc:
         # Not an authorization failure: preserve Final30, but the observer
         # must disclose why HOT/WARM is empty rather than idle silently.
@@ -304,6 +305,11 @@ def _collection_scope_ok(scope: str) -> bool:
 
 def prep_collection_path(date: str, account_scope: str) -> Path:
     return manifest_path(date, account_scope).with_suffix(".collection.json")
+
+
+def _observation_styles(rows: list[dict]) -> dict[str, str]:
+    return {_code(row.get("code")): str(row.get("entry_style_selected") or "")
+            for row in rows if isinstance(row, dict) and _code(row.get("code"))}
 
 
 def _prep_collection_rank(rows: list[dict]) -> list[str]:
@@ -403,6 +409,7 @@ def load_prep_collection(*, date: str, account_scope: str,
             return None
         return {"state": "PREP_COLLECTION_ACTIVE", "hot": hot, "warm": warm, "cold": cold,
                 "code_sha": sha, "final30_digest": prep["final30_digest"],
+                "observation_styles": _observation_styles(prep["rows"]),
                 "is_order_authorization": False}
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
         return None

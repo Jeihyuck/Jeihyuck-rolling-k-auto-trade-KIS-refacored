@@ -340,7 +340,8 @@ def _current_batch_coverage(stored, fetched, observed_at):
 
 
 def run_once(*, kis, codes: list[str], observed_at: datetime,
-             sleep_between: float = 0.8, refresh_clock=None) -> dict:
+             sleep_between: float = 0.8, refresh_clock=None,
+             observation_styles: dict[str, str] | None = None) -> dict:
     """No order methods are called; all I/O is read-only KIS and local proofs."""
     observed_at = observed_at.astimezone(KST)
     if not dtime(9, 0) <= observed_at.time() <= dtime(15, 5):
@@ -605,9 +606,18 @@ def run_once(*, kis, codes: list[str], observed_at: datetime,
                 )
             if not verified_vwap:
                 missing_vwap += 1
-            intelligence = analyze_opening(proof=persisted, now=proof_now)
-            logger.info("[KR][OPENING_OBSERVER][INTELLIGENCE] code=%s facts=%s",
-                        code, json.dumps(intelligence, ensure_ascii=False, sort_keys=True))
+            intelligence = {}
+            if os.getenv("KR_OPENING_INTELLIGENCE_ENABLED", "1") == "1":
+                intelligence_started = time.monotonic()
+                try:
+                    intelligence = analyze_opening(
+                        proof=persisted, now=proof_now,
+                        prep_style=(observation_styles or {}).get(code))
+                    logger.info("[KR][OPENING_OBSERVER][INTELLIGENCE] code=%s elapsed_ms=%.3f facts=%s",
+                                code, (time.monotonic()-intelligence_started)*1000,
+                                json.dumps(intelligence, ensure_ascii=False, sort_keys=True))
+                except Exception:
+                    logger.exception("[KR][OPENING_OBSERVER][INTELLIGENCE_FAIL] code=%s action=KEEP_EXISTING_PROOF", code)
             symbol_outcomes[code] = {
                 "opening_intelligence": intelligence,
                 "state": coverage["state"],
@@ -749,7 +759,8 @@ def main() -> None:
             # receive low-cost PB1 pre-minute evaluation; it does NOT consume
             # native 1-minute REST calls. Only verified observation or execution
             # HOT/WARM candidates receive native collection.
-            priority = promotion.apply(priority, now)
+            if os.getenv("KR_DYNAMIC_COLLECTION_PRIORITY_ENABLED", "1") == "1":
+                priority = promotion.apply(priority, now)
             native_priority = {**priority, "cold": []}
             health = schedule.diagnostics(
                 native_priority, now, interval_sec=planner_wake_sec,
@@ -808,9 +819,10 @@ def main() -> None:
                 len(priority["cold"]), selected, len(codes),
             )
             result = run_once(kis=kis, codes=selected, observed_at=now,
-                              refresh_clock=now_kst)
+                              refresh_clock=now_kst,
+                              observation_styles=priority.get("observation_styles"))
             for code, outcome in result.get("symbol_outcomes", {}).items():
-                promotion.observe(code, outcome.get("opening_intelligence"))
+                promotion.observe(code, outcome.get("opening_intelligence") or {})
                 tier = next(
                     (name for name in ("hot", "warm", "cold")
                      if code in priority[name]), "unknown",

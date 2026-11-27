@@ -8026,6 +8026,14 @@ def run_once(
             if kr_inf_invoked:
                 return
             kr_inf_invoked = True
+            _engine_start = getattr(engine_runner, "_kr_engine_started_mono", None)
+            if isinstance(_engine_start, (int, float)):
+                _handoff_at = time_mod.monotonic()
+                engine_runner._kr_sell_handoff_mono = _handoff_at
+                logger.info("[KR_LATENCY][SELL_HANDOFF] run_id=%s engine_to_handoff_ms=%.3f exit_pass_ok=%s",
+                            getattr(engine_runner, "run_id", "UNKNOWN"),
+                            (_handoff_at-_engine_start)*1000,
+                            int(bool(getattr(engine_runner, "_kr_exit_pass_ok", False))))
             # PB1 protected SELLs have been offered. For either an exact
             # pretrade proof OR a proven narrow SELL-only preflight, the
             # post-exit KIS proof is obtained BEFORE any KR_INFINITE/PB1 BUY.
@@ -8289,6 +8297,7 @@ def run_once(
             result = engine_runner.run_close_cancel()
         else:
             engine_started = True
+            engine_runner._kr_engine_started_mono = time_mod.monotonic()
             try:
                 result = engine_runner.run()
                 engine_completed = True
@@ -8313,6 +8322,14 @@ def run_once(
                         "warning_counts": {"entry_failed_after_exit": 1},
                     }, phase_for_log, "PARTIAL_OK_EXIT_DONE_ENTRY_FAILED"
                 raise
+            finally:
+                _engine_end = time_mod.monotonic()
+                _sell_handoff = getattr(engine_runner, "_kr_sell_handoff_mono", None)
+                logger.info("[KR_LATENCY][ENGINE_BOUNDARIES] run_id=%s engine_ms=%.3f after_sell_handoff_ms=%s completed=%s",
+                            getattr(engine_runner, "run_id", "UNKNOWN"),
+                            (_engine_end-engine_runner._kr_engine_started_mono)*1000,
+                            round((_engine_end-_sell_handoff)*1000, 3) if isinstance(_sell_handoff, (int, float)) else "UNOBSERVED",
+                            int(engine_completed))
             if entry_scan_compat_failed:
                 logger.info("[ENTRY_SCAN][FALLBACK] source=pb1_engine_internal_scan status=ok")
 
