@@ -56,7 +56,7 @@ def clear_feature_cache():
         _hits = _misses = 0
 
 
-def shared_native_features(*, market, scope, trade_date, settings, rows, compute, base, advance=None):
+def shared_native_features(*, market, scope, trade_date, settings, rows, compute, base, advance=None, slide=None):
     """Bounded same-host, cross-process reuse of pure JSON feature outputs.
 
     One row per exact scoped formula; corrections/removals change the operand
@@ -105,6 +105,9 @@ def shared_native_features(*, market, scope, trade_date, settings, rows, compute
     except (OSError, ValueError, TypeError, AttributeError):
         return compute(rows)
     prior = None
+    prior_window = None
+    if advance is not None and slide is not None:
+        return compute(rows)
     try:
         with closing(sqlite3.connect(path, timeout=.025)) as db:
             db.execute("PRAGMA busy_timeout=25")
@@ -116,7 +119,23 @@ def shared_native_features(*, market, scope, trade_date, settings, rows, compute
             if row and len(row[0]) <= 65536 and sha256(row[0].encode()).hexdigest() == row[1]:
                 try:
                     decoded = json.loads(row[0])
-                    if advance is None:
+                    if slide is not None:
+                        if isinstance(decoded,dict) and decoded.get("window_schema")==1:
+                            previous=decoded.get("rows")
+                            if (isinstance(previous,list) and isinstance(rows,list)
+                                    and 0<len(previous)<=15 and len(rows)==len(previous)
+                                    and "value" in decoded
+                                    and sha256(encode(previous).encode()).hexdigest()==row[2]):
+                                if row[2]==digest:
+                                    return decoded["value"]
+                                # Exact suffix/prefix equality, including all
+                                # provenance and numerical operands. Corrections
+                                # inside the overlap never reuse old state.
+                                for shift in range(1,len(rows)):
+                                    if encode(previous[shift:])==encode(rows[:-shift]):
+                                        prior_window=(decoded["value"],previous,shift)
+                                        break
+                    elif advance is None:
                         if row[2] == digest:
                             log.debug("[NATIVE_FEATURES][SHARED_HIT] market=%s lookup_ms=%.3f",
                                       market,(time.monotonic()-started)*1000)
@@ -145,11 +164,24 @@ def shared_native_features(*, market, scope, trade_date, settings, rows, compute
         if value is not None:
             log.debug("[NATIVE_FEATURES][APPEND_REUSE] market=%s prior_rows=%d appended_rows=%d lookup_ms=%.3f",
                       market, prior[1], len(rows)-prior[1], (time.monotonic()-started)*1000)
+    if prior_window is not None:
+        try:
+            value=slide(prior_window[0],prior_window[1],rows,prior_window[2])
+        except (ValueError,TypeError,KeyError,IndexError,ArithmeticError):
+            value=None
+        if value is not None:
+            log.debug("[NATIVE_FEATURES][WINDOW_REUSE] market=%s shifted_rows=%d lookup_ms=%.3f",
+                      market,prior_window[2],(time.monotonic()-started)*1000)
     if value is None:
         value = compute(rows)
     try:
-        payload = encode(value if advance is None else
-                         {"append_schema":1,"rows_count":len(rows),"value":value})
+        if slide is not None:
+            if not isinstance(rows,list) or not 0<len(rows)<=15:
+                return value
+            payload=encode({"window_schema":1,"rows":rows,"value":value})
+        else:
+            payload = encode(value if advance is None else
+                             {"append_schema":1,"rows_count":len(rows),"value":value})
         if len(payload) > 65536:
             return value
         with closing(sqlite3.connect(path, timeout=.025)) as db:

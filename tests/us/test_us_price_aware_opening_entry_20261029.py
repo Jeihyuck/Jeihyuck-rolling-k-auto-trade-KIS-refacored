@@ -600,3 +600,38 @@ def test_incremental_opening_geometry_vwap_parity_and_invalidation(tmp_path,monk
         assert calls==([20] if change in {"append","missing_amount"} else [20,len(rows)])
     finally:
         clear_feature_cache()
+
+
+@pytest.mark.parametrize("change",["slide","min_removed","multi_slide","correction","gap","scope","truncation"])
+def test_rolling_native_feature_slide_exact_parity(tmp_path,monkeypatch,change):
+    from trader.us.entry_timing import opportunity
+    from trader.marketdata.feature_reuse import clear_feature_cache
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("WSL_RUN_MARKET","US")
+    monkeypatch.setenv("KIS_ENV","practice")
+    monkeypatch.setenv("US_SHARED_NATIVE_FEATURES_ENABLED","1")
+    scope=("acct:epoch","ABC","NASDAQ","US_STANDARD")
+    rows=copy.deepcopy(sample_bars()[:20])
+    assert len(rows)==20
+    if change=="min_removed":
+        rows[0]["low"]=1.0
+    original=opportunity._recent_static_features
+    calls=[]
+    def counted(bars):
+        calls.append(len(bars))
+        return original(bars)
+    monkeypatch.setattr(opportunity,"_recent_static_features",counted)
+    clear_feature_cache()
+    try:
+        assert opportunity.recent_static_features(rows[:15],DAY,feature_scope=scope)==original(rows[:15])
+        clear_feature_cache()
+        end=18 if change=="multi_slide" else 16
+        newer=copy.deepcopy(rows[:end])
+        if change=="correction": newer[8]["volume"]+=1
+        if change=="gap": newer.pop(8)
+        if change=="scope": scope=("other:epoch",*scope[1:])
+        if change=="truncation": newer=newer[-10:]
+        assert opportunity.recent_static_features(newer,DAY,feature_scope=scope)==original(newer[-15:])
+        assert calls==([15] if change in {"slide","min_removed","multi_slide"} else [15,min(len(newer),15)])
+    finally:
+        clear_feature_cache()
