@@ -13435,7 +13435,11 @@ class PB1Engine:
 
         max_price = self._to_float(pos.get("max_price")) or 0.0
         new_max = max(max_price, float(mark or 0.0))
-        update_fields: dict[str, Any] = {"max_price": new_max}
+        from trader.kr.exit_feature_reuse import high_water_update_fields
+        update_fields = high_water_update_fields(
+            persisted_max=pos.get("max_price"), computed_max=new_max,
+            enabled=(self.env == "practice" and os.getenv("KR_EXIT_HWM_NOOP_WRITE_ELISION", "1") == "1"),
+        )
         if stop_price is not None and pos.get("stop_price") is None:
             update_fields["stop_price"] = stop_price
         if update_fields:
@@ -15627,7 +15631,16 @@ class PB1Engine:
             features: dict[str, Any] = {}
             if not df.empty:
                 try:
-                    features = compute_features(df)
+                    if self.env == "practice" and os.getenv("KR_EXIT_FEATURE_REUSE_ENABLED", "1") == "1":
+                        from trader.kr.exit_feature_reuse import cached_exit_features
+                        features, reused = cached_exit_features(
+                            df=df, code=str(pos["code"]), trade_date=str(self._today),
+                            compute=compute_features,
+                        )
+                        logger.info("[KR_LATENCY][EXIT_FEATURES] code=%s reused=%s rows=%s",
+                                    display_code, int(reused), len(df))
+                    else:
+                        features = compute_features(df)
                 except ValueError:
                     features = {}
             features["_exit_ohlcv_source"] = str((meta or {}).get("source") or "none")
