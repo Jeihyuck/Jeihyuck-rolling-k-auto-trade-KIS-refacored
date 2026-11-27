@@ -460,8 +460,11 @@ def _tp_decision_fresh_for_native_http(
         check_at = now_utc or _dt.now(_tz.utc)
         if decision_at.tzinfo is None or check_at.tzinfo is None:
             return False, "US_TP_DECISION_TIME_UNVERIFIED"
+        limit = float(max_age_sec)
+        if not 5.0 <= limit <= 90.0:
+            return False, "US_TP_DECISION_AGE_CONFIG_INVALID"
         age = (check_at - decision_at).total_seconds()
-        if not (0 <= age <= max(1.0, float(max_age_sec))):
+        if not (0 <= age <= limit):
             return False, "US_TP_DECISION_EXPIRED_BEFORE_HTTP"
     except (ValueError, TypeError, OverflowError):
         return False, "US_TP_DECISION_TIME_UNVERIFIED"
@@ -3297,7 +3300,7 @@ def route_order(
                 _tp_max_age = float(os.getenv(
                     "US_TP_PRE_HTTP_MAX_DECISION_AGE_SEC", "90"
                 ))
-                if not (5.0 <= _tp_max_age <= 120.0):
+                if not (5.0 <= _tp_max_age <= 90.0):
                     raise ValueError("max age outside safe bound")
             except (TypeError, ValueError, OverflowError):
                 raise KisUSPreSubmitError("US_TP_DECISION_AGE_CONFIG_INVALID") from None
