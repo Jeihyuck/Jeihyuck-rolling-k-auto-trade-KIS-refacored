@@ -419,3 +419,16 @@ def test_hot_deadline_scheduling_never_picks_demoted_symbol():
     selected, tier = next_priority_pair(lanes, slot=0, offsets={},
         promoted_hot={pairs[5]}, last_hot_attempt={pairs[5]:0.0}, now_mono=100)
     assert selected in lanes["HOT"] and tier == "HOT"
+
+
+def test_hot_repair_cooldown_requires_actual_coverage_not_http_success():
+    from trader.us.entry_timing.opening_observer import repair_retry_delay
+    for result, expected in [
+        ({"requests":0,"missing_targets":None,"conflict_targets":None},None),
+        ({"requests":1,"missing_targets":None,"conflict_targets":None},None),
+        ({"requests":1,"missing_targets":4,"conflict_targets":0},0.0),
+        ({"requests":4,"missing_targets":1,"conflict_targets":2},0.0),
+        ({"requests":2,"missing_targets":0,"conflict_targets":2},60.0),
+        ({"requests":1,"missing_targets":0,"conflict_targets":0},120.0),
+    ]:
+        assert repair_retry_delay(result)==expected

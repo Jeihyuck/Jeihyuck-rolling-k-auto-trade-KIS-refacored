@@ -784,15 +784,31 @@ def next_priority_pair(
     return lane[pos % len(lane)], tier
 
 
+def _minute_repair_targets(db, *, trade_date, symbol, requested_at):
+    """Separate missing completed bars from quarantined native conflicts."""
+    from datetime import timedelta
+    present = {b["time_et"] for b in load_bars(db, trade_date=trade_date, symbol=symbol)}
+    conflicts = {row[0] for row in db.execute(
+        "SELECT DISTINCT minute_et FROM bar_conflicts WHERE trade_date=? AND symbol=? "
+        "AND owner='US_STANDARD' AND status='UNRESOLVED'", (trade_date, symbol.upper()))}
+    opening = requested_at.replace(hour=9, minute=30, second=0, microsecond=0)
+    elapsed = min(30, max(0, int((requested_at-opening).total_seconds() // 60)))
+    expected = {(opening + timedelta(minutes=i)).isoformat() for i in range(elapsed)}
+    latest_boundary = requested_at.replace(second=0, microsecond=0)
+    expected.update(at.isoformat() for i in range(1,5)
+                    if (at := latest_boundary - timedelta(minutes=i)) >= opening)
+    return expected - present - conflicts, conflicts
+
+
 def collect_hot_minutes(client, db, *, symbol, exchange, trade_date,
                         repair_due: bool, still_hot, max_pages: int = 4) -> dict:
     """Latest first, then bounded native historical pages only for a HOT symbol."""
-    from datetime import timedelta
     if not still_hot():
-        return {"requests": 0, "changed": 0}
+        return {"requests": 0, "changed": 0, "missing_targets": None, "conflict_targets": None}
     cursor = ""
     seen = set()
     requests = changed = 0
+    missing = conflicts = None
     started = time.monotonic()
     while requests < max(1, min(4, int(max_pages))) and still_hot():
         page = client.get_us_intraday_1m_page(symbol, exchange, before_key=cursor)
@@ -804,22 +820,12 @@ def collect_hot_minutes(client, db, *, symbol, exchange, trade_date,
                                 owner="US_STANDARD", native_rows=page["rows"],
                                 now_et=requested_at, observation_id=page["observation_id"],
                                 observed_epoch=page["observed_epoch"])
+        if repair_due:
+            missing, conflicts = _minute_repair_targets(
+                db, trade_date=trade_date, symbol=symbol, requested_at=requested_at)
         if not repair_due or time.monotonic() - started > 8.0:
             break
-        stored = load_bars(db, trade_date=trade_date, symbol=symbol)
-        present = {b["time_et"] for b in stored}
-        targets = [row[0] for row in db.execute(
-            "SELECT DISTINCT minute_et FROM bar_conflicts WHERE trade_date=? AND symbol=? "
-            "AND owner='US_STANDARD' AND status='UNRESOLVED'", (trade_date, symbol.upper()))]
-        opening = requested_at.replace(hour=9, minute=30, second=0, microsecond=0)
-        elapsed = min(30, max(0, int((requested_at-opening).total_seconds() // 60)))
-        targets.extend((opening + timedelta(minutes=i)).isoformat() for i in range(elapsed)
-                       if (opening + timedelta(minutes=i)).isoformat() not in present)
-        latest_boundary = requested_at.replace(second=0, microsecond=0)
-        for i in range(1, 5):
-            at = latest_boundary - timedelta(minutes=i)
-            if at >= opening and at.isoformat() not in present:
-                targets.append(at.isoformat())
+        targets = missing | conflicts
         next_key = str(page.get("next_key") or "")
         # KEYB is derived from the actual preceding response, never a
         # fabricated anchor. Only continue if unresolved evidence is older.
@@ -832,7 +838,26 @@ def collect_hot_minutes(client, db, *, symbol, exchange, trade_date,
         cursor = next_key
         LOG.info("[US_OPENING_OBSERVER][HISTORICAL_REPAIR] symbol=%s cursor=%s targets=%d",
                  symbol, cursor, len(targets))
-    return {"requests": requests, "changed": changed}
+    return {"requests": requests, "changed": changed,
+            "missing_targets": len(missing) if missing is not None else None,
+            "conflict_targets": len(conflicts) if conflicts is not None else None}
+
+
+def repair_retry_delay(result):
+    """A successful GET is not proof of repaired coverage.
+
+    Retry missing bars on the next ordinary eligible HOT slot, but never
+    accelerate conflict observation beyond its existing 60s spacing.
+    """
+    missing = result.get("missing_targets")
+    conflicts = result.get("conflict_targets")
+    if result.get("requests",0) <= 0 or missing is None or conflicts is None:
+        return None
+    if missing:
+        return 0.0
+    if conflicts:
+        return 60.0
+    return 120.0
 
 
 def start_prep_observer(*, env: str, scope: str, trade_date: str, rows: list[dict],
@@ -1096,9 +1121,12 @@ def run_observer(*, env: str, trade_date: str, scope: str,
                              symbol, "UNKNOWN" if previous_attempt is None else round(attempted_at-previous_attempt, 3))
                 result = collect_hot_minutes(client, db, symbol=symbol, exchange=exchange,
                     trade_date=trade_date, repair_due=repair_due, still_hot=_still_hot, max_pages=4 if tier == "HOT" else 1)
-                if result["requests"] > 0 and repair_due:
-                    next_repair_by_symbol[symbol] = time.monotonic() + 120.0
+                delay = repair_retry_delay(result) if repair_due else None
+                if delay is not None:
+                    next_repair_by_symbol[symbol] = time.monotonic() + delay
                     promoted_hot.discard((symbol, exchange))
+                    LOG.info("[US_OPENING_OBSERVER][REPAIR_OUTCOME] symbol=%s missing=%s conflicts=%s retry_after_sec=%s",
+                             symbol,result["missing_targets"],result["conflict_targets"],delay)
                 elif promoted:
                     LOG.info("[US_OPENING_OBSERVER][PROMOTION_REPAIR_DEFERRED] symbol=%s", symbol)
                 LOG.info("[US_OPENING_OBSERVER][BAR_UPDATE] symbol=%s new_rows=%d requests=%d "
