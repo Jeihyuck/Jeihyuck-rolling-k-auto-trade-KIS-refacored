@@ -115,3 +115,15 @@ def test_idle_sleep_wakeup_does_not_wait_full_slot(monkeypatch):
 def test_protective_wakeup_rejects_unverified_identity_before_broker(monkeypatch):
     from trader.us.runner.trade_tick_runner import run_trade_tick
     assert run_trade_tick(protective_wakeup_identity={"symbol":"ABC"})["reason"]=="protective_wakeup_not_authorized"
+
+
+def test_idle_route_exception_is_uncertain_and_never_retried():
+    from trader.us.runner.protective_entry_interrupt import route_idle_hard_stop_once
+    calls=[]
+    intent={"symbol":"ABC","side":"SELL"}
+    def route(items):
+        calls.append(items)
+        raise RuntimeError("unknown outcome after route")
+    result=route_idle_hard_stop_once([intent],route=route)
+    assert calls==[[intent]]
+    assert result["orders"]==[{"status":"BROKER_SUBMIT_RESULT_UNKNOWN","requires_reconcile":True,"intent":intent}]

@@ -1501,6 +1501,7 @@ def run_trade_session(
         tick_count = 0
         _normal_tick_count = 0
         _protective_wakeup = None
+        _protective_slot_deadline = None
         warn_count = 0
         consecutive_errors = 0
         consecutive_tick_timeouts = 0
@@ -2069,7 +2070,8 @@ def run_trade_session(
                 _prep_entry_blocked = not bool(prep_guard_result.get("entry_can_proceed", False))
                 if (session in {"am", "afternoon"}
                         and (_prep_cache_incomplete or _prep_entry_blocked)
-                        and tick_count % 2 == 0):
+                        and _protective_wakeup is None
+                        and _normal_tick_count % 2 == 0):
                     try:
                         from trader.us.db.repos import (
                             load_latest_us_prep_status,
@@ -2210,6 +2212,7 @@ def run_trade_session(
                     "run_id": str(session_run_id), "tick_id": str(tick_id),
                     "code_sha": _verified_code_sha or "",
                     "account_digest": session_account_scope.get("account_digest"),
+                    "tick_kind": "protective_wakeup" if _wakeup_for_tick is not None else "normal",
                     "native_practice": bool(env == "practice" and not offline
                         and not force_now and not resolved_signal_only and kis_order_allowed),
                 }
@@ -2338,7 +2341,8 @@ def run_trade_session(
                             completed_market_context_age_ticks = 0
                     elif completed_market_context is None:
                         completed_market_context_age_ticks = 0
-                    completed_market_context_age_ticks += 1
+                    if _wakeup_for_tick is None:
+                        completed_market_context_age_ticks += 1
                     # Read-only acceptance record, no additional DB/KIS I/O.
                     # Preserve missing values as null rather than inventing a
                     # zero workload or a completed phase.
@@ -2653,7 +2657,14 @@ def run_trade_session(
 
                 if not force_now:
                     from trader.us.runner.tick_process import fixed_rate_slot
-                    sleep_sec, skipped = fixed_rate_slot(session_anchor_monotonic, _normal_tick_count, interval_sec, time_mod.monotonic())
+                    if _wakeup_for_tick is not None and _protective_slot_deadline is not None:
+                        # An event child does not consume a normal slot. If it
+                        # overran that slot, resume normal work immediately.
+                        sleep_sec=max(0.0,_protective_slot_deadline-time_mod.monotonic())
+                        skipped=0
+                        _protective_slot_deadline=None
+                    else:
+                        sleep_sec, skipped = fixed_rate_slot(session_anchor_monotonic, _normal_tick_count, interval_sec, time_mod.monotonic())
                     skipped_slot_count += skipped
                     if skipped:
                         logger.warning("[US_TICK_LOOP][SLOTS_SKIPPED] count=%d total=%d", skipped, skipped_slot_count)
@@ -2667,7 +2678,10 @@ def run_trade_session(
                         from trader.us.runner.protective_entry_interrupt import make_idle_hard_stop_poll
                         _idle_poll=make_idle_hard_stop_poll(_idle_watch,trade_date=trade_date,env=env)
                     if _idle_poll is not None:
+                        _protective_slot_deadline=time_mod.monotonic()+sleep_sec
                         _protective_wakeup=sleep_with_heartbeat(session,run_id,tick_count,int(sleep_sec),protective_poll=_idle_poll)
+                        if _protective_wakeup is None:
+                            _protective_slot_deadline=None
                     else:
                         sleep_with_heartbeat(session, run_id, tick_count, int(sleep_sec))
 

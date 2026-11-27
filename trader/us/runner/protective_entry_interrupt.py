@@ -208,3 +208,15 @@ def execute_hard_stop_interrupt(snapshot, *, trade_date, context, evaluate,
             or not snapshot_still_fresh(snapshot,trade_date,now_ny())):
         return [], None
     return selected, route(selected)
+
+
+def route_idle_hard_stop_once(intents, *, route):
+    """An exception after the canonical router starts is unresolved, not retryable."""
+    import logging
+    try:
+        return route(intents)
+    except Exception:
+        logging.getLogger(__name__).exception("[US_EXIT][IDLE_WAKEUP][ROUTE_UNCERTAIN]")
+        return {"orders":[{"status":"BROKER_SUBMIT_RESULT_UNKNOWN",
+                           "requires_reconcile":True,"intent":intent}
+                          for intent in intents],"decisions":[]}

@@ -3120,7 +3120,7 @@ def run_trade_tick(
         # No extra soft-stop confirmations, trend updates, BUYs or TQQQ.
         # The existing reconciliation/account/session gates above run anew.
         from trader.us.runner.protective_entry_interrupt import (
-            holding_identity,make_hard_stop_poll,execute_hard_stop_interrupt,
+            holding_identity,make_hard_stop_poll,execute_hard_stop_interrupt,route_idle_hard_stop_once,
         )
         from trader.us.stop_policy_revision import attach_approved_revisions
         from trader.us.pb1.us_exit_engine import generate_exit_intents
@@ -3169,11 +3169,12 @@ def run_trade_tick(
                 on_sell_ready=lambda intent,observed:_observe_pb1_sell(intent,observed,"idle_wakeup")),
             classify_family=_exit_family,
             suppress=_idle_suppress,
-            route=lambda intents:route_exit_orders_immediately(
-                intents,buy_daily_notional=0.0,position_count=position_count,effective_budget=effective_budget,
-                signal_only=signal_only,kis_order_allowed=kis_order_allowed,
-                current_position_symbols={str(p.get("symbol") or "").upper() for p in current_positions},
-                context=tick_context,kis_client=routing_kis_client))
+            route=lambda intents:route_idle_hard_stop_once(
+                intents,route=lambda items:route_exit_orders_immediately(
+                    items,buy_daily_notional=0.0,position_count=position_count,effective_budget=effective_budget,
+                    signal_only=signal_only,kis_order_allowed=kis_order_allowed,
+                    current_position_symbols={str(p.get("symbol") or "").upper() for p in current_positions},
+                    context=tick_context,kis_client=routing_kis_client)))
         if _routed is not None:
             _orders=_routed.get("orders",[])
             _sent,_ack,_rejected,_blocked=_routed_order_truth_counts(_orders)
@@ -5848,7 +5849,8 @@ def run_trade_tick(
             and not force_now and os.getenv("WSL_RUN_MARKET","").upper()=="US"
             and os.getenv("US_WS_COLLECTOR_ENABLED","0")=="1"
             and os.getenv("US_ENTRY_PROTECTIVE_INTERRUPT_ENABLED","1")=="1"
-            and not exit_route_reconcile_required):
+            and not exit_route_reconcile_required
+            and tick_context.broker_submit_allowed()):
         from trader.us.runner.protective_entry_interrupt import export_idle_watch
         _watch_excluded={str(i.get("symbol") or "").upper() for i in exit_intents if str(i.get("side") or "").upper()=="SELL"}
         _watch_excluded.update(_early_pilot_attempted_symbols)
