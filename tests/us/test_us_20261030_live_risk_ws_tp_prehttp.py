@@ -1383,3 +1383,68 @@ def test_native_benchmark_recovery_preserves_freshness_and_isolates_symbol(monke
     assert result["quality"] == "UNKNOWN" and result["returns"]["qqq"] is None
     assert result["returns"]["spy"] == pytest.approx(-.01)
     assert result["returns"]["smh"] == pytest.approx(-.01)
+
+
+@pytest.mark.parametrize("rows,expected", [
+    ([{"xymd":"20261028","clos":"100"},{"xymd":"20261029","clos":"111"}],100.0),
+    ([{"xymd":"20261027","clos":"100"},{"xymd":"20261029","clos":"111"}],None),
+    ([{"xymd":"20261028","clos":"100"},{"xymd":"20261028","clos":"101"}],None),
+    ([{"xymd":"20261028","clos":"nan"}],None),
+])
+def test_benchmark_previous_close_native_exact_day_and_one_attempt(monkeypatch, rows, expected):
+    from types import SimpleNamespace
+    from trader.us.data_provider import USDataProvider
+    p=USDataProvider(env="practice",offline=True)
+    calls=[]
+    # No actual native HTTP: explicit injected stage client.
+    p._offline=False
+    p._tick_context=SimpleNamespace(has_budget=lambda seconds: True)
+    def read(sym,exchange,*,count,as_of_date):
+        calls.append((sym,count,as_of_date))
+        return rows
+    stage=SimpleNamespace(_get_client=lambda:SimpleNamespace(get_us_daily_price=read))
+    monkeypatch.setattr(p,"fork_for_stage",lambda **kw: stage)
+    first=p.recover_benchmark_previous_close("QQQ",trade_date="2026-10-29")
+    assert (first or {}).get("close")==expected
+    assert p.recover_benchmark_previous_close("QQQ",trade_date="2026-10-29")==first
+    assert calls==[("QQQ",10,"20261028")]
+    assert p.recover_benchmark_previous_close("TQQQ",trade_date="2026-10-29") is None
+    p._tick_context.has_budget=lambda seconds: False
+    assert p.recover_benchmark_previous_close("SPY",trade_date="2026-10-29") is None
+    p._offline=True
+    assert p.recover_benchmark_previous_close("SMH",trade_date="2026-10-29") is None
+    assert len(calls)==1
+
+
+@pytest.mark.parametrize("date,quote_bad,expected", [
+    ("20261028",False,-.02),
+    ("20261027",False,None),
+    ("20261028",True,None),
+])
+def test_recovered_previous_close_never_bypasses_live_quote_gate(monkeypatch,date,quote_bad,expected):
+    from trader.us.data_provider import USDataProvider
+    p=USDataProvider(env="practice",offline=True)
+    monkeypatch.setattr(overlay.time,"time",lambda:1000.0)
+    calls=[]
+    def recover(sym,*,trade_date):
+        calls.append(("close",sym))
+        return {"close":100,"date":date,"source":"KIS_NATIVE_DAILY_EXACT_COMPLETED"}
+    def quote(sym,exchange,*,max_quote_age_sec):
+        calls.append(("quote",sym))
+        return _live_quote(98,900 if sym=="QQQ" and quote_bad else 1000)
+    monkeypatch.setattr(p,"recover_benchmark_previous_close",recover)
+    monkeypatch.setattr(p,"get_current_price",quote)
+    daily=dict(_completed_prices(),qqq_previous_close=999,qqq_previous_close_date="20261027")
+    result=overlay.read_us_live_intraday_returns(p,daily,[],trade_date="2026-10-29")
+    assert calls==[("close","QQQ"),("quote","SPY"),("quote","QQQ"),("quote","SMH")]
+    if expected is None:
+        assert result["quality"]=="UNKNOWN" and result["returns"]["qqq"] is None
+    else:
+        assert result["quality"]=="OK" and result["returns"]["qqq"]==pytest.approx(expected)
+        assert result["quotes"]["qqq"]["previous_close_source"]=="KIS_NATIVE_DAILY_EXACT_COMPLETED"
+    assert result["returns"]["spy"]==pytest.approx(-.02)
+    assert result["returns"]["smh"]==pytest.approx(-.02)
+    assert daily["qqq_previous_close"]==999
+    calls.clear()
+    assert overlay.read_us_live_intraday_returns(p,daily,[],trade_date="2026-10-29",fetch_allowed=False)["quality"]=="UNKNOWN"
+    assert calls==[]
