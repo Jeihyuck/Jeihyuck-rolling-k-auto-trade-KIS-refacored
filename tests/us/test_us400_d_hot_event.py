@@ -192,3 +192,46 @@ def test_quote_expiring_during_evaluation_revokes_ready_hint(tmp_path, monkeypat
         assert db.execute("SELECT count(*) FROM hot_retry_events").fetchone()[0] == 0
     finally:
         db.close()
+
+
+def test_hot_quote_evaluated_while_native_minute_request_waits(tmp_path, monkeypatch):
+    import threading
+    from trader.marketdata import us_ws_collector
+    from trader.us.entry_timing import hot_event_evaluator
+    from trader.us.execution import kis_us_client
+
+    blocked, observed, halt = threading.Event(), threading.Event(), threading.Event()
+    now = datetime(2026, 11, 25, 10, 10, tzinfo=ZoneInfo("America/New_York"))
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz)
+    monkeypatch.setattr(observer, "datetime", Clock)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("US_WS_COLLECTOR_ENABLED", "1")
+    # Restore the process-local observer permission overrides after the fixture.
+    for key in ("KIS_ENV", "DRY_RUN", "ALLOW_REAL_ORDER", "US_KIS_ORDER_ALLOWED", "TRADING_REGION",
+                "US_ORDER_ARMED", "LIVE_TRADING_ENABLED", "US_LIVE_TRADING_ENABLED",
+                "US_OPENING_OBSERVER_READ_ONLY", "US_SHARED_KIS_LIMITER_ENABLED"):
+        monkeypatch.setenv(key, "0")
+    monkeypatch.setattr(observer.os, "getppid", lambda: 1 if halt.is_set() else 123)
+    monkeypatch.setattr(kis_us_client, "KisUSClient", lambda **kw: object())
+    monkeypatch.setattr(us_ws_collector, "ensure_started", lambda **kw: None)
+    monkeypatch.setattr(us_ws_collector, "subscribe_many", lambda *args, **kw: None)
+    monkeypatch.setattr(us_ws_collector, "get_quote", lambda *args, **kw: None)
+    lanes = {"HOT": [("AAA", "NYSE")], "WARM": [], "COLD": []}
+    monkeypatch.setattr(observer, "collection_priorities", lambda **kw: (lanes, "VALID"))
+    def native_wait(*args, **kwargs):
+        blocked.set()
+        observed.wait(3)
+        halt.set()
+        return {"requests": 1, "changed": 0}
+    def evaluate(db, **kwargs):
+        if blocked.wait(2):
+            db.execute("SELECT count(*) FROM verified_bars").fetchone()
+            observed.set()
+    monkeypatch.setattr(observer, "collect_hot_minutes", native_wait)
+    monkeypatch.setattr(hot_event_evaluator, "poll_hot_events", evaluate)
+    assert observer.run_observer(env="practice", trade_date="2026-11-25", scope="scope:epoch",
+        parent_pid=123, watchlist=[{"symbol": "AAA", "exchange": "NYSE"}], max_runtime_sec=5) == 0
+    assert observed.is_set() and halt.is_set()
