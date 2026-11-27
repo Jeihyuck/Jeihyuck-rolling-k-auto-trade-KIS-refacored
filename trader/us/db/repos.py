@@ -1903,7 +1903,17 @@ def load_us_order_events(trade_date: str, session_run_id: str | None = None) -> 
         for row in rows:
             item = dict(row)
             payload = _parse_json_meta(item.pop("payload", {}))
+            # Preserve original typed SQL identity separately: historical JSON
+            # metadata may contain conflicting values, and must never erase
+            # the proof columns used for exact BUY ACK recovery.
+            durable_identity = {k: item.get(k) for k in (
+                "event_type", "trade_date", "client_order_key", "submit_attempt_id",
+                "symbol", "side", "requested_qty", "account_id", "trading_epoch_id",
+                "portfolio_epoch_id", "position_cycle_id", "position_lifecycle_id",
+                "canonical_broker_order_no", "raw_broker_order_no",
+            ) if item.get(k) is not None}
             item.update(payload)
+            item["_durable_order_event_identity"] = durable_identity
             item["timestamp"] = str(item.get("timestamp") or "")
             result.append(item)
         return result
@@ -3683,7 +3693,8 @@ def _proven_us_tp_partial_retry(conn, params, stage_row, claim, intent_meta):
            )
     """), params).mappings().all()
     events = conn.execute(text("""
-        SELECT client_order_key, submit_attempt_id, event_type
+        SELECT client_order_key, submit_attempt_id, event_type, payload,
+               canonical_broker_order_no, raw_broker_order_no, cumulative_filled_qty
           FROM us_order_events
          WHERE trading_epoch_id=:epoch AND trade_date<=:td AND symbol=:sym
            AND side='SELL' AND profit_capture_stage=:stage
@@ -3699,6 +3710,12 @@ def _proven_us_tp_partial_retry(conn, params, stage_row, claim, intent_meta):
         symbol=str(params["sym"]), stage_name=str(params["stage"]),
         qty=int(claim["requested_qty"]),
     )
+
+
+def _tp_claim_action_matches_stage(action: object, stage: str) -> bool:
+    """Match only the two explicit durable TP action spellings, never another stage."""
+    normalized = str(action or "").strip().lower()
+    return stage in {"tp1", "tp2", "tp3"} and normalized in {stage, f"take_profit_{stage}"}
 
 
 def reserve_us_profit_capture_stage_after_claim(
@@ -3796,7 +3813,8 @@ def reserve_us_profit_capture_stage_after_claim(
                 or str(claim[0].get("attempt_state") or "") != "CREATED"
                 or str(claim[0].get("client_order_key") or "") != key
                 or str(claim[0].get("lifecycle_id") or "") != cycle
-                or int(claim[0].get("requested_qty") or 0) < int(qty)):
+                or not _tp_claim_action_matches_stage(claim[0].get("action"), stg)
+                or int(claim[0].get("requested_qty") or 0) != int(qty)):
             return False
         prior_stage = stage_row or (historical[0] if historical else None)
         if int(claim[0].get("filled_qty_before_attempt") or 0) > 0 and (
@@ -3951,7 +3969,12 @@ def verify_us_tp_claim_stage_at_http_boundary(
                 or str(claim["active_attempt_id"] or "") != params["attempt"]
                 or str(claim["lifecycle_id"] or "") != params["cycle"]
                 or str(claim["client_order_key"] or "") != params["key"]
-                or str(claim["attempt_state"] or "") not in {"CREATED", "SUBMITTED"}):
+                or str(claim["attempt_state"] or "") not in {"CREATED", "SUBMITTED"}
+                or not _tp_claim_action_matches_stage(claim.get("action"), epoch_params["stage"])):
+            return False
+        # A native submit may only consume the exact reserved TP remainder.
+        stage_remaining = int(stage_row.get("requested_qty") or 0) - int(stage_row.get("cumulative_filled_qty") or 0)
+        if stage_remaining <= 0 or stage_remaining != int(claim.get("requested_qty") or 0):
             return False
         if (int(claim.get("filled_qty_before_attempt") or 0) > 0
                 and int(stage_row.get("cumulative_filled_qty") or 0) <= 0):
@@ -4040,7 +4063,8 @@ def release_us_profit_capture_pre_http_abort(
         if not epoch_id:
             return False
         events = conn.execute(text("""
-            SELECT event_type, submit_attempt_id
+            SELECT event_type, submit_attempt_id, canonical_broker_order_no,
+                   raw_broker_order_no, cumulative_filled_qty, payload
               FROM us_order_events
              WHERE trade_date=:td AND client_order_key=:key
                AND symbol=:sym AND side='SELL' AND profit_capture_stage=:stage
@@ -4057,24 +4081,34 @@ def release_us_profit_capture_pre_http_abort(
         if (not events or "" in abort_ids or len(abort_ids) != 1):
             return False
         attempt_id = next(iter(abort_ids))
-        # A started attempt without its own durable abort, or ANY broker
-        # ACK/possible/terminal event, disproves safe pre-HTTP release.
-        if any(
-            not str(e.get("submit_attempt_id") or "").strip()
-            or (
-                str(e.get("event_type") or "") not in
-                (abort_types | {"BROKER_SUBMIT_STARTED", "BROKER_CLAIM_PREPARED"})
-            )
-            or (
-                str(e.get("submit_attempt_id") or "") != attempt_id
-            )
-            for e in events
-        ):
+        # 11/25 incident: the reconcile worker can record local replay
+        # STARTED/NO_MATCH while the native router records a durable no-POST
+        # abort. These two local diagnostics alone are not broker evidence.
+        # All other replay outcomes, broker numbers, positive fills, or
+        # another attempt still fence this stage.
+        replay_no_match = False
+        for e in events:
+            if str(e.get("submit_attempt_id") or "").strip() != attempt_id:
+                return False
+            if (str(e.get("canonical_broker_order_no") or "").strip()
+                    or str(e.get("raw_broker_order_no") or "").strip()
+                    or int(e.get("cumulative_filled_qty") or 0) != 0):
+                return False
+            event_type = str(e.get("event_type") or "")
+            if event_type in abort_types | {"BROKER_SUBMIT_STARTED", "BROKER_CLAIM_PREPARED"}:
+                continue
+            payload = _parse_json_meta(e.get("payload"))
+            if event_type == "JOURNAL_REPLAY_STARTED" and not payload.get("broker_status"):
+                continue
+            if event_type == "JOURNAL_REPLAY_UNRESOLVED" and payload.get("broker_status") == "NO_MATCH":
+                replay_no_match = True
+                continue
             return False
         attempt = conn.execute(text("""
             SELECT a.attempt_state, a.authoritative, a.requested_qty,
                    c.action_key,c.action,c.target_qty,c.filled_qty_before_attempt,
-                   c.lifecycle_id,c.account_id,c.action_state,c.active_attempt_id
+                   c.lifecycle_id,c.account_id,c.action_state,c.active_attempt_id,
+                   c.claim_conflicts,c.portfolio_epoch_id,c.position_cycle_id
               FROM us_execution_attempts a
               JOIN us_execution_claims c ON c.action_key=a.action_key
              WHERE a.attempt_id=:attempt AND a.client_order_key=:key
@@ -4087,15 +4121,18 @@ def release_us_profit_capture_pre_http_abort(
                 or str(attempt[0].get("attempt_state") or "") != "ABANDONED_PRE_SUBMIT"
                 or attempt[0].get("authoritative") is not True
                 or str(attempt[0].get("action_state") or "") != "OPEN"
-                or attempt[0].get("active_attempt_id")):
+                or attempt[0].get("active_attempt_id")
+                or int(attempt[0].get("claim_conflicts") or 0) != 0):
             return False
         # Even a terminal order row requires independent broker evidence;
         # an order row with this key contradicts the PRE_IO-only certificate.
         if conn.execute(text("""
             SELECT 1 FROM us_orders
-             WHERE trade_date=:td AND client_order_key=:key
-               AND symbol=:sym AND side='SELL'
-               AND trading_epoch_id=:epoch LIMIT 1
+             WHERE client_order_key=:key LIMIT 1
+        """), params).scalar_one_or_none() is not None:
+            return False
+        if conn.execute(text("""
+            SELECT 1 FROM us_fills WHERE client_order_key=:key LIMIT 1
         """), params).scalar_one_or_none() is not None:
             return False
         partial_stage = int(row.get("cumulative_filled_qty") or 0) > 0
@@ -4125,7 +4162,9 @@ def release_us_profit_capture_pre_http_abort(
         if (str(current.get(f"{stg}_order_key") or "") != order_key
                 or not current.get(f"{stg}_pending")
                 or current.get(f"{stg}_done")
-                or str((current.get("meta") or {}).get("last_status") or "") not in {"PENDING", "SUBMITTED"}
+                or str((current.get("meta") or {}).get("last_status") or "") not in (
+                    {"PENDING", "SUBMITTED", "AMBIGUOUS_ACK"} if replay_no_match and not partial_stage
+                    else {"PENDING", "SUBMITTED"})
                 or (current.get(f"{stg}_broker_order_no") and not partial_stage)):
             return False
         if close_intent:
@@ -4142,7 +4181,6 @@ def release_us_profit_capture_pre_http_abort(
                     or str(scope.get("trading_epoch_id") or "") != str(epoch_id)
                     or not scope.get("account_id")
                     or str(attempt_scope.get("account_id") or "") != str(scope["account_id"])
-                    or str(attempt_scope.get("lifecycle_id") or "") != lifecycle
                     or str(attempt_scope.get("action") or "").lower() != stg):
                 return False
             intent_row = conn.execute(text("""
@@ -4156,12 +4194,34 @@ def release_us_profit_capture_pre_http_abort(
             if not intent_row or str(intent_row.get("status") or "") != "PENDING":
                 return False
             intent_meta = _parse_json_meta(intent_row.get("meta"))
+            claim_cycle = str(attempt_scope.get("lifecycle_id") or "")
             if (str(intent_meta.get("submit_attempt_id") or "") != attempt_id
                     or str(intent_meta.get("profit_capture_stage") or "").lower() != stg
                     or str(intent_meta.get("strategy_owner") or "US_STANDARD").upper() != "US_STANDARD"
                     or (intent_meta.get("position_lifecycle_id")
-                        and str(intent_meta["position_lifecycle_id"]) != lifecycle)):
+                        and str(intent_meta["position_lifecycle_id"]) != claim_cycle)):
                 return False
+            if claim_cycle != lifecycle:
+                # Adopted legacy V2 (e.g. PG): the TP ledger stays on the
+                # original BUY lifecycle, the execution claim is a distinct
+                # management cycle. Verify the exact preexisting forward
+                # attribution contract; never guess or rewrite either ID.
+                from trader.us.profit_capture import tp_stage_lifecycle_from_order_proof
+                if (partial_stage
+                        or not claim_cycle
+                        or str(attempt_scope.get("position_cycle_id") or "") != claim_cycle
+                        or str(intent_meta.get("broker_account_hash") or "") != str(scope["account_id"])
+                        or str(intent_meta.get("trading_epoch_id") or "") != str(epoch_id)
+                        or not attempt_scope.get("portfolio_epoch_id")
+                        or str(intent_meta.get("portfolio_epoch_id") or "") != str(attempt_scope["portfolio_epoch_id"])):
+                    return False
+                try:
+                    source_cycle = tp_stage_lifecycle_from_order_proof(
+                        claim_cycle, intent_meta, client_order_key=order_key)
+                except ValueError:
+                    return False
+                if source_cycle != lifecycle:
+                    return False
             updated = conn.execute(text("""
                 UPDATE us_order_intents
                    SET status='BLOCKED',
@@ -4265,6 +4325,80 @@ def mark_us_position_exit_stage(
     risk["state"] = state
     save_us_position_risk_state(sym, td, risk)
     logger.info("[US_POSITION][TREND_STAGE] symbol=%s stage=%s status=%s pending=%s done=%s order_key=%s lifecycle_id=%s", sym, stg, status_upper, trend.get(f"{stg}_pending"), trend.get(f"{stg}_done"), order_key, lifecycle_id)
+
+class CommittedUSRiskState(dict):
+    """Immediate transaction result; never reconstructed from cached position JSON."""
+
+
+def update_us_soft_stop_risk_state_atomic(
+    *, symbol: str, trade_date: str, pnl_pct: float, current_price: float,
+    now: datetime, soft_stop_pct: float, policy_revision: str | None = None,
+) -> dict:
+    """One durable UPSERT: preserve unrelated JSON leaves and concurrent counts.
+
+    Same per-day counter semantics as update_us_soft_stop_risk_state. No
+    cache, no guessed epoch, no retry on ambiguous commit. Only use in the
+    armed US practice snapshot path; never increase the evaluation frequency
+    or change the confirmation threshold here.
+    """
+    if not all(math.isfinite(float(x)) for x in (pnl_pct, current_price, soft_stop_pct)):
+        raise ValueError("US_SOFT_STOP_ATOMIC_INPUT_INVALID")
+    if float(current_price) <= 0 or float(soft_stop_pct) <= 0:
+        raise ValueError("US_SOFT_STOP_ATOMIC_INPUT_INVALID")
+    sym = _risk_state_key(symbol, trade_date)[1]
+    if not sym:
+        raise ValueError("US_SOFT_STOP_ATOMIC_SYMBOL_INVALID")
+    engine = _get_engine_or_none()
+    if engine is None or engine.dialect.name != "postgresql":
+        raise RuntimeError("US_SOFT_STOP_DURABLE_STATE_WRITE_FAILED")
+    observed = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    breached = float(pnl_pct) <= -float(soft_stop_pct)
+    revision = str(policy_revision or "")
+    with engine.begin() as conn:
+        _ensure_us_position_risk_state_table(conn)
+        epoch = _active_us_epoch(conn, required=True)
+        if not epoch:
+            raise RuntimeError("US_SOFT_STOP_DURABLE_EPOCH_UNVERIFIED")
+        result = conn.execute(text("""
+            INSERT INTO us_position_risk_state AS old
+                (trading_epoch_id, trade_date, symbol, soft_stop_breach_count,
+                 first_soft_stop_seen_at, last_soft_stop_seen_at,
+                 lowest_price_since_breach, last_price, last_pnl_pct, state, updated_at)
+            VALUES (:epoch, :td, :symbol, CASE WHEN :breached THEN 1 ELSE 0 END,
+                    CASE WHEN :breached THEN CAST(:at AS timestamptz) ELSE NULL END,
+                    CASE WHEN :breached THEN CAST(:at AS timestamptz) ELSE NULL END,
+                    CASE WHEN :breached THEN :price ELSE NULL END,
+                    :price, :pnl, CASE WHEN :revision <> '' THEN
+                      jsonb_build_object('soft_stop_policy_revision', CAST(:revision AS text))
+                      ELSE '{}'::jsonb END, NOW())
+            ON CONFLICT (trading_epoch_id, trade_date, symbol) DO UPDATE SET
+                soft_stop_breach_count = CASE WHEN NOT :breached THEN 0
+                    WHEN :revision <> '' AND COALESCE(old.state->>'soft_stop_policy_revision','') <> :revision THEN 1
+                    ELSE old.soft_stop_breach_count + 1 END,
+                first_soft_stop_seen_at = CASE WHEN NOT :breached THEN NULL
+                    WHEN :revision <> '' AND COALESCE(old.state->>'soft_stop_policy_revision','') <> :revision THEN CAST(:at AS timestamptz)
+                    ELSE COALESCE(old.first_soft_stop_seen_at, CAST(:at AS timestamptz)) END,
+                last_soft_stop_seen_at = CASE WHEN :breached THEN CAST(:at AS timestamptz) ELSE NULL END,
+                lowest_price_since_breach = CASE WHEN NOT :breached THEN NULL
+                    WHEN :revision <> '' AND COALESCE(old.state->>'soft_stop_policy_revision','') <> :revision THEN :price
+                    ELSE LEAST(COALESCE(old.lowest_price_since_breach,:price),:price) END,
+                last_price = :price, last_pnl_pct = :pnl,
+                state = COALESCE(old.state,'{}'::jsonb) || CASE WHEN :revision <> '' THEN
+                    jsonb_build_object('soft_stop_policy_revision', CAST(:revision AS text))
+                    ELSE '{}'::jsonb END,
+                updated_at = NOW()
+            RETURNING *
+        """), {"epoch": str(epoch), "td": trade_date, "symbol": sym,
+                 "breached": breached, "at": observed, "price": float(current_price),
+                 "pnl": float(pnl_pct), "revision": revision}).mappings().one()
+        saved = dict(result)
+    logger.info("[US_RISK_STATE][ATOMIC_SOFT_STOP] symbol=%s trade_date=%s count=%s action=%s",
+                sym, trade_date, saved.get("soft_stop_breach_count"), "increment" if breached else "reset")
+    return CommittedUSRiskState({
+        **_normalize_risk_state(sym, trade_date, saved),
+        "trading_epoch_id": str(epoch),
+    })
+
 
 def update_us_soft_stop_risk_state(
     *,
@@ -9033,6 +9167,36 @@ def has_pending_order_for_symbol_side(
     except Exception as exc:
         logger.error("[US_ORDERS][PENDING_SYMBOL_SIDE][ERROR] %s", exc)
         return False
+
+
+def load_pending_order_symbols_for_side(*, symbols: list[str], side: str,
+                                        trade_date: str, include_statuses: set[str]) -> set[str]:
+    """One fresh, active-epoch durable pending-order read for a routing batch.
+
+    No memory fallback, no stale cache, no silent False on database failure.
+    The caller must still recheck canonical execution claims at native submit.
+    """
+    requested = sorted({str(x or "").strip().upper() for x in symbols if str(x or "").strip()})
+    if not requested:
+        return set()
+    side_u = str(side or "").strip().upper()
+    if side_u not in {"BUY", "SELL"} or not trade_date or not include_statuses:
+        raise ValueError("pending_order_batch_scope_invalid")
+    engine = _get_engine_or_none()
+    if engine is None:
+        raise RuntimeError("pending_order_batch_db_unavailable")
+    with engine.begin() as conn:
+        epoch = _active_us_epoch(conn, required=True)
+        if not epoch:
+            raise RuntimeError("pending_order_batch_epoch_unavailable")
+        rows = conn.execute(text("""
+            SELECT DISTINCT symbol FROM us_orders
+            WHERE symbol = ANY(:symbols) AND side=:side AND trade_date=:td
+              AND status = ANY(:statuses) AND dry_run=FALSE
+              AND trading_epoch_id=:epoch_id
+        """), {"symbols": requested, "side": side_u, "td": trade_date,
+               "statuses": sorted(include_statuses), "epoch_id": epoch}).scalars().all()
+    return {str(symbol).strip().upper() for symbol in rows}
 
 
 def find_recent_sell_ack(symbol: str, trade_date: str | None = None) -> dict | None:

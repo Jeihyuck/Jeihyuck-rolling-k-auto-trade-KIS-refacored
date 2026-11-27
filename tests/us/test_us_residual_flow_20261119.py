@@ -415,3 +415,64 @@ def test_completed_daily_copy_isolates_nested_provenance():
     copied["rows"][0]["close"] = -1
     copied["rows"].clear()
     assert flat["rows"] == [{"close": 100.0, "xymd": "20261123"}]
+
+
+@pytest.mark.skipif(not os.getenv("PBCORE_TEST_POSTGRES_URL"), reason="requires disposable PostgreSQL")
+def test_tp_boundary_budget_retains_every_unexamined_candidate(pg_engine, monkeypatch):
+    from sqlalchemy import text
+    from trader.us.db import repos
+    from trader.us.execution.tp_retry_boundary import repair_tp_retries_at_boundary
+    epoch,account,cycle="budget-epoch","budget-account","original-cycle"
+    monkeypatch.setattr(repos,"_active_us_epoch",lambda *a,**kw:epoch)
+    monkeypatch.setattr(repos,"_us_state_epoch_id",lambda *a,**kw:epoch)
+    monkeypatch.setattr(repos,"_us_execution_claim_scope",lambda:{"env":"practice","account_id":account,"trading_epoch_id":epoch})
+    for symbol in ("KO","PG"):
+        _seed_boundary_case(pg_engine,symbol=symbol,contradiction=None,epoch=epoch,account=account,
+                           cycle=cycle,key=f"US_PC_2026-11-11_{symbol}_{cycle}_TAKE_PROFIT_TP2")
+    # The real SQL read still executes; only the budget clock is injected.
+    calls=[0]
+    def clock():
+        calls[0]+=1
+        return 0.0 if calls[0]==1 else 31.0
+    result=repair_tp_retries_at_boundary(trade_date="2026-11-18",phase="AM_START",budget_sec=.1,clock=clock)
+    assert result["released"]==0 and result["checked"]==0
+    assert result["candidate_count"]==2
+    assert {x["symbol"] for x in result["unverified"]}=={"KO","PG"}
+    assert all(x["reason"]=="DEFERRED_BOUNDARY_BUDGET" for x in result["unverified"])
+    with pg_engine.connect() as conn:
+        assert set(conn.execute(text("SELECT status FROM us_order_intents")).scalars())=={"PENDING"}
+
+
+@pytest.mark.skipif(not os.getenv("PBCORE_TEST_POSTGRES_URL"), reason="requires disposable PostgreSQL")
+@pytest.mark.parametrize("contradiction", ["raw_order", "fill", "event_account", "event_symbol",
+                                           "event_side", "event_stage", "intent_account"])
+def test_postgres_preclaim_certificate_rejects_contradictory_durable_fields(pg_engine, monkeypatch, contradiction):
+    from sqlalchemy import text
+    from trader.us.db import repos
+    from trader.us.execution.tp_retry_boundary import repair_tp_retries_at_boundary
+    epoch, account, cycle = "residual-epoch", "residual-account", "original-cycle"
+    key = f"US_PC_2026-11-11_KO_{cycle}_TAKE_PROFIT_TP2"
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda *a, **kw: epoch)
+    monkeypatch.setattr(repos, "_us_state_epoch_id", lambda *a, **kw: epoch)
+    monkeypatch.setattr(repos, "_us_execution_claim_scope", lambda: {
+        "env": "practice", "account_id": account, "trading_epoch_id": epoch})
+    _seed_boundary_case(pg_engine, symbol="KO", contradiction=None, epoch=epoch,
+                        account=account, cycle=cycle, key=key)
+    updates = {
+        "raw_order": "UPDATE us_order_events SET raw_broker_order_no='000123'",
+        "fill": "UPDATE us_order_events SET cumulative_filled_qty=1",
+        "event_account": "UPDATE us_order_events SET account_id='foreign-account'",
+        "event_symbol": "UPDATE us_order_events SET symbol='PG'",
+        "event_side": "UPDATE us_order_events SET side='BUY'",
+        "event_stage": "UPDATE us_order_events SET profit_capture_stage='tp1'",
+        "intent_account": "UPDATE us_order_intents SET account_id='residual-account', meta='{\"broker_account_hash\":\"foreign-account\"}'::jsonb",
+    }
+    with pg_engine.begin() as conn:
+        conn.execute(text(updates[contradiction] + " WHERE client_order_key=:key"), {"key": key})
+    result = repair_tp_retries_at_boundary(trade_date="2026-11-18", phase="AM_START")
+    assert result["status"] == "RETRY_FENCES_RETAINED", result
+    assert result["released"] == 0
+    with pg_engine.connect() as conn:
+        assert conn.execute(text("SELECT status FROM us_order_intents WHERE client_order_key=:key"), {"key": key}).scalar_one() == "PENDING"
+        state = conn.execute(text("SELECT state FROM us_profit_capture_lifecycle WHERE client_order_key=:key"), {"key": key}).scalar_one()
+        assert state["meta"]["last_status"] == "US_RECOVERY_SCOPE_UNVERIFIED"

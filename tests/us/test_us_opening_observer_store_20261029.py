@@ -235,3 +235,54 @@ def test_observer_sqlite_replay_is_read_only_and_never_fabricates_missing_quote(
     assert result["realized_pnl"] is None
     assert result["forward_60m"]["status"] == "UNKNOWN_MISSING_FUTURE_BARS"
     assert path.stat().st_mtime_ns == before
+
+
+def test_native_minute_page_cursor_follows_kis_continuation():
+    from trader.us.execution.kis_us_client import KisUSClient
+    client = object.__new__(KisUSClient)
+    client._assert_not_offline = lambda name: None
+    client._build_headers = lambda tr_id: {"tr_id": tr_id}
+    client._resolve_quote_excd = lambda exchange: "NAS"
+    calls = []
+    def fake_get(path, *, headers, params, max_attempts_override):
+        calls.append((headers, params, max_attempts_override))
+        return {"rt_cd": "0", "output2": sample_rows(), "_response_meta": {"tr_cont": "M"}}
+    client._get = fake_get
+    first = client.get_us_intraday_1m_page("ELV", "NASDAQ")
+    assert first["next_key"] == "20261028092900"
+    assert calls[0][1]["PINC"] == "0" and calls[0][1]["NEXT"] == ""
+    second = client.get_us_intraday_1m_page("ELV", "NASDAQ", before_key=first["next_key"])
+    assert calls[1][0]["tr_cont"] == "N"
+    assert calls[1][1]["PINC"] == "1" and calls[1][1]["NEXT"] == "1"
+    assert calls[1][1]["KEYB"] == first["next_key"]
+    assert second["next_key"] == ""  # repeated/non-advancing page stops
+    assert first["observation_id"] != second["observation_id"]
+    assert all(c[2] == 1 for c in calls)
+
+
+def test_hot_historical_repair_stops_on_demotion_and_preserves_opening(tmp_path):
+    from trader.us.entry_timing.opening_observer import collect_hot_minutes
+    date = "2026-10-28"
+    db = open_store(store_path(env="practice", account_scope="scope", trade_date=date, base=tmp_path))
+    requested = datetime(2026, 10, 28, 12, 0, tzinfo=NY)
+    calls = []
+    class Fake:
+        def get_us_intraday_1m_page(self, symbol, exchange, *, before_key):
+            calls.append(before_key)
+            rows = ([{**sample_rows()[-1], "xhms": "115900"}]
+                    if not before_key else sample_rows()[:30])
+            return {"rows": rows, "next_key": "20261028115800" if not before_key else "",
+                    "requested_at": requested, "observation_id": str(len(calls)),
+                    "observed_epoch": requested.timestamp()}
+    try:
+        collect_hot_minutes(Fake(), db, symbol="ELV", exchange="NASDAQ", trade_date=date,
+                            repair_due=True, still_hot=lambda: not calls)
+        assert calls == [""]
+        assert len(load_bars(db, trade_date=date, symbol="ELV")) == 1
+        calls.clear()
+        collect_hot_minutes(Fake(), db, symbol="ELV", exchange="NASDAQ", trade_date=date,
+                            repair_due=True, still_hot=lambda: True)
+        assert calls == ["", "20261028115800"]
+        assert len(load_bars(db, trade_date=date, symbol="ELV")) == 31
+    finally:
+        db.close()

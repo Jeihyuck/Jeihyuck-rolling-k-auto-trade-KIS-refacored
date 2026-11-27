@@ -906,8 +906,20 @@ class USDataProvider:
             raise KisUSTemporaryError("entry stage cancelled before current-price lookup")
         cache_key = (symbol.upper(), exchange.upper())
         ctx = self._tick_context
+        def _strict_cache_usable(row):
+            if max_quote_age_sec is None:
+                return True
+            try:
+                age = __import__("time").time() - float(row.get("asof_epoch"))
+                return (0 <= age <= float(max_quote_age_sec)
+                        and not (row.get("stale") or row.get("suspect") or row.get("_stale_date"))
+                        and str(row.get("quality") or "").upper() in {"FRESH", "FRESH_CACHE"})
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                return False
         if ctx is not None:
             ctx.count("quote_logical_calls")
+            if cache_key in ctx.price_cache and not _strict_cache_usable(ctx.price_cache[cache_key]):
+                ctx.price_cache.pop(cache_key, None)
             if cache_key in ctx.price_cache:
                 cached = ctx.price_cache[cache_key]
                 # A quote that was fresh at tick start may become stale before
@@ -915,6 +927,8 @@ class USDataProvider:
                 if "WEBSOCKET" in str(cached.get("source") or "").upper():
                     received = float(cached.get("asof_epoch") or 0)
                     freshness = float(os.getenv("KIS_WS_FRESH_MAX_AGE_SEC_US", "15") or 15)
+                    if max_quote_age_sec is not None:
+                        freshness = min(freshness, float(max_quote_age_sec))
                     if received <= 0 or __import__("time").time() - received > freshness:
                         ctx.price_cache.pop(cache_key, None)
                     elif str(cached.get("source") or "") == "KIS_WEBSOCKET_COLLECTOR":
@@ -1052,6 +1066,8 @@ class USDataProvider:
             raise KisUSTemporaryError("entry stage cancelled after websocket price lookup")
 
         # Cache hit
+        if self._cache_enabled and cache_key in self._price_cache and not _strict_cache_usable(self._price_cache[cache_key]):
+            self._price_cache.pop(cache_key, None)
         if self._cache_enabled and cache_key in self._price_cache:
             self.stats["price_hit"] += 1
             logger.debug("[US_DATA][CACHE_HIT] type=price symbol=%s", symbol)
@@ -1075,7 +1091,19 @@ class USDataProvider:
         try:
             if ctx is not None:
                 ctx.count("quote_http_calls")
-            result = self._get_client().get_us_price(symbol, exchange)
+            if self._cache_enabled and max_quote_age_sec is None:
+                from trader.marketdata.us_rest_shared import read_price
+                shared_status, result = read_price(self._get_client(), symbol, exchange)
+                logger.info("[US_DATA][REST_SHARED] symbol=%s status=%s", symbol, shared_status)
+            else:
+                # Explicit freshness/protective paths do not join a shared
+                # canonical price request or wait for its producer.
+                client = self._get_client()
+                from trader.us.execution.kis_us_client import KisUSClient
+                if max_quote_age_sec is not None and isinstance(client, KisUSClient):
+                    result = client.get_us_price(symbol, exchange, max_quote_age_sec=max_quote_age_sec)
+                else:
+                    result = client.get_us_price(symbol, exchange)
             if self._stage_cancelled():
                 from trader.us.execution.kis_us_client import KisUSTemporaryError
                 raise KisUSTemporaryError("entry stage cancelled after KIS price lookup")
@@ -1324,6 +1352,58 @@ class USDataProvider:
         return self.get_completed_daily_prices_result(
             symbol, exchange, trade_date=trade_date, required_bars=required_bars, allow_http_sync=allow_http_sync
         ).get("rows", [])
+
+    def recover_benchmark_previous_close(self, symbol: str, *, trade_date: str) -> dict | None:
+        """One bounded native read for a missing/stale SPY/QQQ/SMH close.
+
+        Read-only; no synthetic offline prices, DB write, current-session
+        candle, generic fallback or authorization. An ambiguous exact-day
+        response is rejected. The live quote is fetched AFTER recovery.
+        """
+        import math
+        import time
+        from trader.us.dates import canonical_us_bar_date
+        from trader.us.market_calendar import previous_completed_us_session
+        from trader.us.symbols import resolve_quote_exchange
+        sym = str(symbol).upper()
+        ctx = self._tick_context
+        if (sym not in {"SPY", "QQQ", "SMH"} or self._offline
+                or self._env != "practice" or self._stage_cancelled()
+                or ctx is None or not ctx.has_budget(15.0)):
+            return None
+        expected = previous_completed_us_session(trade_date)
+        key = (sym, expected.isoformat())
+        attempts = getattr(ctx, "_benchmark_close_recovery", None)
+        if attempts is None:
+            attempts = {}
+            ctx._benchmark_close_recovery = attempts
+        if key in attempts:
+            return attempts[key]
+        attempts[key] = None  # one attempt per symbol/day/tick, including failure
+        try:
+            stage = self.fork_for_stage(stage_deadline=time.monotonic()+4.0,
+                                        cancel_event=self._stage_cancel_event)
+            rows = stage._get_client().get_us_daily_price(
+                sym, resolve_quote_exchange(sym), count=10,
+                as_of_date=expected.strftime("%Y%m%d"))
+            exact = [row for row in rows if isinstance(row, dict)
+                     and canonical_us_bar_date(row.get("xymd") or row.get("date")) == expected]
+            closes = set()
+            for row in exact:
+                close = float(row.get("clos") or row.get("close") or row.get("last") or 0)
+                if not math.isfinite(close) or close <= 0:
+                    return None
+                closes.add(close)
+            if len(closes) != 1 or self._stage_cancelled() or not ctx.has_budget(1.0):
+                return None
+            result = {"close": closes.pop(), "date": expected.strftime("%Y%m%d"),
+                      "source": "KIS_NATIVE_DAILY_EXACT_COMPLETED"}
+            attempts[key] = result
+            return result
+        except Exception as exc:
+            logger.warning("[US_BENCHMARK][CLOSE_RECOVERY_FAILED] symbol=%s type=%s",
+                           sym, type(exc).__name__)
+            return None
 
     def get_daily_prices(self, symbol: str, exchange: str, count: int = 120, as_of_date: str | None = None) -> list[dict]:
         """일봉 데이터 조회 (xymd 기준 오름차순 정렬, KIS → DB fallback).

@@ -360,3 +360,175 @@ def test_stale_and_missing_opening_bars_report_native_evidence_without_relaxing_
     assert sparse["facts"]["opening"]["observed_1m"] < 30
     assert sparse["facts"]["last_completed_bar"] is not None
     assert sparse["facts"]["last_completed_bar_age_sec"] is not None
+
+
+def _independent_native_window():
+    # Synthetic complete native-shaped rows, not original Kroger replay.
+    start = datetime(2026, 10, 28, 10, 0, tzinfo=NY)
+    values = [102, 101, 100, 99, 98.5, 98.6, 98.8, 99.0]
+    rows = []
+    for i, price in enumerate(values):
+        rows.append({"xymd": "20261028", "xhms": (start + timedelta(minutes=i)).strftime("%H%M%S"),
+                     "open": str(price), "high": str(price + .1), "low": str(price - .2),
+                     "last": str(price), "evol": "200", "eamt": str(price * 200)})
+    return normalize_bars(rows, trade_date=DAY, now_et=start + timedelta(minutes=8))
+
+
+@pytest.mark.parametrize("family", ["ENTRY_PULLBACK", "ENTRY_MOMENTUM"])
+def test_independent_5_plus_3_does_not_authorize_us_without_opening(family):
+    bars = _independent_native_window()
+    result = evaluate_price_opportunity(style=family, trade_date=DAY,
+        now_et=datetime(2026, 10, 28, 10, 8, tzinfo=NY), verified_bars=bars,
+        quote=sample_quote(99, 98.98, 99))
+    assert result["state"] == "WAIT", result
+    assert result["reason"] == "opening_minute_bars_insufficient"
+    assert result["facts"]["reference_path"] == "OPENING_RANGE"
+    assert result["facts"]["opening"]["observed_1m"] == 0
+    assert result["broker_authorized"] is False
+
+
+@pytest.mark.parametrize("case", ["gap", "stale", "breakout", "no_rebound", "late_peak"])
+def test_independent_window_never_bypasses_missing_dependencies(case):
+    bars = _independent_native_window()
+    now = datetime(2026, 10, 28, 10, 8, tzinfo=NY)
+    family = "ENTRY_PULLBACK"
+    if case == "gap":
+        bars.pop(2)
+    elif case == "stale":
+        now += timedelta(minutes=4)
+    elif case == "breakout":
+        family = "ENTRY_BREAKOUT"
+    elif case == "no_rebound":
+        bars[-1]["close"] = 98.7
+    elif case == "late_peak":
+        bars[4]["high"] = 103
+    result = evaluate_price_opportunity(style=family, trade_date=DAY, now_et=now,
+        verified_bars=bars, quote=sample_quote(99, 98.98, 99))
+    assert result["state"] == "WAIT", result
+
+
+def test_static_feature_reuse_preserves_decision_and_invalidates_correction():
+    from trader.marketdata.feature_reuse import feature_cache_stats, clear_feature_cache
+    clear_feature_cache()
+    bars = sample_bars()
+    kwargs = dict(style="ENTRY_PULLBACK", trade_date=DAY,
+                  now_et=datetime(2026,10,28,10,5,tzinfo=NY), verified_bars=bars,
+                  quote=sample_quote())
+    plain = evaluate_price_opportunity(**kwargs)
+    scope=("practice-account-epoch","ABC","NASDAQ","US_STANDARD")
+    first = evaluate_price_opportunity(**kwargs, feature_scope=scope)
+    second = evaluate_price_opportunity(**kwargs, feature_scope=scope)
+    assert first == second == plain
+    assert feature_cache_stats()["hits"] == 2
+    corrected = copy.deepcopy(bars)
+    corrected[0]["high"] += 1.0
+    kwargs["verified_bars"] = corrected
+    changed = evaluate_price_opportunity(**kwargs, feature_scope=scope)
+    assert changed == evaluate_price_opportunity(**kwargs)
+    assert changed["facts"]["opening"]["opening_high"] != plain["facts"]["opening"]["opening_high"]
+    assert feature_cache_stats()["misses"] == 3
+    # A later time never reuses a stale decision; only static operands.
+    kwargs["now_et"] += timedelta(minutes=5)
+    assert evaluate_price_opportunity(**kwargs, feature_scope=scope)["reason"] == "recent_minute_bars_stale"
+    clear_feature_cache()
+
+
+def test_cross_process_native_features_exact_scope_and_correction(tmp_path, monkeypatch):
+    import json
+    import subprocess
+    import sys
+    from trader.marketdata.feature_reuse import shared_native_features
+    kw=dict(market="US",scope=("acct:epoch","ABC","NASDAQ","US_STANDARD"),
+            trade_date=DAY,settings=("TEST_V1",),base=tmp_path,rows=[{"close":100}])
+    assert shared_native_features(**kw,compute=lambda rows: {"close":rows[0]["close"]})=={"close":100}
+    script = """import json,sys
+from trader.marketdata.feature_reuse import shared_native_features
+def forbidden(rows):
+    raise RuntimeError("expected shared hit, not recomputation")
+kw=json.loads(sys.argv[1])
+print(json.dumps(shared_native_features(**kw,compute=forbidden)))
+"""
+    wire={**kw,"base":str(tmp_path)}
+    assert json.loads(subprocess.check_output([sys.executable,"-c",script,json.dumps(wire)],text=True))=={"close":100}
+    for change in ({"rows":[{"close":101}]},{"scope":("other:epoch","ABC","NASDAQ","US_STANDARD")},
+                   {"settings":("TEST_V2",)},{"trade_date":"2026-10-29"},
+                   {"market":"KR"}):
+        calls=[]
+        def compute(rows):
+            calls.append(rows)
+            return {"close":rows[0]["close"]}
+        assert shared_native_features(**(kw|change),compute=compute)=={"close":(kw|change)["rows"][0]["close"]}
+        assert len(calls)==1
+
+
+def test_shared_feature_cache_failure_never_replaces_native_calculation(tmp_path):
+    import sqlite3
+    from trader.marketdata.feature_reuse import shared_native_features
+    kw=dict(market="US",scope=("acct:epoch","ABC","NASDAQ","US_STANDARD"),
+            trade_date=DAY,settings=("TEST_V1",),base=tmp_path,rows=[{"close":100}])
+    assert shared_native_features(**kw,compute=lambda rows:{"close":100})=={"close":100}
+    path=next(tmp_path.glob("native-features-*.sqlite3"))
+    db=sqlite3.connect(path)
+    try:
+        db.execute("UPDATE native_features SET payload='bad-json'")
+        db.commit()
+        assert shared_native_features(**kw,compute=lambda rows:{"close":100})=={"close":100}
+        db.execute("BEGIN EXCLUSIVE")
+        assert shared_native_features(**kw,compute=lambda rows:{"close":100})=={"close":100}
+    finally:
+        db.rollback()
+        db.close()
+    path.chmod(0o644)
+    calls=[]
+    assert shared_native_features(**kw,compute=lambda rows:calls.append(rows) or {"close":100})=={"close":100}
+    assert len(calls)==1
+
+
+def test_shared_opening_and_rolling_feature_adapter_preserves_live_decision(tmp_path,monkeypatch):
+    from trader.marketdata.feature_reuse import clear_feature_cache
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("WSL_RUN_MARKET","US")
+    monkeypatch.setenv("KIS_ENV","practice")
+    monkeypatch.setenv("US_SHARED_NATIVE_FEATURES_ENABLED","1")
+    scope=("acct:epoch","ABC","NASDAQ","US_STANDARD")
+    kwargs=dict(style="ENTRY_PULLBACK",trade_date=DAY,now_et=datetime(2026,10,28,10,5,tzinfo=NY),
+                verified_bars=sample_bars(),quote=sample_quote())
+    clear_feature_cache()
+    assert evaluate_price_opportunity(**kwargs,feature_scope=scope)==evaluate_price_opportunity(**kwargs)
+    clear_feature_cache()
+    assert evaluate_price_opportunity(**kwargs,feature_scope=scope)==evaluate_price_opportunity(**kwargs)
+    corrected=copy.deepcopy(kwargs["verified_bars"])
+    corrected[-1]["volume"]*=2
+    kwargs["verified_bars"]=corrected
+    assert evaluate_price_opportunity(**kwargs,feature_scope=scope)==evaluate_price_opportunity(**kwargs)
+    kwargs["now_et"]+=timedelta(minutes=5)
+    assert evaluate_price_opportunity(**kwargs,feature_scope=scope)["reason"]=="recent_minute_bars_stale"
+    clear_feature_cache()
+
+
+def test_shared_v3_atr_matches_original_and_invalidates_bad_bar(tmp_path, monkeypatch):
+    from trader.marketdata.feature_reuse import clear_feature_cache
+    from trader.us.pb1.swing_runner_exit_v3 import (cached_chandelier_from_verified_bars,
+        chandelier_from_verified_completed_bars)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("WSL_RUN_MARKET","US")
+    monkeypatch.setenv("KIS_ENV","practice")
+    monkeypatch.setenv("US_SHARED_NATIVE_FEATURES_ENABLED","1")
+    start=datetime(2026,8,1)
+    rows=[{"trade_date":(start+timedelta(days=i)).date().isoformat(),"complete":True,
+           "source":"KIS_DAILY_VERIFIED","adjustment_basis":"RAW",
+           "high":101+i*.1,"low":99+i*.1,"close":100+i*.1} for i in range(60)]
+    kw=dict(decision_date=DAY,atr_period=14,lookback=22,multiplier=3.0,ratchet=True)
+    scope=("acct:epoch","ABC","NASDAQ","US_STANDARD","life","cycle","portfolio","contract")
+    clear_feature_cache()
+    original=chandelier_from_verified_completed_bars(rows,**kw)
+    assert original["valid"]
+    assert cached_chandelier_from_verified_bars(rows,scope=scope,**kw)==original
+    clear_feature_cache()
+    assert cached_chandelier_from_verified_bars(rows,scope=scope,**kw)==original
+    corrected=copy.deepcopy(rows)
+    corrected[-1]["high"]+=2
+    assert cached_chandelier_from_verified_bars(corrected,scope=scope,**kw)==chandelier_from_verified_completed_bars(corrected,**kw)
+    corrected[-1]["source"]="UNVERIFIED"
+    assert cached_chandelier_from_verified_bars(corrected,scope=scope,**kw)=={"valid":False,"reason":"BAR_SOURCE_UNVERIFIED"}
+    clear_feature_cache()

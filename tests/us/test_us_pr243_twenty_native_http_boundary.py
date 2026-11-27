@@ -33,6 +33,15 @@ def test_pr243_twenty_native_sell_http_and_restart_fence(monkeypatch, tmp_path):
     from trader.us.execution import order_router
     from trader.us.execution.kis_us_client import KisUSClient
     import requests
+    from trader.us import market_calendar
+    from zoneinfo import ZoneInfo
+
+    # The replay intents belong to 2026-10-20; pin only the exchange clock
+    # to that regular session. Keep the real market calendar, deadline,
+    # claim and pre-HTTP authorization guards active. CI can run on holidays
+    # or outside market hours without manufacturing a live-session failure.
+    monkeypatch.setattr(market_calendar, "now_ny",
+                        lambda: datetime(2026, 10, 20, 10, 0, tzinfo=ZoneInfo("America/New_York")))
 
     monkeypatch.setenv("KIS_ENV", "practice")
     monkeypatch.setenv("US_KIS_ORDER_ALLOWED", "1")

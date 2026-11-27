@@ -72,3 +72,38 @@ def test_closed_lifecycle_never_short_circuits_atomic_validation(monkeypatch):
     _, writes = _run(monkeypatch, closed=True)
     assert len(writes) == 1
     assert writes[0]["is_open"] is False
+
+
+def test_same_transaction_hwm_reuses_only_exact_noop_row(monkeypatch):
+    from trader.us.db.repos import CommittedUSRiskState
+    monkeypatch.setenv("WSL_RUN_MARKET","US")
+    pos={"symbol":"MSFT","position_lifecycle_id":ID,"position_cycle_id":ID,
+         "portfolio_epoch_id":"portfolio","env":"practice","account_id":"practice:test",
+         "trading_epoch_id":"epoch-test","strategy_owner":"US_STANDARD"}
+    leaf={"lifecycle_id":ID,"position_cycle_id":ID,"portfolio_epoch_id":"portfolio",
+          "env":"practice","account_id":"practice:test","trading_epoch_id":"epoch-test",
+          "strategy_owner":"US_STANDARD","is_open":True,"high_watermark":125.,
+          "high_watermark_at":"2026-10-12T16:00:00+00:00",
+          "high_watermark_source":"us_position_risk_state"}
+    row=CommittedUSRiskState(trade_date=TODAY,symbol="MSFT",trading_epoch_id="epoch-test",
+                             state={"lifecycle":leaf})
+    reads=[]
+    writes=[]
+    monkeypatch.setattr(state,"_identity_is_current",lambda identity:True)
+    monkeypatch.setattr(state,"load_latest_us_position_risk_state",lambda *a:reads.append(a) or row)
+    monkeypatch.setattr(state,"_save_lifecycle",lambda *a:writes.append(a) or a[-1])
+    kwargs=dict(symbol="MSFT",trade_date=TODAY,lifecycle_id=ID,
+                current_price=120.,entry_price=100.,now=NOW,position=pos)
+    result=state.update_us_position_high_watermark(**kwargs,committed_risk_state=row)
+    assert result["high_watermark"]==125 and not reads and not writes
+    state.update_us_position_high_watermark(**kwargs,committed_risk_state=dict(row))
+    assert len(reads)==1 and not writes
+    state.update_us_position_high_watermark(**{**kwargs,"current_price":130.},committed_risk_state=row)
+    assert len(reads)==2 and len(writes)==1
+    bad=CommittedUSRiskState({**row,"trading_epoch_id":"wrong"})
+    state.update_us_position_high_watermark(**kwargs,committed_risk_state=bad)
+    assert len(reads)==3
+    monkeypatch.setattr(state,"_identity_is_current",lambda identity:False)
+    import pytest
+    with pytest.raises(ValueError,match="US_HIGH_WATERMARK_ORIGINAL_SCOPE_UNVERIFIED"):
+        state.update_us_position_high_watermark(**kwargs,committed_risk_state=row)

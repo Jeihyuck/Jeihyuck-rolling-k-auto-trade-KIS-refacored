@@ -1361,7 +1361,7 @@ def prepare_exit_position_snapshots(
     on_snapshot_ready=None,
 ) -> list[dict]:
     from trader.us.symbols import normalize_us_exchange
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
     # Exactly one scoped DB read for approved existing-position revisions.
     # Never change or re-sign original entry/exit contracts.
@@ -1430,8 +1430,37 @@ def prepare_exit_position_snapshots(
         except Exception:
             _pool.shutdown(wait=True, cancel_futures=True)
             raise
+    # Native streaming: a slow quote for the first holding cannot delay a
+    # ready protective SELL for a different holding. Only the existing
+    # caller callback may route; all risk writes stay on this same thread.
+    _stream_ready = (
+        _pool is not None and on_snapshot_ready is not None
+        and os.getenv("WSL_RUN_MARKET", "").upper() == "US"
+        and os.getenv("US_ORDER_ARMED", "0").lower() in {"1", "true", "yes", "on"}
+        and os.getenv("US_EXIT_READY_FIRST_ENABLED", "1") == "1"
+    )
+    def _position_order():
+        if not _stream_ready:
+            yield from enumerate(positions)
+            return
+        remaining = set(range(len(positions)))
+        while remaining:
+            ready = sorted(i for i in remaining if _quote_futures[i].done())
+            if not ready:
+                budget = max(0.0, _prefetch_deadline - time.monotonic())
+                if budget:
+                    wait([_quote_futures[i] for i in remaining], timeout=budget,
+                         return_when=FIRST_COMPLETED)
+                ready = sorted(i for i in remaining if _quote_futures[i].done())
+                if not ready:
+                    # Existing timeout path logs/skips each unresolved quote.
+                    ready = sorted(remaining)
+            for i in ready:
+                remaining.remove(i)
+                yield i, positions[i]
+    _completed_snapshots = []
     try:
-        for _position_index, original_pos in enumerate(positions):
+        for _position_index, original_pos in _position_order():
             _snapshot_start_mono = time.monotonic()
             _quote_elapsed_ms = 0.0
             _state_elapsed_ms = 0.0
@@ -1545,6 +1574,7 @@ def prepare_exit_position_snapshots(
                 _observe_snapshot_outcome("SKIP", "price_nonpositive")
                 continue
             _state_started_mono = time.monotonic()
+            committed_risk_state = None
             entry_price_for_state = _resolve_position_entry_price(pos)
             if entry_price_for_state > 0 and current_price > 0:
                 _risk_start_mono = time.monotonic()
@@ -1565,7 +1595,14 @@ def prepare_exit_position_snapshots(
                         raise ValueError("invalid_entry_exit_contract")
                     frozen_risk_cfg = contract_exit_config(pos)
                     pnl_pct_for_state = (current_price - entry_price_for_state) / entry_price_for_state
-                    risk_state = update_us_soft_stop_risk_state(
+                    _risk_writer = update_us_soft_stop_risk_state
+                    if (os.getenv("WSL_RUN_MARKET", "").upper() == "US"
+                            and os.getenv("KIS_ENV", "").strip().lower() == "practice"
+                            and os.getenv("US_ORDER_ARMED", "0").strip().lower() in {"1", "true", "yes", "on"}
+                            and os.getenv("US_ATOMIC_SOFT_STOP_ENABLED", "1") == "1"):
+                        from trader.us.db.repos import update_us_soft_stop_risk_state_atomic
+                        _risk_writer = update_us_soft_stop_risk_state_atomic
+                    risk_state = _risk_writer(
                         symbol=symbol,
                         trade_date=_trade_date_from_key(resolve_us_trade_date_key(now)),
                         pnl_pct=pnl_pct_for_state,
@@ -1577,6 +1614,9 @@ def prepare_exit_position_snapshots(
                         **({"policy_revision": "PB1_STOP_3_6_V1"}
                            if pos.get("_verified_pb1_stop_revision") else {}),
                     )
+                    from trader.us.db.repos import CommittedUSRiskState
+                    if isinstance(risk_state, CommittedUSRiskState):
+                        committed_risk_state = risk_state
                     # Keep a previous-day partial-fill *candidate* only in
                     # this snapshot. It receives no execution authority until
                     # the original BUY, forward cycle and native first order
@@ -1633,6 +1673,8 @@ def prepare_exit_position_snapshots(
                             symbol=symbol, trade_date=_trade_date_from_key(resolve_us_trade_date_key(now)), lifecycle_id=str(lifecycle_id),
                             current_price=current_price, entry_price=entry_price_for_state, now=now or datetime.now(),
                             position=pos,
+                            **({"committed_risk_state": committed_risk_state}
+                               if committed_risk_state is not None else {}),
                         )
                         pos["high_watermark"] = high_state.get("high_watermark")
                         pos["max_price"] = high_state.get("high_watermark")
@@ -1682,6 +1724,7 @@ def prepare_exit_position_snapshots(
                 datetime.now(timezone.utc).isoformat(),
             )
             snapshots.append(pos)
+            _completed_snapshots.append((_position_index, pos))
             if on_snapshot_ready is not None:
                 # Callback exceptions propagate to the caller, which must fail
                 # closed: it can no longer assume every snapshot was evaluated.
@@ -1697,7 +1740,8 @@ def prepare_exit_position_snapshots(
                 if not _future.done():
                     _future.cancel()
             _pool.shutdown(wait=False, cancel_futures=True)
-    return snapshots
+    # Return historical portfolio order for downstream non-stream arbitration.
+    return [pos for _, pos in sorted(_completed_snapshots)]
 
 
 def _evaluate_exit_intents_from_snapshots(
