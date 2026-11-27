@@ -1361,7 +1361,7 @@ def prepare_exit_position_snapshots(
     on_snapshot_ready=None,
 ) -> list[dict]:
     from trader.us.symbols import normalize_us_exchange
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
     # Exactly one scoped DB read for approved existing-position revisions.
     # Never change or re-sign original entry/exit contracts.
@@ -1430,8 +1430,37 @@ def prepare_exit_position_snapshots(
         except Exception:
             _pool.shutdown(wait=True, cancel_futures=True)
             raise
+    # Native streaming: a slow quote for the first holding cannot delay a
+    # ready protective SELL for a different holding. Only the existing
+    # caller callback may route; all risk writes stay on this same thread.
+    _stream_ready = (
+        _pool is not None and on_snapshot_ready is not None
+        and os.getenv("WSL_RUN_MARKET", "").upper() == "US"
+        and os.getenv("US_ORDER_ARMED", "0").lower() in {"1", "true", "yes", "on"}
+        and os.getenv("US_EXIT_READY_FIRST_ENABLED", "1") == "1"
+    )
+    def _position_order():
+        if not _stream_ready:
+            yield from enumerate(positions)
+            return
+        remaining = set(range(len(positions)))
+        while remaining:
+            ready = sorted(i for i in remaining if _quote_futures[i].done())
+            if not ready:
+                budget = max(0.0, _prefetch_deadline - time.monotonic())
+                if budget:
+                    wait([_quote_futures[i] for i in remaining], timeout=budget,
+                         return_when=FIRST_COMPLETED)
+                ready = sorted(i for i in remaining if _quote_futures[i].done())
+                if not ready:
+                    # Existing timeout path logs/skips each unresolved quote.
+                    ready = sorted(remaining)
+            for i in ready:
+                remaining.remove(i)
+                yield i, positions[i]
+    _completed_snapshots = []
     try:
-        for _position_index, original_pos in enumerate(positions):
+        for _position_index, original_pos in _position_order():
             _snapshot_start_mono = time.monotonic()
             _quote_elapsed_ms = 0.0
             _state_elapsed_ms = 0.0
@@ -1695,6 +1724,7 @@ def prepare_exit_position_snapshots(
                 datetime.now(timezone.utc).isoformat(),
             )
             snapshots.append(pos)
+            _completed_snapshots.append((_position_index, pos))
             if on_snapshot_ready is not None:
                 # Callback exceptions propagate to the caller, which must fail
                 # closed: it can no longer assume every snapshot was evaluated.
@@ -1710,7 +1740,8 @@ def prepare_exit_position_snapshots(
                 if not _future.done():
                     _future.cancel()
             _pool.shutdown(wait=False, cancel_futures=True)
-    return snapshots
+    # Return historical portfolio order for downstream non-stream arbitration.
+    return [pos for _, pos in sorted(_completed_snapshots)]
 
 
 def _evaluate_exit_intents_from_snapshots(

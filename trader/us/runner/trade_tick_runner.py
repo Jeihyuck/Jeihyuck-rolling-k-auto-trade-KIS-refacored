@@ -567,6 +567,42 @@ def _suppress_pending_sell_exit_intents(
     except Exception:
         return [] if strict else exit_intents
     statuses = {"SUBMITTED", "ACK", "PENDING", "PARTIALLY_FILLED", "RECONCILE_PENDING", "ACK_DB_FAILED"}
+    # Native practice submits use one scoped durable snapshot rather than
+    # one transaction per SELL intent. No cache across batches or ticks.
+    # A failed DB read is UNKNOWN, not evidence of no pending order.
+    batch_pending = None
+    native_batch = (
+        str(env).lower() == "practice"
+        and os.getenv("KIS_ENV", "").strip().lower() == "practice"
+        and os.getenv("WSL_RUN_MARKET", "").upper() == "US"
+        and os.getenv("US_ORDER_ARMED", "0").strip().lower() in {"1", "true", "yes", "on"}
+        and os.getenv("US_PENDING_SELL_BATCH_ENABLED", "1") == "1"
+    )
+    if native_batch:
+        requested = sorted({str(i.get("symbol") or "").strip().upper()
+                            for i in exit_intents
+                            if str(i.get("side") or "").upper() == "SELL"
+                            and str(i.get("symbol") or "").strip()
+                            and _standard_lifecycle(i) not in historical_fenced})
+        if requested:
+            from trader.us.db.repos import load_pending_order_symbols_for_side
+            started = time.monotonic()
+            try:
+                batch_pending = load_pending_order_symbols_for_side(
+                    symbols=requested, side="SELL", trade_date=trade_date,
+                    include_statuses=statuses,
+                )
+                logger.info("[US_EXIT][PENDING_SELL_BATCH] symbols=%d pending=%d elapsed_ms=%.2f",
+                            len(requested), len(batch_pending), (time.monotonic()-started)*1000)
+            except Exception as exc:
+                # A fresh account/epoch DB check is mandatory for native
+                # execution. Do not substitute the permissive old bool helper.
+                # Keep non-SELL intents; no orders/claims are changed here.
+                logger.error("[US_EXIT][PENDING_SELL_BATCH_UNVERIFIED] symbols=%d error=%s",
+                             len(requested), type(exc).__name__)
+                return [i for i in exit_intents if str(i.get("side") or "").upper() != "SELL"]
+        else:
+            batch_pending = set()
     kept: list[dict] = []
     for intent in exit_intents:
         if str(intent.get("side") or "").upper() != "SELL":
@@ -582,7 +618,8 @@ def _suppress_pending_sell_exit_intents(
             )
             continue
         try:
-            pending = bool(symbol) and has_pending_order_for_symbol_side(symbol=symbol, side="SELL", trade_date=trade_date, include_statuses=statuses)
+            pending = (symbol in batch_pending if batch_pending is not None
+                       else bool(symbol) and has_pending_order_for_symbol_side(symbol=symbol, side="SELL", trade_date=trade_date, include_statuses=statuses))
         except Exception as exc:
             logger.warning("[US_EXIT][INTENT_SUPPRESS_CHECK_WARN] symbol=%s err=%s", symbol, exc)
             if strict:
