@@ -34,3 +34,26 @@ def test_hot_event_reevaluates_only_changed_native_evidence(tmp_path,monkeypatch
         assert len(calls)==2
     finally:
         db.close()
+
+
+def test_real_hot_evaluator_never_creates_ready_before_30_native_bars(tmp_path,monkeypatch):
+    from trader.us.entry_timing import opportunity
+    monkeypatch.setattr(opportunity,"effective_mode",lambda:"ENFORCE")
+    now=datetime(2026,11,25,10,10,tzinfo=ZoneInfo("America/New_York"))
+    td=now.date().isoformat()
+    observer.publish_preminute_candidates(env="practice",scope="scope:epoch",trade_date=td,
+        candidates=[(10,"AAA","NYSE",None,{"position_state":"NOT_HELD","entry_style":"ENTRY_PULLBACK"})],
+        now_epoch=now.timestamp()-1,base=tmp_path)
+    db=observer.open_store(observer.store_path(env="practice",account_scope="scope:epoch",trade_date=td,base=tmp_path))
+    try:
+        result=poll_hot_events(db,env="practice",scope="scope:epoch",trade_date=td,
+            hot_pairs=[("AAA","NYSE")],now_et=now,
+            quote_reader=lambda *a:{"bid":99.9,"ask":100,"last":100,"received_at":now.timestamp()-1,
+                                    "collector_generation":"g1"},seen={},base=tmp_path)
+        assert len(result)==1
+        assert result[0]["decision"]["state"]=="WAIT"
+        assert result[0]["decision"]["reason"]=="opening_minute_bars_insufficient"
+        assert result[0]["decision"]["broker_authorized"] is False
+        assert result[0]["is_order_authorization"] is False
+    finally:
+        db.close()
