@@ -855,3 +855,22 @@ def test_actual_reconcile_fence_branch_skips_final30_only_after_exit_handoff(
     eng.env = "practice"
     monkeypatch.setenv("KR_SKIP_FENCED_ENTRY_SCAN", "0")
     assert evaluate(eng, reason) == "CONTINUE"
+
+
+def test_kr_daily_preload_only_missing_features_and_unknown_rows(monkeypatch):
+    from trader.pb1_engine import PB1Engine
+    eng = PB1Engine.__new__(PB1Engine)
+    complete = dict.fromkeys(("ma20_slope","vol_contraction","volu_contraction",
+                             "high20","tr_range_pct","trend_strength","ma10","value20"), 1.0)
+    rows = {"000001": (complete, True),
+            "000002": ({**complete,"high20":None}, True),
+            "000003": (complete, False),
+            "000004": ({**complete,"ma20_slope":0.0}, True)}
+    def mapped(code):
+        row, ok = rows[code]
+        return dict(row), {}, [], True, ok
+    monkeypatch.setattr(eng,"_map_precomputed_candidate_row",mapped)
+    needed = eng._kr_select_short_ohlcv_preload(list(rows)+["000005"])
+    assert needed == ["000002","000003","000005"]
+    assert not eng._kr_needs_short_ohlcv_fill(complete,True)
+    assert eng._kr_needs_short_ohlcv_fill(complete,False)
