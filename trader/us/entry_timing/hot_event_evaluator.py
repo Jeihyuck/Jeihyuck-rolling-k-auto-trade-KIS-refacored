@@ -147,14 +147,51 @@ def read_hot_retry_hints(*, env, scope, trade_date, generation, waiting,
     """Bounded read-only hints for a currently eligible, previously WAIT symbol."""
     import sqlite3
     from contextlib import closing
-    from trader.us.entry_timing.opening_observer import store_path
+    from trader.us.entry_timing.opening_observer import store_path, priority_manifest_path
     if env!="practice" or not scope or not generation or not waiting or len(waiting)>30:
         return set()
+
+    def eligible_pairs():
+        # The canonical publisher may replace the shortlist while a Tick is
+        # running. Do not consume orphaned hints from an old generation even
+        # if their individual quote timestamp is still within five seconds.
+        manifest=priority_manifest_path(env=env,scope=scope,trade_date=trade_date,base=base)
+        if manifest.stat().st_size>65536:
+            return set()
+        payload=json.loads(manifest.read_text(encoding="utf-8"))
+        created,expires=float(payload["created_epoch"]),float(payload["expires_epoch"])
+        if (payload.get("schema")!="US_PREMINUTE_PRIORITY_V1"
+                or payload.get("env")!=env or payload.get("owner")!="US_STANDARD"
+                or payload.get("trade_date")!=trade_date
+                or payload.get("is_order_authorization") is not False
+                or payload.get("scope_sha256")!=hashlib.sha256((env+":"+scope).encode()).hexdigest()
+                or payload.get("generation")!=generation
+                or not all(map(math.isfinite,(created,expires,now_epoch)))
+                or not created<=now_epoch<=expires<=created+180.00001):
+            return set()
+        inputs=payload["hot_event_inputs"]
+        if not isinstance(inputs,dict):
+            return set()
+        listed=set()
+        symbols=set()
+        for lane,cap in (("hot",4),("warm",8),("cold",30)):
+            entries=payload[lane]
+            if not isinstance(entries,list) or len(entries)>cap:
+                return set()
+            for item in entries:
+                symbol,exchange=item["symbol"],item["exchange"]
+                if symbol in symbols or exchange not in {"NASDAQ","NYSE","AMEX"}:
+                    return set()
+                symbols.add(symbol)
+                if symbol!="TQQQ" and isinstance(inputs.get(symbol),dict):
+                    listed.add((symbol,exchange))
+        return listed & set(waiting)
+
     try:
         path=store_path(env=env,account_scope=scope,trade_date=trade_date,base=base)
         if not path.is_file():
             return set()
-        pairs=sorted((symbol,exchange) for symbol,exchange in waiting if symbol!="TQQQ")
+        pairs=sorted(eligible_pairs())
         if not pairs:
             return set()
         # Apply eligibility before LIMIT, otherwise newer unrelated hints can
@@ -169,11 +206,12 @@ def read_hot_retry_hints(*, env, scope, trade_date, generation, waiting,
                 AND length(event_id)>0 AND ("""+pair_filter+""")
                 ORDER BY observed_epoch DESC,symbol,exchange LIMIT 4""",
                 (trade_date,generation,now_epoch-5,now_epoch,now_epoch-5,now_epoch,*params)).fetchall()
+        still_eligible=eligible_pairs()
         return {(symbol,exchange) for symbol,exchange,at,received,event_id in rows
-                if (symbol,exchange) in waiting and symbol!="TQQQ"
+                if (symbol,exchange) in still_eligible
                 and event_id and 0<=now_epoch-at<=5 and 0<=at-received<=5
                 and 0<=now_epoch-received<=5}
-    except (OSError,ValueError,TypeError,sqlite3.Error):
+    except (OSError,ValueError,TypeError,KeyError,AttributeError,OverflowError,sqlite3.Error):
         return set()
 
 
