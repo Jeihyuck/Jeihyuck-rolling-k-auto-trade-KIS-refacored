@@ -1441,7 +1441,7 @@ def test_recovered_previous_close_never_bypasses_live_quote_gate(monkeypatch,dat
         assert result["quality"]=="UNKNOWN" and result["returns"]["qqq"] is None
     else:
         assert result["quality"]=="OK" and result["returns"]["qqq"]==pytest.approx(expected)
-        assert result["quotes"]["qqq"]["previous_close_source"]=="KIS_NATIVE_DAILY_EXACT_COMPLETED"
+        assert result["quotes"]["QQQ"]["previous_close_source"]=="KIS_NATIVE_DAILY_EXACT_COMPLETED"
     assert result["returns"]["spy"]==pytest.approx(-.02)
     assert result["returns"]["smh"]==pytest.approx(-.02)
     assert daily["qqq_previous_close"]==999
