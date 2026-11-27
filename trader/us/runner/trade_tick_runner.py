@@ -2038,6 +2038,7 @@ def run_trade_tick(
     tick_deadline_monotonic: float | None = None,
     protective_wakeup_identity: dict | None = None,
     protective_wakeup_kind: str = "stop",
+    hot_focus: dict | None = None,
 ) -> dict:
     """미국장 단일 tick 실행.
 
@@ -4708,6 +4709,18 @@ def run_trade_tick(
                         cluster_eligible_rows, current_positions
                     )
                     preblocked_rows = market_preblocked_rows + cluster_preblocked_rows + trend_preblocked_rows
+                    if hot_focus is not None:
+                        from trader.us.entry_timing.hot_event_evaluator import select_focused_hot_rows
+                        eligible_watchlist_rows=select_focused_hot_rows(
+                            eligible_watchlist_rows,hot_focus,env=env,
+                            scope=str(os.getenv("US_ENTRY_WINDOW_SCOPE") or "").strip(),
+                            trade_date=trade_date,now_epoch=time.time(),
+                        ) if (_stage4_mode and not offline and not force_now and not signal_only
+                              and kis_order_allowed and env=="practice"
+                              and os.getenv("WSL_RUN_MARKET","").upper()=="US"
+                              and os.getenv("US_HOT_EVENT_RETRY_ENABLED","1")=="1") else []
+                        logger.info("[US_HOT_EVENT][FOCUSED_CANONICAL_INPUT] count=%d action=RECHECK_ALL_BUY_GATES",
+                                    len(eligible_watchlist_rows))
                     logger.info(
                         "[US_ENTRY][PREFILTER] raw=%d eligible=%d blocked=%d",
                         len(watchlist_rows), len(eligible_watchlist_rows), len(preblocked_rows),
@@ -4815,6 +4828,7 @@ def run_trade_tick(
                                 max_new_entries=_incremental_total_target,
                                 intent_acceptor=incremental_preflight_session.consider,
                                 cancel_event=_entry_cancel_event,
+                                **({"publish_priority":False} if hot_focus is not None else {}),
                             ),
                             timeout_sec=_entry_budget_sec,
                             cancel_event=_entry_cancel_event,
@@ -5950,7 +5964,7 @@ def run_trade_tick(
         _protective_idle_watch=export_idle_watch(exit_snapshots,excluded_symbols=_watch_excluded,env=env,
             trade_date=trade_date,allow_confirmed_soft=True)
     _hot_wait=None
-    if (_stage4_mode and env=="practice" and not offline and not force_now and not signal_only
+    if (hot_focus is None and _stage4_mode and env=="practice" and not offline and not force_now and not signal_only
             and kis_order_allowed and session in {"am","afternoon"} and entry_can_proceed
             and not entry_degraded and entry_eval_error_count==0 and not orders
             and not entry_intents and not exit_intents

@@ -458,7 +458,7 @@ def make_hot_slot_poll(waiting, *, env, scope, trade_date, not_before_monotonic=
         if not hints:
             return None
         consumed=True
-        return {"kind":"hot_slot","pairs":[list(p) for p in sorted(hints)]}
+        return {"kind":"hot_slot","generation":generation,"pairs":[list(p) for p in sorted(hints)]}
     return poll
 
 
@@ -472,3 +472,42 @@ def combine_idle_polls(protective,hot):
         result=protective()
         return result if result is not None else hot()
     return poll
+
+
+def select_focused_hot_rows(rows, focus, *, env, scope, trade_date, now_epoch,
+                            base="runtime/private"):
+    """Revalidate idle advice after canonical account and portfolio filters.
+
+    Missing/expired/replaced advice means no focused BUY evaluation. Preserve
+    the original locked row and rank, never synthesize a new candidate.
+    """
+    from trader.us.entry_timing.opportunity import effective_mode
+    from trader.us.symbols import normalize_us_exchange
+    if (env!="practice" or not scope or effective_mode()!="ENFORCE"
+            or not isinstance(focus,dict) or set(focus)!={"kind","generation","pairs"}
+            or focus["kind"]!="hot_slot" or not isinstance(focus["generation"],str)
+            or not focus["generation"] or not isinstance(focus["pairs"],list)
+            or not 1<=len(focus["pairs"])<=4):
+        return []
+    pairs=set()
+    for item in focus["pairs"]:
+        if (not isinstance(item,(list,tuple)) or len(item)!=2
+                or not isinstance(item[0],str) or not item[0] or item[0]=="TQQQ"
+                or item[1] not in ("NYSE","NASDAQ","AMEX")):
+            return []
+        pairs.add(tuple(item))
+    if len(pairs)!=len(focus["pairs"]):
+        return []
+    hints=read_hot_retry_hints(env=env,scope=scope,trade_date=trade_date,
+        generation=focus["generation"],waiting=pairs,now_epoch=now_epoch,base=base)
+    selected=[]
+    for row in rows or []:
+        try:
+            symbol=str(row["symbol"]).upper().strip()
+            exchange=normalize_us_exchange(row["exchange"])
+            rank=row.get("rank_final30") or row.get("rank")
+            if (symbol,exchange) in hints and type(rank) is int and 1<=rank<=30:
+                selected.append(row)
+        except (KeyError,ValueError,TypeError,AttributeError):
+            continue
+    return selected if len(selected)==len({str(row["symbol"]).upper().strip() for row in selected}) else []
