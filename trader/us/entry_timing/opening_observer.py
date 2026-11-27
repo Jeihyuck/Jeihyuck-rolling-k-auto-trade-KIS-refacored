@@ -605,11 +605,15 @@ def collection_priorities(*, env, scope, trade_date, pairs, now_epoch=None,
         contract = json.loads(us_prep_contract_path(trade_date).read_text(encoding="utf-8"))
         payload = json.loads(us_final30_scored_path(trade_date).read_text(encoding="utf-8"))
         rows = payload.get("final30_scored") or []
-        if (payload.get("trade_date") != trade_date or payload.get("env") != env
-                or contract.get("final30_hash") != _compute_final30_hash({"final30_scored": rows})):
-            return lanes, state
         verified_pairs = standard_entry_pairs(rows)
         changed = set(verified_pairs) != set(pairs)
+        if (payload.get("trade_date") != trade_date or payload.get("env") != env
+                or contract.get("final30_hash") != _compute_final30_hash({"final30_scored": rows})):
+            if allow_prep_rebind:
+                # A partial PREP replacement is not authority to keep polling
+                # the old universe, even if its execution manifest is still fresh.
+                return {"HOT": [], "WARM": [], "COLD": []}, "PREP_REBIND_UNVERIFIED"
+            return lanes, state
         if changed and not allow_prep_rebind:
             return lanes, state
         verified_kw = {**kw, "pairs":verified_pairs}
