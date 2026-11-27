@@ -637,6 +637,7 @@ def collection_priorities(*, env, scope, trade_date, pairs, now_epoch=None,
 def next_priority_pair(
     lanes: dict[str, list[tuple[str, str]]],
     *, slot: int, offsets: dict[str, int],
+    promoted_hot: set[tuple[str, str]] | None = None,
 ) -> tuple[tuple[str, str], str] | None:
     """V2 baseline 4:1:1; unused slots may serve HOT, never expand COLD budget."""
     if any(len(lanes.get(tier) or []) > cap for tier, cap in (("HOT", 4), ("WARM", 8), ("COLD", 30))):
@@ -649,6 +650,10 @@ def next_priority_pair(
         return None
     pos = offsets.get(tier, 0)
     offsets[tier] = pos + 1
+    if tier == "HOT" and promoted_hot:
+        for candidate in (lane[(pos + i) % len(lane)] for i in range(len(lane))):
+            if candidate in promoted_hot:
+                return candidate, tier
     return lane[pos % len(lane)], tier
 
 
@@ -770,6 +775,8 @@ def run_observer(*, env: str, trade_date: str, scope: str,
         "US_KIS_ORDER_ALLOWED": "0", "TRADING_REGION": "US",
         "US_ORDER_ARMED": "0", "LIVE_TRADING_ENABLED": "0",
         "US_LIVE_TRADING_ENABLED": "0",
+        "US_OPENING_OBSERVER_READ_ONLY": "1",
+        "US_SHARED_KIS_LIMITER_ENABLED": "1",
     })
     from trader.us.market_calendar import is_us_trading_day, regular_close_time_for_date
     from datetime import date
@@ -795,6 +802,8 @@ def run_observer(*, env: str, trade_date: str, scope: str,
     priority_offsets = {"HOT": 0, "WARM": 0, "COLD": 0}
     last_priority_state = None
     next_repair_by_symbol = {}
+    previous_hot = set()
+    promoted_hot = set()
     next_epoch_check = 0.0
     epoch_verified = not continuous
     fetch_enabled = os.getenv("US_OPENING_OBSERVER_BAR_FETCH_ENABLED", "1") == "1"
@@ -854,7 +863,12 @@ def run_observer(*, env: str, trade_date: str, scope: str,
                     len(lanes["COLD"]),
                 )
             last_priority_state = priority_state
-            picked = next_priority_pair(lanes, slot=pointer, offsets=priority_offsets)
+            current_hot = set(lanes["HOT"])
+            promoted_hot.intersection_update(current_hot)
+            promoted_hot.update(current_hot - previous_hot)
+            previous_hot = current_hot
+            picked = next_priority_pair(lanes, slot=pointer, offsets=priority_offsets,
+                                        promoted_hot=promoted_hot)
             pointer += 1
             if picked is None:
                 LOG.warning("[US_OPENING_OBSERVER][NO_COLLECTION_TARGET] action=NO_ORDER")
@@ -882,11 +896,18 @@ def run_observer(*, env: str, trade_date: str, scope: str,
                     return (epoch_verified and live.date().isoformat() == trade_date
                             and live.time() < close_time and state in {"VALID", "PREP_VALID"}
                             and (symbol, exchange) in current[tier])
-                repair_due = tier == "HOT" and time.monotonic() >= next_repair_by_symbol.get(symbol, 0.0)
-                if repair_due:
-                    next_repair_by_symbol[symbol] = time.monotonic() + 120.0
+                promoted = tier == "HOT" and (symbol, exchange) in promoted_hot
+                repair_due = tier == "HOT" and (promoted or time.monotonic() >= next_repair_by_symbol.get(symbol, 0.0))
+                # A failed/deferred native read must not consume the repair
+                # cooldown. A newly promoted HOT symbol gets its first backfill
+                # on a HOT slot without increasing the WARM/COLD request quota.
                 result = collect_hot_minutes(client, db, symbol=symbol, exchange=exchange,
                     trade_date=trade_date, repair_due=repair_due, still_hot=_still_hot, max_pages=4 if tier == "HOT" else 1)
+                if result["requests"] > 0 and repair_due:
+                    next_repair_by_symbol[symbol] = time.monotonic() + 120.0
+                    promoted_hot.discard((symbol, exchange))
+                elif promoted:
+                    LOG.info("[US_OPENING_OBSERVER][PROMOTION_REPAIR_DEFERRED] symbol=%s", symbol)
                 LOG.info("[US_OPENING_OBSERVER][BAR_UPDATE] symbol=%s new_rows=%d requests=%d "
                          "source=KIS_OVERSEAS_1M action=NO_ORDER", symbol, result["changed"], result["requests"])
                 from trader.marketdata.opening_range_intelligence import analyze_opening_range
