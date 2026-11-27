@@ -278,14 +278,24 @@ def write_heartbeat_file(session: str, run_id: str, tick: int, phase: str, **ext
         logger.warning("[US_SESSION][LIVENESS_CHECK][WARN] heartbeat write failed: %s", exc)
 
 
-def sleep_with_heartbeat(session: str, run_id: str, tick: int, total_sec: int, heartbeat_sec: int = 30) -> None:
+def sleep_with_heartbeat(session: str, run_id: str, tick: int, total_sec: int, heartbeat_sec: int = 30, *, protective_poll=None):
     slept = 0
     logger.info("[US_TICK_LOOP][SLEEP_START] session=%s tick=%d seconds=%d", session, tick, total_sec)
     write_heartbeat_file(session, run_id, tick, phase="SLEEP_START", slept=slept)
     while slept < total_sec:
-        step = min(heartbeat_sec, total_sec - slept)
+        step = min(5 if protective_poll is not None else heartbeat_sec, total_sec - slept)
         time_mod.sleep(step)
         slept += step
+        if protective_poll is not None and slept < total_sec:
+            try:
+                wakeup=protective_poll()
+            except Exception:
+                logger.warning("[US_EXIT][IDLE_WATCH_UNAVAILABLE] action=continue_normal_schedule",exc_info=True)
+                protective_poll=None
+                wakeup=None
+            if wakeup is not None:
+                write_heartbeat_file(session, run_id, tick, phase="PROTECTIVE_WAKEUP")
+                return wakeup
         logger.info("[US_TICK_LOOP][SLEEP_HEARTBEAT] session=%s run_id=%s tick=%d slept=%d/%d", session, run_id, tick, slept, total_sec)
         write_heartbeat_file(session, run_id, tick, phase="SLEEP_HEARTBEAT", slept=slept)
     logger.info("[US_TICK_LOOP][SLEEP_DONE] session=%s tick=%d slept=%d", session, tick, slept)
@@ -1489,6 +1499,8 @@ def run_trade_session(
         completed_market_context = None
         completed_market_context_age_ticks = 0
         tick_count = 0
+        _normal_tick_count = 0
+        _protective_wakeup = None
         warn_count = 0
         consecutive_errors = 0
         consecutive_tick_timeouts = 0
@@ -2165,6 +2177,11 @@ def run_trade_session(
                             type(_refresh_exc).__name__,
                         )
 
+                _wakeup_for_tick = _protective_wakeup
+                _protective_wakeup = None
+                _idle_watch = []
+                if _wakeup_for_tick is None:
+                    _normal_tick_count += 1
                 tick_count += 1
                 tick_id = f"{session_run_id}:{tick_count}"
                 _write_active_session_state(
@@ -2218,7 +2235,7 @@ def run_trade_session(
                             kis_order_allowed=kis_order_allowed,
                             session_entry_allowed=session_entry_allowed,
                             session_buy_orders_count=buy_count,
-                            tick_index=tick_count,
+                            tick_index=max(1,_normal_tick_count),
                             balance_reconcile_interval=int(os.getenv("US_BALANCE_RECONCILE_INTERVAL_TICKS", "3")),
                             prep_status_cache=prep_status_cache,
                             locked_watchlist_cache=locked_watchlist_cache,
@@ -2254,6 +2271,10 @@ def run_trade_session(
                             # shared by the watchdog, child and all KIS I/O.
                             tick_deadline_monotonic=time_mod.monotonic() + child_budget_sec,
                         )
+                    if _wakeup_for_tick is not None:
+                        tick_kwargs.update(protective_wakeup_identity=_wakeup_for_tick,
+                            entry_can_proceed=False,tqqq_policy_override_allowed=False,
+                            session_entry_allowed=False,entry_block_reason="PROTECTIVE_WAKEUP")
                     if _stage4_exit_only_fallback:
                         # Block EVERY new BUY, including dedicated TQQQ policy
                         # overrides. Keep existing authorized SELL evaluation.
@@ -2306,6 +2327,7 @@ def run_trade_session(
                         tick_result = process_result.result
                         tick_result.setdefault("child_pid", process_result.child_pid)
                         tick_result.setdefault("total_tick_sec", process_result.duration_sec)
+                    _idle_watch = tick_result.pop("_protective_idle_watch", [])
                     # Never publish incomplete market data as reusable truth.
                     # Scheduled revalidation detects upstream corrections even
                     # if a provider does not publish an explicit new version.
@@ -2631,11 +2653,23 @@ def run_trade_session(
 
                 if not force_now:
                     from trader.us.runner.tick_process import fixed_rate_slot
-                    sleep_sec, skipped = fixed_rate_slot(session_anchor_monotonic, tick_count, interval_sec, time_mod.monotonic())
+                    sleep_sec, skipped = fixed_rate_slot(session_anchor_monotonic, _normal_tick_count, interval_sec, time_mod.monotonic())
                     skipped_slot_count += skipped
                     if skipped:
                         logger.warning("[US_TICK_LOOP][SLOTS_SKIPPED] count=%d total=%d", skipped, skipped_slot_count)
-                    sleep_with_heartbeat(session, run_id, tick_count, int(sleep_sec))
+                    _idle_poll=None
+                    if (_wakeup_for_tick is None and not offline and max_ticks==0
+                            and not resolved_signal_only and kis_order_allowed and env=="practice"
+                            and _reconcile_mode=="WORKER" and not _unreaped_child_seen
+                            and bool(prep_guard_result.get("exit_can_proceed",True))
+                            and os.getenv("US_DISABLE_TICK_PROCESS_ISOLATION")!="1"
+                            and os.getenv("US_ENTRY_PROTECTIVE_INTERRUPT_ENABLED","1")=="1"):
+                        from trader.us.runner.protective_entry_interrupt import make_idle_hard_stop_poll
+                        _idle_poll=make_idle_hard_stop_poll(_idle_watch,trade_date=trade_date,env=env)
+                    if _idle_poll is not None:
+                        _protective_wakeup=sleep_with_heartbeat(session,run_id,tick_count,int(sleep_sec),protective_poll=_idle_poll)
+                    else:
+                        sleep_with_heartbeat(session, run_id, tick_count, int(sleep_sec))
 
         except KeyboardInterrupt:
             final_status = "OPERATOR_CANCELLED_RECONCILE_PENDING" if results else "OPERATOR_CANCELLED"

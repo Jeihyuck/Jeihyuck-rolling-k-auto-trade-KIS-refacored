@@ -77,3 +77,41 @@ def test_interrupt_requires_canonical_hard_stop_and_pending_gate(monkeypatch,cas
     assert ("router" in calls)==(case=="valid")
     if case=="valid": assert calls==["canonical","pending","router"] and selected[0]["symbol"]=="ABC"
     if case in {"stale","no_permission"}: assert not calls
+
+
+@pytest.mark.parametrize("case",["fresh","stale","recovered","closed","bad_identity"])
+def test_idle_watch_is_readonly_identity_only(monkeypatch,case):
+    from trader.us import market_calendar
+    from trader.marketdata import us_ws_collector
+    from trader.us.runner.protective_entry_interrupt import make_idle_hard_stop_poll
+    clock=datetime(2026,11,25,17 if case=="closed" else 11,tzinfo=ZoneInfo("America/New_York"))
+    monkeypatch.setattr(market_calendar,"now_ny",lambda:clock)
+    identity=dict(symbol="ABC",strategy_owner="US_STANDARD",position_lifecycle_id="l",
+                  position_cycle_id="l",portfolio_epoch_id="p",trading_epoch_id="e",broker_account_hash="a")
+    if case=="bad_identity": identity.pop("position_cycle_id")
+    calls=[]
+    def quote(*a,**kw):
+        calls.append(a)
+        return dict(last=98 if case=="recovered" else 93,source="KIS_WEBSOCKET_COLLECTOR",
+                    collector_generation="g",received_at=time.time()-(10 if case=="stale" else 0))
+    monkeypatch.setattr(us_ws_collector,"get_quote",quote)
+    poll=make_idle_hard_stop_poll([dict(identity=identity,entry=100,hard=.06,exchange="NASDAQ")],
+                                trade_date="2026-11-25",env="practice")
+    found=poll() if poll else None
+    assert found==(identity if case=="fresh" else None)
+    if case in {"closed","bad_identity"}: assert not calls
+
+
+def test_idle_sleep_wakeup_does_not_wait_full_slot(monkeypatch):
+    from trader.us.runner import trade_session_runner as session
+    slept=[]
+    monkeypatch.setattr(session.time_mod,"sleep",lambda n:slept.append(n))
+    monkeypatch.setattr(session,"write_heartbeat_file",lambda *a,**kw:None)
+    identity={"symbol":"ABC"}
+    assert session.sleep_with_heartbeat("am","run",1,60,protective_poll=lambda:identity)==identity
+    assert slept==[5]
+
+
+def test_protective_wakeup_rejects_unverified_identity_before_broker(monkeypatch):
+    from trader.us.runner.trade_tick_runner import run_trade_tick
+    assert run_trade_tick(protective_wakeup_identity={"symbol":"ABC"})["reason"]=="protective_wakeup_not_authorized"

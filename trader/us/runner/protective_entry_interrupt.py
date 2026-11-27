@@ -28,16 +28,30 @@ def snapshot_still_fresh(snapshot, trade_date, now):
         return False
 
 
-def make_hard_stop_poll(snapshots, *, excluded_symbols, trade_date, env, context):
-    """Return a bounded observer; a trigger is a snapshot, never an intent."""
+_IDENTITY_FIELDS = ("symbol","strategy_owner","position_lifecycle_id","position_cycle_id",
+                    "portfolio_epoch_id","trading_epoch_id","broker_account_hash")
+
+
+def holding_identity(position):
+    if not isinstance(position,dict):
+        return None
+    identity = {k:str(position.get(k) or "").strip() for k in _IDENTITY_FIELDS}
+    if (not all(identity.values()) or identity["strategy_owner"]!="US_STANDARD"
+            or identity["symbol"].upper()=="TQQQ"
+            or identity["position_lifecycle_id"]!=identity["position_cycle_id"]):
+        return None
+    identity["symbol"]=identity["symbol"].upper()
+    return identity
+
+
+def _verified_candidates(snapshots, excluded_symbols, env):
+    """Return scoped verified positions and existing frozen stop thresholds."""
     from trader.us.entry_exit_contract import contract_exit_config, us_entry_exit_contract_integrity_state
     from trader.us.pb1.us_exit_router import normalize_book, normalize_horizon
     from trader.us.pb1.us_exit_engine import _resolve_position_entry_price
-    from trader.us.market_calendar import now_ny, is_us_regular_market_open
-    from trader.marketdata.us_ws_collector import get_quote
     from trader.us.symbols import normalize_us_exchange
     if env != "practice":
-        return None
+        return []
     counts = Counter(str(p.get("symbol") or "").upper() for p in snapshots or [])
     candidates = []
     for pos in snapshots or []:
@@ -54,10 +68,7 @@ def make_hard_stop_poll(snapshots, *, excluded_symbols, trade_date, env, context
             if normalize_horizon(pos.get("horizon") or meta.get("horizon")) != "SWING_CARRY":
                 continue
             # Require the original typed scope. No inferred lifecycle or owner.
-            if not all(pos.get(k) for k in ("position_lifecycle_id", "position_cycle_id",
-                    "portfolio_epoch_id", "trading_epoch_id", "broker_account_hash")):
-                continue
-            if pos["position_lifecycle_id"] != pos["position_cycle_id"]:
+            if holding_identity(pos) is None:
                 continue
             if us_entry_exit_contract_integrity_state(pos, meta) != "VALID":
                 continue
@@ -70,6 +81,14 @@ def make_hard_stop_poll(snapshots, *, excluded_symbols, trade_date, env, context
             candidates.append((deepcopy(pos),symbol,normalize_us_exchange(pos["exchange"]),entry,hard))
         except (ValueError, TypeError, KeyError, AttributeError, OverflowError):
             continue
+    return candidates
+
+
+def make_hard_stop_poll(snapshots, *, excluded_symbols, trade_date, env, context):
+    """Return a bounded observer; a trigger is a snapshot, never an intent."""
+    from trader.us.market_calendar import now_ny, is_us_regular_market_open
+    from trader.marketdata.us_ws_collector import get_quote
+    candidates = _verified_candidates(snapshots, excluded_symbols, env)
     if not candidates:
         return None
     cursor = 0
@@ -93,15 +112,10 @@ def make_hard_stop_poll(snapshots, *, excluded_symbols, trade_date, env, context
             try:
                 q = get_quote(symbol,exchange,env=env,max_age_sec=5,
                               timeout_sec=min(.15,remaining))
-                if (not isinstance(q,dict) or q.get("source") != "KIS_WEBSOCKET_COLLECTOR"
-                        or not q.get("collector_generation") or q.get("stale") or q.get("suspect")):
+                price = _breached_quote(q,entry,hard)
+                if price is None:
                     continue
-                last = float(q["last"])
-                received = float(q["received_at"])
-                if not (math.isfinite(last) and last > 0 and 0 <= time.time()-received <= 5):
-                    continue
-                if (last-entry)/entry > -hard:
-                    continue
+                last, received = price
                 snapshot = deepcopy(pos)
                 snapshot.update(resolved_current_price=last,current_price_usd=last,
                                 current_price=last,resolved_pnl_pct=(last-entry)/entry,
@@ -112,6 +126,57 @@ def make_hard_stop_poll(snapshots, *, excluded_symbols, trade_date, env, context
                                     "received_at_utc":datetime.now(timezone.utc).isoformat()})
                 if snapshot_still_fresh(snapshot,trade_date,now_ny()):
                     return snapshot
+            except (ValueError,TypeError,KeyError,OverflowError):
+                continue
+        return None
+    return poll
+
+
+def _breached_quote(q, entry, hard):
+    if (not isinstance(q,dict) or q.get("source") != "KIS_WEBSOCKET_COLLECTOR"
+            or not q.get("collector_generation") or q.get("stale") or q.get("suspect")):
+        return None
+    last, received = float(q["last"]), float(q["received_at"])
+    if (not math.isfinite(last) or last<=0 or not 0<=time.time()-received<=5
+            or (last-entry)/entry > -hard):
+        return None
+    return last,received
+
+
+def export_idle_watch(snapshots, *, excluded_symbols, env):
+    """Private parent/child IPC only: advisory identity and threshold, no contract."""
+    return [{"identity":holding_identity(pos),"exchange":exchange,"entry":entry,"hard":hard}
+            for pos,_,exchange,entry,hard in _verified_candidates(snapshots,excluded_symbols,env)]
+
+
+def make_idle_hard_stop_poll(watch, *, trade_date, env):
+    """No broker authority. Wake the existing serial session child on a fresh quote."""
+    from trader.us.market_calendar import now_ny,is_us_regular_market_open
+    from trader.marketdata.us_ws_collector import get_quote
+    candidates = [w for w in watch if isinstance(w,dict) and holding_identity(w.get("identity"))]
+    if env!="practice" or not candidates:
+        return None
+    cursor=0
+    def poll():
+        nonlocal cursor
+        now=now_ny()
+        if now.date().isoformat()!=str(trade_date) or not is_us_regular_market_open(now):
+            return None
+        deadline=time.monotonic()+.8
+        for _ in candidates:
+            remaining=deadline-time.monotonic()
+            if remaining<=0:
+                break
+            candidate=candidates[cursor]
+            cursor=(cursor+1)%len(candidates)
+            try:
+                entry,hard=float(candidate["entry"]),float(candidate["hard"])
+                if not (math.isfinite(entry) and entry>0 and math.isfinite(hard) and 0<hard<1):
+                    continue
+                q=get_quote(candidate["identity"]["symbol"],candidate["exchange"],env=env,
+                            max_age_sec=5,timeout_sec=min(.15,remaining))
+                if _breached_quote(q,entry,hard) is not None:
+                    return dict(candidate["identity"])
             except (ValueError,TypeError,KeyError,OverflowError):
                 continue
         return None
