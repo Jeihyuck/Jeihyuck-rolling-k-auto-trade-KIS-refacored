@@ -208,14 +208,18 @@ def test_old_conflicted_completed_minute_gets_exact_native_anchor(
     ] == 0
 
 
-def test_loop_waits_for_late_prep_then_starts_readonly_collection(tmp_path, monkeypatch):
+@pytest.mark.parametrize("preopen", [False, True])
+def test_loop_waits_for_late_prep_then_starts_readonly_collection(tmp_path, monkeypatch, preopen):
     import json
     import sys
     import trader.kis_wrapper as kw
     from trader.kr import entry_priority_queue as pq
 
     scope = "practice:12345678:01"
-    times = iter([at(9, 0), at(9, 1), at(15, 6)])
+    seed_time = at(8, 55) if preopen else at(9, 0)
+    times = iter([at(8, 55), at(8, 56), at(9, 0), at(15, 6)] if preopen
+                 else [at(9, 0), at(9, 1), at(15, 6)])
+    monkeypatch.setenv("KR_PREOPEN_OBSERVER_READY_ENABLED", "1")
     monkeypatch.setattr(observer, "now_kst", lambda: next(times))
     monkeypatch.setattr(sys, "argv", [
         "scripts.kr_opening_observer", "--loop", "--date", DATE,
@@ -247,9 +251,13 @@ def test_loop_waits_for_late_prep_then_starts_readonly_collection(tmp_path, monk
 
     monkeypatch.setattr(kw, "KisAPI", get_client)
     published = []
+    preopen_ready = []
 
     def sleep_then_late_prep(_):
         if published:
+            if preopen and not counts["runs"]:
+                assert counts == {"client_creations": 1, "runs": 0, "final30_loads": 1}
+                preopen_ready.append(True)
             return
         # No broker client or collection before verified same-day PREP.
         assert counts == {"client_creations": 0, "runs": 0, "final30_loads": 0}
@@ -267,7 +275,7 @@ def test_loop_waits_for_late_prep_then_starts_readonly_collection(tmp_path, monk
             "expected_as_of": "2026-11-16", "actual_as_of": "2026-11-16",
             "contract_hash": "late-prep-test",
         }), encoding="utf-8")
-        result = pq.publish_prep_collection(date=DATE, account_scope=scope, now=at(9, 0))
+        result = pq.publish_prep_collection(date=DATE, account_scope=scope, now=seed_time)
         assert result["state"] == "PREP_COLLECTION_PUBLISHED"
         assert result["hot"] == ["093320"] and result["warm"] == []
         assert pq.collection_priorities(date=DATE, account_scope=scope,
@@ -290,6 +298,7 @@ def test_loop_waits_for_late_prep_then_starts_readonly_collection(tmp_path, monk
     monkeypatch.setattr(observer, "run_once", collect)
     observer.main()
     assert len(published) == 1
+    assert bool(preopen_ready) is preopen
     assert counts == {"client_creations": 1, "final30_loads": 1, "runs": 1}
 
 
