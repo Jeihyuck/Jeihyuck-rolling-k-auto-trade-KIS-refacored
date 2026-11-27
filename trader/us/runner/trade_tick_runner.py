@@ -910,7 +910,10 @@ def _build_final30_symbol_map_for_trend(*, trade_date: str, locked_watchlist_cac
 
 
 def _update_position_trends_for_tick(*, positions: list[dict], provider: Any, trade_date: str, now: datetime, locked_watchlist_cache: list[dict] | None = None, watchlist_cache_source: str | None = None, protective_checkpoint=None) -> tuple[list[dict], dict, list[dict] | None, str | None]:
+    daily_reader=None
     if protective_checkpoint is not None:
+        from trader.us.runner.protective_entry_interrupt import BoundedTrendDailyReads
+        daily_reader=BoundedTrendDailyReads(protective_checkpoint)
         protective_checkpoint()
     final30_map, final30_ok, final30_quality, loaded_rows = _build_final30_symbol_map_for_trend(trade_date=trade_date, locked_watchlist_cache=locked_watchlist_cache, watchlist_cache_source=watchlist_cache_source)
     if locked_watchlist_cache is None and loaded_rows:
@@ -979,7 +982,9 @@ def _update_position_trends_for_tick(*, positions: list[dict], provider: Any, tr
                 metrics_source = "final30_prep_metrics"
             else:
                 from trader.us.db.price_daily_repo import load_recent_us_daily_bars
-                rows = load_recent_us_daily_bars(symbol=symbol, before_date=trade_date, limit=int(os.getenv("US_DAILY_REQUIRED_BARS", "260")))
+                _daily_kwargs=dict(symbol=symbol,before_date=trade_date,limit=int(os.getenv("US_DAILY_REQUIRED_BARS","260")))
+                rows=(daily_reader.read(load_recent_us_daily_bars,**_daily_kwargs)
+                      if daily_reader is not None else load_recent_us_daily_bars(**_daily_kwargs))
                 from trader.us.runner.daily_feature_cache import reuse_daily_metrics
                 daily = reuse_daily_metrics(
                     list(rows or []), trade_date, position=pos,

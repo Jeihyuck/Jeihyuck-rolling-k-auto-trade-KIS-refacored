@@ -457,3 +457,44 @@ def test_active_entry_profit_signal_requires_clean_serial_followup(monkeypatch,c
     if case=="buy": result["entry_intents"]=1
     if case=="missing_proof": result.pop("exit_route_liveness_failure")
     assert guard.validated_entry_profit_followup(snap,watch=watch,result=result)==(signal if case=="valid" else None)
+
+
+def test_bounded_trend_daily_read_preserves_main_writer_and_late_result_is_discarded():
+    from threading import Event,get_ident
+    from trader.us.runner.protective_entry_interrupt import BoundedTrendDailyReads
+    entered=Event()
+    release=Event()
+    finished=Event()
+    main=get_ident()
+    checks=[]
+    def checkpoint():
+        checks.append(get_ident())
+    def reader(**kwargs):
+        assert get_ident()!=main
+        entered.set()
+        try:
+            release.wait(2)
+            return [{"close":100}]
+        finally:
+            finished.set()
+    bounded=BoundedTrendDailyReads(checkpoint,timeout_sec=.06,poll_sec=.01)
+    try:
+        with pytest.raises(TimeoutError,match="trend_daily_read_deadline"):
+            bounded.read(reader,symbol="ABC")
+        assert entered.is_set() and len(checks)>=2 and set(checks)=={main}
+        with pytest.raises(TimeoutError,match="already_abandoned"):
+            bounded.read(lambda:pytest.fail("second read must not start"))
+    finally:
+        release.set()
+        assert finished.wait(1)
+
+
+def test_bounded_trend_daily_read_preserves_value_and_loader_error():
+    from trader.us.runner.protective_entry_interrupt import BoundedTrendDailyReads
+    reader=BoundedTrendDailyReads(lambda:None)
+    assert reader.read(lambda **kw:[{"close":100,"symbol":kw["symbol"]}],symbol="ABC")==[{"close":100,"symbol":"ABC"}]
+    def failed():
+        raise ValueError("native read failed")
+    with pytest.raises(ValueError,match="native read failed"):
+        reader.read(failed)
+    assert not reader.abandoned
