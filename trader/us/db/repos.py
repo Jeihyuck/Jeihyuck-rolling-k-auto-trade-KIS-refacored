@@ -4303,6 +4303,10 @@ def mark_us_position_exit_stage(
     save_us_position_risk_state(sym, td, risk)
     logger.info("[US_POSITION][TREND_STAGE] symbol=%s stage=%s status=%s pending=%s done=%s order_key=%s lifecycle_id=%s", sym, stg, status_upper, trend.get(f"{stg}_pending"), trend.get(f"{stg}_done"), order_key, lifecycle_id)
 
+class CommittedUSRiskState(dict):
+    """Immediate transaction result; never reconstructed from cached position JSON."""
+
+
 def update_us_soft_stop_risk_state_atomic(
     *, symbol: str, trade_date: str, pnl_pct: float, current_price: float,
     now: datetime, soft_stop_pct: float, policy_revision: str | None = None,
@@ -4367,7 +4371,10 @@ def update_us_soft_stop_risk_state_atomic(
         saved = dict(result)
     logger.info("[US_RISK_STATE][ATOMIC_SOFT_STOP] symbol=%s trade_date=%s count=%s action=%s",
                 sym, trade_date, saved.get("soft_stop_breach_count"), "increment" if breached else "reset")
-    return _normalize_risk_state(sym, trade_date, saved)
+    return CommittedUSRiskState({
+        **_normalize_risk_state(sym, trade_date, saved),
+        "trading_epoch_id": str(epoch),
+    })
 
 
 def update_us_soft_stop_risk_state(

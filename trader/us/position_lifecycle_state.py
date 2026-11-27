@@ -810,9 +810,59 @@ def reconcile_us_position_lifecycles(
     return out
 
 
-def update_us_position_high_watermark(*, symbol: str, trade_date: str, lifecycle_id: str, current_price: float, entry_price: float, now: datetime, position: dict | None = None) -> dict:
+def _same_transaction_hwm_row(*, symbol, trade_date, lifecycle_id, current_price,
+                              entry_price, position, committed_risk_state):
+    """Reuse only the immediately committed same-day row for a no-op HWM.
+
+    The caller still performs all current identity and original BUY checks.
+    New highs, old dates, incomplete identities and non-atomic reads must use
+    the existing durable load/write path. No across-tick memo or guessed HWM.
+    """
+    from trader.us.db.repos import CommittedUSRiskState
+    if (not isinstance(committed_risk_state, CommittedUSRiskState)
+            or not isinstance(position, dict)
+            or os.getenv("WSL_RUN_MARKET", "").upper() != "US"
+            or str(committed_risk_state.get("trade_date")) != str(trade_date)
+            or _sym(committed_risk_state.get("symbol")) != symbol):
+        return None
+    identity = _position_identity(position, env=None)
+    leaf = (committed_risk_state.get("state") or {}).get("lifecycle") or {}
+    if (not isinstance(leaf, dict)
+            or _sym(position.get("symbol")) != symbol
+            or identity.get("position_lifecycle_id") != lifecycle_id
+            or leaf.get("lifecycle_id") != lifecycle_id
+            or not all(identity.get(k) for k in ("env","account_id","trading_epoch_id","strategy_owner"))
+            or str(committed_risk_state.get("trading_epoch_id") or "") != identity["trading_epoch_id"]
+            or any(str(leaf.get(k) or "") != identity[k] for k in
+                   ("env","account_id","trading_epoch_id","strategy_owner"))
+            or leaf.get("is_open") is not True
+            or leaf.get("high_watermark_source") != "us_position_risk_state"
+            or not leaf.get("high_watermark_at")):
+        return None
+    if identity.get("portfolio_epoch_id"):
+        if (not _lifecycle_matches_identity(leaf, identity)
+                or identity.get("position_cycle_id") != lifecycle_id):
+            return None
+    elif leaf.get("portfolio_epoch_id") or leaf.get("position_cycle_id"):
+        return None
+    import math
+    high = _f(leaf.get("high_watermark"))
+    if (not all(math.isfinite(x) and x > 0 for x in (high, _f(current_price), _f(entry_price)))
+            or max(_f(current_price), _f(entry_price)) > high):
+        return None
+    return committed_risk_state
+
+
+def update_us_position_high_watermark(*, symbol: str, trade_date: str, lifecycle_id: str, current_price: float, entry_price: float, now: datetime, position: dict | None = None, committed_risk_state: dict | None = None) -> dict:
     symbol = _sym(symbol)
-    latest = load_latest_us_position_risk_state(symbol, trade_date)
+    latest = _same_transaction_hwm_row(
+        symbol=symbol, trade_date=trade_date, lifecycle_id=lifecycle_id,
+        current_price=current_price, entry_price=entry_price, position=position,
+        committed_risk_state=committed_risk_state)
+    if latest is None:
+        latest = load_latest_us_position_risk_state(symbol, trade_date)
+    else:
+        logger.info("[US_POSITION][HIGH_WATERMARK_REUSE_COMMITTED] symbol=%s lifecycle_id=%s", symbol, lifecycle_id)
     lifecycle = dict(((latest.get("state") or {}).get("lifecycle") or {}))
     # Native US exit evaluation must update only the already-bound open
     # lifecycle. Legacy V2 retains its original historical risk lifecycle;

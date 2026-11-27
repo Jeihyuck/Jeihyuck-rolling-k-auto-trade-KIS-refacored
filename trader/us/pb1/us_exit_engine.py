@@ -1545,6 +1545,7 @@ def prepare_exit_position_snapshots(
                 _observe_snapshot_outcome("SKIP", "price_nonpositive")
                 continue
             _state_started_mono = time.monotonic()
+            committed_risk_state = None
             entry_price_for_state = _resolve_position_entry_price(pos)
             if entry_price_for_state > 0 and current_price > 0:
                 _risk_start_mono = time.monotonic()
@@ -1584,6 +1585,9 @@ def prepare_exit_position_snapshots(
                         **({"policy_revision": "PB1_STOP_3_6_V1"}
                            if pos.get("_verified_pb1_stop_revision") else {}),
                     )
+                    from trader.us.db.repos import CommittedUSRiskState
+                    if isinstance(risk_state, CommittedUSRiskState):
+                        committed_risk_state = risk_state
                     # Keep a previous-day partial-fill *candidate* only in
                     # this snapshot. It receives no execution authority until
                     # the original BUY, forward cycle and native first order
@@ -1640,6 +1644,8 @@ def prepare_exit_position_snapshots(
                             symbol=symbol, trade_date=_trade_date_from_key(resolve_us_trade_date_key(now)), lifecycle_id=str(lifecycle_id),
                             current_price=current_price, entry_price=entry_price_for_state, now=now or datetime.now(),
                             position=pos,
+                            **({"committed_risk_state": committed_risk_state}
+                               if committed_risk_state is not None else {}),
                         )
                         pos["high_watermark"] = high_state.get("high_watermark")
                         pos["max_price"] = high_state.get("high_watermark")
