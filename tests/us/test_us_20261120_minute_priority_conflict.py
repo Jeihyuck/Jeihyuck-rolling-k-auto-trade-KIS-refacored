@@ -217,9 +217,14 @@ def test_holiday_observer_never_opens_store_or_broker(monkeypatch):
     def unexpected(*args, **kwargs):
         raise AssertionError("holiday must not open store")
     monkeypatch.setattr(observer, "open_store", unexpected)
+    import os
+    for flag in ("US_ORDER_ARMED", "LIVE_TRADING_ENABLED", "US_LIVE_TRADING_ENABLED"):
+        monkeypatch.setenv(flag, "1")
     assert observer.run_observer(env="practice", trade_date="2026-11-26",
         scope="scope:epoch", parent_pid=1, watchlist=[{"symbol":"CL","exchange":"NYSE"}],
         continuous=True) == 0
+    for flag in ("US_ORDER_ARMED", "LIVE_TRADING_ENABLED", "US_LIVE_TRADING_ENABLED"):
+        assert os.environ[flag] == "0"
 
 
 def test_continuous_observer_singleton_does_not_start_second_collector(tmp_path, monkeypatch):
@@ -312,6 +317,8 @@ def test_prep_launch_is_readonly_and_never_runs_on_holiday(tmp_path, monkeypatch
     assert "--continuous" in args[0]
     assert kwargs["start_new_session"] is True
     assert kwargs["env"]["US_ORDER_ARMED"]=="0"
+    assert kwargs["env"]["LIVE_TRADING_ENABLED"]=="0"
+    assert kwargs["env"]["US_LIVE_TRADING_ENABLED"]=="0"
     assert kwargs["env"]["US_KIS_ORDER_ALLOWED"]=="0"
     assert kwargs["env"]["DRY_RUN"]=="1"
 
