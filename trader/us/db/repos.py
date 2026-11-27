@@ -3683,7 +3683,8 @@ def _proven_us_tp_partial_retry(conn, params, stage_row, claim, intent_meta):
            )
     """), params).mappings().all()
     events = conn.execute(text("""
-        SELECT client_order_key, submit_attempt_id, event_type
+        SELECT client_order_key, submit_attempt_id, event_type, payload,
+               canonical_broker_order_no, raw_broker_order_no, cumulative_filled_qty
           FROM us_order_events
          WHERE trading_epoch_id=:epoch AND trade_date<=:td AND symbol=:sym
            AND side='SELL' AND profit_capture_stage=:stage
