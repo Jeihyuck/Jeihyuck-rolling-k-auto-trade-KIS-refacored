@@ -125,7 +125,10 @@ class ObservationPromotion:
             self.snapshot_key = key
             self.hot, self.warm = list(priority["hot"]), list(priority["warm"])
             self.last_swap = None
-            self.facts = {c:f for c,f in self.facts.items() if c in self.hot+self.warm}
+            # Even an overlapping symbol may have different owner geometry
+            # after a PREP snapshot or code revision changes. Do not carry
+            # prior observation facts across that identity boundary.
+            self.facts.clear()
         def fresh_near(code):
             f = self.facts.get(code, {})
             try:
