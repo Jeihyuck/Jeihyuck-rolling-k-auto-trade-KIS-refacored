@@ -55,7 +55,7 @@ jobs:
       - name: 20 genuine route functions with stubbed native HTTP
         run: |
           set -euo pipefail
-          python -m pytest -q -s \
+          python -m pytest -q -s --junitxml=/tmp/us243-boundary.xml \
             tests/us/test_us_pr243_twenty_native_http_boundary.py \
             tests/us/test_us_pr243_latency_fail_closed.py
           python - <<'PY'
@@ -74,7 +74,9 @@ jobs:
       - name: PR311 scoped recovery regression tests (mock only)
         run: |
           set -euo pipefail
-          python -m pytest -q \
+          # The exact database-dependent case is executed in pr311-postgres-safety below.
+          python -m pytest -q --junitxml=/tmp/us243-recovery.xml \
+            --deselect=tests/us/test_us_20261008_entry_tp_recovery.py::test_real_postgres_cross_day_tp_cancel_reservation_is_once_per_claim \
             tests/us/test_us_pr311_portfolio_cycle_recovery_scope.py \
             tests/us/test_us_stage4_historical_reader_split_20261103.py \
             tests/us/test_us_stop_debt_replay_20261023.py \
@@ -83,12 +85,25 @@ jobs:
       - name: Incident-specific market data, quote and lifecycle checks
         run: |
           set -euo pipefail
-          python -m pytest -q \
+          python -m pytest -q --junitxml=/tmp/us243-incidents.xml \
             tests/us/test_us_20261125_market_data_recovery.py \
             tests/us/test_us_20261125_tp_freshness.py \
             tests/us/test_us_20261125_account_summary.py \
             tests/us/test_us_high_watermark_persistence.py \
             tests/us/test_us_legacy_nine_active_sell_20261111.py
+      - name: Require every selected offline test to execute
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          for name in ("boundary", "recovery", "incidents"):
+              path = Path(f"/tmp/us243-{name}.xml")
+              cases = list(ET.parse(path).iter("testcase"))
+              assert cases, f"{name}: no tests collected"
+              skipped = [c.get("name") for c in cases if c.find("skipped") is not None]
+              assert not skipped, f"{name}: mandatory tests skipped: {skipped}"
+              print(f"{name}: {len(cases)} executed, zero skipped")
+          PY
       - name: Preserve mock-only evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -138,7 +153,19 @@ jobs:
       - run: python -m pip install -r requirements.txt psycopg2-binary pytest
       - name: PostgreSQL and stop recovery regression
         run: |
-          python -m pytest -q tests/us/test_us_pr311_portfolio_cycle_recovery_scope.py tests/us/test_us_postgres_integration_real.py tests/us/test_us_20261007_sustained_real_buy_ack.py tests/us/test_us_protective_stop_recovery_worker_20261023.py tests/us/test_us_stop_debt_replay_20261023.py
+          python -m pytest -q --junitxml=/tmp/us311-postgres.xml tests/us/test_us_pr311_portfolio_cycle_recovery_scope.py tests/us/test_us_postgres_integration_real.py tests/us/test_us_20261007_sustained_real_buy_ack.py tests/us/test_us_protective_stop_recovery_worker_20261023.py tests/us/test_us_stop_debt_replay_20261023.py tests/us/test_us_20261008_entry_tp_recovery.py::test_real_postgres_cross_day_tp_cancel_reservation_is_once_per_claim
+      - name: Require real PostgreSQL cases and zero skips
+        run: |
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+          cases = list(ET.parse("/tmp/us311-postgres.xml").iter("testcase"))
+          assert cases, "No PostgreSQL tests collected"
+          skipped = [c.get("name") for c in cases if c.find("skipped") is not None]
+          assert not skipped, f"Mandatory PostgreSQL tests skipped: {skipped}"
+          expected = "test_real_postgres_cross_day_tp_cancel_reservation_is_once_per_claim"
+          assert sum(c.get("name") == expected for c in cases) == 1, "Cross-day TP cancel test not executed"
+          print(f"PostgreSQL: {len(cases)} executed, zero skipped; cross-day cancellation covered")
+          PY
 
   required-offline-execution-gate:
     # A skipped/cancelled job must not be treated as a passing execution gate.
