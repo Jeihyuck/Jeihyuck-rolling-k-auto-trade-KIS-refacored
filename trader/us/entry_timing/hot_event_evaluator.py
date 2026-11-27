@@ -76,7 +76,8 @@ def poll_hot_events(db, *, env, scope, trade_date, hot_pairs, now_et,
             received=float(q["received_at"])
             age=at.timestamp()-received
             bid,ask,last=(float(q[k]) for k in ("bid","ask","last"))
-            if (not q.get("collector_generation") or not all(map(math.isfinite,(received,bid,ask,last)))
+            if (q.get("source")!="KIS_WEBSOCKET_COLLECTOR"
+                    or not q.get("collector_generation") or not all(map(math.isfinite,(received,bid,ask,last)))
                     or not 0<=age<=5 or not 0<bid<=ask or last<=0
                     or q.get("stale") or q.get("suspect")):
                 revoke_hint(symbol,exchange,at)
@@ -92,7 +93,7 @@ def poll_hot_events(db, *, env, scope, trade_date, hot_pairs, now_et,
                 continue
             decision=evaluate_price_opportunity(
                 style=candidate["family"],trade_date=trade_date,now_et=at,
-                verified_bars=bars,quote={"source":"KIS_WEBSOCKET_COLLECTOR","last":last,
+                verified_bars=bars,quote={"source":q["source"],"last":last,
                                           "bid":bid,"ask":ask,"age_sec":age},
                 prep=candidate["prep"],feature_scope=(scope,symbol,exchange,"US_STANDARD"),
                 min_rr=min_rr,max_stop_distance=max_stop,
