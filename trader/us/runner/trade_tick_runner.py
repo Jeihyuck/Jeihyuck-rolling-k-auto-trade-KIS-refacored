@@ -83,7 +83,8 @@ def budgeted_entry_timeout_sec(context: Any, configured_timeout_sec: float) -> f
     return max(0.0, min(float(configured_timeout_sec), remaining - reserve))
 
 
-def run_entry_eval_with_timeout(fn, *, timeout_sec: float, cancel_event: Any):
+def run_entry_eval_with_timeout(fn, *, timeout_sec: float, cancel_event: Any,
+                                protective_poll=None):
     """Run entry evaluation without waiting for a timed-out worker to finish.
 
     The caller must pass an isolated/stage-bounded provider to the worker.
@@ -92,7 +93,25 @@ def run_entry_eval_with_timeout(fn, *, timeout_sec: float, cancel_event: Any):
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     future = pool.submit(fn)
     try:
-        result = future.result(timeout=max(0.001, float(timeout_sec)))
+        if protective_poll is None:
+            result = future.result(timeout=max(0.001, float(timeout_sec)))
+        else:
+            from trader.us.runner.protective_entry_interrupt import ProtectiveEntryInterrupted
+            deadline = time.monotonic() + max(.001, float(timeout_sec))
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise concurrent.futures.TimeoutError()
+                done, _ = concurrent.futures.wait([future], timeout=min(5.0, remaining))
+                if not done and time.monotonic() >= deadline:
+                    raise concurrent.futures.TimeoutError()
+                # Caller thread only; the entry worker never routes orders.
+                snapshot = protective_poll()
+                if snapshot is not None:
+                    raise ProtectiveEntryInterrupted(snapshot)
+                if done:
+                    result = future.result()
+                    break
     except TimeoutError:
         if cancel_event is not None and hasattr(cancel_event, "set"):
             cancel_event.set()
@@ -4567,6 +4586,31 @@ def run_trade_tick(
                             )
                             if hasattr(provider, "fork_for_stage") else provider
                         )
+                        from trader.us.runner.protective_entry_interrupt import (
+                            ProtectiveEntryInterrupted, make_hard_stop_poll,
+                        )
+                        _protective_poll = None
+                        if (_early_pilot_enabled and not force_now and _stage4_mode
+                                and session in {"am", "afternoon"}
+                                and os.getenv("WSL_RUN_MARKET", "").upper() == "US"
+                                and os.getenv("US_WS_COLLECTOR_ENABLED", "0") == "1"
+                                and os.getenv("US_ENTRY_PROTECTIVE_INTERRUPT_ENABLED", "1") == "1"
+                                and not _early_pilot_stream_incomplete
+                                and tick_context.broker_submit_allowed()):
+                            # No retry of an already selected/attempted SELL on
+                            # this tick, even if its broker outcome is unknown.
+                            _excluded = {
+                                str(i.get("symbol") or "").upper()
+                                for i in exit_intents if str(i.get("side") or "").upper() == "SELL"
+                            } | _early_pilot_attempted_symbols
+                            _excluded.update(
+                                str((o.get("intent") or {}).get("symbol") or o.get("symbol") or "").upper()
+                                for o in orders
+                            )
+                            _protective_poll = make_hard_stop_poll(
+                                exit_snapshots, excluded_symbols=_excluded,
+                                trade_date=trade_date, env=env, context=tick_context,
+                            )
                         entry_intents = run_entry_eval_with_timeout(
                             lambda: engine.evaluate_entries(
                                 None,
@@ -4586,6 +4630,7 @@ def run_trade_tick(
                             ),
                             timeout_sec=_entry_budget_sec,
                             cancel_event=_entry_cancel_event,
+                            **({"protective_poll": _protective_poll} if _protective_poll else {}),
                         )
                         entry_generation_diagnostics = dict(getattr(engine, "last_entry_diagnostics", {}) or {})
                         contract_integrity_blocks = [
@@ -4610,6 +4655,52 @@ def run_trade_tick(
                                 "[US_ENTRY][ELIGIBLE_BUT_NO_INTENT] eligible=%d preblocked=%d",
                                 len(eligible_watchlist_rows), len(preblocked_rows),
                             )
+                    except ProtectiveEntryInterrupted as _interrupt:
+                        # The helper cancelled the read-only entry worker.
+                        # Do not use any of its preflight BUY approvals.
+                        entry_intents = []
+                        entry_degraded = True
+                        entry_degraded_reason = "PROTECTIVE_ENTRY_INTERRUPTED"
+                        entry_can_proceed = False
+                        _new_snapshot = _interrupt.snapshot
+                        _sym = str(_new_snapshot.get("symbol") or "").upper()
+                        logger.warning("[US_EXIT][ENTRY_INTERRUPT] symbol=%s action=cancel_buy_evaluate_canonical_hard_stop", _sym)
+                        from trader.us.market_calendar import now_ny
+                        _decision_now = now_ny()
+                        from trader.us.runner.protective_entry_interrupt import snapshot_still_fresh
+                        if (tick_context.broker_submit_allowed()
+                                and snapshot_still_fresh(_new_snapshot, trade_date, _decision_now)):
+                            _protective = _gen_exit_from_snapshots(
+                                [], provider=None, now=_decision_now,
+                                prepared_snapshots=[_new_snapshot], include_trend_time=False,
+                                on_sell_ready=lambda intent, observed: _observe_pb1_sell(intent, observed, "entry_interrupt"),
+                            )
+                            if (len(_protective) == 1
+                                    and str(_protective[0].get("side") or "").upper() == "SELL"
+                                    and _exit_family(_protective[0]) == "HARD_STOP"
+                                    and str(_protective[0].get("symbol") or "").upper() == _sym):
+                                _protective = _suppress_pending_sell_exit_intents(
+                                    _protective, trade_date, env=env, strict=True)
+                                if len(_protective) == 1 and snapshot_still_fresh(
+                                        _new_snapshot, trade_date, now_ny()):
+                                    if not isinstance(getattr(tick_context, "_sell_selected_ready_by_symbol", None), dict):
+                                        tick_context._sell_selected_ready_by_symbol = {}
+                                        tick_context._sell_selected_trace_id_by_symbol = {}
+                                    _late = route_exit_orders_immediately(
+                                        _protective, buy_daily_notional=buy_daily_notional,
+                                        position_count=position_count, effective_budget=effective_budget,
+                                        signal_only=signal_only, kis_order_allowed=kis_order_allowed,
+                                        current_position_symbols=current_position_symbols,
+                                        context=tick_context, kis_client=routing_kis_client,
+                                    )
+                                    exit_intents.extend(_protective)
+                                    exit_intents_count = len(exit_intents)
+                                    orders.extend(_late.get("orders", []))
+                                    exit_route_result["orders"].extend(_late.get("orders", []))
+                                    exit_route_result["decisions"].extend(_late.get("decisions", []))
+                                    sell_notional_routed = _routed_sell_notional(orders)
+                                    routed_sent, routed_ack, routed_rejected, routed_blocked = _routed_order_truth_counts(orders)
+                                    logger.warning("[US_EXIT][ENTRY_INTERRUPT][ROUTED] symbol=%s", _sym)
                     except concurrent.futures.TimeoutError:
                         if entry_degraded_reason == "NEXT_TICK_ENTRY_DEFER_INSUFFICIENT_BUDGET":
                             logger.warning(
