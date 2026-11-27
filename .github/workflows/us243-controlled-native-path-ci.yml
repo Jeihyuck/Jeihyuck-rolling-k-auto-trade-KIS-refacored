@@ -20,6 +20,12 @@ on:
       - "tests/us/**"
   workflow_dispatch:
 
+
+# Only superseded PR validation runs are cancellable; manual/push runs stay isolated.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
