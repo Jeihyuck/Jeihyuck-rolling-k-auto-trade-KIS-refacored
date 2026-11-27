@@ -1336,3 +1336,17 @@ def test_pg_us353_standard_tp_native_partial_cancel_commits_claim_stage_together
         client_order_key=third_key, attempt_id=third_attempt, action_key=identity.action_key,
         qty=2, notional_usd=204, limit_price_usd=102, intent_meta=third_meta,
     )
+
+
+def test_intraday_quote_age_is_measured_after_each_delayed_read(monkeypatch):
+    # Broker responses are received after the function starts; an old loop
+    # start clock would incorrectly label the later responses as future.
+    clock = [1000.0]
+    monkeypatch.setattr(overlay.time, "time", lambda: clock[0])
+    class Provider:
+        def get_current_price(self, symbol, exchange):
+            clock[0] += 2.0
+            return _live_quote(99, clock[0])
+    result = overlay.read_us_live_intraday_returns(Provider(), _completed_prices(), [])
+    assert result["quality"] == "OK"
+    assert all(q["age_sec"] == 0 for q in result["quotes"].values())

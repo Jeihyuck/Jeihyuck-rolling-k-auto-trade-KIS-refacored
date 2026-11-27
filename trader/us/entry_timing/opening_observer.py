@@ -735,17 +735,22 @@ def run_observer(*, env: str, trade_date: str, scope: str,
                 continue
             # Collector starts asynchronously; subscription warmup must
             # retry after readiness/reconnect, not fire once and disappear.
-            if ws_on and time.monotonic() >= next_subscription_refresh:
-                for _i in range(0, len(pairs), 16):
-                    subscribe_many(pairs[_i:_i + 16], env=env, timeout_sec=0.3)
-                next_subscription_refresh = time.monotonic() + 30.0
-            if (now_et.hour, now_et.minute) < (9, 30):
-                time.sleep(2.0)
-                continue
             lanes, priority_state = collection_priorities(
                 env=env, scope=scope, trade_date=trade_date,
                 pairs=pairs, now_epoch=time.time(),
             )
+            if ws_on and time.monotonic() >= next_subscription_refresh:
+                from trader.us.symbols import resolve_quote_exchange
+                benchmark_pairs = [(sym, resolve_quote_exchange(sym)) for sym in ("SPY","QQQ","SMH")]
+                # Benchmark subscriptions are independent of the entry shortlist.
+                # Do not bulk-prewarm COLD ahead of held/exit-owner quotes.
+                targets = list(dict.fromkeys(benchmark_pairs + lanes["HOT"] + lanes["WARM"]))
+                for _i in range(0, len(targets), 16):
+                    subscribe_many(targets[_i:_i + 16], env=env, timeout_sec=0.3)
+                next_subscription_refresh = time.monotonic() + 30.0
+            if (now_et.hour, now_et.minute) < (9, 30):
+                time.sleep(2.0)
+                continue
             if pointer == 0 or priority_state != last_priority_state:
                 LOG.info(
                     "[US_OPENING_OBSERVER][PRIORITY_SCOPE] state=%s hot=%d warm=%d cold=%d "

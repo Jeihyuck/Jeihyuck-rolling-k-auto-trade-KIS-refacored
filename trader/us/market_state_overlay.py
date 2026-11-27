@@ -347,7 +347,6 @@ def read_us_live_intraday_returns(
     """
     symbols = ("SPY", "QQQ", "SMH")
     result: dict = {"quality": "UNKNOWN", "returns": {}, "quotes": {}}
-    clock = time.time()
     expected_close_date = ""
     if trade_date:
         from trader.us.market_calendar import previous_completed_us_session
@@ -374,7 +373,9 @@ def read_us_live_intraday_returns(
         completed_date = str(completed_returns.get(f"{sym.lower()}_previous_close_date") or "")
         received = _num(q.get("asof_epoch") or q.get("received_at"))
         source = str(q.get("source") or "").upper()
-        age = (clock - received) if received is not None else None
+        # Each native quote may complete after earlier sequential reads.
+        # Measure against its actual evaluation time, not the loop start.
+        age = (time.time() - received) if received is not None else None
         valid = bool(
             current is not None and previous is not None
             and math.isfinite(previous) and previous > 0
