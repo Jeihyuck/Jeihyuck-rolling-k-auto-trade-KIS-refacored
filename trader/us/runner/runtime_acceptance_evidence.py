@@ -136,6 +136,8 @@ def summarize_runtime(lines,*,expected_sha):
                 unknown+=1
                 continue
             if (row.get("classification")=="success" and row.get("runtime_integrity_status")=="POLICY_ENTRY_BLOCKED"
+                    and row.get("status") in (_NORMAL | {"NO_ORDERS_RISK_BLOCKED"})
+                    and row.get("entry_can_proceed") is False and row.get("exit_can_proceed") is True
                     and row.get("sell_liveness_status")=="OK" and row.get("entry_liveness_status")=="OK"
                     and row.get("reconcile_liveness_status") in {"OK","PENDING_SETTLEMENT"}):
                 policy+=1

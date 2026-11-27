@@ -106,3 +106,38 @@ def test_policy_blocked_population_cannot_disappear_from_timing_comparison(case)
     assert (report["status"]=="PASS_LOG_TIMING_ONLY")== (case=="same")
     assert ("am:NONCOMPARABLE_POLICY_WORKLOAD" in report["blockers"]) == (case!="same")
     assert report["operational_go"] is False
+
+
+@pytest.mark.parametrize("overrides", [
+    {"exit_can_proceed": False},
+    {"exit_can_proceed": None},
+    {"entry_can_proceed": True},
+    {"entry_can_proceed": None},
+    {"status": "DEGRADED_NO_TRADE"},
+    {"status": "DEGRADED_FILLS_UNAVAILABLE"},
+])
+def test_policy_entry_block_never_masks_degraded_or_unverified_exit(overrides):
+    def population(sha):
+        lines = list(rows(sha))
+        scope = dict(trade_date="2026-11-25", session="am", run_id="run-am",
+                     tick_id="policy-1", code_sha=sha, native_practice=True,
+                     account_digest="d"*64)
+        data = dict(status="OK", runtime_integrity_status="POLICY_ENTRY_BLOCKED",
+                    sell_liveness_status="OK", entry_liveness_status="OK",
+                    reconcile_liveness_status="OK", tick_total_ms=50000,
+                    entry_can_proceed=False, exit_can_proceed=True,
+                    positions_evaluated=12, raw_watchlist_candidates=30,
+                    intent_generation_attempted=0, orders_routed=1, fills_api_count=2)
+        data.update(overrides)
+        lines.append("[US400_RUNTIME][ATTEMPT] payload="+json.dumps(scope))
+        lines.append("[US400_RUNTIME][RESULT] payload="+json.dumps(
+            result_evidence(scope, data, wall_sec=50)))
+        return summarize_runtime(lines, expected_sha=sha)
+
+    baseline = population("a"*40)
+    candidate = population("b"*40)
+    report = compare_runtime(baseline, candidate)
+    assert report["status"] == "NOT_PROVEN"
+    assert "DEGRADED_OR_FAILED_ATTEMPTS" in report["blockers"]
+    assert candidate["sessions"]["am"]["policy_blocked"] == 0
+    assert candidate["sessions"]["am"]["degraded"] == 1
