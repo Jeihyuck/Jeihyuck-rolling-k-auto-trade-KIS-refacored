@@ -59,3 +59,51 @@ def test_promotion_clears_facts_on_prep_revision_even_with_same_symbols():
         assert not p.facts
         p.observe("2",facts)
     assert p.apply(revision,now)["hot"] == ["2"]
+
+
+def test_cold_discovery_is_spare_only_bounded_and_owner_specific(monkeypatch):
+    from trader.kr.opening_intelligence import ColdDiscovery
+    from trader.kr.entry_priority_queue import CandidateSchedule
+    now = datetime(2026,11,27,9,10,tzinfo=KST)
+    seed = {"state":"PREP_COLLECTION_ACTIVE","hot":["000001"],"warm":["000002"],
+            "cold":["000003","000004","000005","122630"],"code_sha":"a",
+            "final30_digest":"x","is_order_authorization":False,
+            "observation_styles":{"000003":"PULLBACK","000004":"BREAKOUT",
+                                  "000005":"ENTRY_MOMENTUM","122630":"PULLBACK"}}
+    s = CandidateSchedule()
+    d = ColdDiscovery()
+    assert d.select(seed,s,now) is None
+    s.select({**seed,"cold":[]},now)
+    assert d.select(seed,s,now+timedelta(seconds=26)) is None
+    assert d.select(seed,s,now) == "000003"
+    assert d.select(seed,s,now+timedelta(seconds=10)) is None
+    later = now+timedelta(seconds=180)
+    s.select({**seed,"cold":[]},later)
+    assert d.select({**seed,"state":"PB1_ACTIVE"},s,later) is None
+    assert d.select(seed,s,later) == "000005"
+
+
+def test_cold_promotion_keeps_partition_and_execution_manifest(monkeypatch):
+    monkeypatch.setenv("KR_COLD_DISCOVERY_ENABLED","1")
+    now = datetime(2026,11,27,9,10,tzinfo=KST)
+    p = ObservationPromotion()
+    seed = {"state":"PREP_COLLECTION_ACTIVE","hot":["1"],"warm":["2"],
+            "cold":["3","4"],"code_sha":"a","final30_digest":"x",
+            "is_order_authorization":False}
+    p.apply(seed,now)
+    facts = {"state":"PROVISIONAL_RANGE","price_near_range":True,
+             "is_order_authorization":False,"observed_at":now.isoformat()}
+    p.observe("3",facts)
+    result = p.apply(seed,now)
+    assert result["warm"] == ["3"]
+    assert set(result["cold"]) == {"2","4"}
+    assert result["hot"] == ["1"]
+    assert len(set(result["hot"]+result["warm"]+result["cold"])) == 4
+    assert result["is_order_authorization"] is False
+    p.observe("4",facts)
+    assert p.apply(seed,now+timedelta(seconds=1))["warm"] == ["3"]
+    assert p.apply({**seed,"state":"PB1_ACTIVE"},now)["warm"] == ["2"]
+    p.apply(seed,now)
+    monkeypatch.setenv("KR_COLD_DISCOVERY_ENABLED","0")
+    p.observe("3",facts)
+    assert p.apply(seed,now)["warm"] == ["2"]
