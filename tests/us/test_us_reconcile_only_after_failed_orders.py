@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from trader.us.execution import reconcile
 from trader.us.runner.trade_tick_runner import (
     _journal_has_unrecovered_buy_ack,
@@ -220,3 +222,32 @@ def test_close_balance_absent_unaccepted_sell_remains_unresolved(monkeypatch):
     result = reconcile.classify_ack_orders_with_final_balance(provider=object(), trade_date="2026-07-21", orders=orders)
     assert result["pending_order_count"] == 1
     assert result["orders"][0]["final_status"] == "ack_unresolved_error"
+
+
+@pytest.mark.parametrize("variant,blocked", [
+    ("exact", False), ("other_attempt", True), ("other_order", True),
+    ("other_account", True), ("other_epoch", True), ("sell_recovery", True),
+    ("missing_order", True), ("conflicting_order_columns", True),
+    ("second_ack", True), ("legacy_exact", False),
+])
+def test_buy_ack_fence_requires_exact_attempt_and_broker_identity(monkeypatch, variant, blocked):
+    from trader.us.execution import order_journal
+    ack = dict(event_type="BROKER_ACK_RECEIVED", client_order_key="buy-key",
+               submit_attempt_id="attempt-2", side="BUY", broker_order_no="000123",
+               account_id="account", trading_epoch_id="epoch")
+    restored = dict(ack, event_type="JOURNAL_REPLAY_DB_ACK_RESTORED", broker_order_no="123")
+    events = [ack, restored]
+    if variant == "other_attempt": restored["submit_attempt_id"] = "attempt-1"
+    if variant == "other_order": restored["broker_order_no"] = "456"
+    if variant == "other_account": restored["account_id"] = "other"
+    if variant == "other_epoch": restored["trading_epoch_id"] = "other"
+    if variant == "sell_recovery": restored["side"] = "SELL"
+    if variant == "missing_order": restored["broker_order_no"] = ""
+    if variant == "conflicting_order_columns": restored["raw_broker_order_no"] = "456"
+    if variant == "second_ack":
+        events.append(dict(ack, submit_attempt_id="attempt-3", broker_order_no="456"))
+    if variant == "legacy_exact":
+        for event in events:
+            event.pop("submit_attempt_id")
+    monkeypatch.setattr(order_journal, "load_order_events", lambda _td: events)
+    assert _journal_has_unrecovered_buy_ack("2026-11-27") is blocked

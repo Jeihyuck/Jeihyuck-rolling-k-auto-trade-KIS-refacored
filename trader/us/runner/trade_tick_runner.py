@@ -472,16 +472,36 @@ def _journal_has_unrecovered_buy_ack(trade_date: str) -> bool:
         # commit before every POST.  Keep exit evaluation/reconciliation alive;
         # any real submit is fail-closed at that final boundary.
         return False
-    grouped: dict[str, list[dict]] = {}
-    for event in events:
-        key = str(event.get("client_order_key") or "").strip()
-        if key:
-            grouped.setdefault(key, []).append(event)
+    # A client key can have multiple immutable attempts. Recovery of an
+    # earlier attempt or a different KIS order must never clear a later ACK.
+    from trader.us.utils.order_no import normalize_us_order_no
+
+    def identity(event):
+        numbers = {normalize_us_order_no(event.get(field)) for field in
+                   ("canonical_broker_order_no", "raw_broker_order_no", "broker_order_no")}
+        numbers.discard("")
+        return (
+            str(event.get("client_order_key") or "").strip(),
+            str(event.get("submit_attempt_id") or "").strip(),
+            next(iter(numbers)) if len(numbers) == 1 else "",
+            str(event.get("account_id") or event.get("broker_account_hash") or "").strip(),
+            str(event.get("trading_epoch_id") or "").strip(),
+        )
+
     recovered_types = {"DB_ACK_PERSISTED", "JOURNAL_REPLAY_DB_ACK_RESTORED"}
-    for order_events in grouped.values():
-        types = {str(event.get("event_type") or "") for event in order_events}
-        side = str(order_events[-1].get("side") or "").upper()
-        if side == "BUY" and "BROKER_ACK_RECEIVED" in types and not (types & recovered_types):
+    recovered = set()
+    for event in events:
+        if (str(event.get("side") or "").upper() == "BUY"
+                and event.get("event_type") in recovered_types):
+            scope = identity(event)
+            if scope[0] and scope[2]:
+                recovered.add(scope)
+    for event in events:
+        if (str(event.get("side") or "").upper() != "BUY"
+                or event.get("event_type") != "BROKER_ACK_RECEIVED"):
+            continue
+        scope = identity(event)
+        if not scope[0] or not scope[2] or scope not in recovered:
             return True
     return False
 
