@@ -520,5 +520,5 @@ class CandidateSchedule:
         chosen.extend(code for _, _, code in remaining[:self.max_batch - len(chosen)])
         for code in chosen:
             self.last_attempt[code] = now
-            self.last_tier[code] = next(t for t in ("hot", "warm", "cold") if code in snapshot.get(t, []))
+            self.last_tier[code] = next(t for t in ("hot", "warm", "cold") if code in _unique(snapshot.get(t) or []))
         return chosen

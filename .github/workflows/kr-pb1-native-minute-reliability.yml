@@ -106,6 +106,7 @@ jobs:
           python -m pytest -q -rs --junitxml="$RUNNER_TEMP/kr-native-minute.xml" \
             tests/kr/test_kr_pb1_minute_priority_queue.py \
             tests/kr/test_kr_prep_collection_20261127.py \
+            tests/kr/test_kr_opening_intelligence_20261127.py \
             tests/kr/test_kr_practice_readonly_auth.py \
             tests/kr/test_kr_assert_no_skips.py \
             tests/kr/test_kr_pb1_minute_native_conflicts.py \
