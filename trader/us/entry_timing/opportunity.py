@@ -193,7 +193,7 @@ def opening_static_features(bars, trade_date, min_opening_bars, *, feature_scope
     return tuple(result["result"])
 
 
-def _reuse_us_static_features(*, scope, trade_date, settings, rows, compute, advance=None):
+def _reuse_us_static_features(*, scope, trade_date, settings, rows, compute, advance=None, slide=None):
     import os
     from trader.marketdata.feature_reuse import cached_native_features, shared_native_features
     def shared_or_compute(operands):
@@ -203,7 +203,7 @@ def _reuse_us_static_features(*, scope, trade_date, settings, rows, compute, adv
                 and len(scope) == 4 and scope[3] == "US_STANDARD"):
             return shared_native_features(
                 market="US", scope=scope, trade_date=trade_date,
-                settings=settings, rows=operands, compute=compute, advance=advance,
+                settings=settings, rows=operands, compute=compute, advance=advance, slide=slide,
                 base="runtime/private/native-features")
         return compute(operands)
     return cached_native_features(
@@ -223,6 +223,35 @@ def _recent_static_features(rows):
     }
 
 
+def _slide_recent_static(prior, previous, rows, shift):
+    """Reuse rolling extrema only when the original minimum survives.
+
+    The shared cache already checked exact overlap. Preserve tail volume
+    addition and comparisons exactly, and recompute when the minimum leaves.
+    No live quote, decision, or risk state is part of this cache.
+    """
+    if not isinstance(prior,dict) or len(rows)!=15 or len(previous)!=15 or not 1<=shift<15:
+        return None
+    # Duplicate or out-of-order timestamps could produce ambiguous overlap.
+    stamps=[r["time_et"] for r in previous]
+    next_stamps=[r["time_et"] for r in rows]
+    if (not all(a<b for a,b in zip(stamps,stamps[1:]))
+            or not all(a<b for a,b in zip(next_stamps,next_stamps[1:]))
+            or next_stamps[-1]<=stamps[-1]):
+        return None
+    old_min=prior["local_trough"]
+    if any(r["low"]==old_min for r in previous[:shift]):
+        trough=min(r["low"] for r in rows)
+    else:
+        trough=min(old_min,min(r["low"] for r in rows[-shift:]))
+    tail=rows[-4:]
+    return {"recent_volume":sum(b["volume"] for b in tail[-2:]),
+            "prior_volume":sum(b["volume"] for b in tail[:2]),
+            "rising_closes":tail[-1]["close"]>tail[-2]["close"]>tail[-3]["close"],
+            "higher_lows":tail[-1]["low"]>=tail[-2]["low"]>=tail[-3]["low"],
+            "local_trough":trough,"stop":min(b["low"] for b in tail[-3:])}
+
+
 def recent_static_features(bars, trade_date, *, feature_scope=None):
     # Only a completed native bar entering/leaving the rolling 15-bar window,
     # or a correction within it, invalidates these exact operands.
@@ -231,8 +260,8 @@ def recent_static_features(bars, trade_date, *, feature_scope=None):
         return _recent_static_features(rows)
     return _reuse_us_static_features(
         scope=feature_scope, trade_date=trade_date,
-        settings=("US_RECENT_STATIC_V1", 15, 4, 3),
-        rows=rows, compute=_recent_static_features)
+        settings=("US_RECENT_STATIC_WINDOW_V2", 15, 4, 3),
+        rows=rows, compute=_recent_static_features, slide=_slide_recent_static)
 
 
 def _decision(state: str, reason: str, *, style: str, facts: dict,
