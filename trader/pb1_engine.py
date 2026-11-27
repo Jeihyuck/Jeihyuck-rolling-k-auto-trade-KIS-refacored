@@ -18872,6 +18872,52 @@ class PB1Engine:
             logger.info("[PB1][EXIT] entry_skipped=1")
             self._log_tick_price_cache_summary()
             return self._finalize_run_result(status=final_status, notes=final_notes or "exit_phase")
+        # An authoritative historical/post-exit reconciliation fence cannot
+        # be cleared by scanning entry candidates. Do not delay the next
+        # protective pass by doing an entire Final30 scan which cannot submit.
+        # Keep diagnostic, non-trading, other-owner and real-account paths
+        # unchanged. The runner still performs its normal final settlement.
+        _reconcile_fence = (
+            "KR_POST_EXIT_BROKER_RECONCILE_UNVERIFIED"
+            if not getattr(self, "_kr_post_exit_reconcile_ok", True)
+            else str(entry_reason or "")
+        )
+        if (
+            self.env == "practice" and self.STRATEGY_NAME == "pb1_pullback_close"
+            and self.phase in {"entry", "pm_entry"}
+            and self.trading_day and self.intended_live and not self.dry_run
+            and not self.force_block_live and not engine_compute_only
+            and not compute_only_full_run and not diag_compute_only
+            and not diag_full_exec and not minervini_only
+            and not entry_allowed and not order_allowed
+            and _reconcile_fence in {
+                "historical_recovery_unverified",
+                "KR_POST_EXIT_BROKER_RECONCILE_UNVERIFIED",
+            }
+            and os.getenv("KR_SKIP_FENCED_ENTRY_SCAN", "1") == "1"
+        ):
+            entry_reason = _reconcile_fence
+            self.order_allowed = False
+            self.entry_block_reason = _reconcile_fence
+            logger.warning(
+                "[KR][ENTRY][RECONCILE_FENCE_FAST_RETURN] reason=%s "
+                "exit_pass_ok=%s scanner_skipped=1 final30_compute_skipped=1",
+                _reconcile_fence, int(exit_pass_ok),
+            )
+            _blocked = Counter({_reconcile_fence: 1})
+            _emit_entry_summary([], [], _blocked)
+            _emit_entry_decision("SKIP", reason=_reconcile_fence,
+                                 ok_setups=0, blocked_by=_blocked)
+            _set_run_summary_payload(
+                scanned=0, setup_ok=0, relax_ok=0, score_ok=0,
+                risk_ok=0, sized_ok=0, buyable_ok=0,
+                order_candidates=0, submitted=0, api_submitted=0,
+                blocked_reasons_counter=_blocked, no_trade_reason=_reconcile_fence,
+            )
+            self._log_tick_price_cache_summary()
+            return self._finalize_run_result(status="BLOCKED_RECONCILE",
+                                             notes=_reconcile_fence)
+
         logger.info("[PB1][POST_CAPITAL][OPEN_ORDERS_LOOKUP]")
         open_orders = self._safe_get_open_orders()
         if open_orders:
