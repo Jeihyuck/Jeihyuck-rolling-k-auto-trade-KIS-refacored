@@ -407,3 +407,24 @@ def test_idle_protective_ipc_failure_does_not_starve_other_holdings(monkeypatch,
     poll=make_idle_hard_stop_poll(watch,trade_date="2026-11-25",env="practice")
     assert poll()==watch[-1]["identity"]
     assert [len(p) for p in calls]==[16,16,3]
+
+
+def test_protective_checkpoint_uses_main_thread_and_bounded_cadence():
+    from trader.us.runner.protective_entry_interrupt import make_protective_checkpoint
+    import threading
+    clock=[0.0]
+    excluded=set()
+    snapshots=iter([{"symbol":"ABC"},{"symbol":"ABC"},{"symbol":"DEF"}])
+    polled=[]
+    handled=[]
+    def poll():
+        polled.append(clock[0])
+        return next(snapshots)
+    check=make_protective_checkpoint(poll,on_snapshot=lambda s:handled.append((s["symbol"],threading.get_ident())),
+                                    excluded_symbols=excluded,monotonic=lambda:clock[0])
+    for t in (0,1,4.9,5,6,10):
+        clock[0]=t
+        check()
+    assert polled==[0,5,10]
+    assert handled==[("ABC",threading.get_ident()),("DEF",threading.get_ident())]
+    assert excluded=={"ABC","DEF"}
