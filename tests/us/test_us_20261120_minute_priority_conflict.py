@@ -220,6 +220,8 @@ def test_holiday_observer_never_opens_store_or_broker(monkeypatch):
     import os
     for flag in ("US_ORDER_ARMED", "LIVE_TRADING_ENABLED", "US_LIVE_TRADING_ENABLED"):
         monkeypatch.setenv(flag, "1")
+    for flag in ("US_OPENING_OBSERVER_READ_ONLY", "US_SHARED_KIS_LIMITER_ENABLED"):
+        monkeypatch.setenv(flag, "0")
     assert observer.run_observer(env="practice", trade_date="2026-11-26",
         scope="scope:epoch", parent_pid=1, watchlist=[{"symbol":"CL","exchange":"NYSE"}],
         continuous=True) == 0
@@ -359,3 +361,21 @@ def test_continuous_collection_rebind_requires_exact_recovered_prep_contract(tmp
     cfile.write_text(json.dumps(dict(contract,run_revision="b"*40)))
     lanes,status=collection_priorities(**kw,allow_prep_rebind=True)
     assert status=="PREP_REBIND_UNVERIFIED" and not sum(lanes.values(),[])
+
+
+def test_promoted_hot_gets_next_hot_slot_without_using_warm_cold_quota():
+    pairs = _pairs(14)
+    lanes = {"HOT": pairs[:4], "WARM": pairs[4:12], "COLD": pairs[12:]}
+    promoted = {pairs[3]}
+    offsets = {}
+    assert next_priority_pair(lanes, slot=0, offsets=offsets, promoted_hot=promoted) == (pairs[3], "HOT")
+    assert next_priority_pair(lanes, slot=4, offsets=offsets, promoted_hot=promoted)[1] == "WARM"
+    assert next_priority_pair(lanes, slot=5, offsets=offsets, promoted_hot=promoted)[1] == "COLD"
+    promoted.clear()
+    assert next_priority_pair(lanes, slot=6, offsets=offsets, promoted_hot=promoted) == (pairs[1], "HOT")
+
+
+def test_demoted_symbol_cannot_be_polled_as_hot():
+    pairs = _pairs(6)
+    lanes = {"HOT": pairs[:4], "WARM": pairs[4:], "COLD": []}
+    assert next_priority_pair(lanes, slot=0, offsets={}, promoted_hot={pairs[5]}) == (pairs[0], "HOT")
