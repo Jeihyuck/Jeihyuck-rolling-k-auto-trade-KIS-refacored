@@ -4,6 +4,7 @@ on:
     branches: [fix/us-20261126-hot-only-tp90-integrated]
     paths:
       - 'trader/us/entry_timing/**'
+      - 'trader/us/pb1/us_entry_engine.py'
       - 'tests/us/test_us400_d_hot_event.py'
       - '.github/workflows/us400-d-event.yml'
 permissions:
@@ -33,4 +34,4 @@ jobs:
       - run: python -m pip install -r requirements.txt pytest
       - run: |
           python -m pytest -q --junitxml=/tmp/us400-d.xml tests/us/test_us400_d_hot_event.py tests/us/test_us_20261120_minute_priority_conflict.py
-          python -c 'import xml.etree.ElementTree as E; c=list(E.parse("/tmp/us400-d.xml").iter("testcase")); assert len(c)>=20 and all(x.find("skipped") is None for x in c)'
+          python -c 'import xml.etree.ElementTree as E; c=list(E.parse("/tmp/us400-d.xml").iter("testcase")); assert len(c)>=21 and all(x.find("skipped") is None for x in c)'
