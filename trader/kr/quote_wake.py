@@ -112,13 +112,85 @@ def probe_wait_target(target, now, *, read_quote=_local_quote):
         return None
 
 
+def make_protective_target(evaluation, now):
+    """Existing routed PB1 SWING hard stop only; hint, never a SELL decision."""
+    try:
+        code = evaluation["code"]
+        facts = evaluation["condition_details"]["paper_stop36"]
+        stop = _positive(facts.get("effective_hard_stop"))
+        mark = _positive(evaluation.get("current_price"))
+        if (now.tzinfo is None or not isinstance(code, str)
+                or len(code) != 6 or not code.isascii() or not code.isdigit()
+                or code == "122630" or facts.get("eligible") is not True
+                or evaluation.get("exit_policy_family") != "SWING_STAGED_EXIT"
+                or evaluation.get("exit_ok") is not False
+                or evaluation.get("signal_hit") or evaluation.get("submit_attempted")
+                or evaluation.get("order_skip_reasons")
+                or not _positive(evaluation.get("orderable_qty"))
+                or not stop or not mark or mark <= stop):
+            return None
+        return {"code": code, "stop": stop, "created_at": now.isoformat(),
+                "is_order_authorization": False}
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return None
+
+
+def _protective_quote(code):
+    from trader.marketdata.kis_ws_price import get_kis_ws_price_service
+    from trader.marketdata.kr_ws_shared import read_owner_quote
+    service = get_kis_ws_price_service()
+    q = service.get_fresh_quote("KR", code, max_age_sec=5)
+    if not verified_price(q, code, now=datetime.now(KST).timestamp()):
+        _, q = read_owner_quote(service, code, max_age_sec=5, timeout_sec=.10,
+                                required_fields=("last",))
+    return q
+
+
+def probe_protective_targets(targets, now, *, read_quote=_protective_quote):
+    """Fresh same-day WS marks only, bounded to ten existing holdings."""
+    if now.tzinfo is None or not time(9, 0) <= now.astimezone(KST).time() <= time(15, 5):
+        return None
+    for target in targets[:10]:
+        try:
+            stamp = datetime.fromisoformat(target["created_at"])
+            if (target.get("is_order_authorization") is not False
+                    or stamp.tzinfo is None or stamp.astimezone(KST).date() != now.astimezone(KST).date()
+                    or not 0 <= (now-stamp).total_seconds() <= 180
+                    or target["code"] == "122630"):
+                continue
+            q = read_quote(target["code"])
+            if (not verified_price(q, target["code"], now=now.timestamp())
+                    or q.get("source") != "KIS_WEBSOCKET"):
+                continue
+            mark = _positive(q.get("last") or q.get("prpr") or q.get("stck_prpr"))
+            stop = _positive(target["stop"])
+            if mark and stop and mark <= stop:
+                return {"code":target["code"], "kind":"PROTECTIVE_HARD_STOP_HINT",
+                        "is_order_authorization":False}
+        except (KeyError, ValueError, TypeError, OSError, AttributeError, OverflowError):
+            continue
+    return None
+
+
 def wait_for_quote_wake(*, targets, state, seconds, session_end, now, monotonic, sleep,
-                        probe=probe_wait_target):
+                        probe=probe_wait_target, protective_targets=(),
+                        protective_probe=probe_protective_targets):
     deadline = monotonic() + max(0.0, float(seconds))
     while True:
         remaining = min(deadline-monotonic(), (session_end-now()).total_seconds())
         if remaining <= 0:
             return None
+        # Protection takes priority over entry hints. A hint wakes the same
+        # serial owner for fresh holdings, broker and policy evaluation.
+        if protective_targets:
+            try:
+                result = protective_probe(protective_targets, now())
+                if monotonic() >= deadline or now() >= session_end:
+                    return None
+                if result:
+                    return result
+            except Exception:
+                pass
         # At most three selected symbols, no new subscription or REST I/O.
         for target in targets[:3]:
             if monotonic() >= deadline or now() >= session_end:
