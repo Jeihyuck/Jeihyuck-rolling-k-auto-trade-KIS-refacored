@@ -168,3 +168,27 @@ def test_shared_state_failure_preserves_existing_local_gate_for_trading_only(mon
     with pytest.raises(kw.KisTemporaryError):
         api._safe_request("GET", url)
     assert api.session.request.call_count == 1
+
+
+@pytest.mark.parametrize("body,explicit", [
+    ({"rt_cd":"1","msg_cd":"EGW00201","msg1":"초당 거래건수 초과"}, True),
+    ({"rt_cd":"1","msg_cd":"EGW00201","msg1":"초당 거래건수 초과","output":{}}, True),
+    ({"rt_cd":"0","msg_cd":"EGW00201"}, False),
+    ({"rt_cd":"1","msg_cd":"OTHER"}, False),
+    ({"rt_cd":"1","msg_cd":"EGW00201","output":{"ODNO":"0000000123"}}, False),
+    ({"rt_cd":"1","msg_cd":"EGW00201","ODNO":"0000000123"}, False),
+    ({"rt_cd":"1","msg_cd":"EGW00201","_diag_stub":True}, False),
+])
+def test_domestic_practice_500_exact_quota_reject_vs_uncertain_no_retry(monkeypatch, body, explicit):
+    api = _api(monkeypatch, body=body)
+    monkeypatch.setenv("KR_SHARED_HTTP_BUDGET_ENABLED","0")
+    monkeypatch.setenv("KIS_ORDER_RETRY_MAX","5")
+    api.session.request.return_value.status_code = 500
+    url = "https://example.invalid/uapi/domestic-stock/v1/trading/order-cash"
+    if explicit:
+        assert api._safe_request("POST",url,json={"PDNO":"012750"}).json() == body
+    else:
+        with pytest.raises(kw.KisTemporaryError) as caught:
+            api._safe_request("POST",url,json={"PDNO":"012750"})
+        assert kw.is_kr_order_submit_outcome_ambiguous(caught.value)
+    assert api.session.request.call_count == 1
