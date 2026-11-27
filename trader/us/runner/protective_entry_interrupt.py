@@ -79,14 +79,16 @@ def _confirmed_soft_snapshot(position, trade_date, *, fresh_resolver=False):
         life=state.get("lifecycle") or {}
         if (str(row.get("trade_date") or "")!=str(trade_date)
                 or life.get("is_open") is not True
+                or str(life.get("portfolio_epoch_id") or "")!=scope["portfolio_epoch_id"]
+                or str(life.get("position_cycle_id") or "")!=scope["position_cycle_id"]
                 or not _lifecycle_matches_identity(row,life,identity)):
             return None
         if position.get("_verified_pb1_stop_revision") and state.get("soft_stop_policy_revision")!="PB1_STOP_3_6_V1":
             return None
         cfg=contract_exit_config(position)
         soft=float(cfg["soft_stop"])
-        count=int(row["soft_stop_breach_count"])
-        if (not math.isfinite(soft) or not 0<soft<1
+        count=row["soft_stop_breach_count"]
+        if (type(count) is not int or not math.isfinite(soft) or not 0<soft<1
                 or count<max(1,int(cfg.get("soft_stop_confirm_ticks",2)))
                 or not math.isfinite(float(row["last_pnl_pct"]))
                 or float(row["last_pnl_pct"]) > -soft):

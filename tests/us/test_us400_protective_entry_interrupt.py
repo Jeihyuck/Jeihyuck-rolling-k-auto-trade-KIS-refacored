@@ -197,7 +197,7 @@ def test_remaining_idle_watch_keeps_only_independent_unattempted_holdings(case):
     assert len(watch)==3
 
 
-@pytest.mark.parametrize("case",["valid","unconfirmed","old_day","wrong_lifecycle","wrong_account","recovered","not_committed","stale_revision"])
+@pytest.mark.parametrize("case",["valid","unconfirmed","old_day","wrong_lifecycle","wrong_account","recovered","not_committed","stale_revision","wrong_portfolio","wrong_cycle","bool_count"])
 def test_confirmed_soft_poll_never_creates_new_confirmations(monkeypatch,case):
     from hashlib import sha256
     from types import SimpleNamespace
@@ -212,9 +212,11 @@ def test_confirmed_soft_poll_never_creates_new_confirmations(monkeypatch,case):
     monkeypatch.setattr(resolver,"_position_identity",lambda *a,**kw:dict(env="practice",account_id="other" if case=="wrong_account" else "raw",trading_epoch_id="e",position_lifecycle_id="l",strategy_owner="US_STANDARD"))
     monkeypatch.setattr(us_ws_collector,"get_quote",lambda *a,**kw:dict(last=98 if case=="recovered" else 96,source="KIS_WEBSOCKET_COLLECTOR",collector_generation="g",received_at=time.time()))
     row=CommittedUSRiskState(dict(trade_date="2026-11-24" if case=="old_day" else "2026-11-25",
-        trading_epoch_id="e",soft_stop_breach_count=1 if case=="unconfirmed" else 2,last_pnl_pct=-.04,
+        trading_epoch_id="e",soft_stop_breach_count=True if case=="bool_count" else 1 if case=="unconfirmed" else 2,last_pnl_pct=-.04,
         state=dict(lifecycle=dict(lifecycle_id="other" if case=="wrong_lifecycle" else "l",
-            env="practice",account_id="raw",trading_epoch_id="e",strategy_owner="US_STANDARD",is_open=True))))
+            env="practice",account_id="raw",trading_epoch_id="e",strategy_owner="US_STANDARD",is_open=True,
+            portfolio_epoch_id="other" if case=="wrong_portfolio" else "p",
+            position_cycle_id="other" if case=="wrong_cycle" else "l"))))
     p=dict(symbol="ABC",exchange="NASDAQ",strategy_owner="US_STANDARD",book="SWING_BOOK",horizon="SWING_CARRY",
         position_lifecycle_id="l",position_cycle_id="l",portfolio_epoch_id="p",trading_epoch_id="e",
         broker_account_hash=sha256(b"raw").hexdigest(),qty=5,orderable_qty=5,entry_price=100,
@@ -226,7 +228,7 @@ def test_confirmed_soft_poll_never_creates_new_confirmations(monkeypatch,case):
     if result:
         assert result["_protective_trigger_family"]=="CONFIRMED_SOFT_STOP"
         assert result["soft_stop_breach_count"]==2
-    assert row["soft_stop_breach_count"]==(1 if case=="unconfirmed" else 2)
+    assert row["soft_stop_breach_count"]==(True if case=="bool_count" else 1 if case=="unconfirmed" else 2)
     assert "resolved_current_price" not in p
 
 
