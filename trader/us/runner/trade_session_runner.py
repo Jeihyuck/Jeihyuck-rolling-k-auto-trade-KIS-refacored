@@ -2353,10 +2353,14 @@ def run_trade_session(
                     if _wakeup_for_tick is None:
                         _remaining_protective_watch = _idle_watch
                     else:
-                        from trader.us.runner.protective_entry_interrupt import remaining_idle_watch
+                        from trader.us.runner.protective_entry_interrupt import (
+                            remaining_idle_watch, remaining_profit_idle_watch,
+                        )
                         _remaining_protective_watch = (
                             remaining_idle_watch(_remaining_protective_watch,_wake_identity,tick_result)
-                            if _wake_kind=="stop" else []
+                            if _wake_kind=="stop" else
+                            remaining_profit_idle_watch(_remaining_protective_watch,_wake_identity,tick_result)
+                            if _wake_kind=="profit" else []
                         )
                     # Never publish incomplete market data as reusable truth.
                     # Scheduled revalidation detects upstream corrections even

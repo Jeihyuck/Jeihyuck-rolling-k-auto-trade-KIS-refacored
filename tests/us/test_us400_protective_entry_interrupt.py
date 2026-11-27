@@ -360,3 +360,25 @@ def test_entry_poll_overrun_never_returns_buy_result(monkeypatch, protective_sig
     assert cancelled.is_set()
     if protective_signal:
         assert exc.value.snapshot == snapshot
+
+
+@pytest.mark.parametrize("case",["no_trade","ack","foreign","unknown","duplicate","missing_proof","buy"])
+def test_profit_wakeup_keeps_only_unattempted_exact_holdings(case):
+    from trader.us.runner.protective_entry_interrupt import remaining_profit_idle_watch
+    def identity(s):
+        return dict(symbol=s,strategy_owner="US_STANDARD",position_lifecycle_id=s,
+                    position_cycle_id=s,portfolio_epoch_id="p",trading_epoch_id="e",broker_account_hash="a")
+    watch=[dict(identity=identity(s),exchange="NYSE",entry=100,hard=.06) for s in ("ABC","DEF","GHI")]
+    orders=[] if case=="no_trade" else [dict(status="ACK",intent={**identity("DEF"),"side":"SELL"})]
+    if case=="foreign": orders[0]["intent"]["broker_account_hash"]="foreign"
+    if case=="unknown": orders[0]["status"]="BROKER_SUBMIT_RESULT_UNKNOWN"
+    if case=="duplicate": orders.append(dict(orders[0]))
+    result=dict(protective_wakeup=True,protective_wakeup_kind="profit",exit_route_reconcile_required=False,
+                manual_reconcile_required=0,entry_intents=0,buy_orders=int(case=="buy"),
+                status="OK_EXIT_ORDERS_SENT" if orders else "OK_NO_TRADE",
+                reason="protective_profit_wakeup_routed" if orders else "protective_profit_wakeup_no_trade",
+                orders=orders,orders_sent=len(orders),orders_ack=len(orders),exit_intents=len(orders))
+    if case=="missing_proof": result.pop("exit_route_reconcile_required")
+    expected=watch[1:] if case=="no_trade" else watch[2:] if case=="ack" else []
+    assert remaining_profit_idle_watch(watch,identity("ABC"),result)==expected
+    assert len(watch)==3
