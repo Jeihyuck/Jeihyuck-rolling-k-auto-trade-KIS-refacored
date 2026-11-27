@@ -460,8 +460,52 @@ def publish_preminute_candidates(
     # First prioritize new candidates; retained/add BUY candidates are still
     # eligible for WARM collection and are not treated as global excludes.
     ranked.sort(key=lambda row: row["position_state"] == "HELD")
-    hot = ranked[:max(0, min(4, int(hot_limit)))]
-    warm = ranked[len(hot):len(hot) + max(0, min(8, int(warm_limit)))]
+    hot_cap = max(0, min(4, int(hot_limit)))
+    desired_hot = ranked[:hot_cap]
+    hot = list(desired_hot)
+    # Collection-only hysteresis: an eligible, unheld incumbent at rank
+    # HOT+1 or HOT+2 survives a single new challenger publication. A challenger
+    # ranked HOT on two consecutive fresh manifests takes its slot. A removed,
+    # held, stale or scope-invalid incumbent has no retention privilege.
+    if prep_contract is None and hot_cap and len(ranked) > hot_cap:
+        pairs = [(row["symbol"], row["exchange"]) for row in ranked]
+        previous, previous_state = load_preminute_priority(
+            env=env, scope=scope, trade_date=trade_date, pairs=pairs,
+            now_epoch=epoch, base=base)
+        if previous_state == "VALID":
+            previous_path = priority_manifest_path(
+                env=env, scope=scope, trade_date=trade_date, base=base)
+            try:
+                prior = json.loads(previous_path.read_text(encoding="utf-8"))
+                prior_desired = prior.get("desired_hot")
+                # The extra read must match the previously validated HOT list
+                # and exact scope, time, and ranked membership.
+                if (isinstance(prior_desired, list) and len(prior_desired) <= 4
+                        and prior.get("hot") == [{"symbol": a, "exchange": b} for a,b in previous["HOT"]]
+                        and prior.get("schema") == "US_PREMINUTE_PRIORITY_V1"
+                        and prior.get("owner") == "US_STANDARD"
+                        and prior.get("env") == env and prior.get("trade_date") == trade_date
+                        and prior.get("is_order_authorization") is False
+                        and prior.get("scope_sha256") == hashlib.sha256((env+":"+scope).encode()).hexdigest()
+                        and float(prior["created_epoch"]) < epoch <= float(prior["expires_epoch"])
+                        <= float(prior["created_epoch"]) + 180.00001):
+                    prior_raw = {(row["symbol"],row["exchange"]) for row in prior_desired}
+                    if prior_raw <= set(pairs):
+                        desired_pairs = {(row["symbol"],row["exchange"]) for row in desired_hot}
+                        challengers = [row for row in reversed(desired_hot)
+                            if (row["symbol"],row["exchange"]) not in prior_raw
+                            and (row["symbol"],row["exchange"]) not in previous["HOT"]]
+                        incumbents = [row for row in ranked[hot_cap:hot_cap+2]
+                            if row["position_state"] == "NOT_HELD"
+                            and (row["symbol"],row["exchange"]) in previous["HOT"]
+                            and (row["symbol"],row["exchange"]) not in desired_pairs]
+                        for incumbent, challenger in zip(incumbents, challengers):
+                            hot[hot.index(challenger)] = incumbent
+            except (OSError, ValueError, TypeError, KeyError, AttributeError):
+                pass
+    hot_keys = {(row["symbol"],row["exchange"]) for row in hot}
+    remaining = [row for row in ranked if (row["symbol"],row["exchange"]) not in hot_keys]
+    warm = remaining[:max(0, min(8, int(warm_limit)))]
     payload = {
         "schema": "US_PREMINUTE_PRIORITY_V1", "env": env,
         "owner": "US_STANDARD", "trade_date": trade_date,
@@ -470,7 +514,8 @@ def publish_preminute_candidates(
         "generation": str(os.getpid()) + ":" + str(epoch),
         "hot": [{"symbol": x["symbol"], "exchange": x["exchange"]} for x in hot],
         "warm": [{"symbol": x["symbol"], "exchange": x["exchange"]} for x in warm],
-        "cold": [{"symbol": x["symbol"], "exchange": x["exchange"]} for x in ranked[len(hot)+len(warm):]],
+        "cold": [{"symbol": x["symbol"], "exchange": x["exchange"]} for x in remaining[len(warm):]],
+        "desired_hot": [{"symbol": x["symbol"], "exchange": x["exchange"]} for x in desired_hot],
         "is_order_authorization": False,
         "hot_event_inputs": {r["symbol"]: event_inputs[r["symbol"]] for r in ranked
                              if r["symbol"] in event_inputs},
