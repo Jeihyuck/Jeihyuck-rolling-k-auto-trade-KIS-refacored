@@ -646,10 +646,15 @@ def collect_hot_minutes(client, db, *, symbol, exchange, trade_date,
         targets = [row[0] for row in db.execute(
             "SELECT DISTINCT minute_et FROM bar_conflicts WHERE trade_date=? AND symbol=? "
             "AND owner='US_STANDARD' AND status='UNRESOLVED'", (trade_date, symbol.upper()))]
-        if (requested_at.hour, requested_at.minute) >= (10, 0):
-            opening = requested_at.replace(hour=9, minute=30, second=0, microsecond=0)
-            targets.extend((opening + timedelta(minutes=i)).isoformat() for i in range(30)
-                           if (opening + timedelta(minutes=i)).isoformat() not in present)
+        opening = requested_at.replace(hour=9, minute=30, second=0, microsecond=0)
+        elapsed = min(30, max(0, int((requested_at-opening).total_seconds() // 60)))
+        targets.extend((opening + timedelta(minutes=i)).isoformat() for i in range(elapsed)
+                       if (opening + timedelta(minutes=i)).isoformat() not in present)
+        latest_boundary = requested_at.replace(second=0, microsecond=0)
+        for i in range(1, 5):
+            at = latest_boundary - timedelta(minutes=i)
+            if at >= opening and at.isoformat() not in present:
+                targets.append(at.isoformat())
         next_key = str(page.get("next_key") or "")
         # KEYB is derived from the actual preceding response, never a
         # fabricated anchor. Only continue if unresolved evidence is older.
@@ -725,9 +730,6 @@ def run_observer(*, env: str, trade_date: str, scope: str,
             if not epoch_verified:
                 time.sleep(2.0)
                 continue
-            if (now_et.hour, now_et.minute) < (9, 30):
-                time.sleep(2.0)
-                continue
             if time.monotonic() < next_poll:
                 time.sleep(min(1.0, next_poll - time.monotonic()))
                 continue
@@ -737,6 +739,9 @@ def run_observer(*, env: str, trade_date: str, scope: str,
                 for _i in range(0, len(pairs), 16):
                     subscribe_many(pairs[_i:_i + 16], env=env, timeout_sec=0.3)
                 next_subscription_refresh = time.monotonic() + 30.0
+            if (now_et.hour, now_et.minute) < (9, 30):
+                time.sleep(2.0)
+                continue
             lanes, priority_state = collection_priorities(
                 env=env, scope=scope, trade_date=trade_date,
                 pairs=pairs, now_epoch=time.time(),
@@ -757,6 +762,7 @@ def run_observer(*, env: str, trade_date: str, scope: str,
                 continue
             (symbol, exchange), tier = picked
             next_poll = time.monotonic() + interval
+            quote = None
             try:
                 quote = get_quote(symbol, exchange, env=env, timeout_sec=0.13)
                 if quote:
@@ -782,6 +788,16 @@ def run_observer(*, env: str, trade_date: str, scope: str,
                     trade_date=trade_date, repair_due=repair_due, still_hot=_still_hot, max_pages=4 if tier == "HOT" else 1)
                 LOG.info("[US_OPENING_OBSERVER][BAR_UPDATE] symbol=%s new_rows=%d requests=%d "
                          "source=KIS_OVERSEAS_1M action=NO_ORDER", symbol, result["changed"], result["requests"])
+                from trader.marketdata.opening_range_intelligence import analyze_opening_range
+                summary = analyze_opening_range(
+                    market="US", trade_date=trade_date, now=datetime.now(NY),
+                    bars=load_bars(db, trade_date=trade_date, symbol=symbol),
+                    # Market-specific structural target must be provided by
+                    # the actual strategy adapter before a ceiling is emitted.
+                    quote=quote or {},
+                )
+                LOG.info("[US_OPENING_OBSERVER][OPENING_INTELLIGENCE] symbol=%s tier=%s %s",
+                         symbol, tier, json.dumps(summary, sort_keys=True, allow_nan=False))
             except Exception as exc:
                 # Missing bars must remain WAIT. Never block an unrelated SELL.
                 LOG.warning("[US_OPENING_OBSERVER][BAR_UNAVAILABLE] symbol=%s error=%s",
