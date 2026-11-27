@@ -348,3 +348,35 @@ def test_provisional_coverage_does_not_hide_contradictory_native_rows():
     older = native_mins(30, 39)
     changed = {**older[-1], "close": older[-1]["close"] + 10}
     assert observer._current_batch_coverage({"bars": older}, [changed], now) == {}
+
+
+def test_cold_discovery_native_reads_are_bounded_and_missing_bars_stay_missing(
+    setup_readonly, monkeypatch
+):
+    now = at(9, 36)
+    monkeypatch.setattr(observer, "now_kst", lambda: now)
+    calls = []
+    def reply(code, anchor):
+        if anchor == "092900":
+            return native_mins(0, 18)
+        assert anchor == "093600"
+        return native_mins(30, 36)
+    result = observer.run_once(
+        kis=fake_client(calls, reply), codes=["093320"], observed_at=now,
+        sleep_between=0, discovery_only=True,
+        observation_styles={"093320":"PULLBACK"},
+    )
+    assert calls == [("093320","093600"),("093320","092900")]
+    assert result["native_minute_request_attempts"] == 2
+    assert result["native_quote_request_attempts"] == 1
+    persisted = proof.load_opening_proof(
+        env="practice", account_scope="replay-only", code="093320", now=now,
+    )
+    coverage = proof.inspect_completed_bar_coverage(rows=persisted["bars"],now=now)
+    assert coverage["opening_count"] == 18
+    assert coverage["state"] == "UNKNOWN"
+    assert proof.evaluate_proof_for_candidate(
+        env="practice", account_scope="replay-only", code="093320", now=now,
+        style="ENTRY_PULLBACK", setup_ok=True, trigger_ok=False,
+        pivot=None, order_price=10000,
+    )["state"] != "READY_SHADOW"
