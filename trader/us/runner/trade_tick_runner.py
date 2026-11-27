@@ -4561,6 +4561,9 @@ def run_trade_tick(
                         max_add_to_existing_buys=int(os.getenv("US_MAX_ADD_TO_EXISTING_BUYS_PER_TICK", str(_incremental_total_target))),
                     )
                     engine = _get_strategy_engine(env=env, offline=offline)
+                    from trader.us.runner.protective_entry_interrupt import (
+                        ProtectiveEntryInterrupted, make_hard_stop_poll,
+                    )
                     try:
                         last_stage = "entry_eval"
                         _entry_budget_sec = budgeted_entry_timeout_sec(tick_context, entry_eval_timeout_sec)
@@ -4585,9 +4588,6 @@ def run_trade_tick(
                                 cancel_event=_entry_cancel_event,
                             )
                             if hasattr(provider, "fork_for_stage") else provider
-                        )
-                        from trader.us.runner.protective_entry_interrupt import (
-                            ProtectiveEntryInterrupted, make_hard_stop_poll,
                         )
                         _protective_poll = None
                         if (_early_pilot_enabled and not force_now and _stage4_mode
@@ -4694,10 +4694,15 @@ def run_trade_tick(
                                         context=tick_context, kis_client=routing_kis_client,
                                     )
                                     exit_intents.extend(_protective)
-                                    exit_intents_count = len(exit_intents)
                                     orders.extend(_late.get("orders", []))
                                     exit_route_result["orders"].extend(_late.get("orders", []))
                                     exit_route_result["decisions"].extend(_late.get("decisions", []))
+                                    _sent, _ack, _rejected, _blocked = _routed_order_truth_counts(exit_route_result["orders"])
+                                    exit_route_result.update(
+                                        sent=_sent, ack=_ack, rejected=_rejected, blocked=_blocked,
+                                        sell_notional_routed=_routed_sell_notional(exit_route_result["orders"]),
+                                        exit_notional_routed=_routed_sell_notional(exit_route_result["orders"]),
+                                    )
                                     sell_notional_routed = _routed_sell_notional(orders)
                                     routed_sent, routed_ack, routed_rejected, routed_blocked = _routed_order_truth_counts(orders)
                                     logger.warning("[US_EXIT][ENTRY_INTERRUPT][ROUTED] symbol=%s", _sym)
