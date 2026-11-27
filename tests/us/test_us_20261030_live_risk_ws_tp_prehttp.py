@@ -675,7 +675,8 @@ def test_tp_router_status_requires_complete_pre_http_proof(router, expected):
     not os.getenv("PBCORE_TEST_POSTGRES_URL"),
     reason="disposable PostgreSQL acceptance URL unavailable",
 )
-def test_pg_tp_claim_reservation_rearms_only_unsent_intent(pg_engine, monkeypatch):
+@pytest.mark.parametrize("claim_action", ["TP1", "TAKE_PROFIT_TP1"])
+def test_pg_tp_claim_reservation_rearms_only_unsent_intent(pg_engine, monkeypatch, claim_action):
     """Real migrated PG: old risk BLOCKED intent -> fresh Claim -> TP -> HTTP gate."""
     from datetime import date, datetime, timezone
     from uuid import uuid4
@@ -720,7 +721,7 @@ def test_pg_tp_claim_reservation_rearms_only_unsent_intent(pg_engine, monkeypatc
     identity = SemanticActionIdentity(
         env="practice", account_id=account, market="US",
         trading_epoch_id=epoch, strategy_owner="US_STANDARD",
-        lifecycle_id=cycle, action="TAKE_PROFIT_TP1",
+        lifecycle_id=cycle, action=claim_action,
         trade_date=date.fromisoformat(td),
     )
     assert claim_repo.acquire(

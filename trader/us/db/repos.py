@@ -3712,6 +3712,12 @@ def _proven_us_tp_partial_retry(conn, params, stage_row, claim, intent_meta):
     )
 
 
+def _tp_claim_action_matches_stage(action: object, stage: str) -> bool:
+    """Match only the two explicit durable TP action spellings, never another stage."""
+    normalized = str(action or "").strip().lower()
+    return stage in {"tp1", "tp2", "tp3"} and normalized in {stage, f"take_profit_{stage}"}
+
+
 def reserve_us_profit_capture_stage_after_claim(
     *, trade_date: str, symbol: str, stage: str, position_lifecycle_id: str,
     client_order_key: str, attempt_id: str, action_key: str, qty: int,
@@ -3807,7 +3813,7 @@ def reserve_us_profit_capture_stage_after_claim(
                 or str(claim[0].get("attempt_state") or "") != "CREATED"
                 or str(claim[0].get("client_order_key") or "") != key
                 or str(claim[0].get("lifecycle_id") or "") != cycle
-                or str(claim[0].get("action") or "").strip().lower() != stg
+                or not _tp_claim_action_matches_stage(claim[0].get("action"), stg)
                 or int(claim[0].get("requested_qty") or 0) != int(qty)):
             return False
         prior_stage = stage_row or (historical[0] if historical else None)
@@ -3964,7 +3970,7 @@ def verify_us_tp_claim_stage_at_http_boundary(
                 or str(claim["lifecycle_id"] or "") != params["cycle"]
                 or str(claim["client_order_key"] or "") != params["key"]
                 or str(claim["attempt_state"] or "") not in {"CREATED", "SUBMITTED"}
-                or str(claim.get("action") or "").strip().lower() != epoch_params["stage"]):
+                or not _tp_claim_action_matches_stage(claim.get("action"), epoch_params["stage"])):
             return False
         # A native submit may only consume the exact reserved TP remainder.
         stage_remaining = int(stage_row.get("requested_qty") or 0) - int(stage_row.get("cumulative_filled_qty") or 0)
