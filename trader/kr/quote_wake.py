@@ -73,7 +73,9 @@ def _local_quote(code):
     from trader.marketdata.kr_ws_shared import read_owner_quote
     service = get_kis_ws_price_service()
     q = service.get_fresh_quote("KR", code, max_age_sec=5)
-    if not q:
+    # A fresh trade-only frame is not an executable book. Consult the
+    # existing bounded shared WS owner rather than hiding its complete quote.
+    if not verified_price(q, code, now=datetime.now(KST).timestamp()) or not complete_book(q):
         _, q = read_owner_quote(service, code, max_age_sec=5, timeout_sec=.10,
                                 required_fields=("last", "bid", "ask"))
     return q
