@@ -906,8 +906,20 @@ class USDataProvider:
             raise KisUSTemporaryError("entry stage cancelled before current-price lookup")
         cache_key = (symbol.upper(), exchange.upper())
         ctx = self._tick_context
+        def _strict_cache_usable(row):
+            if max_quote_age_sec is None:
+                return True
+            try:
+                age = __import__("time").time() - float(row.get("asof_epoch"))
+                return (0 <= age <= float(max_quote_age_sec)
+                        and not (row.get("stale") or row.get("suspect") or row.get("_stale_date"))
+                        and str(row.get("quality") or "").upper() in {"FRESH", "FRESH_CACHE"})
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                return False
         if ctx is not None:
             ctx.count("quote_logical_calls")
+            if cache_key in ctx.price_cache and not _strict_cache_usable(ctx.price_cache[cache_key]):
+                ctx.price_cache.pop(cache_key, None)
             if cache_key in ctx.price_cache:
                 cached = ctx.price_cache[cache_key]
                 # A quote that was fresh at tick start may become stale before
@@ -915,6 +927,8 @@ class USDataProvider:
                 if "WEBSOCKET" in str(cached.get("source") or "").upper():
                     received = float(cached.get("asof_epoch") or 0)
                     freshness = float(os.getenv("KIS_WS_FRESH_MAX_AGE_SEC_US", "15") or 15)
+                    if max_quote_age_sec is not None:
+                        freshness = min(freshness, float(max_quote_age_sec))
                     if received <= 0 or __import__("time").time() - received > freshness:
                         ctx.price_cache.pop(cache_key, None)
                     elif str(cached.get("source") or "") == "KIS_WEBSOCKET_COLLECTOR":
@@ -1052,6 +1066,8 @@ class USDataProvider:
             raise KisUSTemporaryError("entry stage cancelled after websocket price lookup")
 
         # Cache hit
+        if self._cache_enabled and cache_key in self._price_cache and not _strict_cache_usable(self._price_cache[cache_key]):
+            self._price_cache.pop(cache_key, None)
         if self._cache_enabled and cache_key in self._price_cache:
             self.stats["price_hit"] += 1
             logger.debug("[US_DATA][CACHE_HIT] type=price symbol=%s", symbol)
@@ -1082,7 +1098,12 @@ class USDataProvider:
             else:
                 # Explicit freshness/protective paths do not join a shared
                 # canonical price request or wait for its producer.
-                result = self._get_client().get_us_price(symbol, exchange)
+                client = self._get_client()
+                from trader.us.execution.kis_us_client import KisUSClient
+                if max_quote_age_sec is not None and isinstance(client, KisUSClient):
+                    result = client.get_us_price(symbol, exchange, max_quote_age_sec=max_quote_age_sec)
+                else:
+                    result = client.get_us_price(symbol, exchange)
             if self._stage_cancelled():
                 from trader.us.execution.kis_us_client import KisUSTemporaryError
                 raise KisUSTemporaryError("entry stage cancelled after KIS price lookup")
