@@ -476,3 +476,26 @@ def test_postgres_preclaim_certificate_rejects_contradictory_durable_fields(pg_e
         assert conn.execute(text("SELECT status FROM us_order_intents WHERE client_order_key=:key"), {"key": key}).scalar_one() == "PENDING"
         state = conn.execute(text("SELECT state FROM us_profit_capture_lifecycle WHERE client_order_key=:key"), {"key": key}).scalar_one()
         assert state["meta"]["last_status"] == "US_RECOVERY_SCOPE_UNVERIFIED"
+
+
+@pytest.mark.parametrize("location,field", [
+    ("intent","broker_account_hash"), ("meta","broker_account_hash"),
+    ("intent","account_id"), ("meta","account_id"),
+    ("intent","trading_epoch_id"), ("meta","trading_epoch_id"),
+    ("intent","strategy_owner"), ("meta","strategy_owner"),
+])
+def test_preclaim_abort_cannot_retag_foreign_declared_scope(monkeypatch, location, field):
+    from trader.us.db import repos
+    from trader.us.execution import order_journal
+    from trader.us.execution.tp_retry_boundary import record_router_abort
+    scope={"env":"practice","account_id":"active-account","trading_epoch_id":"active-epoch"}
+    monkeypatch.setattr(repos,"_us_execution_claim_scope",lambda:dict(scope))
+    monkeypatch.setattr(order_journal,"append_order_event",lambda *a,**kw:pytest.fail("foreign certificate persisted"))
+    intent={"symbol":"ABC","side":"SELL","trade_date":"2026-11-11",
+            "position_lifecycle_id":"cycle","strategy_owner":"US_STANDARD",
+            "broker_account_hash":scope["account_id"],"trading_epoch_id":scope["trading_epoch_id"],
+            "client_order_key":"US_PC_2026-11-11_ABC_cycle_TAKE_PROFIT_TP2",
+            "meta":{"profit_capture_stage":"tp2","strategy_owner":"US_STANDARD",
+                    "broker_account_hash":scope["account_id"],"trading_epoch_id":scope["trading_epoch_id"]}}
+    (intent if location=="intent" else intent["meta"])[field]="foreign"
+    assert not record_router_abort(intent,checkpoint="original_scope_rejected")
