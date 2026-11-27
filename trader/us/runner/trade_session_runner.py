@@ -2197,6 +2197,7 @@ def run_trade_session(
                 _hot_focus=None
                 _protective_wakeup = None
                 _idle_watch = []
+                _entry_profit_followup=None
                 if _wakeup_for_tick is None:
                     _normal_tick_count += 1
                     _protective_slot_deadline = None
@@ -2359,6 +2360,7 @@ def run_trade_session(
                         tick_result.setdefault("total_tick_sec", process_result.duration_sec)
                     _idle_watch = tick_result.pop("_protective_idle_watch", [])
                     _returned_hot_wait=tick_result.pop("_hot_idle_wait",None)
+                    _entry_profit_followup=tick_result.pop("_entry_profit_followup",None)
                     if _wakeup_for_tick is None:
                         _remaining_protective_watch = _idle_watch
                         _hot_idle_wait=_returned_hot_wait
@@ -2711,6 +2713,22 @@ def run_trade_session(
                     skipped_slot_count += skipped
                     if skipped:
                         logger.warning("[US_TICK_LOOP][SLOTS_SKIPPED] count=%d total=%d", skipped, skipped_slot_count)
+                    if (_entry_profit_followup is not None and _wakeup_for_tick is None
+                            and sleep_sec>5 and not offline and max_ticks==0
+                            and not resolved_signal_only and kis_order_allowed and env=="practice"
+                            and _reconcile_mode=="WORKER" and not _unreaped_child_seen
+                            and bool(prep_guard_result.get("exit_can_proceed",True))
+                            and os.getenv("US_DISABLE_TICK_PROCESS_ISOLATION")!="1"):
+                        from trader.us.runner.protective_entry_interrupt import split_wakeup
+                        _follow_identity,_follow_kind=split_wakeup(_entry_profit_followup)
+                        if _follow_identity is not None and _follow_kind=="profit":
+                            # Previous child is already reaped. Existing
+                            # canonical SELL-only child revalidates all evidence.
+                            _protective_wakeup=_entry_profit_followup
+                            _protective_slot_deadline=time_mod.monotonic()+sleep_sec
+                            _hot_idle_wait=None
+                            logger.info("[US_EXIT][ENTRY_PROFIT_FOLLOWUP] action=SERIAL_SELL_ONLY")
+                            continue
                     _idle_poll=None
                     if (sleep_sec>5 and not offline and max_ticks==0
                             and not resolved_signal_only and kis_order_allowed and env=="practice"

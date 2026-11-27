@@ -2062,6 +2062,8 @@ def run_trade_tick(
     tick_started_at = time.monotonic()
     _profit_wakeup=protective_wakeup_identity is not None and protective_wakeup_kind=="profit"
     _profit_eval_incomplete=False
+    _entry_profit_interrupt=None
+    _entry_profit_watch=[]
     if protective_wakeup_identity is None and protective_wakeup_kind!="stop":
         return {"status":"WARN_RECONCILE_PENDING","reason":"protective_wakeup_identity_missing",
                 "protective_wakeup":True,"orders":[],"entry_can_proceed":False}
@@ -4812,6 +4814,18 @@ def run_trade_tick(
                                 trade_date=trade_date, env=env, context=tick_context,
                                 allow_confirmed_soft=True,
                             )
+                            from trader.us.runner.protective_entry_interrupt import (
+                                export_idle_watch,make_entry_protective_poll,
+                            )
+                            _entry_profit_watch=export_idle_watch(
+                                exit_snapshots,excluded_symbols=_excluded,env=env,
+                                trade_date=trade_date,allow_confirmed_soft=True)
+                            # Never accelerate a second order path on the
+                            # heels of existing or uncertain order activity.
+                            if not orders and not exit_intents:
+                                _protective_poll=make_entry_protective_poll(
+                                    _protective_poll,_entry_profit_watch,trade_date=trade_date,
+                                    env=env,context=tick_context)
                         entry_intents = run_entry_eval_with_timeout(
                             lambda: engine.evaluate_entries(
                                 None,
@@ -4865,45 +4879,50 @@ def run_trade_tick(
                         entry_degraded_reason = "PROTECTIVE_ENTRY_INTERRUPTED"
                         entry_can_proceed = False
                         _new_snapshot = _interrupt.snapshot
-                        _sym = str(_new_snapshot.get("symbol") or "").upper()
-                        logger.warning("[US_EXIT][ENTRY_INTERRUPT] symbol=%s action=cancel_buy_evaluate_canonical_hard_stop", _sym)
-                        from trader.us.runner.protective_entry_interrupt import execute_hard_stop_interrupt
-                        if not isinstance(getattr(tick_context, "_sell_selected_ready_by_symbol", None), dict):
-                            tick_context._sell_selected_ready_by_symbol = {}
-                            tick_context._sell_selected_trace_id_by_symbol = {}
-                        _protective, _late = execute_hard_stop_interrupt(
-                            _new_snapshot, trade_date=trade_date, context=tick_context,
-                            evaluate=lambda snap, clock: _gen_exit_from_snapshots(
-                                [], provider=None, now=clock, prepared_snapshots=[snap],
-                                include_trend_time=False,
-                                on_sell_ready=lambda intent, observed: _observe_pb1_sell(intent, observed, "entry_interrupt"),
-                            ),
-                            classify_family=_exit_family,
-                            suppress=lambda intents: _suppress_pending_sell_exit_intents(
-                                intents, trade_date, env=env, strict=True,
-                            ),
-                            route=lambda intents: route_exit_orders_immediately(
-                                intents, buy_daily_notional=buy_daily_notional,
-                                position_count=position_count, effective_budget=effective_budget,
-                                signal_only=signal_only, kis_order_allowed=kis_order_allowed,
-                                current_position_symbols=current_position_symbols,
-                                context=tick_context, kis_client=routing_kis_client,
-                            ),
-                        )
-                        if _late is not None:
-                            exit_intents.extend(_protective)
-                            orders.extend(_late.get("orders", []))
-                            exit_route_result["orders"].extend(_late.get("orders", []))
-                            exit_route_result["decisions"].extend(_late.get("decisions", []))
-                            _sent, _ack, _rejected, _blocked = _routed_order_truth_counts(exit_route_result["orders"])
-                            exit_route_result.update(
-                                sent=_sent, ack=_ack, rejected=_rejected, blocked=_blocked,
-                                sell_notional_routed=_routed_sell_notional(exit_route_result["orders"]),
-                                exit_notional_routed=_routed_sell_notional(exit_route_result["orders"]),
+                        if isinstance(_new_snapshot,dict) and "_entry_profit_wakeup" in _new_snapshot:
+                            _entry_profit_interrupt=_new_snapshot
+                            entry_degraded_reason="PROTECTIVE_PROFIT_ENTRY_INTERRUPTED"
+                            logger.warning("[US_EXIT][ENTRY_PROFIT_INTERRUPT] action=cancel_buy_request_serial_sell_only")
+                        else:
+                            _sym = str(_new_snapshot.get("symbol") or "").upper()
+                            logger.warning("[US_EXIT][ENTRY_INTERRUPT] symbol=%s action=cancel_buy_evaluate_canonical_hard_stop", _sym)
+                            from trader.us.runner.protective_entry_interrupt import execute_hard_stop_interrupt
+                            if not isinstance(getattr(tick_context, "_sell_selected_ready_by_symbol", None), dict):
+                                tick_context._sell_selected_ready_by_symbol = {}
+                                tick_context._sell_selected_trace_id_by_symbol = {}
+                            _protective, _late = execute_hard_stop_interrupt(
+                                _new_snapshot, trade_date=trade_date, context=tick_context,
+                                evaluate=lambda snap, clock: _gen_exit_from_snapshots(
+                                    [], provider=None, now=clock, prepared_snapshots=[snap],
+                                    include_trend_time=False,
+                                    on_sell_ready=lambda intent, observed: _observe_pb1_sell(intent, observed, "entry_interrupt"),
+                                ),
+                                classify_family=_exit_family,
+                                suppress=lambda intents: _suppress_pending_sell_exit_intents(
+                                    intents, trade_date, env=env, strict=True,
+                                ),
+                                route=lambda intents: route_exit_orders_immediately(
+                                    intents, buy_daily_notional=buy_daily_notional,
+                                    position_count=position_count, effective_budget=effective_budget,
+                                    signal_only=signal_only, kis_order_allowed=kis_order_allowed,
+                                    current_position_symbols=current_position_symbols,
+                                    context=tick_context, kis_client=routing_kis_client,
+                                ),
                             )
-                            sell_notional_routed = _routed_sell_notional(orders)
-                            routed_sent, routed_ack, routed_rejected, routed_blocked = _routed_order_truth_counts(orders)
-                            logger.warning("[US_EXIT][ENTRY_INTERRUPT][ROUTED] symbol=%s", _sym)
+                            if _late is not None:
+                                exit_intents.extend(_protective)
+                                orders.extend(_late.get("orders", []))
+                                exit_route_result["orders"].extend(_late.get("orders", []))
+                                exit_route_result["decisions"].extend(_late.get("decisions", []))
+                                _sent, _ack, _rejected, _blocked = _routed_order_truth_counts(exit_route_result["orders"])
+                                exit_route_result.update(
+                                    sent=_sent, ack=_ack, rejected=_rejected, blocked=_blocked,
+                                    sell_notional_routed=_routed_sell_notional(exit_route_result["orders"]),
+                                    exit_notional_routed=_routed_sell_notional(exit_route_result["orders"]),
+                                )
+                                sell_notional_routed = _routed_sell_notional(orders)
+                                routed_sent, routed_ack, routed_rejected, routed_blocked = _routed_order_truth_counts(orders)
+                                logger.warning("[US_EXIT][ENTRY_INTERRUPT][ROUTED] symbol=%s", _sym)
                     except concurrent.futures.TimeoutError:
                         if entry_degraded_reason == "NEXT_TICK_ENTRY_DEFER_INSUFFICIENT_BUDGET":
                             logger.warning(
@@ -5972,8 +5991,19 @@ def run_trade_tick(
             and os.getenv("WSL_RUN_MARKET","").upper()=="US"
             and os.getenv("US_HOT_EVENT_RETRY_ENABLED","1")=="1"):
         _hot_wait=locals().get("entry_generation_diagnostics",{}).get("hot_wait")
+    _entry_profit_followup=None
+    if _entry_profit_interrupt is not None and runtime_integrity_status=="LIVENESS_DEGRADED":
+        from trader.us.runner.protective_entry_interrupt import validated_entry_profit_followup
+        _entry_profit_followup=validated_entry_profit_followup(
+            _entry_profit_interrupt,watch=_entry_profit_watch,result={
+                "orders":orders,"entry_intents":entry_intents_count,"exit_intents":exit_intents_count,
+                "orders_sent":orders_sent,"manual_reconcile_required":int(locals().get("ack_db_failed_buy_stop",False)),
+                "exit_route_reconcile_required":exit_route_reconcile_required,
+                "exit_route_liveness_failure":exit_route_liveness_failure,
+                "entry_degraded_reason":entry_degraded_reason})
     return {
         **latency_metrics,
+        "_entry_profit_followup":_entry_profit_followup,
         "_protective_idle_watch":_protective_idle_watch,
         "_hot_idle_wait":_hot_wait,
         "status": status,
