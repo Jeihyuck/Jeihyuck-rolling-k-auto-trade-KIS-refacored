@@ -1512,6 +1512,7 @@ def run_trade_session(
         _protective_slot_deadline = None
         _remaining_protective_watch = []
         _hot_idle_wait=None
+        _hot_focus=None
         _hot_not_before=0.0
         _protective_tick_count = 0
         warn_count = 0
@@ -2192,6 +2193,8 @@ def run_trade_session(
                         )
 
                 _wakeup_for_tick = _protective_wakeup
+                _focus_for_tick=_hot_focus
+                _hot_focus=None
                 _protective_wakeup = None
                 _idle_watch = []
                 if _wakeup_for_tick is None:
@@ -2300,6 +2303,8 @@ def run_trade_session(
                             protective_wakeup_kind=_wake_kind,
                             entry_can_proceed=False,tqqq_policy_override_allowed=False,
                             session_entry_allowed=False,entry_block_reason="PROTECTIVE_WAKEUP")
+                    if _focus_for_tick is not None and _wakeup_for_tick is None:
+                        tick_kwargs['hot_focus']=_focus_for_tick
                     if _stage4_exit_only_fallback:
                         # Block EVERY new BUY, including dedicated TQQQ policy
                         # overrides. Keep existing authorized SELL evaluation.
@@ -2738,6 +2743,7 @@ def run_trade_session(
                             # Consume the already scheduled normal slot, not an extra
                             # BUY tick. No chain advance before its original boundary.
                             _hot_not_before=_protective_slot_deadline
+                            _hot_focus=_protective_wakeup
                             logger.info("[US_HOT_EVENT][NORMAL_SLOT_ADVANCED] pairs=%s action=CANONICAL_TICK",_protective_wakeup.get("pairs"))
                             _protective_wakeup=None
                             _hot_idle_wait=None

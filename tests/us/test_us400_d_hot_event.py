@@ -417,7 +417,28 @@ def test_hot_idle_poll_advances_only_once_after_slot_boundary_and_protective_pri
     clock[0]=10
     stop={"symbol":"DEF"}
     assert hot.combine_idle_polls(lambda:stop,poll)()==stop and not reads
-    assert hot.combine_idle_polls(lambda:None,poll)()=={"kind":"hot_slot","pairs":[["AAA","NYSE"]]}
+    assert hot.combine_idle_polls(lambda:None,poll)()=={"kind":"hot_slot","generation":"g","pairs":[["AAA","NYSE"]]}
     assert poll() is None and len(reads)==1
     assert hot.make_hot_slot_poll({"generation":"g","pairs":[["TQQQ","NASDAQ"]]},
         env="practice",scope="scope:epoch",trade_date="2026-11-25") is None
+
+
+@pytest.mark.parametrize("case",["valid","stale","generation","filtered","wrong_exchange","duplicate","missing_rank","tqqq"])
+def test_focused_hot_rows_require_current_hint_and_original_canonical_rank(monkeypatch,case):
+    from trader.us.entry_timing import hot_event_evaluator as hot,opportunity
+    monkeypatch.setattr(opportunity,"effective_mode",lambda:"ENFORCE")
+    focus={"kind":"hot_slot","generation":"g","pairs":[["AAA","NYSE"]]}
+    row={"symbol":"AAA","exchange":"NYSE","rank_final30":17,"score_final":.95}
+    rows=[row,{"symbol":"BBB","exchange":"NYSE","rank_final30":1}]
+    if case=="filtered": rows=rows[1:]
+    if case=="wrong_exchange": row["exchange"]="NASDAQ"
+    if case=="duplicate": rows.append(dict(row))
+    if case=="missing_rank": row.pop("rank_final30")
+    if case=="tqqq": focus["pairs"]=[["TQQQ","NASDAQ"]]
+    if case=="generation": focus["generation"]="old"
+    monkeypatch.setattr(hot,"read_hot_retry_hints",lambda **kw:
+        {("AAA","NYSE")} if case!="stale" and kw["generation"]=="g" else set())
+    selected=hot.select_focused_hot_rows(rows,focus,env="practice",scope="acct:epoch",
+        trade_date="2026-11-25",now_epoch=100)
+    assert selected==([row] if case=="valid" else [])
+    if selected: assert selected[0] is row and selected[0]["rank_final30"]==17
