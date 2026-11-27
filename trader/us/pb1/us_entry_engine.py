@@ -626,6 +626,7 @@ def generate_entry_intents(
     diagnostics: dict[str, Any] | None = None,
     intent_acceptor: Any | None = None,
     cancel_event: Any | None = None,
+    publish_priority: bool = True,
 ) -> list[dict]:
     """진입 intent 목록 생성.
 
@@ -1025,7 +1026,8 @@ def generate_entry_intents(
     # required to turn a candidate READY. This is only collection priority;
     # it cannot create an intent or bypass risk/owner/timing gates.
     if (
-        os.getenv("KIS_ENV", "practice").lower() == "practice"
+        publish_priority
+        and os.getenv("KIS_ENV", "practice").lower() == "practice"
         and os.getenv("US_OPENING_OBSERVER_ENABLED", "0") == "1"
         and str(os.getenv("US_ENTRY_WINDOW_SCOPE") or "").strip()
     ):
