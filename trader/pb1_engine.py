@@ -5998,20 +5998,23 @@ class PB1Engine:
             # Only an actual owner-approved pre-submit timing WAIT can seed
             # a wake hint. The observer never creates execution authority.
             if os.getenv("KR_PB1_QUOTE_WAKE_ENABLED", "1") == "1":
-                from trader.kr.quote_wake import make_wait_target
-                _wake_target = make_wait_target(
-                    code=str(cf.code).zfill(6), style=_timing_style,
-                    setup_ok=bool((cf.features or {}).get("setup_ok", cf.setup_ok)),
-                    trigger_ok=bool((cf.features or {}).get("breakout_trigger_ok")
-                                    or (cf.features or {}).get("trigger_ok")),
-                    pivot=(cf.features or {}).get("pivot"), timing=_timing,
-                    now=_timing_now, account_scope=get_account_key(env=self.env),
-                )
-                if _wake_target:
-                    _targets = getattr(self, "_kr_quote_wake_targets", {})
-                    if len(_targets) < 3 or _wake_target["code"] in _targets:
-                        _targets[_wake_target["code"]] = _wake_target
-                        self._kr_quote_wake_targets = _targets
+                try:
+                    from trader.kr.quote_wake import make_wait_target
+                    _wake_target = make_wait_target(
+                        code=str(cf.code).zfill(6), style=_timing_style,
+                        setup_ok=bool((cf.features or {}).get("setup_ok", cf.setup_ok)),
+                        trigger_ok=bool((cf.features or {}).get("breakout_trigger_ok")
+                                        or (cf.features or {}).get("trigger_ok")),
+                        pivot=(cf.features or {}).get("pivot"), timing=_timing,
+                        now=_timing_now, account_scope=get_account_key(env=self.env),
+                    )
+                    if _wake_target:
+                        _targets = getattr(self, "_kr_quote_wake_targets", {})
+                        if len(_targets) < 3 or _wake_target["code"] in _targets:
+                            _targets[_wake_target["code"]] = _wake_target
+                            self._kr_quote_wake_targets = _targets
+                except Exception:
+                    logger.warning("[KR][QUOTE_WAKE][HINT_UNAVAILABLE] code=%s action=KEEP_NORMAL_TIMING_GATE", cf.code)
             logger.info(
                 "[KR][ENTRY][DECISION_LATENCY] code=%s style=%s decision_at=%s latest_bar_ts=%s eval_elapsed_ms=%.1f state=%s reason=%s",
                 cf.code, _timing_style, now_kst().isoformat(), _timing.get("latest_bar_ts"),
@@ -14155,33 +14158,46 @@ class PB1Engine:
                 and not _policy_adoption_active
                 and code != "122630"
             ):
-                from trader.kr.us_profit_execution_router import evaluate_active_kr_tp
-                _kr_candidate = evaluate_active_kr_tp(
-                    position=pos, engine=self.orders_repo.engine,
-                    kis=self.kis, env=self.env, code=code,
-                    balance_snapshot=self._authoritative_balance,
-                    # An analytical dry-run/DIAG is read-only. Explicit
-                    # historical policy amendment must not mutate account
-                    # positions until the real KIS practice SELL lane is
-                    # armed; all other existing V1 policies remain frozen.
-                    allow_amendment=bool(
-                        self.intended_live and not self.dry_run
-                        and not self.force_block_live
-                        and self.trading_day and self.strategy_mode != "DIAG"
-                    ),
+                from trader.kr.us_profit_execution_router import evaluate_active_kr_tp, frozen_kr_profit_contract
+                _safety_exit = bool(
+                    stop_hit or trail_hit or ma20_break or ma50_break
+                    or risk_off_hit or time_stop_hit
+                    or str(final_reason or "").upper() in {
+                        "EXIT_HARD_STOP", "EXIT_TRAIL", "EXIT_MA20_BREAK",
+                        "EXIT_MA50_BREAK", "EXIT_FORCE_EOD",
+                        "KR_PB1_SOFT_STOP_3PCT",
+                    }
+                    or _paper_stop36_signal
                 )
+                _frozen_profit = frozen_kr_profit_contract(pos)
+                if ((stop_hit or _paper_stop36_signal) and _safety_exit
+                        and isinstance(_frozen_profit, dict)
+                        and _frozen_profit.get("activation_mode") == "ACTIVE_PRACTICE"
+                        and os.getenv("KR_PROTECTIVE_STOP_SKIP_UNUSED_TP", "1") == "1"):
+                    # The original routing gives protection precedence even
+                    # when TP evidence is BLOCK. A frozen ACTIVE policy must
+                    # still suppress legacy profit overlays, but it cannot
+                    # authorize any TP order in this branch. No amendment.
+                    _kr_candidate = {"action": "DEFERRED_FOR_PROTECTIVE_STOP"}
+                    logger.info("[KR_LATENCY][UNUSED_TP_DEFERRED] code=%s reason=PROTECTIVE_STOP_PRIORITY",
+                                display_code)
+                else:
+                    _kr_candidate = evaluate_active_kr_tp(
+                        position=pos, engine=self.orders_repo.engine,
+                        kis=self.kis, env=self.env, code=code,
+                        balance_snapshot=self._authoritative_balance,
+                        # An analytical dry-run/DIAG is read-only. Explicit
+                        # historical policy amendment must not mutate account
+                        # positions until the real KIS practice SELL lane is
+                        # armed; all other existing V1 policies remain frozen.
+                        allow_amendment=bool(
+                            self.intended_live and not self.dry_run
+                            and not self.force_block_live
+                            and self.trading_day and self.strategy_mode != "DIAG"
+                        ),
+                    )
                 if _kr_candidate is not None:
                     _kr_us_tp_contract_active = True
-                    _safety_exit = bool(
-                        stop_hit or trail_hit or ma20_break or ma50_break
-                        or risk_off_hit or time_stop_hit
-                        or str(final_reason or "").upper() in {
-                            "EXIT_HARD_STOP", "EXIT_TRAIL", "EXIT_MA20_BREAK",
-                            "EXIT_MA50_BREAK", "EXIT_FORCE_EOD",
-                            "KR_PB1_SOFT_STOP_3PCT",
-                        }
-                        or _paper_stop36_signal
-                    )
                     if _safety_exit:
                         logger.info(
                             "[KR_PROFIT_PARITY][SAFETY_PRIORITY] code=%s reason=%s",

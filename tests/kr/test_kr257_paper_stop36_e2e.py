@@ -219,3 +219,23 @@ def test_active_profit_hold_preserves_recovery_reset(monkeypatch):
         assert kis.sell_quantities == []
     finally:
         db.dispose()
+
+
+def test_frozen_active_tp_io_is_deferred_when_hard_stop_already_decided(monkeypatch):
+    db = _new_db()
+    kis = RetryableSellKis()
+    def unused(**kw):
+        raise AssertionError("unused TP broker/DB I/O must not delay hard protection")
+    monkeypatch.setattr("trader.kr.us_profit_execution_router.evaluate_active_kr_tp", unused)
+    monkeypatch.setattr("trader.kr.us_profit_execution_router.frozen_kr_profit_contract",
+                        lambda position: {"activation_mode": "ACTIVE_PRACTICE"})
+    monkeypatch.setenv("KR_PROTECTIVE_STOP_SKIP_UNUSED_TP", "1")
+    try:
+        engine, pos = _setup(monkeypatch, db, kis, mark=94.0)
+        result = _tick(engine, pos, mark=94.0)
+        assert result["decision_reason"] == "EXIT_HARD_STOP"
+        assert result["submitted"] == 1
+        assert kis.sell_quantities == [20]
+        assert _order(db)["request_json"]["exit_stage"] == "FULL_EXIT"
+    finally:
+        db.dispose()
