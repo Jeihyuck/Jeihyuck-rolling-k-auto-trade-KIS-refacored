@@ -744,8 +744,16 @@ def next_priority_pair(
     lanes: dict[str, list[tuple[str, str]]],
     *, slot: int, offsets: dict[str, int],
     promoted_hot: set[tuple[str, str]] | None = None,
+    last_hot_attempt: dict[tuple[str, str], float] | None = None,
+    now_mono: float | None = None,
+    poll_interval_sec: float = 10.0,
 ) -> tuple[tuple[str, str], str] | None:
-    """V2 baseline 4:1:1; unused slots may serve HOT, never expand COLD budget."""
+    """V2 4:1:1; prioritize HOT attempt deadlines without adding requests.
+
+    Attempt time is scheduling evidence, not proof of a fresh completed bar.
+    An overdue established symbol wins over repeated promotions. The next
+    ordinary HOT slot still honors unattempted promotions and rotation.
+    """
     if any(len(lanes.get(tier) or []) > cap for tier, cap in (("HOT", 4), ("WARM", 8), ("COLD", 30))):
         return None
     schedule = ("HOT", "HOT", "HOT", "HOT", "WARM", "COLD")
@@ -756,10 +764,23 @@ def next_priority_pair(
         return None
     pos = offsets.get(tier, 0)
     offsets[tier] = pos + 1
-    if tier == "HOT" and promoted_hot:
-        for candidate in (lane[(pos + i) % len(lane)] for i in range(len(lane))):
-            if candidate in promoted_hot:
-                return candidate, tier
+    if tier == "HOT":
+        rotated = [lane[(pos + i) % len(lane)] for i in range(len(lane))]
+        if last_hot_attempt is not None and now_mono is not None:
+            # Reserve one normal poll interval before the 60s attempt
+            # target. This is admission priority, not a latency guarantee.
+            cutoff = now_mono - max(0.0, 60.0 - max(0.0, poll_interval_sec))
+            due = [pair for pair in rotated if pair in last_hot_attempt
+                   and last_hot_attempt[pair] <= cutoff]
+            if due:
+                return min(due, key=lambda pair: last_hot_attempt[pair]), tier
+            unseen = [pair for pair in rotated if pair not in last_hot_attempt]
+            if unseen:
+                return next((pair for pair in unseen if pair in (promoted_hot or set())), unseen[0]), tier
+        if promoted_hot:
+            for candidate in rotated:
+                if candidate in promoted_hot:
+                    return candidate, tier
     return lane[pos % len(lane)], tier
 
 
@@ -946,6 +967,7 @@ def run_observer(*, env: str, trade_date: str, scope: str,
     next_repair_by_symbol = {}
     previous_hot = set()
     promoted_hot = set()
+    last_hot_attempt = {}
     next_epoch_check = 0.0
     epoch_verified = not continuous
     fetch_enabled = os.getenv("US_OPENING_OBSERVER_BAR_FETCH_ENABLED", "1") == "1"
@@ -1025,8 +1047,13 @@ def run_observer(*, env: str, trade_date: str, scope: str,
             promoted_hot.intersection_update(current_hot)
             promoted_hot.update(current_hot - previous_hot)
             previous_hot = current_hot
+            # A demoted or removed symbol must not inherit a previous HOT
+            # attempt deadline when it later earns a new HOT admission.
+            last_hot_attempt = {pair: at for pair, at in last_hot_attempt.items()
+                                if pair in current_hot}
             picked = next_priority_pair(lanes, slot=pointer, offsets=priority_offsets,
-                                        promoted_hot=promoted_hot)
+                                        promoted_hot=promoted_hot, last_hot_attempt=last_hot_attempt,
+                                        now_mono=time.monotonic(), poll_interval_sec=interval)
             pointer += 1
             if picked is None:
                 LOG.warning("[US_OPENING_OBSERVER][NO_COLLECTION_TARGET] action=NO_ORDER")
@@ -1059,6 +1086,14 @@ def run_observer(*, env: str, trade_date: str, scope: str,
                 # A failed/deferred native read must not consume the repair
                 # cooldown. A newly promoted HOT symbol gets its first backfill
                 # on a HOT slot without increasing the WARM/COLD request quota.
+                if tier == "HOT" and _still_hot():
+                    # Track attempted admission even if the native call fails;
+                    # do not mistake it for a verified bar or retry endlessly.
+                    attempted_at = time.monotonic()
+                    previous_attempt = last_hot_attempt.get((symbol, exchange))
+                    last_hot_attempt[(symbol, exchange)] = attempted_at
+                    LOG.info("[US_OPENING_OBSERVER][HOT_ATTEMPT_INTERVAL] symbol=%s interval_sec=%s target_sec=60",
+                             symbol, "UNKNOWN" if previous_attempt is None else round(attempted_at-previous_attempt, 3))
                 result = collect_hot_minutes(client, db, symbol=symbol, exchange=exchange,
                     trade_date=trade_date, repair_due=repair_due, still_hot=_still_hot, max_pages=4 if tier == "HOT" else 1)
                 if result["requests"] > 0 and repair_due:

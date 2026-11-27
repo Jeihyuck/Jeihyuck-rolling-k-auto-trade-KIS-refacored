@@ -391,3 +391,31 @@ def test_demoted_symbol_cannot_be_polled_as_hot():
     pairs = _pairs(6)
     lanes = {"HOT": pairs[:4], "WARM": pairs[4:], "COLD": []}
     assert next_priority_pair(lanes, slot=0, offsets={}, promoted_hot={pairs[5]}) == (pairs[0], "HOT")
+
+
+def test_hot_deadline_prevents_repeated_promotion_starvation_without_extra_slots():
+    pairs = _pairs(14)
+    lanes = {"HOT": pairs[:4], "WARM": pairs[4:12], "COLD": pairs[12:]}
+    attempts = {pairs[0]: 0.0, pairs[1]: 10.0, pairs[2]: 20.0}
+    offsets = {}
+    # New promotion cannot displace an established HOT symbol nearing its
+    # next collection deadline; the promotion receives the next free HOT slot.
+    options = dict(lanes=lanes, offsets=offsets, promoted_hot={pairs[3]},
+                   last_hot_attempt=attempts, poll_interval_sec=10.0)
+    assert next_priority_pair(slot=0, now_mono=55, **options) == (pairs[0], "HOT")
+    attempts[pairs[0]] = 55.0
+    assert next_priority_pair(slot=1, now_mono=65, **options) == (pairs[1], "HOT")
+    attempts[pairs[1]] = 65.0
+    assert next_priority_pair(slot=2, now_mono=66, **options) == (pairs[3], "HOT")
+    attempts[pairs[3]] = 66.0
+    assert next_priority_pair(slot=3, now_mono=75, **options) == (pairs[2], "HOT")
+    assert next_priority_pair(slot=4, now_mono=85, **options)[1] == "WARM"
+    assert next_priority_pair(slot=5, now_mono=95, **options)[1] == "COLD"
+
+
+def test_hot_deadline_scheduling_never_picks_demoted_symbol():
+    pairs = _pairs(6)
+    lanes = {"HOT": pairs[:4], "WARM": pairs[4:], "COLD": []}
+    selected, tier = next_priority_pair(lanes, slot=0, offsets={},
+        promoted_hot={pairs[5]}, last_hot_attempt={pairs[5]:0.0}, now_mono=100)
+    assert selected in lanes["HOT"] and tier == "HOT"
