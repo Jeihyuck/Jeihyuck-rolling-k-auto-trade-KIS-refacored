@@ -8728,6 +8728,7 @@ def run_once(
         "degraded": bool(getattr(result, "status", "") == "DEGRADED_POSTPROCESS"),
         "tick_result_reason": str(getattr(result, "notes", None) or ""),
         "strategy_owner": str(getattr(engine_runner, "STRATEGY_NAME", "") or ""),
+        "quote_wake_targets": list((getattr(engine_runner, "_kr_quote_wake_targets", {}) or {}).values()),
         # A terminal tick skip is NOT the number of skipped *order intents*.
         # Carry both evidence types separately; absent order-skip count is
         # unknown, not a verified zero.
@@ -8824,6 +8825,8 @@ def _run_nontrading_smoke_if_needed(
 
 
 def _run_loop(*, args: argparse.Namespace) -> None:
+    from trader.kr.quote_wake import QuoteWakeState, wait_for_quote_wake
+    quote_wake_state = QuoteWakeState()
     loop_interval = _parse_int_env("PB1_LOOP_INTERVAL_SEC", 60)
     _run_loop_minutes, _loop_max_minutes, max_seconds, _ = _resolve_loop_limits()
     now = _get_now_kst()
@@ -9348,7 +9351,24 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                     if sleep_for <= 0:
                         exit_reason = "session_end"
                         break
-                    time_mod.sleep(sleep_for)
+                    if (_kr_fresh_policy_wait_resume(
+                            env=ctx.env, strategy=last_tick_metrics.get("strategy_owner", ""),
+                            session_kind=session_kind, status=result_status, metrics=last_tick_metrics)
+                            and os.getenv("KR_PB1_QUOTE_WAKE_ENABLED", "1") == "1"
+                            and last_tick_metrics.get("quote_wake_targets")):
+                        # Still the same serial runner under its session lock.
+                        # Waking never carries an old candidate into submission.
+                        wake = wait_for_quote_wake(
+                            targets=last_tick_metrics["quote_wake_targets"],
+                            state=quote_wake_state, seconds=sleep_for,
+                            session_end=session_end_dt, now=_get_now_kst,
+                            monotonic=time_mod.monotonic, sleep=time_mod.sleep,
+                        )
+                        if wake:
+                            logger.info("[KR][QUOTE_WAKE][SERIAL_REEVALUATE] code=%s bar=%s order_authorization=0",
+                                        wake["code"], wake["latest_bar_ts"])
+                    else:
+                        time_mod.sleep(sleep_for)
                     sticky_precheck_reason = None
                     sticky_precheck_count = 0
                     sticky_runtime_signature = None

@@ -5995,6 +5995,23 @@ class PB1Engine:
                 _timing = {**_timing, "live_quote_validation": _quote_check}
                 if _quote_check["state"] != "READY":
                     _timing.update(state=_quote_check["state"], reason=_quote_check["reason"])
+            # Only an actual owner-approved pre-submit timing WAIT can seed
+            # a wake hint. The observer never creates execution authority.
+            if os.getenv("KR_PB1_QUOTE_WAKE_ENABLED", "1") == "1":
+                from trader.kr.quote_wake import make_wait_target
+                _wake_target = make_wait_target(
+                    code=str(cf.code).zfill(6), style=_timing_style,
+                    setup_ok=bool((cf.features or {}).get("setup_ok", cf.setup_ok)),
+                    trigger_ok=bool((cf.features or {}).get("breakout_trigger_ok")
+                                    or (cf.features or {}).get("trigger_ok")),
+                    pivot=(cf.features or {}).get("pivot"), timing=_timing,
+                    now=_timing_now, account_scope=get_account_key(env=self.env),
+                )
+                if _wake_target:
+                    _targets = getattr(self, "_kr_quote_wake_targets", {})
+                    if len(_targets) < 3 or _wake_target["code"] in _targets:
+                        _targets[_wake_target["code"]] = _wake_target
+                        self._kr_quote_wake_targets = _targets
             logger.info(
                 "[KR][ENTRY][DECISION_LATENCY] code=%s style=%s decision_at=%s latest_bar_ts=%s eval_elapsed_ms=%.1f state=%s reason=%s",
                 cf.code, _timing_style, now_kst().isoformat(), _timing.get("latest_bar_ts"),
