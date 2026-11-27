@@ -55,3 +55,88 @@ def test_shared_pacing_requires_valid_scope_and_interval(tmp_path):
             "test", min_interval_sec=0,
             root=str(tmp_path), sleep_with_budget=_budget_sleep,
         )
+
+
+def test_observer_defers_without_consuming_shared_slot(tmp_path):
+    scope = "observer-background"
+    kwargs = dict(min_interval_sec=5.0, root=str(tmp_path))
+    wait_for_shared_slot(scope, sleep_with_budget=_budget_sleep, **kwargs)
+    slot_file = next(tmp_path.glob("*.slot"))
+    original = slot_file.read_text()
+    def forbidden_sleep(_):
+        pytest.fail("background request must not wait with account lock")
+    with pytest.raises(SharedLimiterUnavailable, match="background_deferred"):
+        wait_for_shared_slot(scope, sleep_with_budget=forbidden_sleep,
+                             defer_if_busy=True, **kwargs)
+    assert slot_file.read_text() == original
+
+
+def test_observer_defers_when_execution_holds_shared_lock(tmp_path):
+    import fcntl
+    import hashlib
+    scope = "observer-lock"
+    path = tmp_path / (hashlib.sha256(scope.encode()).hexdigest() + ".slot")
+    with path.open("w+") as held:
+        fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        def forbidden_sleep(_):
+            pytest.fail("observer must not wait behind execution")
+        with pytest.raises(SharedLimiterUnavailable, match="background_deferred"):
+            wait_for_shared_slot(scope, min_interval_sec=1.0, root=str(tmp_path),
+                                 sleep_with_budget=forbidden_sleep, defer_if_busy=True)
+        assert path.read_text() == ""
+    assert wait_for_shared_slot(scope, min_interval_sec=1.0, root=str(tmp_path),
+                                sleep_with_budget=_budget_sleep, defer_if_busy=True) > 0
+
+
+def test_observer_cannot_jump_waiting_foreground_even_when_slot_free(tmp_path):
+    import fcntl
+    import hashlib
+    scope = "foreground-waiter"
+    path = tmp_path / (hashlib.sha256(scope.encode()).hexdigest() + ".foreground")
+    with path.open("w+") as marker:
+        fcntl.flock(marker.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+        with pytest.raises(SharedLimiterUnavailable, match="background_deferred"):
+            wait_for_shared_slot(scope, min_interval_sec=.1, root=str(tmp_path),
+                                 sleep_with_budget=lambda _: pytest.fail("background waited"),
+                                 defer_if_busy=True)
+        assert not list(tmp_path.glob("*.slot"))
+    assert wait_for_shared_slot(scope, min_interval_sec=.1, root=str(tmp_path),
+                                sleep_with_budget=_budget_sleep, defer_if_busy=True) > 0
+
+
+def test_urgent_sell_waiter_preempts_ordinary_future_reservation(tmp_path):
+    import threading
+    scope = "urgent-preemption"
+    kw = dict(min_interval_sec=.16, root=str(tmp_path))
+    initial = wait_for_shared_slot(scope, sleep_with_budget=_budget_sleep, **kw)
+    waiting = threading.Event()
+    urgent_reserved = threading.Event()
+    def ordinary_sleep(delay):
+        waiting.set()
+        # Hold ordinary at a real wait boundary until urgent starts.
+        assert urgent_reserved.wait(3)
+        return _budget_sleep(delay)
+    def urgent_request():
+        assert waiting.wait(3)
+        slot = wait_for_shared_slot(scope, urgent=True, sleep_with_budget=_budget_sleep, **kw)
+        urgent_reserved.set()
+        return slot
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        ordinary = executor.submit(wait_for_shared_slot, scope, sleep_with_budget=ordinary_sleep, **kw)
+        urgent = executor.submit(urgent_request)
+        first = urgent.result(timeout=4)
+        second = ordinary.result(timeout=4)
+    assert first-initial>=.13
+    assert second-first>=.13
+
+
+def test_kis_priority_exact_registry_never_treats_buy_as_sell():
+    from trader.us.execution.kis_us_client import _urgent_kis_request
+    from trader.us.execution.kis_us_registry import get_tr_info
+    for name, expected in (("us_sell_order", True),("us_order_cancel",True),
+                           ("us_fills_today",True),("us_buy_order",False),
+                           ("us_price",False),("us_orderable_cash",False)):
+        tr=get_tr_info(name)
+        assert _urgent_kis_request(tr["method"],tr["path"],{"tr_id":tr["tr_id"]}) is expected
+    tr=get_tr_info("us_sell_order")
+    assert not _urgent_kis_request("POST",tr["path"],{"tr_id":"UNKNOWN"})

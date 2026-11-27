@@ -45,7 +45,10 @@ def test_same_batch_conflicting_completed_minute_is_quarantined_no_authoritative
     assert conflicts[0][2] == "UNRESOLVED"
     # Subsequent identical native output cannot simply overwrite/clear a
     # previously conflicted completed minute.
-    assert _ingest(db, [original]) == 1
+    # V2 repair requires three independent spaced native observations;
+    # an un-attested re-read cannot publish an authoritative row.
+    assert _ingest(db, [original]) == 0
+    assert db.execute("SELECT COUNT(*) FROM verified_bars").fetchone()[0] == 0
     assert load_bars(db, trade_date=DAY, symbol="KO") == []
     db.close()
 
