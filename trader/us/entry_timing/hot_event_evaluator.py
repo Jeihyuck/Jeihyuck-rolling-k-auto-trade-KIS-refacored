@@ -10,6 +10,29 @@ import os
 LOG = logging.getLogger(__name__)
 
 
+def _execution_hot_pairs(payload):
+    """Collection promotion alone cannot authorize an execution HOT hint."""
+    inputs = payload["hot_event_inputs"]
+    if not isinstance(inputs, dict):
+        raise ValueError("invalid HOT inputs")
+    symbols, hot = set(), set()
+    for lane, cap in (("hot", 4), ("warm", 8), ("cold", 30)):
+        entries = payload[lane]
+        if not isinstance(entries, list) or len(entries) > cap:
+            raise ValueError("invalid execution lane")
+        for item in entries:
+            symbol, exchange = item["symbol"], item["exchange"]
+            if (not isinstance(symbol, str) or not symbol or symbol in symbols
+                    or exchange not in {"NASDAQ", "NYSE", "AMEX"}):
+                raise ValueError("invalid execution symbol")
+            symbols.add(symbol)
+            if lane == "hot" and symbol != "TQQQ" and isinstance(inputs.get(symbol), dict):
+                hot.add((symbol, exchange))
+    if len(symbols) > 30:
+        raise ValueError("execution shortlist exceeds Final30")
+    return hot
+
+
 def poll_hot_events(db, *, env, scope, trade_date, hot_pairs, now_et,
                     quote_reader, seen, base="runtime/private", live_clock=None):
     from trader.us.entry_timing.opening_observer import priority_manifest_path, load_bars
@@ -45,9 +68,7 @@ def poll_hot_events(db, *, env, scope, trade_date, hot_pairs, now_et,
         generation=payload["generation"]
         if not isinstance(generation,str) or not generation:
             return []
-        listed={(x["symbol"],x["exchange"]) for lane in ("hot","warm","cold") for x in payload[lane]}
-        if not isinstance(inputs,dict):
-            return []
+        listed=_execution_hot_pairs(payload)
     except (OSError,ValueError,TypeError,KeyError,AttributeError):
         return []
     eligible={pair for pair in hot_pairs if pair in listed and pair[0]!="TQQQ"}
@@ -172,20 +193,7 @@ def read_hot_retry_hints(*, env, scope, trade_date, generation, waiting,
         inputs=payload["hot_event_inputs"]
         if not isinstance(inputs,dict):
             return set()
-        listed=set()
-        symbols=set()
-        for lane,cap in (("hot",4),("warm",8),("cold",30)):
-            entries=payload[lane]
-            if not isinstance(entries,list) or len(entries)>cap:
-                return set()
-            for item in entries:
-                symbol,exchange=item["symbol"],item["exchange"]
-                if symbol in symbols or exchange not in {"NASDAQ","NYSE","AMEX"}:
-                    return set()
-                symbols.add(symbol)
-                if symbol!="TQQQ" and isinstance(inputs.get(symbol),dict):
-                    listed.add((symbol,exchange))
-        return listed & set(waiting)
+        return _execution_hot_pairs(payload) & set(waiting)
 
     try:
         path=store_path(env=env,account_scope=scope,trade_date=trade_date,base=base)
