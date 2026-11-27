@@ -11,6 +11,7 @@ def _quote(code="003490", receipt=None):
     return {"source":"KIS_REST_INQUIRE_PRICE",
             "source_identity":"AUTHENTICATED_REST_REQUEST_BOUND",
             "market":"KR", "requested_symbol":code, "last":29250,
+            "native_market_division":"J", "native_requested_code":code,
             "bid":29200, "ask":29250, "received_at":time.time() if receipt is None else receipt}
 
 
@@ -60,7 +61,10 @@ def test_cross_process_busy_then_hit_same_native_receipt():
 
 @pytest.mark.parametrize("invalid", [{}, {"source":"KIS_WEBSOCKET"},
                                      {"requested_symbol":"012750"},
-                                     {"received_at":1.0}, {"last":float("nan")}])
+                                     {"received_at":1.0}, {"last":float("nan")},
+                                     {"native_market_division":"U"},
+                                     {"native_requested_code":"A003490"},
+                                     {"native_market_division":None}])
 def test_invalid_response_not_reused(invalid):
     key = "fixture-" + uuid.uuid4().hex
     calls = []

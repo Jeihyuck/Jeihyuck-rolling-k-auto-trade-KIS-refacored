@@ -56,6 +56,8 @@ def _open_private(path, flags):
 def _valid(row, code, now):
     return (isinstance(row, dict)
             and row.get("source") == "KIS_REST_INQUIRE_PRICE"
+            and row.get("native_market_division") == "J"
+            and row.get("native_requested_code") == code
             and verified_price(row, code, now=now, max_age_sec=5.0))
 
 

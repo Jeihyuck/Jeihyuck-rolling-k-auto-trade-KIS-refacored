@@ -2869,7 +2869,15 @@ class KisAPI:
         cache_key = ("inquire-price", c)
         cached = price_cache.get(cache_key) if not native_rest_only else None
         if cached:
-            return cached
+            # A generic J/U fallback result is not proof of a canonical
+            # domestic J request. Preserve generic callers, but do not
+            # publish/reuse ambiguous origin through the KR scoped path.
+            if not (retry_cap is not None and len(c) == 6 and c.isascii() and c.isdigit()
+                    and getattr(self, "env", None) == "practice"
+                    and os.getenv("KR_WS_SHARED_QUOTE_ENABLED") == "1") or (
+                        cached.get("native_market_division") == "J"
+                        and cached.get("native_requested_code") == c):
+                return cached
 
         # Reuse the exact canonical native price cache across processes.
         # Explicit source probes and selected order-bound refreshes remain independent.
@@ -2907,6 +2915,9 @@ class KisAPI:
         url = f"{base}/uapi/domestic-stock/v1/quotations/inquire-price"
         last_error: Exception | None = None
         raw_output: dict | None = None
+        native_market_division = None
+        native_requested_code = None
+        native_received_at = None
 
         def _to_float(val: Any) -> float | None:
             try:
@@ -2977,6 +2988,9 @@ class KisAPI:
                                 continue
                             if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
                                 raw_output = dict(data["output"])
+                                native_market_division = market_div
+                                native_requested_code = code_fmt
+                                native_received_at = time.time()
                                 break
                             else:
                                 if entry_refresh:
@@ -2998,9 +3012,6 @@ class KisAPI:
                 sleep_time, stage_deadline=getattr(self, "_kr_stage_deadline", None)
             ):
                 raise KisTemporaryError("KR_TICK_DEADLINE_EXHAUSTED_BEFORE_QUOTE_RETRY")
-
-        elapsed_ms = (time.time() - start_time) * 1000
-        self._log_kis_resp("QUOTE", code, {"attempts": attempts}, raw_output and {"rt_cd": "0", "output": raw_output} or None, elapsed_ms)
 
         elapsed_ms = (time.time() - start_time) * 1000
         self._log_kis_resp("QUOTE", code, {"attempts": attempts}, raw_output and {"rt_cd": "0", "output": raw_output} or None, elapsed_ms)
@@ -3029,7 +3040,9 @@ class KisAPI:
             "raw": raw_output, "source": "KIS_REST_INQUIRE_PRICE",
             "source_identity": "AUTHENTICATED_REST_REQUEST_BOUND",
             "requested_symbol": c, "market": "KR",
-            "received_at": time.time(),  # local receipt metadata, not exchange clock
+            "native_market_division": native_market_division,
+            "native_requested_code": native_requested_code,
+            "received_at": native_received_at,  # receipt at successful native response
         })
         # A one-shot native REST probe must not modify normal WS/REST caches.
         if not native_rest_only:
