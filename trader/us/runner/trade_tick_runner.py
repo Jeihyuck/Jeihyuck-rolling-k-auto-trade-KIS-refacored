@@ -5460,6 +5460,16 @@ def run_trade_tick(
         latency_metrics["measured_phase_evidence"] = _observed
         logger.info("[US_TICK][PHASE_EVIDENCE_JSON] payload=%s",
                     json.dumps(_observed, sort_keys=True, allow_nan=False))
+        # Separate measured wall-clock spans from nested HTTP/DB counters.
+        # Missing stages remain absent, not zero-duration successes.
+        _p0_phases = {k: float(tick_context.metrics[k])
+                      for k in _ACCOUNTED_TOP_LEVEL_STAGES
+                      if k in tick_context.metrics
+                      and isinstance(tick_context.metrics[k], (int, float))
+                      and 0 <= tick_context.metrics[k] < float("inf")}
+        logger.info("[MARKET_DATA_P0][TICK_PHASES] market=US session=%s trade_date=%s tick=%s total_ms=%.3f phases=%s",
+                    session, trade_date, tick_index, tick_total_ms,
+                    json.dumps(_p0_phases, sort_keys=True, separators=(",", ":")))
     except Exception as _phase_exc:
         logger.warning("[US_TICK][PHASE_EVIDENCE_UNAVAILABLE] error_type=%s",
                        type(_phase_exc).__name__)
