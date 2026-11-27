@@ -288,3 +288,31 @@ def test_identical_republication_keeps_only_fresh_cross_tick_hot_hint(tmp_path,m
         assert hints(expired,epoch+183)==set()
     finally:
         db.close()
+
+
+def test_collection_only_warm_promotion_cannot_emit_or_consume_execution_hot_hint(tmp_path,monkeypatch):
+    from trader.us.entry_timing import opportunity
+    from trader.us.entry_timing.hot_event_evaluator import read_hot_retry_hints
+    monkeypatch.setattr(opportunity,"effective_mode",lambda:"ENFORCE")
+    now=datetime(2026,11,25,10,10,tzinfo=ZoneInfo("America/New_York"))
+    scope=dict(env="practice",scope="scope:epoch",trade_date=now.date().isoformat(),base=tmp_path)
+    manifest=observer.publish_preminute_candidates(**scope,now_epoch=now.timestamp()-1,
+        candidates=[(10-i,s,"NYSE",None,{"position_state":"NOT_HELD","entry_style":"ENTRY_PULLBACK"})
+                    for i,s in enumerate(("AAA","BBB","CCC","DDD","EEE"))])
+    db=observer.open_store(observer.store_path(env=scope["env"],account_scope=scope["scope"],
+        trade_date=scope["trade_date"],base=tmp_path))
+    try:
+        # A collection fallback or stale caller can label EEE HOT, but the
+        # current canonical execution manifest places EEE in WARM.
+        def quote(*args):
+            raise AssertionError("WARM cannot consume execution quote")
+        assert poll_hot_events(db,**scope,hot_pairs=[("EEE","NYSE")],now_et=now,
+            quote_reader=quote,seen={})==[]
+        db.execute("INSERT INTO hot_retry_events VALUES (?,?,?,?,?,?,?,?)",
+            (scope["trade_date"],"EEE","NYSE",manifest["generation"],"old-ready",
+             now.timestamp(),now.timestamp()-1,"READY"))
+        db.commit()
+        assert read_hot_retry_hints(**scope,generation=manifest["generation"],
+            waiting={("EEE","NYSE")},now_epoch=now.timestamp())==set()
+    finally:
+        db.close()
