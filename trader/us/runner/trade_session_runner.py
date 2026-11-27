@@ -280,23 +280,31 @@ def write_heartbeat_file(session: str, run_id: str, tick: int, phase: str, **ext
 
 def sleep_with_heartbeat(session: str, run_id: str, tick: int, total_sec: int, heartbeat_sec: int = 30, *, protective_poll=None):
     slept = 0
+    # The protective observer shares the normal slot's time budget: IPC and
+    # heartbeat overhead must not become extra sleep after the fixed deadline.
+    # Keep the ordinary no-observer scheduler unchanged.
+    watch_started = time_mod.monotonic() if protective_poll is not None else None
+    def elapsed():
+        return max(slept, time_mod.monotonic() - watch_started) if watch_started is not None else slept
     logger.info("[US_TICK_LOOP][SLEEP_START] session=%s tick=%d seconds=%d", session, tick, total_sec)
     write_heartbeat_file(session, run_id, tick, phase="SLEEP_START", slept=slept)
-    while slept < total_sec:
-        step = min(5 if protective_poll is not None else heartbeat_sec, total_sec - slept)
+    while elapsed() < total_sec:
+        step = min(5 if protective_poll is not None else heartbeat_sec, total_sec - elapsed())
+        if step <= 0:
+            break
         time_mod.sleep(step)
         slept += step
-        if protective_poll is not None and slept < total_sec:
+        if protective_poll is not None and elapsed() < total_sec:
             try:
                 wakeup=protective_poll()
             except Exception:
                 logger.warning("[US_EXIT][IDLE_WATCH_UNAVAILABLE] action=continue_normal_schedule",exc_info=True)
                 protective_poll=None
                 wakeup=None
-            if wakeup is not None:
+            if wakeup is not None and elapsed() < total_sec:
                 write_heartbeat_file(session, run_id, tick, phase="PROTECTIVE_WAKEUP")
                 return wakeup
-        logger.info("[US_TICK_LOOP][SLEEP_HEARTBEAT] session=%s run_id=%s tick=%d slept=%d/%d", session, run_id, tick, slept, total_sec)
+        logger.info("[US_TICK_LOOP][SLEEP_HEARTBEAT] session=%s run_id=%s tick=%d slept=%d/%d", session, run_id, tick, elapsed(), total_sec)
         write_heartbeat_file(session, run_id, tick, phase="SLEEP_HEARTBEAT", slept=slept)
     logger.info("[US_TICK_LOOP][SLEEP_DONE] session=%s tick=%d slept=%d", session, tick, slept)
     write_heartbeat_file(session, run_id, tick, phase="SLEEP_DONE", slept=slept)
