@@ -1,0 +1,53 @@
+name: US400-A focused lifecycle acceptance
+on:
+  pull_request:
+    branches: [fix/us-20261126-hot-only-tp90-integrated]
+    paths:
+      - 'trader/us/db/repos.py'
+      - 'trader/us/execution/**'
+      - 'tests/us/test_us_20261030_live_risk_ws_tp_prehttp.py'
+      - '.github/workflows/us400-a-lifecycle.yml'
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  focused-lifecycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: us_ci
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres -d us_ci"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      PYTHONPATH: .
+      KIS_ENV: practice
+      DRY_RUN: '1'
+      US_KIS_ORDER_ALLOWED: '0'
+      US_ORDER_ARMED: '0'
+      ALLOW_REAL_ORDER: '0'
+      KIS_HTTP_BLOCK: '1'
+      PBCORE_DB_URL: ''
+      DATABASE_URL: ''
+      KIS_APP_KEY: ''
+      KIS_APP_SECRET: ''
+      PBCORE_TEST_POSTGRES_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/us_ci
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install -r requirements.txt psycopg2-binary pytest
+      - run: |
+          python -m pytest -q --junitxml=/tmp/us400-a.xml tests/us/test_us_20261030_live_risk_ws_tp_prehttp.py::test_pg_us353_native_tp_claim_reserve_http_gate_and_exact_abort
+          python -c 'import xml.etree.ElementTree as E; c=list(E.parse("/tmp/us400-a.xml").iter("testcase")); assert len(c)==1 and c[0].find("skipped") is None'

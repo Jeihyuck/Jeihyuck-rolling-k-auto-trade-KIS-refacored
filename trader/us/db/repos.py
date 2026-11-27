@@ -3797,7 +3797,8 @@ def reserve_us_profit_capture_stage_after_claim(
                 or str(claim[0].get("attempt_state") or "") != "CREATED"
                 or str(claim[0].get("client_order_key") or "") != key
                 or str(claim[0].get("lifecycle_id") or "") != cycle
-                or int(claim[0].get("requested_qty") or 0) < int(qty)):
+                or str(claim[0].get("action") or "").strip().lower() != stg
+                or int(claim[0].get("requested_qty") or 0) != int(qty)):
             return False
         prior_stage = stage_row or (historical[0] if historical else None)
         if int(claim[0].get("filled_qty_before_attempt") or 0) > 0 and (
@@ -3952,7 +3953,12 @@ def verify_us_tp_claim_stage_at_http_boundary(
                 or str(claim["active_attempt_id"] or "") != params["attempt"]
                 or str(claim["lifecycle_id"] or "") != params["cycle"]
                 or str(claim["client_order_key"] or "") != params["key"]
-                or str(claim["attempt_state"] or "") not in {"CREATED", "SUBMITTED"}):
+                or str(claim["attempt_state"] or "") not in {"CREATED", "SUBMITTED"}
+                or str(claim.get("action") or "").strip().lower() != epoch_params["stage"]):
+            return False
+        # A native submit may only consume the exact reserved TP remainder.
+        stage_remaining = int(stage_row.get("requested_qty") or 0) - int(stage_row.get("cumulative_filled_qty") or 0)
+        if stage_remaining <= 0 or stage_remaining != int(claim.get("requested_qty") or 0):
             return False
         if (int(claim.get("filled_qty_before_attempt") or 0) > 0
                 and int(stage_row.get("cumulative_filled_qty") or 0) <= 0):
