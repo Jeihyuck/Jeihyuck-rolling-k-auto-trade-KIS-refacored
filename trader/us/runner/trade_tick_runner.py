@@ -3141,16 +3141,16 @@ def run_trade_tick(
         if len(_matching)!=1 or holding_identity(_matching[0])!=protective_wakeup_identity:
             result["reason"]="protective_wakeup_holding_changed"
             return result
-        _poll=make_hard_stop_poll(attach_approved_revisions(_matching),excluded_symbols=set(),
-                                  trade_date=trade_date,env=env,context=tick_context)
+        _poll=make_hard_stop_poll(attach_approved_revisions(_matching,env=env),excluded_symbols=set(),
+                                  trade_date=trade_date,env=env,context=tick_context,
+                                  allow_confirmed_soft=True,fresh_resolver=True)
         _snapshot=_poll() if _poll else None
         if _snapshot is None:
             return result
         tick_context._sell_selected_ready_by_symbol={}
         tick_context._sell_selected_trace_id_by_symbol={}
         def _idle_suppress(intents):
-            if (len(intents)!=1 or holding_identity(intents[0])!=protective_wakeup_identity
-                    or str(intents[0].get("exit_type") or "").lower() not in {"hard_stop","hard_stop_loss"}):
+            if len(intents)!=1 or holding_identity(intents[0])!=protective_wakeup_identity:
                 return []
             selected=_suppress_pending_sell_exit_intents(intents,trade_date,env=env,strict=True)
             if len(selected)==1:
@@ -4708,6 +4708,7 @@ def run_trade_tick(
                             _protective_poll = make_hard_stop_poll(
                                 exit_snapshots, excluded_symbols=_excluded,
                                 trade_date=trade_date, env=env, context=tick_context,
+                                allow_confirmed_soft=True,
                             )
                         entry_intents = run_entry_eval_with_timeout(
                             lambda: engine.evaluate_entries(
@@ -5857,7 +5858,8 @@ def run_trade_tick(
         _watch_excluded.update(sym for sym,count in _pb1_symbol_counts.items() if count!=1)
         _watch_excluded.update(str((o.get("intent") or {}).get("symbol") or o.get("symbol") or "").upper()
                                for o in orders)
-        _protective_idle_watch=export_idle_watch(exit_snapshots,excluded_symbols=_watch_excluded,env=env)
+        _protective_idle_watch=export_idle_watch(exit_snapshots,excluded_symbols=_watch_excluded,env=env,
+            trade_date=trade_date,allow_confirmed_soft=True)
     return {
         **latency_metrics,
         "_protective_idle_watch":_protective_idle_watch,

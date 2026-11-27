@@ -52,7 +52,61 @@ def holding_identity(position):
     return identity
 
 
-def _verified_candidates(snapshots, excluded_symbols, env):
+def _confirmed_soft_snapshot(position, trade_date, *, fresh_resolver=False):
+    """Reuse already confirmed state, never manufacture another confirmation."""
+    import os
+    from hashlib import sha256
+    from trader.us.db.repos import CommittedUSRiskState
+    from trader.us.pb1.us_exit_position_resolver import _position_identity,_lifecycle_matches_identity
+    from trader.us.entry_exit_contract import contract_exit_config
+    if os.getenv("US_EARLY_SOFT_STOP_PILOT_ENABLED","0")!="1":
+        return None
+    try:
+        scope=holding_identity(position)
+        if scope is None:
+            return None
+        identity=_position_identity(position,env="practice")
+        if (identity["env"]!="practice" or not identity["account_id"]
+                or sha256(identity["account_id"].encode()).hexdigest()!=scope["broker_account_hash"]
+                or identity["trading_epoch_id"]!=scope["trading_epoch_id"]
+                or identity["position_lifecycle_id"]!=scope["position_lifecycle_id"]
+                or identity["strategy_owner"]!="US_STANDARD"):
+            return None
+        row=position.get("_protective_verified_risk_state") if fresh_resolver else position.get("risk_state")
+        if not isinstance(row,dict) or (not fresh_resolver and not isinstance(row,CommittedUSRiskState)):
+            return None
+        state=row.get("state") or {}
+        life=state.get("lifecycle") or {}
+        if (str(row.get("trade_date") or "")!=str(trade_date)
+                or life.get("is_open") is not True
+                or not _lifecycle_matches_identity(row,life,identity)):
+            return None
+        if position.get("_verified_pb1_stop_revision") and state.get("soft_stop_policy_revision")!="PB1_STOP_3_6_V1":
+            return None
+        cfg=contract_exit_config(position)
+        soft=float(cfg["soft_stop"])
+        count=int(row["soft_stop_breach_count"])
+        if (not math.isfinite(soft) or not 0<soft<1
+                or count<max(1,int(cfg.get("soft_stop_confirm_ticks",2)))
+                or not math.isfinite(float(row["last_pnl_pct"]))
+                or float(row["last_pnl_pct"]) > -soft):
+            return None
+        result=deepcopy(position)
+        result["risk_state"]=deepcopy(row)
+        result["soft_stop_breach_count"]=count
+        # Existing repeat/escalation predicates must receive the same current
+        # lifecycle's persisted execution fields, never another day's flags.
+        execution=state.get("soft_stop_execution") or {}
+        if execution and execution.get("position_lifecycle_id")!=scope["position_lifecycle_id"]:
+            return None
+        for key in ("soft_stop_triggered_today","soft_stop_partial_done","first_soft_stop_at","first_soft_stop_price"):
+            result[key]=execution.get(key)
+        return result,soft
+    except (ValueError,TypeError,KeyError,AttributeError,OverflowError):
+        return None
+
+
+def _verified_candidates(snapshots, excluded_symbols, env, *, trade_date=None, allow_confirmed_soft=False, fresh_resolver=False):
     """Return scoped verified positions and existing frozen stop thresholds."""
     from trader.us.entry_exit_contract import contract_exit_config, us_entry_exit_contract_integrity_state
     from trader.us.pb1.us_exit_router import normalize_book, normalize_horizon
@@ -86,16 +140,23 @@ def _verified_candidates(snapshots, excluded_symbols, env):
             hard = float(contract_exit_config(pos)["hard_stop"])
             if not (math.isfinite(entry) and entry > 0 and math.isfinite(hard) and 0 < hard < 1):
                 continue
-            candidates.append((deepcopy(pos),symbol,normalize_us_exchange(pos["exchange"]),entry,hard))
+            soft=None
+            if allow_confirmed_soft:
+                proof=_confirmed_soft_snapshot(pos,trade_date,fresh_resolver=fresh_resolver)
+                if proof is not None and 0<proof[1]<hard:
+                    pos,soft=proof
+            candidates.append((deepcopy(pos),symbol,normalize_us_exchange(pos["exchange"]),entry,hard,soft))
         except (ValueError, TypeError, KeyError, AttributeError, OverflowError):
             continue
     return candidates
 
 
-def make_hard_stop_poll(snapshots, *, excluded_symbols, trade_date, env, context):
+def make_hard_stop_poll(snapshots, *, excluded_symbols, trade_date, env, context,
+                        allow_confirmed_soft=False, fresh_resolver=False):
     """Return a bounded observer; a trigger is a snapshot, never an intent."""
     from trader.us.market_calendar import now_ny, is_us_regular_market_open
-    candidates = _verified_candidates(snapshots, excluded_symbols, env)
+    candidates = _verified_candidates(snapshots, excluded_symbols, env,trade_date=trade_date,
+        allow_confirmed_soft=allow_confirmed_soft,fresh_resolver=fresh_resolver)
     if not candidates:
         return None
     cursor = 0
@@ -111,13 +172,18 @@ def make_hard_stop_poll(snapshots, *, excluded_symbols, trade_date, env, context
         # burst, no concurrent broker authority, and no stale fallback.
         batch,cursor = _bounded_quotes(candidates,cursor,env,
             pair=lambda item:(item[1],item[2]))
-        for (pos,symbol,exchange,entry,hard),q in batch:
+        for (pos,symbol,exchange,entry,hard,soft),q in batch:
             try:
                 price = _breached_quote(q,entry,hard)
+                family="HARD_STOP"
+                if price is None and soft is not None:
+                    price=_breached_quote(q,entry,soft)
+                    family="CONFIRMED_SOFT_STOP"
                 if price is None:
                     continue
                 last, received = price
                 snapshot = deepcopy(pos)
+                snapshot["_protective_trigger_family"]=family
                 snapshot.update(resolved_current_price=last,current_price_usd=last,
                                 current_price=last,resolved_pnl_pct=(last-entry)/entry,
                                 resolved_quote_source=q["source"],resolved_quote_asof=received,
@@ -172,10 +238,11 @@ def _breached_quote(q, entry, hard):
     return last,received
 
 
-def export_idle_watch(snapshots, *, excluded_symbols, env):
-    """Private parent/child IPC only: advisory identity and threshold, no contract."""
-    return [{"identity":holding_identity(pos),"exchange":exchange,"entry":entry,"hard":hard}
-            for pos,_,exchange,entry,hard in _verified_candidates(snapshots,excluded_symbols,env)]
+def export_idle_watch(snapshots, *, excluded_symbols, env, trade_date=None, allow_confirmed_soft=False):
+    """Private IPC only: advisory identity and threshold, no contract."""
+    return [{"identity":holding_identity(pos),"exchange":exchange,"entry":entry,"hard":hard,"soft":soft}
+            for pos,_,exchange,entry,hard,soft in _verified_candidates(snapshots,excluded_symbols,env,
+                trade_date=trade_date,allow_confirmed_soft=allow_confirmed_soft)]
 
 
 def make_idle_hard_stop_poll(watch, *, trade_date, env):
@@ -198,7 +265,10 @@ def make_idle_hard_stop_poll(watch, *, trade_date, env):
                 entry,hard=float(candidate["entry"]),float(candidate["hard"])
                 if not (math.isfinite(entry) and entry>0 and math.isfinite(hard) and 0<hard<1):
                     continue
-                if _breached_quote(q,entry,hard) is not None:
+                soft=candidate.get("soft")
+                if (_breached_quote(q,entry,hard) is not None
+                        or (isinstance(soft,(int,float)) and 0<soft<hard
+                            and _breached_quote(q,entry,soft) is not None)):
                     return dict(candidate["identity"])
             except (ValueError,TypeError,KeyError,OverflowError):
                 continue
@@ -221,11 +291,19 @@ def execute_hard_stop_interrupt(snapshot, *, trade_date, context, evaluate,
     identity=holding_identity(snapshot)
     if identity is None:
         return [],None
+    family=snapshot.get("_protective_trigger_family","HARD_STOP")
     def matches(intents):
-        return (len(intents) == 1 and str(intents[0].get("side") or "").upper() == "SELL"
-                and holding_identity(intents[0])==identity
-                and str(intents[0].get("exit_type") or "").lower() in {"hard_stop","hard_stop_loss"}
-                and classify_family(intents[0]) == "HARD_STOP")
+        if (len(intents)!=1 or str(intents[0].get("side") or "").upper()!="SELL"
+                or holding_identity(intents[0])!=identity):
+            return False
+        kind=str(intents[0].get("exit_type") or "").lower()
+        selected=classify_family(intents[0])
+        if family=="HARD_STOP":
+            return kind in {"hard_stop","hard_stop_loss"} and selected=="HARD_STOP"
+        if family=="CONFIRMED_SOFT_STOP":
+            return ((kind=="soft_stop_loss" and selected=="SOFT_STOP")
+                    or (kind=="persistent_soft_stop_full_exit" and selected=="HARD_STOP"))
+        return False
     intents = evaluate(snapshot,clock)
     if not matches(intents):
         return [], None
