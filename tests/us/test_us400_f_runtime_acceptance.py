@@ -51,3 +51,30 @@ def test_comparison_requires_matching_account_and_order_workload(overrides, bloc
     report = compare_runtime(baseline, candidate)
     assert report["status"] == "NOT_PROVEN"
     assert blocker in report["blockers"]
+
+
+@pytest.mark.parametrize("case",["clean","ack","unknown","missing","failure","kind_conflict","buy","wrong_account"])
+def test_protective_wakeup_is_separate_and_cannot_pad_or_hide_normal_work(case):
+    before=list(rows("a"*40))
+    after=list(rows("b"*40))
+    scope=dict(trade_date="2026-11-25",session="am",run_id="run-am",
+               tick_id="protective-1",code_sha="b"*40,native_practice=True,
+               account_digest="d"*64,tick_kind="protective_wakeup")
+    after.append("[US400_RUNTIME][ATTEMPT] payload="+json.dumps(scope))
+    data=dict(status="OK_EXIT_ORDERS_SENT" if case=="ack" else "OK_NO_TRADE",
+              reason="protective_wakeup_routed" if case=="ack" else "protective_wakeup_no_fresh_signal",
+              protective_wakeup=True,entry_can_proceed=False,exit_can_proceed=True,
+              entry_intents=0,buy_orders=1 if case=="buy" else 0,
+              exit_intents=1 if case=="ack" else 0,orders_sent=1 if case=="ack" else 0,
+              orders_ack=1 if case=="ack" else 0,exit_route_reconcile_required=case=="unknown")
+    if case=="kind_conflict": scope=dict(scope,tick_kind="normal")
+    if case=="wrong_account": scope=dict(scope,account_digest="e"*64)
+    if case=="failure": after.append("[US400_RUNTIME][FAILURE] payload="+json.dumps(scope))
+    elif case!="missing": after.append("[US400_RUNTIME][RESULT] payload="+json.dumps(result_evidence(scope,data,wall_sec=2)))
+    report=compare_runtime(summarize_runtime(before,expected_sha="a"*40),
+                           summarize_runtime(after,expected_sha="b"*40))
+    assert (report["status"]=="PASS_LOG_TIMING_ONLY")== (case in {"clean","ack"})
+    am=report["candidate"]["sessions"]["am"]
+    assert am["attempted"]==am["normal"]==20
+    assert am["total_attempted"]==21 and am["protective_wakeup_attempted"]==1
+    assert report["operational_go"] is False

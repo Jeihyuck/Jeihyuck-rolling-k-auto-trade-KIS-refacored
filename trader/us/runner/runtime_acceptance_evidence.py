@@ -38,6 +38,14 @@ def result_evidence(scope,result,*,wall_sec):
     for key in _WORKLOAD:
         v=result.get(key)
         out[key]=v if isinstance(v,int) and not isinstance(v,bool) and v>=0 else None
+    if scope.get("tick_kind")=="protective_wakeup":
+        out["protective_wakeup"]=result.get("protective_wakeup") is True
+        out["reason"]=str(result.get("reason") or "UNKNOWN")
+        out["exit_route_reconcile_required"]=bool(result.get("exit_route_reconcile_required"))
+        out["manual_reconcile_required"]=bool(result.get("manual_reconcile_required"))
+        for key in ("entry_intents","exit_intents","buy_orders","orders_sent","orders_ack"):
+            v=result.get(key)
+            out[key]=v if type(v) is int and v>=0 else None
     return out
 
 
@@ -56,6 +64,8 @@ def summarize_runtime(lines,*,expected_sha):
                     raise ValueError("missing_identity")
                 if row.get("code_sha")!=expected_sha or row.get("native_practice") is not True:
                     raise ValueError("unverified_scope")
+                if row.get("tick_kind","normal") not in {"normal","protective_wakeup"}:
+                    raise ValueError("unverified_tick_kind")
                 digest = row.get("account_digest")
                 if not isinstance(digest, str) or not re.fullmatch("[0-9a-f]{64}", digest):
                     raise ValueError("unverified_account")
@@ -76,9 +86,33 @@ def summarize_runtime(lines,*,expected_sha):
     missing=set(started)-set(ended)-set(failed)
     orphan=(set(ended)|set(failed))-set(started)
     ambiguous=set(ended)&set(failed)
+    for key in set(started)&(set(ended)|set(failed)):
+        for rows in (ended,failed):
+            if key in rows and any(started[key].get(field,default)!=rows[key].get(field,default)
+                                  for field,default in (("tick_kind","normal"),("account_digest",None))):
+                conflicts+=1
     sessions={}
     for session in ("am","afternoon"):
-        keys={k for k in started if k[1]==session}
+        all_keys={k for k in started if k[1]==session}
+        wake_keys={k for k in all_keys if started[k].get("tick_kind","normal")=="protective_wakeup"}
+        keys=all_keys-wake_keys
+        wake_ok=wake_uncertain=0
+        for key in wake_keys & set(ended)-set(failed):
+            row=ended[key]
+            common=(row.get("protective_wakeup") is True and finite(row.get("wall_sec"))
+                    and row.get("entry_can_proceed") is False and row.get("exit_can_proceed") is True
+                    and row.get("entry_intents")==row.get("buy_orders")==0
+                    and row.get("classification")=="success"
+                    and not row.get("exit_route_reconcile_required")
+                    and not row.get("manual_reconcile_required"))
+            if common and (
+                (row.get("status")=="OK_NO_TRADE" and row.get("orders_sent")==row.get("orders_ack")==row.get("exit_intents")==0
+                 and row.get("reason") in {"protective_wakeup_no_fresh_signal","protective_wakeup_holding_changed"})
+                or (row.get("status")=="OK_EXIT_ORDERS_SENT" and row.get("orders_sent")==row.get("orders_ack")==row.get("exit_intents")==1
+                    and row.get("reason")=="protective_wakeup_routed")):
+                wake_ok+=1
+            else:
+                wake_uncertain+=1
         values=[]
         workload=Counter()
         policy=degraded=unknown=0
@@ -107,7 +141,12 @@ def summarize_runtime(lines,*,expected_sha):
         values.sort()
         def percentile(p):
             return round(values[math.ceil(p*len(values))-1],3) if values else None
-        sessions[session]={"attempted":len(keys),"normal":len(values),"policy_blocked":policy,
+        sessions[session]={"attempted":len(keys),"total_attempted":len(all_keys),
+                          "protective_wakeup_attempted":len(wake_keys),"protective_wakeup_clean":wake_ok,
+                          "protective_wakeup_uncertain":wake_uncertain,
+                          "protective_wakeup_failed":len(wake_keys & set(failed)),
+                          "protective_wakeup_missing":len(wake_keys & missing),
+                          "normal":len(values),"policy_blocked":policy,
                           "degraded":degraded,"unknown":unknown,"failed":len(keys & set(failed)),
                           "missing_result":len(keys & missing),"mean_sec":mean(values) if values else None,
                           "p50_sec":percentile(.5),"p95_sec":percentile(.95),"max_sec":max(values) if values else None,
@@ -121,6 +160,8 @@ def summarize_runtime(lines,*,expected_sha):
     if missing: blockers.append("INCOMPLETE_ATTEMPT_POPULATION")
     if any(r["degraded"] or r["unknown"] or r["failed"] for r in sessions.values()):
         blockers.append("DEGRADED_OR_FAILED_ATTEMPTS")
+    if any(r["protective_wakeup_uncertain"] or r["protective_wakeup_failed"] or r["protective_wakeup_missing"] for r in sessions.values()):
+        blockers.append("PROTECTIVE_WAKEUP_UNVERIFIED")
     return {"account_digest": next(iter(account_digests)) if len(account_digests) == 1 else None,
             "expected_sha":expected_sha,"sessions":sessions,"malformed":malformed,
             "conflicts":conflicts,"orphan":len(orphan),"ambiguous":len(ambiguous),"blockers":blockers}
