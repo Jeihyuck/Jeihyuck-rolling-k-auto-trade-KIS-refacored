@@ -2228,6 +2228,17 @@ def generate_entry_intents(
 
     logger.info("[US_ENTRY][EVAL][DONE] entry_intents=%d", len(intents))
     if diagnostics is not None:
+        if (_hot_retry_generation and _hot_retry_waiting and not intents
+                and not _entry_cancelled()):
+            from trader.us.entry_timing.hot_event_evaluator import collection_manifest,_execution_hot_pairs
+            import time as _hot_wait_time
+            _manifest=collection_manifest(env="practice",scope=str(os.getenv("US_ENTRY_WINDOW_SCOPE") or "").strip(),
+                trade_date=_resolve_us_trade_date(now),now_epoch=_hot_wait_time.time())
+            if _manifest and _manifest["generation"]==_hot_retry_generation:
+                _waiting=sorted(_execution_hot_pairs(_manifest)&_hot_retry_waiting)
+                if _waiting:
+                    diagnostics["hot_wait"]={"generation":_hot_retry_generation,
+                                             "pairs":[list(p) for p in _waiting]}
         diagnostics.update({
             "attempted": len(seen_symbols),
             "accepted": len(intents),
