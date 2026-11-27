@@ -24,6 +24,7 @@ from trader.kr.opening_bar_contract import (
 from trader.runtime_paths import repo_root
 from trader.time_utils import now_kst
 from trader.kr.entry_priority_queue import CandidateSchedule, observer_collection_priorities
+from trader.kr.opening_intelligence import analyze_opening, ObservationPromotion
 
 logger = logging.getLogger(__name__)
 
@@ -604,7 +605,11 @@ def run_once(*, kis, codes: list[str], observed_at: datetime,
                 )
             if not verified_vwap:
                 missing_vwap += 1
+            intelligence = analyze_opening(proof=persisted, now=proof_now)
+            logger.info("[KR][OPENING_OBSERVER][INTELLIGENCE] code=%s facts=%s",
+                        code, json.dumps(intelligence, ensure_ascii=False, sort_keys=True))
             symbol_outcomes[code] = {
+                "opening_intelligence": intelligence,
                 "state": coverage["state"],
                 "reason": coverage["reason"],
                 "opening_count": coverage["opening_count"],
@@ -707,6 +712,7 @@ def main() -> None:
     planner_wake_sec = min(15.0, configured_period)
     schedule = CandidateSchedule(max_batch=6, hot_sec=max(45, int(configured_period)),
                                  warm_sec=max(180, int(configured_period)))
+    promotion = ObservationPromotion()
     last_capacity_warning_key = None
     last_idle_key = None
     last_idle_logged_at = 0.0
@@ -743,6 +749,7 @@ def main() -> None:
             # receive low-cost PB1 pre-minute evaluation; it does NOT consume
             # native 1-minute REST calls. Only verified observation or execution
             # HOT/WARM candidates receive native collection.
+            priority = promotion.apply(priority, now)
             native_priority = {**priority, "cold": []}
             health = schedule.diagnostics(
                 native_priority, now, interval_sec=planner_wake_sec,
@@ -803,6 +810,7 @@ def main() -> None:
             result = run_once(kis=kis, codes=selected, observed_at=now,
                               refresh_clock=now_kst)
             for code, outcome in result.get("symbol_outcomes", {}).items():
+                promotion.observe(code, outcome.get("opening_intelligence"))
                 tier = next(
                     (name for name in ("hot", "warm", "cold")
                      if code in priority[name]), "unknown",

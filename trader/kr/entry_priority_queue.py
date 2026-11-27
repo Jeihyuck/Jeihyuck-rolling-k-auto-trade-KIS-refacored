@@ -402,7 +402,8 @@ def load_prep_collection(*, date: str, account_scope: str,
                 or len(set(groups)) != 30 or set(groups) != set(prep["codes"])):
             return None
         return {"state": "PREP_COLLECTION_ACTIVE", "hot": hot, "warm": warm, "cold": cold,
-                "code_sha": sha, "is_order_authorization": False}
+                "code_sha": sha, "final30_digest": prep["final30_digest"],
+                "is_order_authorization": False}
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
         return None
 
@@ -482,7 +483,6 @@ class CandidateSchedule:
                 age = float("inf") if last is None or promoted else (now - last).total_seconds()
                 if age >= self.periods[category]:
                     items.append((age, code))
-                self.last_tier[code] = category
             items.sort(key=lambda x: (-x[0], x[1]))
             due[category] = items
 
@@ -513,4 +513,5 @@ class CandidateSchedule:
         chosen.extend(code for _, _, code in remaining[:self.max_batch - len(chosen)])
         for code in chosen:
             self.last_attempt[code] = now
+            self.last_tier[code] = next(t for t in ("hot", "warm", "cold") if code in snapshot.get(t, []))
         return chosen
