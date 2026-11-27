@@ -53,6 +53,13 @@ def test_sustained_twenty_slow_ticks_reach_real_buy_router_and_mock_kis_ack(
     }.items():
         monkeypatch.setenv(key, value)
 
+    # This scenario must be independent of the workflow's default disarmed
+    # flags. Enable only the existing mock practice fixture, which blocks
+    # every requests Session.request before enabling the practice router.
+    # Never relax CI job-level or production order permissions.
+    from tests.us.test_us_postgres_integration_real import _enable_mock_practice_router_permissions
+    _enable_mock_practice_router_permissions(monkeypatch)
+
     # Real postgres and the production claim acquisition code are kept on.
     # A DB-offline run is expected to block BUY, never fabricate a mock ACK.
     monkeypatch.setattr(repos, "_active_us_epoch", lambda *_a, **_kw: "incident-epoch")
