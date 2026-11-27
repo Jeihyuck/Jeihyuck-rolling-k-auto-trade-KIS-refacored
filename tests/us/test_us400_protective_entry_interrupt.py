@@ -339,3 +339,24 @@ def test_idle_poll_overhead_does_not_extend_normal_slot(monkeypatch, overrun):
     assert polls == [5]
     assert sleeps == ([5] if overrun else [5, 5])
     assert clock[0] == (13 if overrun else 12)
+
+
+@pytest.mark.parametrize("protective_signal",[False, True])
+def test_entry_poll_overrun_never_returns_buy_result(monkeypatch, protective_signal):
+    from types import SimpleNamespace
+    from trader.us.runner import trade_tick_runner as runner
+    clock = [0.0]
+    cancelled = Event()
+    snapshot = {"symbol":"ABC"}
+    monkeypatch.setattr(runner,"time",SimpleNamespace(monotonic=lambda:clock[0]))
+    def poll():
+        clock[0] += 2.0
+        return snapshot if protective_signal else None
+    expected = ProtectiveEntryInterrupted if protective_signal else TimeoutError
+    with pytest.raises(expected) as exc:
+        run_entry_eval_with_timeout(lambda:[{"side":"BUY","symbol":"XYZ"}],
+                                    timeout_sec=1, cancel_event=cancelled,
+                                    protective_poll=poll)
+    assert cancelled.is_set()
+    if protective_signal:
+        assert exc.value.snapshot == snapshot
