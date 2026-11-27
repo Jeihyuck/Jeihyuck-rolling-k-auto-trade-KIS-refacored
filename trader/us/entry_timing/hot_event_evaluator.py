@@ -33,6 +33,163 @@ def _execution_hot_pairs(payload):
     return hot
 
 
+class CollectionRankState:
+    """Thread-safe, advisory collection promotion; never edits execution manifests.
+
+    Only a verified price-specific WAIT incumbent can yield one collection
+    slot to a WARM challenger with two distinct fresh READY observations.
+    Missing/stale data is never a reason to demote the incumbent.
+    """
+    def __init__(self):
+        from threading import Lock
+        self._lock=Lock()
+        self._generation=None
+        self._signature=None
+        self._previous={}
+        self._swap=None
+        self._expires=0.0
+
+    @staticmethod
+    def _key(lanes):
+        return tuple(tuple(lanes.get(tier,())) for tier in ("HOT","WARM","COLD"))
+
+    def update(self, lanes, generation, observations, now_epoch):
+        with self._lock:
+            key=self._key(lanes)
+            if self._generation!=generation or self._signature!=key:
+                self._previous={}
+                self._swap=None
+            self._generation,self._signature=generation,key
+            current={}
+            for pair,obs in observations.items():
+                if not isinstance(obs,dict):
+                    continue
+                try:
+                    received=float(obs["received"])
+                    if (not 0<=now_epoch-received<=5 or not obs.get("receipt_id")
+                            or obs["state"] not in {"READY","PRICE_WAIT"}):
+                        continue
+                    current[pair]=obs
+                except (ValueError,TypeError,KeyError):
+                    continue
+            warm=[p for p in lanes.get("WARM",()) if current.get(p,{}).get("state")=="READY"]
+            weak=[p for p in reversed(lanes.get("HOT",())) if current.get(p,{}).get("state")=="PRICE_WAIT"]
+            chosen=None
+            if weak:
+                for candidate in warm:
+                    prior=self._previous.get(candidate,{})
+                    obs=current[candidate]
+                    if (prior.get("state")=="READY" and prior.get("receipt_id")!=obs["receipt_id"]
+                            and 0 < obs["received"]-prior.get("received",float("inf")) <= 15):
+                        chosen=(weak[0],candidate)
+                        break
+                    if (self._swap==(weak[0],candidate) and now_epoch<=self._expires):
+                        chosen=self._swap
+                        break
+            self._previous=current
+            self._swap=chosen
+            self._expires=min((current[p]["received"]+5 for p in chosen),default=0.0) if chosen else 0.0
+            return chosen
+
+    def apply(self, lanes, generation, now_epoch):
+        with self._lock:
+            if (not self._swap or generation!=self._generation
+                    or self._key(lanes)!=self._signature or now_epoch>self._expires):
+                return lanes
+            incumbent,challenger=self._swap
+            result={tier:list(lanes[tier]) for tier in ("HOT","WARM","COLD")}
+            i=result["HOT"].index(incumbent)
+            j=result["WARM"].index(challenger)
+            result["HOT"][i],result["WARM"][j]=challenger,incumbent
+            return result
+
+
+def collection_manifest(*,env,scope,trade_date,now_epoch,base="runtime/private"):
+    """Read the existing canonical identity; do not renew or authorize it."""
+    from trader.us.entry_timing.opening_observer import priority_manifest_path
+    try:
+        path=priority_manifest_path(env=env,scope=scope,trade_date=trade_date,base=base)
+        if path.stat().st_size>65536:
+            return None
+        p=json.loads(path.read_text(encoding="utf-8"))
+        created,expires=float(p["created_epoch"]),float(p["expires_epoch"])
+        if (env!="practice" or not scope or p.get("schema")!="US_PREMINUTE_PRIORITY_V1"
+                or p.get("env")!=env or p.get("owner")!="US_STANDARD" or p.get("trade_date")!=trade_date
+                or p.get("is_order_authorization") is not False
+                or p.get("scope_sha256")!=hashlib.sha256((env+":"+scope).encode()).hexdigest()
+                or not isinstance(p.get("generation"),str) or not p["generation"]
+                or not all(map(math.isfinite,(created,expires,now_epoch)))
+                or not created<=now_epoch<=expires<=created+180.00001):
+            return None
+        _execution_hot_pairs(p)
+        return p
+    except (OSError,ValueError,TypeError,KeyError,AttributeError,OverflowError):
+        return None
+
+
+def refresh_collection_rank(db, *, rank, lanes, env, scope, trade_date, now_et,
+                            quote_many, base="runtime/private", live_clock=None):
+    """One bounded collector IPC batch, pure strategy evaluation, no order output."""
+    from trader.us.entry_timing.opening_observer import load_bars
+    from trader.us.entry_timing.opportunity import evaluate_price_opportunity,effective_mode
+    import time
+    from trader.us.market_calendar import is_us_trading_day, regular_close_time_for_date
+    from zoneinfo import ZoneInfo
+    now=now_et.astimezone(ZoneInfo("America/New_York")) if now_et.tzinfo else None
+    if (now is None or now.date().isoformat()!=trade_date or not is_us_trading_day(now.date())
+            or (now.hour,now.minute)<(10,0) or now.time()>=regular_close_time_for_date(now.date())
+            or effective_mode()!="ENFORCE"):
+        return None
+    p=collection_manifest(env=env,scope=scope,trade_date=trade_date,now_epoch=now.timestamp(),base=base)
+    if not p:
+        return None
+    allowed={(x["symbol"],x["exchange"]) for lane in ("hot","warm") for x in p[lane]}
+    pairs=[pair for pair in lanes["HOT"]+lanes["WARM"]
+           if pair in allowed and pair[0]!="TQQQ" and isinstance(p["hot_event_inputs"].get(pair[0]),dict)]
+    if not pairs or len(pairs)>12:
+        return None
+    deadline=time.monotonic()+.8
+    quotes=quote_many(pairs) or {}
+    observations={}
+    price_wait={"spread_exceeds_limit","live_price_far_from_completed_bar",
+                "breakout_chase_too_large","reversal_not_confirmed","breakout_not_confirmed",
+                "stop_geometry_invalid","stop_reference_too_far",
+                "unfavorable_reference_reward_risk","entry_ceiling_below_ask"}
+    for symbol,exchange in pairs:
+        if time.monotonic()>=deadline:
+            break
+        at=live_clock() if live_clock else now
+        try:
+            q=quotes.get((symbol,exchange)) or {}
+            received=float(q["received_at"])
+            bid,ask,last=(float(q[k]) for k in ("bid","ask","last"))
+            if (q.get("source")!="KIS_WEBSOCKET_COLLECTOR" or not q.get("collector_generation")
+                    or q.get("stale") or q.get("suspect") or not all(map(math.isfinite,(received,bid,ask,last)))
+                    or not 0<=at.timestamp()-received<=5 or not 0<bid<=ask or last<=0):
+                continue
+            c=p["hot_event_inputs"][symbol]
+            decision=evaluate_price_opportunity(
+                style=c["family"],trade_date=trade_date,now_et=at,
+                verified_bars=load_bars(db,trade_date=trade_date,symbol=symbol,owner="US_STANDARD"),
+                quote={"source":q["source"],"last":last,"bid":bid,"ask":ask,"age_sec":at.timestamp()-received},
+                prep=c["prep"],feature_scope=(scope,symbol,exchange,"US_STANDARD"),
+                min_rr=float(os.getenv("US_OPPORTUNITY_MIN_REFERENCE_RR","1.5")),
+                max_stop_distance=float(os.getenv("US_OPPORTUNITY_MAX_STOP_DISTANCE","0.025")))
+            state="READY" if decision["state"]=="READY" else "PRICE_WAIT" if decision.get("reason") in price_wait else None
+            if state:
+                observations[(symbol,exchange)]={"state":state,"received":received,
+                        "receipt_id":(q["collector_generation"],received)}
+        except (ValueError,TypeError,KeyError,AttributeError,OSError,OverflowError):
+            continue
+    at=live_clock() if live_clock else now
+    if at.date()!=now.date() or at.time()>=regular_close_time_for_date(now.date()):
+        return None
+    current=collection_manifest(env=env,scope=scope,trade_date=trade_date,now_epoch=at.timestamp(),base=base)
+    if not current or current["generation"]!=p["generation"]:
+        return None
+    return rank.update(lanes,p["generation"],observations,at.timestamp())
+
+
 def poll_hot_events(db, *, env, scope, trade_date, hot_pairs, now_et,
                     quote_reader, seen, base="runtime/private", live_clock=None):
     from trader.us.entry_timing.opening_observer import priority_manifest_path, load_bars

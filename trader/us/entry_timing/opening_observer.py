@@ -914,12 +914,14 @@ def start_prep_observer(*, env: str, scope: str, trade_date: str, rows: list[dic
 
 
 def _run_hot_quote_observer(*, stop, session_valid, env, scope, trade_date,
-                            pairs, continuous, quote_reader, path):
+                            pairs, continuous, quote_reader, path, collection_rank=None):
     """Watch collector quotes even while the native minute reader is blocked."""
-    from trader.us.entry_timing.hot_event_evaluator import poll_hot_events
+    from trader.us.entry_timing.hot_event_evaluator import poll_hot_events, refresh_collection_rank
+    from trader.marketdata.us_ws_collector import get_quotes_many
     from trader.us.market_calendar import regular_close_time_for_date
 
     seen = {}
+    next_rank_refresh=0.0
     db = sqlite3.connect(path, timeout=0.1)
     try:
         while not stop.is_set():
@@ -935,6 +937,14 @@ def _run_hot_quote_observer(*, stop, session_valid, env, scope, trade_date,
                         poll_hot_events(db, env=env, scope=scope, trade_date=trade_date,
                                         hot_pairs=lanes["HOT"], now_et=now, quote_reader=quote_reader,
                                         seen=seen, live_clock=lambda: datetime.now(NY))
+                        if collection_rank is not None and time.monotonic()>=next_rank_refresh:
+                            next_rank_refresh=time.monotonic()+2.0
+                            swap=refresh_collection_rank(db,rank=collection_rank,lanes=lanes,env=env,
+                                scope=scope,trade_date=trade_date,now_et=now,
+                                quote_many=lambda items:get_quotes_many(items,env=env,max_age_sec=5,timeout_sec=.2),
+                                live_clock=lambda:datetime.now(NY))
+                            if swap:
+                                LOG.info("[US_OPENING_OBSERVER][DYNAMIC_COLLECTION_HOT] demote=%s promote=%s action=NO_ORDER",*swap)
                     else:
                         seen.clear()
                 except Exception as exc:
@@ -986,6 +996,12 @@ def run_observer(*, env: str, trade_date: str, scope: str,
     next_poll = 0.0
     event_stop = threading.Event()
     event_worker = None
+    from trader.us.entry_timing.hot_event_evaluator import CollectionRankState, collection_manifest
+    collection_rank=CollectionRankState()
+    def dynamic_lanes(lanes):
+        epoch=time.time()
+        manifest=collection_manifest(env=env,scope=scope,trade_date=trade_date,now_epoch=epoch)
+        return collection_rank.apply(lanes,manifest["generation"],epoch) if manifest else lanes
     pointer = 0
     priority_offsets = {"HOT": 0, "WARM": 0, "COLD": 0}
     last_priority_state = None
@@ -1033,7 +1049,8 @@ def run_observer(*, env: str, trade_date: str, scope: str,
                                 trade_date=trade_date, pairs=pairs, continuous=continuous,
                                 quote_reader=lambda sym, exch: get_quote(
                                     sym, exch, env=env, max_age_sec=5, timeout_sec=.11),
-                                path=store_path(env=env, account_scope=scope, trade_date=trade_date)))
+                                path=store_path(env=env, account_scope=scope, trade_date=trade_date),
+                                collection_rank=collection_rank))
                 event_worker.start()
             if time.monotonic() < next_poll:
                 time.sleep(min(1.0, next_poll - time.monotonic()))
@@ -1044,6 +1061,7 @@ def run_observer(*, env: str, trade_date: str, scope: str,
                 env=env, scope=scope, trade_date=trade_date,
                 pairs=pairs, now_epoch=time.time(), allow_prep_rebind=continuous,
             )
+            lanes=dynamic_lanes(lanes)
             if ws_on and time.monotonic() >= next_subscription_refresh:
                 try:
                     ensure_started(env=env, offline=False)
@@ -1102,6 +1120,7 @@ def run_observer(*, env: str, trade_date: str, scope: str,
                     current, state = collection_priorities(env=env, scope=scope,
                         trade_date=trade_date, pairs=pairs, now_epoch=time.time(),
                         allow_prep_rebind=continuous)
+                    current=dynamic_lanes(current)
                     live = datetime.now(NY)
                     return (epoch_verified and live.date().isoformat() == trade_date
                             and live.time() < close_time and state in {"VALID", "PREP_VALID"}
