@@ -54,10 +54,19 @@ def poll_hot_events(db, *, env, scope, trade_date, hot_pairs, now_et,
         if key not in eligible:
             seen.pop(key,None)
     results=[]
+    def revoke_hint(symbol, exchange, at):
+        # Invalid native evidence must not leave a previously READY hint live.
+        # Never delete a newer observation or a different manifest generation.
+        db.execute("""DELETE FROM hot_retry_events WHERE trade_date=? AND symbol=?
+            AND exchange=? AND manifest_generation=? AND observed_epoch<=?""",
+            (trade_date,symbol,exchange,generation,at.timestamp()))
+        db.commit()
+        seen.pop((symbol,exchange),None)
     for symbol,exchange in sorted(eligible):
         candidate=inputs.get(symbol)
         if not isinstance(candidate,dict):
             continue
+        at=now_et
         try:
             q=quote_reader(symbol,exchange) or {}
             at=live_clock().astimezone(ny) if live_clock else now_et
@@ -69,12 +78,13 @@ def poll_hot_events(db, *, env, scope, trade_date, hot_pairs, now_et,
             if (not q.get("collector_generation") or not all(map(math.isfinite,(received,bid,ask,last)))
                     or not 0<=age<=5 or not 0<bid<=ask or last<=0
                     or q.get("stale") or q.get("suspect")):
+                revoke_hint(symbol,exchange,at)
                 continue
             bars=load_bars(db,trade_date=trade_date,symbol=symbol,owner="US_STANDARD")
             min_rr=float(os.getenv("US_OPPORTUNITY_MIN_REFERENCE_RR","1.5"))
             max_stop=float(os.getenv("US_OPPORTUNITY_MAX_STOP_DISTANCE","0.025"))
             signature=hashlib.sha256(json.dumps(
-                [generation,candidate,bars,bid,ask,last,q["collector_generation"],min_rr,max_stop],
+                [generation,candidate,bars,bid,ask,last,received,q["collector_generation"],min_rr,max_stop],
                 sort_keys=True,separators=(",",":"),allow_nan=False).encode()).hexdigest()
             key=(symbol,exchange)
             if seen.get(key)==signature:
@@ -107,6 +117,7 @@ def poll_hot_events(db, *, env, scope, trade_date, hot_pairs, now_et,
                      symbol,decision["state"],decision["reason"],age,
                      decision.get("facts",{}).get("last_completed_bar"))
         except (ValueError,TypeError,KeyError,AttributeError,OSError):
+            revoke_hint(symbol,exchange,at)
             continue
     return results
 
@@ -123,12 +134,21 @@ def read_hot_retry_hints(*, env, scope, trade_date, generation, waiting,
         path=store_path(env=env,account_scope=scope,trade_date=trade_date,base=base)
         if not path.is_file():
             return set()
+        pairs=sorted((symbol,exchange) for symbol,exchange in waiting if symbol!="TQQQ")
+        if not pairs:
+            return set()
+        # Apply eligibility before LIMIT, otherwise newer unrelated hints can
+        # starve a canonical WAIT candidate. The input is bounded to Final30.
+        pair_filter=" OR ".join("(symbol=? AND exchange=?)" for _ in pairs)
+        params=[part for pair in pairs for part in pair]
         with closing(sqlite3.connect("file:"+str(path.resolve())+"?mode=ro",uri=True,timeout=.025)) as db:
             rows=db.execute("""SELECT symbol,exchange,observed_epoch,quote_received_epoch,event_id
                 FROM hot_retry_events WHERE trade_date=? AND manifest_generation=? AND state='READY'
                 AND observed_epoch BETWEEN ? AND ? AND quote_received_epoch BETWEEN ? AND ?
-                ORDER BY observed_epoch DESC LIMIT 4""",
-                (trade_date,generation,now_epoch-5,now_epoch,now_epoch-5,now_epoch)).fetchall()
+                AND observed_epoch>=quote_received_epoch AND observed_epoch-quote_received_epoch<=5
+                AND length(event_id)>0 AND ("""+pair_filter+""")
+                ORDER BY observed_epoch DESC,symbol,exchange LIMIT 4""",
+                (trade_date,generation,now_epoch-5,now_epoch,now_epoch-5,now_epoch,*params)).fetchall()
         return {(symbol,exchange) for symbol,exchange,at,received,event_id in rows
                 if (symbol,exchange) in waiting and symbol!="TQQQ"
                 and event_id and 0<=now_epoch-at<=5 and 0<=at-received<=5
