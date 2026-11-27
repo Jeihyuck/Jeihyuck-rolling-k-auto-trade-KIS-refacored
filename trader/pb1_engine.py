@@ -16577,6 +16577,31 @@ class PB1Engine:
         daily_cache.set(key, dict(result), 1800)
         return result
 
+    def _kr_needs_short_ohlcv_fill(self, merged_features, precomputed_data_ok):
+        # Shared by the original fill branch and selective batch preload.
+        return not precomputed_data_ok or any(
+            self._value_missing(merged_features.get(key))
+            for key in ("ma20_slope", "vol_contraction", "volu_contraction",
+                        "high20", "tr_range_pct", "trend_strength", "ma10", "value20")
+        )
+
+    def _kr_select_short_ohlcv_preload(self, codes):
+        """Only prefetch daily frames actually needed by the existing entry path.
+
+        No candidate filtering, selection or authorization changes. If a
+        malformed row cannot be classified, retain the original prefetch.
+        """
+        needed = []
+        for raw in codes:
+            code = str(raw or "").zfill(6)
+            try:
+                mapped, _, _, _, data_ok = self._map_precomputed_candidate_row(code)
+                if self._kr_needs_short_ohlcv_fill(mapped, data_ok):
+                    needed.append(code)
+            except Exception:
+                needed.append(code)
+        return needed
+
     def _compute_candidates_from_codes(self, codes: list[str]) -> list[CandidateFeature]:
         # ── [KR][PB1] scope guard + batch OHLCV preload ─────────────────────
         # 한국장 PB1 trade 모드일 때 final30 코드 전체를 단일 DB 커넥션으로
@@ -16595,7 +16620,13 @@ class PB1Engine:
                 _final30_source,
                 _session,
             )
-            self._kr_pb1_batch_preload_ohlcv(list(codes or []), days=60)
+            preload_codes = list(codes or [])
+            if (str(getattr(self, "env", "")).lower() == "practice"
+                    and os.getenv("KR_SELECTIVE_DAILY_PRELOAD_ENABLED", "1") == "1"):
+                preload_codes = self._kr_select_short_ohlcv_preload(preload_codes)
+            logger.info("[KR_LATENCY][ENTRY_DAILY_PRELOAD] requested=%s needed=%s",
+                        len(codes or []), len(preload_codes))
+            self._kr_pb1_batch_preload_ohlcv(preload_codes, days=60)
 
         code_market = {
             str(m.get("code") or "").zfill(6): (m.get("market") or "")
@@ -16659,10 +16690,8 @@ class PB1Engine:
 
                 df = pd.DataFrame()
                 meta: dict[str, Any] = {}
-                need_short_ohlcv_fill = not precomputed_data_ok or any(
-                    self._value_missing(merged_features.get(key))
-                    for key in ("ma20_slope", "vol_contraction", "volu_contraction", "high20", "tr_range_pct", "trend_strength", "ma10", "value20")
-                )
+                need_short_ohlcv_fill = self._kr_needs_short_ohlcv_fill(
+                    merged_features, precomputed_data_ok)
                 if need_short_ohlcv_fill:
                     df, meta = self._fetch_daily(code, days=60)
                     if df is None or df.empty:
