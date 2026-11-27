@@ -1546,6 +1546,10 @@ class KisUSClient:
                         float(os.getenv("US_SHARED_KIS_HTTP_MIN_INTERVAL_SEC", "0.35")),
                     ),
                     sleep_with_budget=self._sleep_with_budget,
+                    **({"defer_if_busy": True} if (
+                        os.getenv("US_OPENING_OBSERVER_READ_ONLY") == "1"
+                        and path.split("?")[0] == "/uapi/overseas-price/v1/quotations/inquire-time-itemchartprice"
+                    ) else {}),
                 )
             except Exception as exc:
                 raise KisUSTemporaryError(
