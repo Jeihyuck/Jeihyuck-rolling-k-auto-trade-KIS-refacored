@@ -38,6 +38,19 @@ def record_router_abort(intent: dict, *, checkpoint: str) -> bool:
         scope = _us_execution_claim_scope()
         if scope.get("env") != "practice" or not scope.get("trading_epoch_id") or not scope.get("account_id"):
             return False
+        # The current account cannot certify an abort belonging to another
+        # account/epoch/owner. In particular, the original-scope rejection
+        # path must not replace contradictory identity with current values.
+        for source in (intent, meta):
+            for field, expected in (
+                ("broker_account_hash", scope["account_id"]),
+                ("account_id", scope["account_id"]),
+                ("trading_epoch_id", scope["trading_epoch_id"]),
+                ("strategy_owner", "US_STANDARD"),
+            ):
+                declared = source.get(field)
+                if declared is not None and str(declared).strip() and str(declared) != str(expected):
+                    return False
         proof_intent = {**intent, "strategy_owner": "US_STANDARD", "submit_attempt_id": str(uuid4()),
                         "broker_account_hash": scope["account_id"], "position_lifecycle_id": cycle,
                         "trading_epoch_id": scope["trading_epoch_id"],
