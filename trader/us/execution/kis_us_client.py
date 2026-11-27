@@ -323,7 +323,7 @@ class KisUSClient:
     # Market Data
     # ------------------------------------------------------------------
 
-    def get_us_price(self, symbol: str, exchange: str) -> dict:
+    def get_us_price(self, symbol: str, exchange: str, *, max_quote_age_sec: float | None = None) -> dict:
         """해외주식 현재가 조회."""
         self._assert_not_offline("get_us_price")
         tr = get_tr_info("us_price")
@@ -335,9 +335,11 @@ class KisUSClient:
         }
         cache_key = ("price", symbol.upper(), self._resolve_quote_excd(exchange))
         ttl = float(os.getenv("US_KIS_PRICE_CACHE_TTL_SEC", "20") or 20)
+        if max_quote_age_sec is not None:
+            ttl = min(ttl, max(0.0, float(max_quote_age_sec)))
         now_ts = time.time()
         cached = self._response_cache.get(cache_key)
-        if cached and now_ts - cached[0] <= ttl:
+        if cached and 0 <= now_ts - cached[0] <= ttl:
             age_sec = max(0.0, now_ts - float(cached[0]))
             logger.debug("[US_KIS][CACHE_HIT] endpoint=GET_price symbol=%s ttl=%.1f", symbol, ttl)
             cached_payload = dict(cached[1]) if isinstance(cached[1], dict) else cached[1]
