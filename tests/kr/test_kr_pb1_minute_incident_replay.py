@@ -208,50 +208,89 @@ def test_old_conflicted_completed_minute_gets_exact_native_anchor(
     ] == 0
 
 
-def test_loop_waits_for_late_prep_then_starts_readonly_collection(monkeypatch):
+def test_loop_waits_for_late_prep_then_starts_readonly_collection(tmp_path, monkeypatch):
+    import json
     import sys
     import trader.kis_wrapper as kw
+    from trader.kr import entry_priority_queue as pq
+
+    scope = "practice:12345678:01"
     times = iter([at(9, 0), at(9, 1), at(15, 6)])
     monkeypatch.setattr(observer, "now_kst", lambda: next(times))
     monkeypatch.setattr(sys, "argv", [
         "scripts.kr_opening_observer", "--loop", "--date", DATE,
     ])
-    no_http_or_order = {"client_creations": 0, "runs": 0, "final30_loads": 0}
-    snapshots = iter([
-        {"state": "INVALID_PREP", "hot": [], "warm": [], "cold": []},
-        {"state": "PREP_FALLBACK", "hot": ["093320"],
-         "warm": [], "cold": []},
-    ])
-    monkeypatch.setattr(observer, "collection_priorities",
-                        lambda **kw: next(snapshots))
-    monkeypatch.setattr(observer, "get_account_key", lambda **kw: "replay-only")
+    monkeypatch.setattr(observer, "repo_root", lambda: tmp_path)
+    monkeypatch.setattr(pq, "repo_root", lambda: tmp_path)
+    monkeypatch.setattr(pq, "_current_sha", lambda: "a" * 40)
+    monkeypatch.setenv("KR_PREP_COLLECTION_PRIORITY_ENABLED", "1")
+    monkeypatch.setattr(observer, "get_account_key", lambda **kw: scope)
+    counts = {"client_creations": 0, "runs": 0, "final30_loads": 0}
+    actual_load = observer.final30_codes
 
     def load_final30(**kw):
-        no_http_or_order["final30_loads"] += 1
-        return ["093320"] * 30
+        counts["final30_loads"] += 1
+        return actual_load(**kw)
 
     monkeypatch.setattr(observer, "final30_codes", load_final30)
 
+    class ReadOnly:
+        def buy_stock(self, *a, **kw):
+            raise AssertionError("observer must never place BUY")
+
+        def sell_stock(self, *a, **kw):
+            raise AssertionError("observer must never place SELL")
+
     def get_client(**kw):
-        no_http_or_order["client_creations"] += 1
-        return object()
+        counts["client_creations"] += 1
+        return ReadOnly()
 
     monkeypatch.setattr(kw, "KisAPI", get_client)
-    monkeypatch.setattr(observer.time, "sleep", lambda _: None)
+    published = []
+
+    def sleep_then_late_prep(_):
+        if published:
+            return
+        # No broker client or collection before verified same-day PREP.
+        assert counts == {"client_creations": 0, "runs": 0, "final30_loads": 0}
+        path = pq.final30_path(DATE)
+        path.parent.mkdir(parents=True)
+        rows = [{"code": f"{i:06d}"} for i in range(1, 30)]
+        rows.append({"code": "093320", "rank_final30": 30,
+                     "entry_style_selected": "MOMENTUM", "momentum_score": 98})
+        path.write_text(json.dumps({"rows": rows, "trade_date": DATE,
+                                    "market": "KR", "env": "practice",
+                                    "as_of": "2026-11-16"}), encoding="utf-8")
+        path.with_name("prep_contract.json").write_text(json.dumps({
+            "trade_date": DATE, "market": "KR", "env": "practice",
+            "contract_ok": True, "trade_can_proceed": True, "final30_rows": 30,
+            "expected_as_of": "2026-11-16", "actual_as_of": "2026-11-16",
+            "contract_hash": "late-prep-test",
+        }), encoding="utf-8")
+        result = pq.publish_prep_collection(date=DATE, account_scope=scope, now=at(9, 0))
+        assert result["state"] == "PREP_COLLECTION_PUBLISHED"
+        assert result["hot"] == ["093320"] and result["warm"] == []
+        assert pq.collection_priorities(date=DATE, account_scope=scope,
+                                         now=at(9, 0))["hot"] == []
+        published.append(result)
+
+    monkeypatch.setattr(observer.time, "sleep", sleep_then_late_prep)
+
     def collect(**kw):
-        no_http_or_order["runs"] += 1
+        counts["runs"] += 1
+        assert kw["codes"] == ["093320"]
+        assert isinstance(kw["kis"], ReadOnly)
         return {
             "completed": 1, "unknown": 0, "coverage_ok": 1,
             "vwap_unverified": 0, "symbol_scan_p95_sec": 0,
             "symbol_scan_max_sec": 0, "native_minute_request_attempts": 1,
             "native_quote_request_attempts": 1, "native_request_failures": 0,
         }
+
     monkeypatch.setattr(observer, "run_once", collect)
     observer.main()
-    assert no_http_or_order == {
-        "client_creations": 1, "final30_loads": 1, "runs": 1,
-    }
-
+    assert len(published) == 1
+    assert counts == {"client_creations": 1, "final30_loads": 1, "runs": 1}
 
 
 def test_quote_failure_keeps_native_minute_proof_but_never_fabricates_vwap(
