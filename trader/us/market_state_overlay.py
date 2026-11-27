@@ -359,7 +359,16 @@ def read_us_live_intraday_returns(
                     quotes = provider.get("intraday_quotes") or provider.get("quotes") or {}
                     q = quotes.get(sym) or quotes.get(sym.lower()) or {}
                 elif callable(getattr(provider, "get_current_price", None)):
-                    q = provider.get_current_price(sym, resolve_quote_exchange(sym))
+                    # A normal tick cache may contain a quote from several
+                    # minutes ago. Native provider bypasses expired tick,
+                    # provider and REST caches using the existing strict age
+                    # contract. Each index is recovered independently.
+                    from trader.us.data_provider import USDataProvider
+                    if isinstance(provider, USDataProvider):
+                        q = provider.get_current_price(sym, resolve_quote_exchange(sym),
+                                                       max_quote_age_sec=max_age_sec)
+                    else:
+                        q = provider.get_current_price(sym, resolve_quote_exchange(sym))
             except Exception as exc:
                 warnings.append(f"live_intraday_quote_failed:{sym}:{type(exc).__name__}")
         q = q if isinstance(q, dict) else {}
@@ -371,7 +380,10 @@ def read_us_live_intraday_returns(
         ), None)
         previous = _num(completed_returns.get(f"{sym.lower()}_previous_close"))
         completed_date = str(completed_returns.get(f"{sym.lower()}_previous_close_date") or "")
-        received = _num(q.get("asof_epoch") or q.get("received_at"))
+        # Do not replace a present invalid/old source timestamp by a newer
+        # receipt timestamp; the native quote's own age is authoritative.
+        received = _num(q.get("asof_epoch") if q.get("asof_epoch") is not None
+                        else q.get("received_at"))
         source = str(q.get("source") or "").upper()
         # Each native quote may complete after earlier sequential reads.
         # Measure against its actual evaluation time, not the loop start.
@@ -380,7 +392,7 @@ def read_us_live_intraday_returns(
             current is not None and previous is not None
             and math.isfinite(previous) and previous > 0
             and age is not None and -1.0 <= age <= max_age_sec
-            and not q.get("stale") and not q.get("_stale_date")
+            and not q.get("stale") and not q.get("suspect") and not q.get("_stale_date")
             and str(q.get("quality") or "").upper() not in {
                 "STALE", "SUSPECT", "DEGRADED", "OFFLINE",
             }

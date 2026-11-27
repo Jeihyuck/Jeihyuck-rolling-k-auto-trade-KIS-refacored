@@ -1,0 +1,38 @@
+name: US400-C focused data acceptance
+on:
+  pull_request:
+    branches: [fix/us-20261126-hot-only-tp90-integrated]
+    paths:
+      - 'trader/us/market_state_overlay.py'
+      - 'trader/us/execution/shared_kis_limiter.py'
+      - 'tests/us/test_us_20261022_shared_kis_limiter.py'
+      - 'tests/us/test_us_20261030_live_risk_ws_tp_prehttp.py'
+      - '.github/workflows/us400-c-data.yml'
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  focused-data:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONPATH: .
+      KIS_ENV: practice
+      DRY_RUN: '1'
+      US_ORDER_ARMED: '0'
+      KIS_HTTP_BLOCK: '1'
+      DATABASE_URL: ''
+      PBCORE_DB_URL: ''
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install -r requirements.txt pytest
+      - run: |
+          python -m pytest -q --junitxml=/tmp/us400-c.xml tests/us/test_us_20261022_shared_kis_limiter.py tests/us/test_us_20261030_live_risk_ws_tp_prehttp.py::test_native_benchmark_recovery_preserves_freshness_and_isolates_symbol tests/us/test_us_20261030_live_risk_ws_tp_prehttp.py::test_intraday_quote_age_is_measured_after_each_delayed_read tests/us/test_us_20261030_live_risk_ws_tp_prehttp.py::test_live_intraday_risk_overrides_positive_completed_day tests/us/test_us_20261030_live_risk_ws_tp_prehttp.py::test_stale_or_missing_live_quotes_never_make_risk_look_normal
+          python -c 'import xml.etree.ElementTree as E; c=list(E.parse("/tmp/us400-c.xml").iter("testcase")); assert len(c)==12 and all(x.find("skipped") is None for x in c)'

@@ -86,3 +86,19 @@ def test_observer_defers_when_execution_holds_shared_lock(tmp_path):
         assert path.read_text() == ""
     assert wait_for_shared_slot(scope, min_interval_sec=1.0, root=str(tmp_path),
                                 sleep_with_budget=_budget_sleep, defer_if_busy=True) > 0
+
+
+def test_observer_cannot_jump_waiting_foreground_even_when_slot_free(tmp_path):
+    import fcntl
+    import hashlib
+    scope = "foreground-waiter"
+    path = tmp_path / (hashlib.sha256(scope.encode()).hexdigest() + ".foreground")
+    with path.open("w+") as marker:
+        fcntl.flock(marker.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+        with pytest.raises(SharedLimiterUnavailable, match="background_deferred"):
+            wait_for_shared_slot(scope, min_interval_sec=.1, root=str(tmp_path),
+                                 sleep_with_budget=lambda _: pytest.fail("background waited"),
+                                 defer_if_busy=True)
+        assert not list(tmp_path.glob("*.slot"))
+    assert wait_for_shared_slot(scope, min_interval_sec=.1, root=str(tmp_path),
+                                sleep_with_budget=_budget_sleep, defer_if_busy=True) > 0

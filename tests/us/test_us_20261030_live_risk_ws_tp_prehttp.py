@@ -1350,3 +1350,21 @@ def test_intraday_quote_age_is_measured_after_each_delayed_read(monkeypatch):
     result = overlay.read_us_live_intraday_returns(Provider(), _completed_prices(), [])
     assert result["quality"] == "OK"
     assert all(q["age_sec"] == 0 for q in result["quotes"].values())
+
+
+@pytest.mark.parametrize("bad", [{"suspect": True}, {"asof_epoch": 0, "received_at": 1000.0},
+                                  {"asof_epoch": float("nan")}])
+def test_native_benchmark_recovery_preserves_freshness_and_isolates_symbol(monkeypatch, bad):
+    from trader.us.data_provider import USDataProvider
+    monkeypatch.setattr(overlay.time, "time", lambda: 1000.0)
+    provider = USDataProvider(env="practice", offline=True)
+    calls = []
+    def quote(symbol, exchange, *, max_quote_age_sec=None):
+        calls.append((symbol, max_quote_age_sec))
+        return dict(_live_quote(99, 1000.0), **(bad if symbol == "QQQ" else {}))
+    monkeypatch.setattr(provider, "get_current_price", quote)
+    result = overlay.read_us_live_intraday_returns(provider, _completed_prices(), [], max_age_sec=5)
+    assert calls == [("SPY",5),("QQQ",5),("SMH",5)]
+    assert result["quality"] == "UNKNOWN" and result["returns"]["qqq"] is None
+    assert result["returns"]["spy"] == pytest.approx(-.01)
+    assert result["returns"]["smh"] == pytest.approx(-.01)

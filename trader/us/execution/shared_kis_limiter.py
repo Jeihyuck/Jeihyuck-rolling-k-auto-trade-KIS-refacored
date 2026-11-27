@@ -46,8 +46,23 @@ def wait_for_shared_slot(
     flags = os.O_CREAT | os.O_RDWR
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    fd = os.open(path, flags, 0o600)
+    priority_fd = os.open(directory / (key + ".foreground"), flags, 0o600)
+    fd = None
     try:
+        # Foreground contenders announce themselves before competing for
+        # the slot. Shared locks allow multiple waiters; a background
+        # observer requires the exclusive lock and cannot jump their queue.
+        # OS reaping releases markers automatically, including crashes.
+        while True:
+            try:
+                fcntl.flock(priority_fd, (fcntl.LOCK_EX if defer_if_busy else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if defer_if_busy:
+                    raise SharedLimiterUnavailable("shared_KIS_background_deferred")
+                if not sleep_with_budget(0.03):
+                    raise SharedLimiterUnavailable("shared_KIS_limiter_priority_budget_exceeded")
+        fd = os.open(path, flags, 0o600)
         # Nonblocking acquire allows the Tick deadline to cancel instead of
         # hanging behind a dead or unexpectedly slow process.
         while True:
@@ -82,7 +97,9 @@ def wait_for_shared_slot(
         finally:
             fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
-        os.close(fd)
+        if fd is not None:
+            os.close(fd)
+        os.close(priority_fd)
     # This is the under-lock reserved native HTTP START slot, not the
     # caller's completion time (which can be reordered by OS scheduling).
     return slot
