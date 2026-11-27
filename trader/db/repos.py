@@ -179,6 +179,45 @@ def _assert_kr_buy_entry_contract(request_json: Any) -> None:
         raise RuntimeError(f"KR_BUY_ENTRY_CONTRACT_INVALID:{','.join(missing)}")
 
 
+
+def _assert_kr_buy_intent_readback(persisted: Any, expected: dict[str, Any]) -> None:
+    """Verify a BUY intent inside its insert transaction, before broker submission.
+
+    PostgreSQL deployments may expose request_json as TEXT; JSON/JSONB
+    drivers may instead return a mapping. Decode exactly once and use the
+    same object for all contract, parity and hash checks. No repair or
+    mutation of the persisted contract is permitted at this boundary.
+    """
+    from collections.abc import Mapping
+
+    if isinstance(persisted, str):
+        try:
+            persisted = json.loads(persisted)
+        except (ValueError, TypeError) as exc:
+            raise RuntimeError("KR_BUY_ENTRY_CONTRACT_NOT_JSON") from exc
+    if not isinstance(persisted, Mapping):
+        raise RuntimeError("KR_BUY_ENTRY_CONTRACT_NOT_JSON")
+    persisted = dict(persisted)
+    _assert_kr_buy_entry_contract(persisted)
+
+    if (expected.get("kr_us_profit_contract") is not None
+            or persisted.get("kr_us_profit_contract") is not None):
+        from trader.kr.us_standard_profit_parity import verified_contract
+
+        frozen_parity = persisted.get("kr_us_profit_contract")
+        entry_meta = persisted.get("entry_meta")
+        if (
+            not isinstance(frozen_parity, dict)
+            or not isinstance(entry_meta, dict)
+            or not verified_contract(frozen_parity)
+            or frozen_parity != expected.get("kr_us_profit_contract")
+            or entry_meta.get("kr_us_profit_contract") != frozen_parity
+        ):
+            raise RuntimeError("KR_PROFIT_PARITY_BUY_PERSISTENCE_MISMATCH")
+    if _kr_buy_entry_contract_hash(persisted) != _kr_buy_entry_contract_hash(expected):
+        raise RuntimeError("KR_BUY_ENTRY_CONTRACT_PERSISTENCE_MISMATCH")
+
+
 def _is_transient_db_connection_exception(exc: BaseException) -> bool:
     text = f"{type(exc).__module__}.{type(exc).__name__}: {exc}".lower()
     return any(
@@ -3703,6 +3742,7 @@ class OrdersRepo:
                     self._schema.orders.c.trading_epoch_id,
                     self._schema.orders.c.portfolio_epoch_id,
                     self._schema.orders.c.position_cycle_id,
+                    self._schema.orders.c.request_json,
                 ).where(
                     and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key)
                 )
@@ -3715,6 +3755,12 @@ class OrdersRepo:
                 if position_cycle_id and str(existing_row.get("position_cycle_id") or "") != str(position_cycle_id):
                     raise RuntimeError("KR_ORDER_POSITION_CYCLE_COLLISION")
                 existing = existing_row["order_id"]
+                if enforce_buy_contract:
+                    # A retry cannot replace the root BUY evidence or its
+                    # signed exit contract. Verify the original intent before
+                    # returning the existing identity; do not rewrite metadata.
+                    _assert_kr_buy_intent_readback(existing_row.get("request_json"), safe_request_json)
+                    return str(existing), False
                 if entry_meta_json:
                     conn.execute(
                         sa.update(self._schema.orders)
@@ -3745,18 +3791,7 @@ class OrdersRepo:
                         and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key)
                     )
                 ).scalar()
-                _assert_kr_buy_entry_contract(persisted)
-                if safe_request_json.get("kr_us_profit_contract"):
-                    from trader.kr.us_standard_profit_parity import verified_contract
-                    frozen_parity = (persisted or {}).get("kr_us_profit_contract")
-                    if (
-                        not verified_contract(frozen_parity)
-                        or frozen_parity != safe_request_json["kr_us_profit_contract"]
-                        or (persisted.get("entry_meta") or {}).get("kr_us_profit_contract") != frozen_parity
-                    ):
-                        raise RuntimeError("KR_PROFIT_PARITY_BUY_PERSISTENCE_MISMATCH")
-                if _kr_buy_entry_contract_hash(persisted) != _kr_buy_entry_contract_hash(safe_request_json):
-                    raise RuntimeError("KR_BUY_ENTRY_CONTRACT_PERSISTENCE_MISMATCH")
+                _assert_kr_buy_intent_readback(persisted, safe_request_json)
             return inserted_id, True
 
     def mark_submitted(
@@ -7931,6 +7966,32 @@ class PositionsRepo:
                     _assert_kr_buy_entry_contract(request_json)
                     if not entry_exit_plan:
                         entry_exit_plan = json_sanitize(request_json.get("entry_exit_plan") or {})
+                    # A recovered root BUY must retain its own signed profit
+                    # policy even when the original runner died before
+                    # passing entry_meta to the position-accounting path.
+                    # This applies only to the new PB1 practice SWING owner;
+                    # no parity is synthesized for legacy/ADD/other sleeves.
+                    frozen_profit = request_json.get("kr_us_profit_contract")
+                    if (str(env).lower() == "practice" and strategy == "pb1_pullback_close"
+                            and frozen_profit is not None
+                            and not request_json.get("parent_entry_contract_sha256")):
+                        from trader.kr.us_standard_profit_parity import verified_contract
+                        original_meta = request_json.get("entry_meta")
+                        owner_account = str(account_id or get_account_key(env=env))
+                        if (not verified_contract(frozen_profit)
+                                or not isinstance(original_meta, dict)
+                                or original_meta.get("kr_us_profit_contract") != frozen_profit
+                                or frozen_profit.get("code") != str(code).zfill(6)
+                                or str(frozen_profit.get("position_cycle_id")) != str(position_cycle_id)
+                                or str(frozen_profit.get("trading_epoch_id")) != str(provenance.get("trading_epoch_id"))
+                                or frozen_profit.get("account_sha256") != hashlib.sha256(owner_account.encode("utf-8")).hexdigest()):
+                            raise RuntimeError("KR_BUY_FILL_ORIGINAL_PROFIT_CONTRACT_UNVERIFIED")
+                        # The stored BUY is authoritative, not a newer
+                        # caller-supplied plan after a restart.
+                        entry_exit_plan = json_sanitize(request_json["entry_exit_plan"])
+                        entry_meta_json = _merge_json_dict(entry_meta_json, {
+                            "kr_us_profit_contract": frozen_profit,
+                        })
                     root_contract_sha = (
                         request_json.get("parent_entry_contract_sha256")
                         or request_json.get("entry_contract_sha256")
@@ -8140,6 +8201,14 @@ class PositionsRepo:
                 existing_entry_meta = _merge_json_dict(row.get("entry_meta_json") if row else None, {})
                 merged_entry_meta = _merge_json_dict(existing_entry_meta, entry_meta_json)
                 if row:
+                    if str(env).lower() == "practice" and strategy == "pb1_pullback_close":
+                        # BUY/ADD accounting never amends the exit contract
+                        # already frozen on an open position. An explicit
+                        # approved amendment has its own dedicated path.
+                        if "kr_us_profit_contract" in existing_entry_meta:
+                            merged_entry_meta["kr_us_profit_contract"] = existing_entry_meta["kr_us_profit_contract"]
+                        elif isinstance(request_json, dict) and request_json.get("parent_entry_contract_sha256"):
+                            merged_entry_meta.pop("kr_us_profit_contract", None)
                     for key in (
                         "entry_contract_sha256",
                         "entry_contract_version",

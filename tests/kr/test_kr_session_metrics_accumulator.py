@@ -124,3 +124,60 @@ def test_unknown_terminal_event_does_not_prove_zero_final_skips():
     assert metrics["skipped_order_unobserved_ticks"] == 1
     # This zero is merely "not observed", not authoritative evidence that
     # no per-order or terminal skips happened in the engine.
+
+
+def test_1126_retryable_tick_errors_survive_last_normal_wait():
+    from trader.pb1_runner import (
+        _accumulate_kr_tick_outcome, _resolve_session_terminal_state,
+    )
+    metrics, warnings = {}, {}
+    groups = [
+        ("OK_NO_TRADE", "OPENING_30MIN_BUY_BLOCK", 16),
+        ("RETRYABLE_MARKET_DATA_ERROR", "KR_ENTRY_TIMING_DATA_UNVERIFIED", 45),
+        ("RETRYABLE_ORDER_BUILD_ERROR", "ORDER_CANDIDATE_BUT_ZERO_API_SUBMIT", 14),
+        ("OK_NO_TRADE", "KR_ENTRY_TIMING_POLICY_WAIT", 82),
+    ]
+    degraded = 0
+    for status, reason, count in groups:
+        for _ in range(count):
+            degraded += int(_accumulate_kr_tick_outcome(
+                metrics, warnings, status=status, reason=reason))
+    assert sum(metrics.values()) == 157
+    assert degraded == 59
+    assert metrics["market_data_error_ticks"] == 45
+    assert metrics["order_build_error_ticks"] == 14
+    assert metrics["entry_policy_wait_ticks"] == 82
+    assert metrics["opening_buy_block_ticks"] == 16
+    assert _resolve_session_terminal_state(
+        result_status="OK_NO_TRADE", exit_reason="session_end", warning_counts=warnings,
+    ) == "SESSION_END_OK_DEGRADED"
+    assert _resolve_session_terminal_state(
+        result_status="OK_NO_TRADE", exit_reason="session_end", warning_counts={},
+    ) == "SESSION_END_OK"
+
+
+def test_1126_mail_log_records_distinguish_policy_and_errors(tmp_path):
+    from scripts.wsl.kr_mail_execution_evidence import _session_order_activity
+
+    rel = "runtime/logs/kr/2026-11-26/am/fixture.log"
+    path = tmp_path / rel
+    path.parent.mkdir(parents=True)
+    groups = [
+        ("OK_NO_TRADE", "OPENING_30MIN_BUY_BLOCK", 16),
+        ("RETRYABLE_MARKET_DATA_ERROR", "KR_ENTRY_TIMING_DATA_UNVERIFIED", 21),
+        ("RETRYABLE_ORDER_BUILD_ERROR", "ORDER_CANDIDATE_BUT_ZERO_API_SUBMIT", 14),
+        ("OK_NO_TRADE", "KR_ENTRY_TIMING_POLICY_WAIT", 62),
+    ]
+    path.write_text("\n".join(
+        f"[RUN_SUMMARY][RESULT] status={status} reason={reason} session=morning"
+        for status, reason, count in groups for _ in range(count)
+    ) + "\n[RUN_SUMMARY][RESULT] status=OK reason=PB1_SESSION_DONE session=morning")
+    evidence = _session_order_activity(tmp_path, "2026-11-26", "am", {"log_file": rel})
+    assert evidence["tick_summary_records"] == 113
+    assert evidence["market_data_error_ticks"] == 21
+    assert evidence["order_build_error_ticks"] == 14
+    assert evidence["entry_policy_wait_ticks"] == 62
+    assert evidence["opening_buy_block_ticks"] == 16
+    path.write_text("no terminal records")
+    assert _session_order_activity(tmp_path, "2026-11-26", "am", {"log_file": rel})[
+        "order_build_error_ticks"] is None

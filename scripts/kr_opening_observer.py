@@ -19,7 +19,7 @@ import time
 from trader.account_state import get_account_key
 from trader.kr.opening_bar_contract import (
     KST, save_opening_proof, load_opening_proof, inspect_completed_bar_coverage,
-    diagnose_native_bar_rows, _source_time,
+    diagnose_native_bar_rows, _source_time, clean_completed_bars,
 )
 from trader.runtime_paths import repo_root
 from trader.time_utils import now_kst
@@ -317,6 +317,27 @@ def _stale_minute_anchor(coverage, observed_at):
     return observed_at.astimezone(KST).replace(second=0, microsecond=0).strftime("%H%M%S")
 
 
+def _current_batch_coverage(stored, fetched, observed_at):
+    """Skip redundant repair only if the latest native response supplies it.
+
+    A contradictory OHLCV row is never treated as coverage improvement:
+    persistence still performs the original three-observation quarantine.
+    """
+    merged = {}
+    for row in list((stored or {}).get("bars") or []) + list(fetched):
+        for bar in clean_completed_bars([row], observed_at):
+            key = bar["timestamp"]
+            if key in merged and merged[key] != bar:
+                return {}
+            merged[key] = bar
+    return inspect_completed_bar_coverage(
+        rows=[{**bar, "date": observed_at.date().isoformat(),
+               "time": datetime.fromisoformat(bar["timestamp"]).strftime("%H%M%S")}
+              for bar in merged.values()], now=observed_at,
+        source_conflicts=(stored or {}).get("source_conflicts"),
+    )
+
+
 def run_once(*, kis, codes: list[str], observed_at: datetime,
              sleep_between: float = 0.8, refresh_clock=None) -> dict:
     """No order methods are called; all I/O is read-only KIS and local proofs."""
@@ -386,8 +407,8 @@ def run_once(*, kis, codes: list[str], observed_at: datetime,
             # The original value and conflict quarantine remain intact until
             # the normal multi-read proof resolves it. Maximum two targeted
             # reads per repair cycle to preserve the observer-only KIS budget.
-            if conflict_due:
-                anchors.extend(_conflict_repair_anchors(code, unresolved, observed_at))
+            conflict_anchors = _conflict_repair_anchors(code, unresolved, observed_at) if conflict_due else []
+            anchors.extend(conflict_anchors)
             anchors = list(dict.fromkeys(anchors))
             if repair_due or conflict_due:
                 logger.info(
@@ -396,11 +417,23 @@ def run_once(*, kis, codes: list[str], observed_at: datetime,
                     code, opening_coverage.get("opening_count"), anchors,
                 )
             data: list[dict] = []
-            for anchor in dict.fromkeys(anchors):
+            for index, anchor in enumerate(anchors):
                 try:
                     request_at = (refresh_clock().astimezone(KST) if refresh_clock else observed_at)
-                    if request_at.date() != session_date:
+                    if request_at.date() != session_date or request_at.time() > dtime(15, 5):
                         break
+                    if index and data and anchor not in conflict_anchors:
+                        # Most KIS latest-window responses contain multiple
+                        # completed minutes. Reassess before issuing an old
+                        # repair request; don't query a hole that is now filled.
+                        current = _current_batch_coverage(stored, data, request_at)
+                        if (current.get("state") == "COVERED"
+                                or current.get("native_post_open_window_ready")):
+                            logger.info(
+                                "[KR][OPENING_OBSERVER][REPAIR_SUPERSEDED] code=%s anchor=%s action=SKIP_REDUNDANT_NATIVE_READ",
+                                code, anchor,
+                            )
+                            continue
                     minute_requests += 1
                     try:
                         rows = kis.get_intraday_candles_today(
@@ -433,7 +466,9 @@ def run_once(*, kis, codes: list[str], observed_at: datetime,
             # a verified VWAP remain fail-closed at their original gate.
             try:
                 quote_requests += 1
-                quote = kis.get_price_snapshot(code, market="J")
+                native_observer_quote = getattr(kis, "get_kr_observer_quote", None)
+                quote = (native_observer_quote(code) if callable(native_observer_quote)
+                         else kis.get_price_snapshot(code, market="J"))
                 if not isinstance(quote, dict):
                     quote = {}
             except Exception as quote_exc:
@@ -487,6 +522,7 @@ def run_once(*, kis, codes: list[str], observed_at: datetime,
             # request the 09:15 repair anchor if that first replay still left
             # unobserved original minutes. A full proof needs no extra read.
             if (coverage["reason"] == "OPENING_BARS_MISSING_OR_INCOMPLETE"
+                    and not coverage.get("native_post_open_window_ready")
                     and repair_due):
                 try:
                     repair_at = (refresh_clock().astimezone(KST) if refresh_clock else observed_at)
@@ -664,15 +700,21 @@ def main() -> None:
     # PREP contract is actually verified.  No stale prior-day fallback.
     codes: list[str] = []
     kis = None
-    schedule = CandidateSchedule(max_batch=6)
+    # Wake frequently to pick up newly HOT symbols and the next due
+    # subset. Per-symbol periods still bound REST demand; no all-Final30
+    # scan, and an explicit slower interval continues to slow polling.
+    configured_period = max(15.0, float(args.interval_sec))
+    planner_wake_sec = min(15.0, configured_period)
+    schedule = CandidateSchedule(max_batch=6, hot_sec=max(45, int(configured_period)),
+                                 warm_sec=max(180, int(configured_period)))
     last_capacity_warning_key = None
     last_idle_key = None
     last_idle_logged_at = 0.0
     scope = get_account_key(env="practice")
     logger.info(
-        "[KR][OPENING_OBSERVER][COLLECTOR_BOOT] date=%s module=%s interval_sec=%s "
+        "[KR][OPENING_OBSERVER][COLLECTOR_BOOT] date=%s module=%s interval_sec=%s planner_wake_sec=%.1f hot_period_sec=%s warm_period_sec=%s "
         "collection_scope=VERIFIED_PB1_HOT_WARM_ONLY",
-        today, __file__, args.interval_sec,
+        today, __file__, args.interval_sec, planner_wake_sec, schedule.periods["hot"], schedule.periods["warm"],
     )
     while True:
         now = now_kst()
@@ -703,12 +745,12 @@ def main() -> None:
             # are eligible for high-frequency native collection.
             native_priority = {**priority, "cold": []}
             health = schedule.diagnostics(
-                native_priority, now, interval_sec=float(args.interval_sec),
+                native_priority, now, interval_sec=planner_wake_sec,
             )
             warning_key = (
                 priority["state"], tuple(health["tiers"][tier]["count"]
                                          for tier in ("hot", "warm", "cold")),
-                round(float(args.interval_sec), 3),
+                round(configured_period, 3),
             )
             if health["overcommitted"] and warning_key != last_capacity_warning_key:
                 logger.warning(
@@ -723,6 +765,11 @@ def main() -> None:
             last_capacity_warning_key = warning_key
             selected = schedule.select(native_priority, now)
             if not selected:
+                if priority["state"] == "PB1_ACTIVE" and (priority["hot"] or priority["warm"]):
+                    # A nonempty verified shortlist with nothing due is not
+                    # a collection-target outage. Keep per-symbol due periods.
+                    time.sleep(min(5.0, planner_wake_sec))
+                    continue
                 # A missing/mismatched priority manifest means zero broker
                 # 1m requests. Distinguish this P0 fault from a legitimate
                 # owner-selected empty shortlist, without adding COLD I/O.
@@ -792,7 +839,7 @@ def main() -> None:
             result["native_quote_request_attempts"],
             result["native_request_failures"],
         )
-        time.sleep(max(1.0, max(15.0, float(args.interval_sec)) - elapsed))
+        time.sleep(max(1.0, planner_wake_sec - elapsed))
 
 
 if __name__ == "__main__":

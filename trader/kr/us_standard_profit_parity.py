@@ -11,6 +11,7 @@ import json
 import math
 import os
 from dataclasses import dataclass
+from datetime import date
 from typing import Any, Mapping
 
 from trader.us.market_state_overlay import resolve_profit_capture_stage_quantity
@@ -166,6 +167,63 @@ class StageDecision:
     order_authorized: bool = False
 
 
+def verified_tp_retry_remainder(state: Mapping[str, Any]) -> int | None:
+    """Validate immutable stage target against original cancelled attempts.
+
+    RETRY_READY is never inferred from a status flag or a broker-free ACK.
+    Each archived attempt must account for its entire originally requested
+    quantity, with zero open shares and positive native cancellation proof.
+    """
+    def exact(value):
+        if isinstance(value, bool):
+            raise ValueError("boolean quantity")
+        if isinstance(value, int) and value >= 0:
+            return value
+        if isinstance(value, str) and value.isascii() and value.isdecimal():
+            return int(value)
+        raise ValueError("unverified quantity")
+    try:
+        if state.get("status") != "RETRY_READY" or state.get("stage") not in {"TP1", "TP2", "TP3", "PROFIT_DEFENSE_PARTIAL", "RUNNER_FINAL"}:
+            return None
+        target = exact(state["target_qty"])
+        history = state.get("cancelled_attempts")
+        if target <= 0 or not isinstance(history, list) or not history:
+            return None
+        total, keys, odnos = 0, set(), set()
+        for row in history:
+            key = row["client_order_key"]
+            raw_odno = row["broker_odno"]
+            trade_day = row["trade_date"]
+            digest = row.get("native_row_sha256")
+            if (not isinstance(key, str) or not key.strip() or key != key.strip()
+                    or not isinstance(raw_odno, str) or not raw_odno.isascii()
+                    or not raw_odno.isdecimal() or int(raw_odno) <= 0
+                    or not isinstance(trade_day, str)
+                    or date.fromisoformat(trade_day).isoformat() != trade_day
+                    or not isinstance(digest, str) or len(digest) != 64
+                    or any(c not in "0123456789abcdef" for c in digest)):
+                return None
+            # KIS ODNO may be padded differently on subsequent observations.
+            # A different spelling of the same native order is not a new attempt.
+            odno = (trade_day, int(raw_odno))
+            if key in keys or odno in odnos:
+                return None
+            ordered, filled, cancelled = (exact(row[k]) for k in (
+                "requested_qty", "filled_qty", "cancelled_qty"))
+            if (row.get("source") != "KIS_DAILY_CCLD_CANCEL_VERIFIED"
+                    or ordered != target-total or cancelled <= 0
+                    or filled+cancelled != ordered or exact(row["open_qty"]) != 0):
+                return None
+            total += filled
+            keys.add(key)
+            odnos.add(odno)
+        if total != exact(state["cumulative_filled_qty"]) or total >= target:
+            return None
+        return target-total
+    except (KeyError, ValueError, TypeError, AttributeError, OverflowError):
+        return None
+
+
 def calculate_next_tp_stage(
     *,
     contract: Mapping[str, Any], stage_states: Mapping[str, Mapping[str, Any]],
@@ -221,10 +279,25 @@ def calculate_next_tp_stage(
             # accepted or partially-filled TP is absent. Require a separate
             # exact broker cancellation + cumulative fill observation first.
             return StageDecision("BLOCK", name, reason="RETRY_REQUIRES_BROKER_PROOF")
-        if status != "NOT_TRIGGERED":
+        if status not in {"NOT_TRIGGERED", "RETRY_READY"}:
             return StageDecision("BLOCK", name, reason="STAGE_STATE_UNKNOWN")
         if gain + 1e-12 < threshold:
             return StageDecision("HOLD", name, reason="TP_THRESHOLD_NOT_MET")
+        if status == "RETRY_READY":
+            remaining = verified_tp_retry_remainder(state)
+            if remaining is None:
+                return StageDecision("BLOCK", name, reason="TP_CANCEL_RETRY_PROOF_INVALID")
+            capacity = resolve_profit_capture_stage_quantity(
+                holding_qty=q, sell_fraction=frac,
+                runner_min_remain_pct=RUNNER_MIN_REMAIN_PCT,
+                stage_target_qty=remaining, stage_filled_qty=0,
+            )
+            if min(capacity, orderable) < remaining:
+                return StageDecision("BLOCK", name, reason="TP_CANCEL_RETRY_REMAINING_QTY_UNAVAILABLE")
+            active = contract.get("activation_mode") == "ACTIVE_PRACTICE"
+            return StageDecision("ACTIVE_TP" if active else "SHADOW_TP", name, remaining,
+                                 reason="KIS_CANCEL_PROVEN_EXACT_REMAINING_STAGE",
+                                 order_authorized=False)
         # Do not reuse yesterday's target qty across an unproven new lifecycle.
         target = state.get("target_qty") or 0
         filled = state.get("filled_qty") or 0

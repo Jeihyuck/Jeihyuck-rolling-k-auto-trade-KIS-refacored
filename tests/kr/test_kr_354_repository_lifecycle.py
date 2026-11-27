@@ -20,8 +20,42 @@ from trader.db.trading_epoch import active_trading_epoch_id
 from tests.kr.execution_claim_fixtures import create_schema_with_active_test_epoch
 
 
-def test_signed_buy_fill_crash_then_recovery_and_native_sell_once():
-    engine = sa.create_engine("sqlite:///:memory:")
+@pytest.fixture(params=["sqlite", "postgres"])
+def isolated_lifecycle_engine(request):
+    import os
+    if request.param == "sqlite":
+        engine = sa.create_engine("sqlite:///:memory:")
+        try:
+            yield engine
+        finally:
+            engine.dispose()
+        return
+    url = os.getenv("PBCORE_TEST_POSTGRES_URL")
+    if not url:
+        pytest.skip("disposable PostgreSQL test database not configured")
+    # Unique CI-only schema. Never use the operational database URL.
+    schema_name = "kr401_" + uuid4().hex
+    admin = sa.create_engine(url)
+    if admin.dialect.name != "postgresql":
+        admin.dispose()
+        pytest.fail("PBCORE_TEST_POSTGRES_URL must be PostgreSQL")
+    with admin.begin() as conn:
+        conn.execute(sa.text(f'CREATE SCHEMA "{schema_name}"'))
+    engine = sa.create_engine(url, connect_args={"options": f"-csearch_path={schema_name}"})
+    try:
+        yield engine
+    finally:
+        engine.dispose()
+        with admin.begin() as conn:
+            conn.execute(sa.text(f'DROP SCHEMA "{schema_name}" CASCADE'))
+        admin.dispose()
+
+
+@pytest.mark.parametrize('profit_mode', ['LEGACY', 'ACTIVE_PRACTICE'])
+def test_signed_buy_fill_crash_then_recovery_and_native_sell_once(monkeypatch, profit_mode, isolated_lifecycle_engine):
+    monkeypatch.setenv('KIS_ENV', 'practice')
+    monkeypatch.setenv('KR_SWING_US_PROFIT_MODE', profit_mode)
+    engine = isolated_lifecycle_engine
     schema = create_schema_with_active_test_epoch(engine)
     env, owner, code, market = "practice", "pb1_pullback_close", "035760", "KOSDAQ"
     account = get_account_key(env=env)
@@ -103,7 +137,7 @@ def test_signed_buy_fill_crash_then_recovery_and_native_sell_once():
     positions.apply_fill(
         env=env, strategy=owner, sid=1, mode=1, code=code, market=market,
         side="BUY", qty=10, price=2000, fee=0, tax=0, filled_at=stamp,
-        entry_exit_plan=plan, portfolio_epoch_id=portfolio,
+        entry_exit_plan={} if profit_mode == "ACTIVE_PRACTICE" else plan, portfolio_epoch_id=portfolio,
         position_cycle_id=cycle, order_id=str(order_id),
         buy_application_cumulative_qty=10,
         buy_application_previous_confirmed_qty=0,
@@ -129,6 +163,10 @@ def test_signed_buy_fill_crash_then_recovery_and_native_sell_once():
     assert opened["entry_meta_json"]["entry_contract_sha256"] == frozen["entry_contract_sha256"]
     assert opened["entry_meta_json"]["source_buy_order_id"] == str(order_id)
     assert opened["entry_exit_plan_json"] == plan
+    if profit_mode == "ACTIVE_PRACTICE":
+        from trader.kr.us_standard_profit_parity import verified_contract
+        assert verified_contract(frozen["kr_us_profit_contract"])
+        assert opened["entry_meta_json"]["kr_us_profit_contract"] == frozen["kr_us_profit_contract"]
 
     sell_key = "pr354-sell-" + uuid4().hex
     sell_order_id, created = orders.create_intent_idempotent(
@@ -181,11 +219,59 @@ def test_signed_buy_fill_crash_then_recovery_and_native_sell_once():
     assert residual["qty"] == 6
     assert residual["entry_meta_json"]["entry_contract_sha256"] == frozen["entry_contract_sha256"]
     assert residual["entry_exit_plan_json"] == plan
+    if profit_mode == "ACTIVE_PRACTICE":
+        assert residual["entry_meta_json"]["kr_us_profit_contract"] == frozen["kr_us_profit_contract"]
     with engine.connect() as conn:
         rows = conn.execute(
             sa.select(schema.fills).where(schema.fills.c.trading_epoch_id == epoch)
         ).mappings().all()
     assert len(rows) == 2  # exact KIS BUY and SELL cumulative order identities
+
+    # Complete the remainder in a separate broker-proven order after restart.
+    # This tests accounting convergence, not live authorization of a TP stage.
+    final_key = "kr401-final-" + uuid4().hex
+    final_id, created = OrdersRepo(engine).create_intent_idempotent(
+        env=env, run_id=None, strategy=owner, sid=1, mode=1,
+        code=code, market=market, side="SELL", ord_type="LIMIT",
+        qty=6, limit_price=2200, stage="RUNNER_FINAL",
+        client_order_key=final_key, request_json={"source_buy_order_id": str(order_id)},
+        status="CREATED", account_id=account,
+        portfolio_epoch_id=portfolio, position_cycle_id=cycle,
+    )
+    assert created
+    assert OrdersRepo(engine).mark_submitted(
+        env, final_key, "0000005004", {"rt_cd":"0"},
+    ) == "SUBMITTED"
+    native_final = dict(
+        native_sell, order_id=str(final_id), qty=6, price=2200.0,
+        kis_odno="0000005004", trade_id="KR_KIS_CUM:KR401_FINAL",
+        raw_json={"kis_response": {"ord_dt":"20261106", "pdno":code,
+                                   "odno":"0000005004", "tot_ccld_qty":"6",
+                                   "tot_ccld_amt":"13200"}},
+    )
+    final_args = dict(
+        env=env, strategy=owner, sid=1, mode=1, code=code, market=market,
+        confirmed_cumulative_qty=6, fill_price=2200.0, filled_at=stamp,
+        position_cycle_id=cycle, portfolio_epoch_id=portfolio,
+        order_id=str(final_id), pre_order_holding_qty=6, broker_holding_qty=0,
+        native_original_order_price_proof=True,
+    )
+    for expected in (6, 0):
+        FillsRepo(engine).upsert_fill(**native_final)
+        assert PositionsRepo(engine).reconcile_sell_execution(**final_args)["qty_applied"] == expected
+    with engine.connect() as conn:
+        closed = conn.execute(sa.select(schema.positions).where(
+            sa.cast(schema.positions.c.position_cycle_id, sa.String) == cycle
+        )).mappings().one()
+        assert int(closed["qty"]) == 0
+        assert closed["status"] == "CLOSED"
+        assert float(closed["realized_pnl"]) == pytest.approx(1600)
+        assert closed["entry_meta_json"]["source_buy_order_id"] == str(order_id)
+        if profit_mode == "ACTIVE_PRACTICE":
+            assert closed["entry_meta_json"]["kr_us_profit_contract"] == frozen["kr_us_profit_contract"]
+        rows = conn.execute(sa.select(schema.fills).where(
+            schema.fills.c.trading_epoch_id == epoch)).mappings().all()
+        assert len(rows) == 3
 
 
 def test_pyramid_add_preserves_original_signed_buy_provenance():

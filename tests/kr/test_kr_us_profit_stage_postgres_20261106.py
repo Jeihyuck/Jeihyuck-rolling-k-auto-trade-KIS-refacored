@@ -407,3 +407,103 @@ def test_20261119_business_reject_not_database_disconnect():
     assert not _is_connection_poison_error(
         RuntimeError("KIS business rejection 40570000")
     )
+
+
+def _native_partial_cancel_row(**overrides):
+    row = {"pdno": "005930", "sll_buy_dvsn_cd": "01",
+           "ord_dt": DAY.strftime("%Y%m%d"), "odno": "0000012345",
+           "cncl_yn": "N", "ord_qty": "25", "tot_ccld_qty": "12",
+           "cncl_cfrm_qty": "13", "rjct_qty": "0", "rmn_qty": "0",
+           "tot_ccld_amt": "1272", "avg_prvs": "106"}
+    row.update(overrides)
+    return row
+
+
+@pytest.mark.parametrize("change", [
+    {"rmn_qty": "1"}, {"cncl_cfrm_qty": "12"}, {"rjct_qty": "1"},
+    {"ord_qty": "24"}, {"tot_ccld_qty": "13"}, {"odno": "0000099999"},
+    {"pdno": "012750"}, {"ord_dt": "20261105"}, {"cncl_yn": "Y"},
+    {"tot_ccld_amt": "0"}, {"avg_prvs": "120"},
+])
+def test_kr401_native_cancel_proof_requires_exact_terminal_shares(change):
+    from trader.kr.us_profit_stage_journal import verified_native_tp_cancellation
+    assert verified_native_tp_cancellation(
+        _native_partial_cancel_row(), code="005930", broker_odno="0000012345",
+        trade_date=DAY, requested_qty=25, filled_qty=12)
+    assert verified_native_tp_cancellation(
+        _native_partial_cancel_row(**change), code="005930", broker_odno="0000012345",
+        trade_date=DAY, requested_qty=25, filled_qty=12) is None
+
+
+def test_kr401_partial_cancel_retry_keeps_stage_target_and_original_attempt(stage_db):
+    from trader.kr.us_standard_profit_parity import _canonical_sha, calculate_next_tp_stage
+    args = dict(stage_db)
+    contract = {**args["contract"], "activation_mode": "ACTIVE_PRACTICE"}
+    contract["sha256"] = _canonical_sha({k:v for k,v in contract.items() if k!="sha256"})
+    args["contract"] = contract
+    original = "kr401-old"
+    assert reserve(args, "TP1", 25, original).accepted
+    assert observe(args, "TP1", original, "0000012345", 12).status == "PARTIAL_FILLED"
+    common = dict(**args, stage="TP1", client_order_key=original,
+                  broker_odno="0000012345", cumulative_filled_qty=12,
+                  broker_order_accepted=True, broker_fill_source="KIS_DAILY_CCLD_VERIFIED",
+                  source_trade_date=DAY)
+    assert not observe_broker_stage(**common, cancellation_row=_native_partial_cancel_row(rmn_qty="1")).accepted
+    assert not reserve(args, "TP1", 13, "not-yet-proven").accepted
+    result = observe_broker_stage(**common, cancellation_row=_native_partial_cancel_row())
+    assert result.accepted and result.status == "RETRY_READY"
+    states = load_frozen_stage_states(**args)
+    assert states["TP1"]["target_qty"] == 25
+    assert states["TP1"]["cumulative_filled_qty"] == 12
+    assert states["TP1"]["cancelled_attempts"][0]["cancelled_qty"] == 13
+    def decision(**extra):
+        return calculate_next_tp_stage(contract=contract, stage_states=states,
+                                      holding_qty=88, orderable_qty=88,
+                                      verified_entry_price=100, executable_price=106,
+                                      **extra)
+    assert decision().target_qty == 13
+    assert decision().action == "ACTIVE_TP"
+    assert decision().order_authorized is False
+    assert decision(unresolved_sell=True).action == "BLOCK"
+    assert not reserve(args, "TP1", 12, "wrong-quantity").accepted
+    assert not reserve(args, "TP1", 13, original).accepted
+    assert not reserve(args, "TP2", 20, "premature-next-stage").accepted
+    assert reserve(args, "TP1", 13, "kr401-new").accepted
+    pending = load_frozen_stage_states(**args)["TP1"]
+    assert pending["target_qty"] == 25 and pending["attempt_target_qty"] == 13
+    assert observe_broker_stage(**common, cancellation_row=_native_partial_cancel_row()).accepted
+    assert load_frozen_stage_states(**args)["TP1"]["client_order_key"] == "kr401-new"
+    assert not observe(args, "TP1", "kr401-new", "0000012346", 14).accepted
+    assert observe(args, "TP1", "kr401-new", "0000012346", 13).status == "FILLED"
+    final = load_frozen_stage_states(**args)["TP1"]
+    assert final["cumulative_filled_qty"] == final["target_qty"] == 25
+    assert final["broker_fill_proven"] is True
+    assert observe_broker_stage(**common, cancellation_row=_native_partial_cancel_row()).accepted
+    assert load_frozen_stage_states(**args)["TP1"] == final
+    assert reserve(args, "TP2", 18, "new-tp2").accepted
+
+
+@pytest.mark.parametrize("stage", ["PROFIT_DEFENSE_PARTIAL", "RUNNER_FINAL"])
+def test_kr401_native_runner_cancellation_retains_original_target(stage_db, stage):
+    from trader.kr.us_standard_profit_parity import _canonical_sha
+    args = dict(stage_db)
+    contract = {**args["contract"], "activation_mode": "ACTIVE_PRACTICE"}
+    contract["sha256"] = _canonical_sha({k:v for k,v in contract.items() if k!="sha256"})
+    args["contract"] = contract
+    _prove_three_tp_stages(args)
+    old, new = "kr401-runner-original", "kr401-runner-residual"
+    assert reserve(args, stage, 25, old).accepted
+    assert observe(args, stage, old, "0000012345", 12).status == "PARTIAL_FILLED"
+    common = dict(**args, stage=stage, client_order_key=old, broker_odno="0000012345",
+                  cumulative_filled_qty=12, broker_order_accepted=True,
+                  broker_fill_source="KIS_DAILY_CCLD_VERIFIED", source_trade_date=DAY)
+    assert not observe_broker_stage(**common, cancellation_row=_native_partial_cancel_row(rmn_qty="1")).accepted
+    assert observe_broker_stage(**common, cancellation_row=_native_partial_cancel_row()).status == "RETRY_READY"
+    assert not reserve(args, stage, 12, new).accepted
+    assert not reserve(args, stage, 13, old).accepted
+    assert reserve(args, stage, 13, new).accepted
+    assert observe_broker_stage(**common, cancellation_row=_native_partial_cancel_row()).accepted
+    assert observe(args, stage, new, "0000012346", 13).status == "FILLED"
+    result = load_frozen_stage_states(**args)[stage]
+    assert result["target_qty"] == result["cumulative_filled_qty"] == 25
+    assert result["broker_fill_proven"] is True

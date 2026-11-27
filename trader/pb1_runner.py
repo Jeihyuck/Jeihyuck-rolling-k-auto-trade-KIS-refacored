@@ -298,6 +298,37 @@ def _merge_warning_counts(base: dict[str, int], incoming: dict[str, Any] | None)
     return merged
 
 
+_KR_RETRYABLE_TICK_ERRORS = {
+    "RETRYABLE_MARKET_DATA_ERROR": "market_data_error_ticks",
+    "RETRYABLE_ORDER_BUILD_ERROR": "order_build_error_ticks",
+}
+
+
+def _accumulate_kr_tick_outcome(
+    session_metrics: dict[str, int], warning_counts: dict[str, int],
+    *, status: str, reason: str,
+) -> bool:
+    """One returned tick, not one order. Keep transient errors across later WAITs.
+
+    The scheduler's last-tick status remains separate from session health:
+    changing a historical warning into a retry command can duplicate orders.
+    """
+    status_u = str(status or "UNKNOWN").upper()
+    reason_u = str(reason or "").upper()
+    error_key = _KR_RETRYABLE_TICK_ERRORS.get(status_u)
+    if error_key:
+        session_metrics[error_key] = int(session_metrics.get(error_key, 0)) + 1
+        warning_counts[error_key] = int(warning_counts.get(error_key, 0)) + 1
+        return True
+    if status_u == "OK_NO_TRADE":
+        key = {
+            "KR_ENTRY_TIMING_POLICY_WAIT": "entry_policy_wait_ticks",
+            "OPENING_30MIN_BUY_BLOCK": "opening_buy_block_ticks",
+        }.get(reason_u, "other_no_trade_ticks")
+        session_metrics[key] = int(session_metrics.get(key, 0)) + 1
+    return False
+
+
 def _warning_total(counts: dict[str, Any] | None) -> int:
     return sum(int(value or 0) for value in dict(counts or {}).values())
 
@@ -310,7 +341,11 @@ def _resolve_session_terminal_state(*, result_status: str, exit_reason: str, war
         return "SESSION_END_FATAL"
     if status.startswith("SKIP") or exit_reason_norm.startswith("phase_guard_skip"):
         return "SESSION_END_SKIPPED"
-    if status in {"OK_DEGRADED", "DEGRADED_POSTPROCESS"} or counts.get("degraded_stage_count", 0) > 0:
+    if (
+        status in {"OK_DEGRADED", "DEGRADED_POSTPROCESS", *_KR_RETRYABLE_TICK_ERRORS}
+        or counts.get("degraded_stage_count", 0) > 0
+        or any(counts.get(key, 0) > 0 for key in _KR_RETRYABLE_TICK_ERRORS.values())
+    ):
         return "SESSION_END_OK_DEGRADED"
     if _warning_total(counts) > 0 or status in {"WARN_FAIL_OPEN", "OK_WITH_WARNINGS"}:
         return "SESSION_END_OK_WITH_WARNINGS"
@@ -3967,6 +4002,7 @@ def _sleep_until_start_aligned_tick(
     loop_interval: int,
     current_monotonic: float | None = None,
     current_kst: datetime | None = None,
+    fresh_policy_wait_resume: bool = False,
 ) -> float:
     """Wait for the next *start-aligned* slot, not tick-finish + interval.
 
@@ -3982,12 +4018,45 @@ def _sleep_until_start_aligned_tick(
     if remaining_session <= 0:
         return 0.0
     skipped = max(0, int(elapsed // period))
+    if skipped and fresh_policy_wait_resume:
+        # A completed, clean policy WAIT has no broker side effect to replay.
+        # Start one NEW full tick after a short rest, never run catch-up ticks
+        # or overlap writers. Keep the original alignment for error/reconcile
+        # paths. This removes only the idle tail, not the tick workload.
+        delay = min(5.0, period, remaining_session)
+        logger.info(
+            "[PB1][LOOP][POLICY_WAIT_RESUME] skipped=%d elapsed_sec=%.3f sleep=%.3f action=FRESH_SERIAL_TICK",
+            skipped, elapsed, delay,
+        )
+        return delay
     if skipped:
         logger.warning(
             "[PB1][LOOP][MISSED_START_SLOT] skipped=%d elapsed_sec=%.3f interval_sec=%.1f action=SKIP_NO_CATCHUP",
             skipped, elapsed, period,
         )
     return max(0.0, min(next_slot - elapsed, remaining_session))
+
+
+def _kr_fresh_policy_wait_resume(*, env: str, strategy: str, session_kind: str,
+                                 status: str, metrics: dict[str, Any]) -> bool:
+    """Only verified clean PB1 practice timing WAITs may shorten overrun idle."""
+    if (env != "practice" or strategy != "pb1_pullback_close"
+            or session_kind not in {"am", "afternoon", "pm"}
+            or status != "OK_NO_TRADE"
+            or metrics.get("tick_result_reason") != "KR_ENTRY_TIMING_POLICY_WAIT"
+            or metrics.get("degraded")
+            or metrics.get("kr_infinite_decision") != "WAIT"
+            or str(os.getenv("PB1_PENDING_RECONCILE_ONLY") or "0") == "1"
+            or os.getenv("KR_PB1_FRESH_POLICY_WAIT_RESUME", "1") != "1"):
+        return False
+    # Missing transport counters are not proof of a clean no-order tick.
+    for key in ("api_submitted", "buy_orders", "sell_orders"):
+        if key not in metrics or metrics[key] != 0:
+            return False
+    for key in ("accepted", "rejected", "filled", "buy_orders_ack", "sell_orders_ack"):
+        if metrics.get(key, 0) != 0:
+            return False
+    return not any((metrics.get("warning_counts") or {}).values())
 
 
 _WINDOW_MISMATCH_LOGGED = False
@@ -8640,6 +8709,8 @@ def run_once(
         "order_candidates": int((getattr(engine_runner, "_run_summary_payload", {}) or {}).get("order_candidates", 0)),
         "api_submitted": int((getattr(engine_runner, "_run_summary_payload", {}) or {}).get("api_submitted", (getattr(engine_runner, "_run_summary_payload", {}) or {}).get("submitted", 0))),
         "degraded": bool(getattr(result, "status", "") == "DEGRADED_POSTPROCESS"),
+        "tick_result_reason": str(getattr(result, "notes", None) or ""),
+        "strategy_owner": str(getattr(engine_runner, "STRATEGY_NAME", "") or ""),
         # A terminal tick skip is NOT the number of skipped *order intents*.
         # Carry both evidence types separately; absent order-skip count is
         # unknown, not a verified zero.
@@ -9183,7 +9254,11 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                     else:
                         os.environ.pop("PB1_PENDING_RECONCILE_ONLY", None)
                 session_warning_counts = _merge_warning_counts(session_warning_counts, metrics.get("warning_counts"))
-                if bool(metrics.get("degraded", False)) or str(result_status or "").startswith("DEGRADED"):
+                retryable_error = _accumulate_kr_tick_outcome(
+                    session_metrics, session_warning_counts,
+                    status=result_status, reason=metrics.get("tick_result_reason", ""),
+                )
+                if retryable_error or bool(metrics.get("degraded", False)) or str(result_status or "").startswith("DEGRADED"):
                     ticks_degraded += 1
                 elif result_status in {"NO_TRADE", "OK_NO_TRADE", "OK_NO_CANDIDATES", "HANDOFF_TO_CLOSE", "NONTRADING_SMOKE_DONE"}:
                     ticks_no_trade += 1
@@ -9241,6 +9316,11 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                         tick_started_monotonic=tick_started_monotonic,
                         session_end_dt=session_end_dt,
                         loop_interval=loop_interval,
+                        fresh_policy_wait_resume=_kr_fresh_policy_wait_resume(
+                            env=ctx.env, strategy=last_tick_metrics.get("strategy_owner", ""),
+                            session_kind=session_kind,
+                            status=result_status, metrics=last_tick_metrics,
+                        ),
                     )
                     logger.info(
                         "[PB1][LOOP] no-trade tick only -> continue result_status=%s sleep=%.0fs session_end=%s",
@@ -9520,6 +9600,18 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             "exit_reason": exit_reason,
             "ticks_total": int(session_metrics.get("ticks_total", ticks_total) or 0),
             "ticks_completed": int(session_metrics.get("ticks_completed", 0) or 0),
+            # Keep the control status for backward compatibility. Health is
+            # a whole-session observation, not a request to replay orders.
+            "operation_health": (
+                "FAILED" if ticks_fatal else "DEGRADED" if ticks_degraded
+                else "UNKNOWN" if not session_metrics.get("ticks_completed") else "OK"
+            ),
+            "last_tick_status": str(last_result_status or "UNKNOWN"),
+            "market_data_error_ticks": int(session_metrics.get("market_data_error_ticks", 0)),
+            "order_build_error_ticks": int(session_metrics.get("order_build_error_ticks", 0)),
+            "entry_policy_wait_ticks": int(session_metrics.get("entry_policy_wait_ticks", 0)),
+            "opening_buy_block_ticks": int(session_metrics.get("opening_buy_block_ticks", 0)),
+            "other_no_trade_ticks": int(session_metrics.get("other_no_trade_ticks", 0)),
             "ticks_degraded": int(ticks_degraded),
             "ticks_fatal": int(ticks_fatal),
             "ticks_timeout": int(session_warning_counts.get("timeout_count", 0)),
