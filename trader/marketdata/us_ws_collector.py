@@ -110,6 +110,50 @@ def get_quote(symbol: str, exchange: str, *, env: str, max_age_sec: float = 15,
         return None
 
 
+def get_quotes_many(pairs: list[tuple[str, str]], *, env: str, max_age_sec: float = 5,
+                    timeout_sec: float = .2) -> dict:
+    """One bounded read-only IPC round trip for up to 16 requested pairs.
+
+    Never invent quotes or combine generations. A partial response is usable
+    only for the exact requested pair and independently fresh quote.
+    """
+    if not enabled() or not 1 <= len(pairs) <= 16:
+        return {}
+    try:
+        normalized = [(str(s).strip().upper(), str(e).strip().upper()) for s,e in pairs]
+        if (len(set(normalized)) != len(normalized)
+                or any(not s or not e or len(s)>16 or len(e)>12 for s,e in normalized)):
+            return {}
+        reply = _send_request(env, {"cmd":"QUOTE_MANY",
+            "pairs":[{"symbol":s,"exchange":e} for s,e in normalized],
+            "max_age_sec":min(30.,max(.05,float(max_age_sec)))},timeout_sec=timeout_sec)
+        if not reply or reply.get("status")!="OK" or not reply.get("generation"):
+            return {}
+        rows=reply.get("quotes")
+        if not isinstance(rows,list) or len(rows)>len(normalized):
+            return {}
+        result={}
+        seen=set()
+        import math
+        for row in rows:
+            pair=(row.get("symbol"),row.get("exchange"))
+            if pair not in normalized or pair in seen:
+                return {}
+            seen.add(pair)
+            q=row.get("quote")
+            if not isinstance(q,dict):
+                continue
+            received=float(q.get("received_at") or 0)
+            last=float(q.get("last") or 0)
+            if (not math.isfinite(last) or last<=0 or not 0<=time.time()-received<=max_age_sec
+                    or q.get("stale") or q.get("suspect")):
+                continue
+            result[pair]={**q,"source":"KIS_WEBSOCKET_COLLECTOR","collector_generation":reply["generation"]}
+        return result
+    except (OSError,ValueError,RuntimeError,TypeError,AttributeError,OverflowError):
+        return {}
+
+
 def subscribe_many(pairs: list[tuple[str, str]], *, env: str,
                    timeout_sec: float = 0.5) -> bool:
     """Best-effort READ-ONLY subscription warmup, never a quote/order truth.
@@ -197,6 +241,30 @@ def _reply(request: dict, *, env: str, generation: str, service) -> dict:
         return {"status": "OK" if accepted == len(valid) else "SUBSCRIPTION_DISABLED",
                 "generation": generation, "subscribed": accepted,
                 "collector": "READ_ONLY"}
+    if request.get("cmd") == "QUOTE_MANY":
+        pairs=request.get("pairs")
+        if not isinstance(pairs,list) or not 1<=len(pairs)<=16:
+            return {"status":"BAD_REQUEST"}
+        normalized=[]
+        for item in pairs:
+            if not isinstance(item,dict):
+                return {"status":"BAD_REQUEST"}
+            s=str(item.get("symbol") or "").strip().upper()
+            e=str(item.get("exchange") or "").strip().upper()
+            if not s or not e or len(s)>16 or len(e)>12 or (s,e) in normalized:
+                return {"status":"BAD_REQUEST"}
+            normalized.append((s,e))
+        age=max(.05,min(float(request.get("max_age_sec") or 5),30.))
+        quotes=[]
+        for s,e in normalized:
+            if service.subscribe_us(s,e) is False:
+                continue
+            quote=service.get_fresh_quote("US",s,max_age_sec=age)
+            if isinstance(quote,dict):
+                # Bound response size; never return arbitrary provider metadata.
+                quotes.append({"symbol":s,"exchange":e,"quote":{
+                    k:quote.get(k) for k in ("last","received_at","stale","suspect")}})
+        return {"status":"OK","generation":generation,"quotes":quotes,"collector":"READ_ONLY"}
     if request.get("cmd") != "QUOTE":
         return {"status": "BAD_REQUEST"}
     symbol = str(request.get("symbol") or "").strip().upper()

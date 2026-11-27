@@ -897,6 +897,29 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
     if not finish_us_prep_run(run_id=run_id, status=final_status, result=result_dict):
         return {"status": "ERROR", "stage": "prep_run_finish", "trade_date": trade_date}
 
+    if env == "practice" and not offline and not force_now:
+        try:
+            from trader.us.utils.session_guard import _child_fence_scope
+            from trader.db.trading_epoch import active_trading_epoch_id
+            from trader.us.entry_timing.opening_observer import (
+                publish_prep_collection_priority, start_prep_observer,
+            )
+            epoch = active_trading_epoch_id(env=env, required=True)
+            if not epoch:
+                raise RuntimeError("US_PREP_COLLECTION_EPOCH_UNVERIFIED")
+            scope = str(_child_fence_scope(env)) + ":" + str(epoch)
+            stats = publish_prep_collection_priority(env=env, scope=scope,
+                trade_date=trade_date, rows=final30_scored, contract=contract)
+            logger.info("[US_PREP][COLLECTION_PRIORITY] hot=%s warm=%s order_authorization=0",
+                        stats["hot"], stats["warm"])
+            if (os.getenv("US_OPENING_OBSERVER_ENABLED", "0") == "1"
+                    and os.getenv("US_ENTRY_OPPORTUNITY_MODE", "SHADOW").upper() in {"SHADOW","ENFORCE"}):
+                child = start_prep_observer(env=env, scope=scope, trade_date=trade_date, rows=final30_scored)
+                if child is not None:
+                    logger.info("[US_PREP][OPENING_OBSERVER_STARTED] pid=%s read_only=1", child.pid)
+        except Exception as exc:
+            logger.warning("[US_PREP][COLLECTION_PRIORITY_UNAVAILABLE] type=%s", type(exc).__name__)
+
     logger.info(
         "[US_PREP][FINISH] status=%s final30=%d score_nonzero=%d trade_can_proceed=%d",
         final_status, wl_final30, score_nonzero_count, trade_can_proceed,
