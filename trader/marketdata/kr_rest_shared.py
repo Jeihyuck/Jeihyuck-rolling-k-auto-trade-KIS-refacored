@@ -72,7 +72,8 @@ def _read(path, code):
         if not _valid(data, code, now):
             return None
         # Receipt identity is immutable; only its derived age changes.
-        return {**data, "age_sec": now - float(data["received_at"])}
+        return {**data, "age_sec": now - float(data["received_at"]),
+                "shared_transport": "KR_REST_FILE_CACHE"}
     except (OSError, ValueError, TypeError, OverflowError):
         return None
 

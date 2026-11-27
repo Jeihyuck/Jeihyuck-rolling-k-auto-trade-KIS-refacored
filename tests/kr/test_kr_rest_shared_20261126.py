@@ -116,6 +116,7 @@ def test_nonblocking_native_cache_read_preserves_receipt_and_expiry(monkeypatch)
         row = shared.read_cached(appkey=key, code="003490")
         assert row["received_at"] == original["received_at"]
         assert row["age_sec"] == 2
+        assert row["shared_transport"] == "KR_REST_FILE_CACHE"
         assert shared.read_cached(appkey=key + "-other", code="003490") is None
         monkeypatch.setattr(shared.time, "time", lambda: now + 6)
         assert shared.read_cached(appkey=key, code="003490") is None

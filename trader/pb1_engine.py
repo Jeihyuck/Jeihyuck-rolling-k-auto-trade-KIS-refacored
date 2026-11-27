@@ -6017,6 +6017,8 @@ class PB1Engine:
                     # These observations do NOT relax or authorize BUY.
                     "entry_policy": _timing.get("entry_policy", "LEGACY_V1"),
                     "adaptive_revision": _timing.get("adaptive_revision"),
+                    "entry_engine_revision": _timing.get("entry_engine_revision"),
+                    "signal_variant": _timing.get("signal_variant"),
                     "rebound_pattern": _timing.get("rebound_pattern"),
                     "diagnostic_entry_ceiling": _timing.get("diagnostic_entry_ceiling"),
                     "reference_source": _timing.get("reference_source"),

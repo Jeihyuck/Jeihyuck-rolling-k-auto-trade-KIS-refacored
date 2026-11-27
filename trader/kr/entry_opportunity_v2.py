@@ -179,7 +179,15 @@ def validate_live_quote(*, code, timing, quote, now, order_price, allow_passive=
     if None in (last, close, cap, price):
         return verdict("UNKNOWN", "V2_NATIVE_PRICE_UNVERIFIED")
     facts = dict(quote_age_sec=age, quote_source=source, quote_last=last,
-                 latest_bar_age_sec=bar_age)
+                 latest_bar_age_sec=bar_age, quote_received_at=receipt)
+    # Evidence only. A KIS_WEBSOCKET source is not itself proof that
+    # inter-process sharing was used. Do not copy raw responses or secrets.
+    if quote.get("shared_transport") == "KR_OWNER_UNIX_SOCKET":
+        facts.update(shared_transport="KR_OWNER_UNIX_SOCKET",
+                     shared_generation=quote.get("shared_generation"),
+                     shared_owner_pid=quote.get("shared_owner_pid"))
+    elif quote.get("shared_transport") == "KR_REST_FILE_CACHE":
+        facts.update(shared_transport="KR_REST_FILE_CACHE")
     if abs(last/close-1) > MAX_DEVIATION:
         return verdict("WAIT", "ORDER_PRICE_MOVED_FROM_CONFIRMED_BAR", **facts)
     if price > cap:
