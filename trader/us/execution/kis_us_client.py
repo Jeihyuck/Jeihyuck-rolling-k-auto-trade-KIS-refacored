@@ -1748,6 +1748,19 @@ class KisUSClient:
                     # the same Tick deadline; a timeout measured *before*
                     # those checks must not authorize a late native POST.
                     timeout = self._request_budget()
+                # A regular-session tick can reach this point after the exchange
+                # closes while waiting on quota, the writer or reservation I/O.
+                # Cancellations and reconciliation have separate session rules.
+                context = getattr(self, "_tick_context", None)
+                if (path == get_tr_info("us_buy_order")["path"]
+                        and getattr(context, "session", None) in {"am", "afternoon"}):
+                    from trader.us import market_calendar
+                    now = market_calendar.now_ny()
+                    if (context.trade_date != now.date().isoformat()
+                            or market_calendar.us_calendar_load_error()
+                            or now.year not in market_calendar.us_calendar_supported_years()
+                            or not market_calendar.is_us_regular_market_open(now)):
+                        raise KisUSPreSubmitError("US_REGULAR_SESSION_CLOSED_BEFORE_HTTP")
                 # A pre-HTTP callback may fence the attempt; a logged POST
                 # must not be fabricated when requests.post was never reached.
                 record_kis_http_call("POST", path)

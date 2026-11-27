@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import sqlite3
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -842,6 +843,40 @@ def start_prep_observer(*, env: str, scope: str, trade_date: str, rows: list[dic
         )
 
 
+def _run_hot_quote_observer(*, stop, session_valid, env, scope, trade_date,
+                            pairs, continuous, quote_reader, path):
+    """Watch collector quotes even while the native minute reader is blocked."""
+    from trader.us.entry_timing.hot_event_evaluator import poll_hot_events
+    from trader.us.market_calendar import regular_close_time_for_date
+
+    seen = {}
+    db = sqlite3.connect(path, timeout=0.1)
+    try:
+        while not stop.is_set():
+            now = datetime.now(NY)
+            if now.date().isoformat() != trade_date or now.time() >= regular_close_time_for_date(now.date()):
+                break
+            if session_valid() and (now.hour, now.minute) >= (10, 0):
+                try:
+                    lanes, state = collection_priorities(
+                        env=env, scope=scope, trade_date=trade_date, pairs=pairs,
+                        now_epoch=now.timestamp(), allow_prep_rebind=continuous)
+                    if state in {"VALID", "PREP_VALID"}:
+                        poll_hot_events(db, env=env, scope=scope, trade_date=trade_date,
+                                        hot_pairs=lanes["HOT"], now_et=now, quote_reader=quote_reader,
+                                        seen=seen, live_clock=lambda: datetime.now(NY))
+                    else:
+                        seen.clear()
+                except Exception as exc:
+                    db.rollback()
+                    LOG.warning("[US_HOT_EVENT][UNAVAILABLE] error=%s action=NO_ORDER", type(exc).__name__)
+            else:
+                seen.clear()
+            stop.wait(1.0)
+    finally:
+        db.close()
+
+
 def run_observer(*, env: str, trade_date: str, scope: str,
                  parent_pid: int, watchlist: list[dict],
                  min_interval_sec: float = 10.0,
@@ -879,8 +914,8 @@ def run_observer(*, env: str, trade_date: str, scope: str,
     interval = max(6.0, float(min_interval_sec))
     start = time.monotonic()
     next_poll = 0.0
-    next_event_poll = 0.0
-    event_seen = {}
+    event_stop = threading.Event()
+    event_worker = None
     pointer = 0
     priority_offsets = {"HOT": 0, "WARM": 0, "COLD": 0}
     last_priority_state = None
@@ -896,6 +931,7 @@ def run_observer(*, env: str, trade_date: str, scope: str,
             if now_et.date().isoformat() != trade_date or now_et.time() >= close_time:
                 break
             if continuous and time.monotonic() >= next_epoch_check:
+                epoch_verified = False
                 next_epoch_check = time.monotonic() + 60.0
                 try:
                     from trader.db.trading_epoch import active_trading_epoch_id
@@ -913,28 +949,21 @@ def run_observer(*, env: str, trade_date: str, scope: str,
             if (now_et.hour, now_et.minute) < (9, 25):
                 time.sleep(2.0)
                 continue
-            # Evaluate up to four HOT symbols between native minute slots.
-            # This process never owns trading or submission authority.
-            if (ws_on and (now_et.hour, now_et.minute) >= (10, 0)
-                    and time.monotonic() >= next_event_poll):
-                next_event_poll = time.monotonic() + 1.0
-                try:
-                    from trader.us.entry_timing.hot_event_evaluator import poll_hot_events
-                    event_lanes, event_state = collection_priorities(
-                        env=env, scope=scope, trade_date=trade_date, pairs=pairs,
-                        now_epoch=time.time(), allow_prep_rebind=continuous)
-                    if event_state in {"VALID","PREP_VALID"}:
-                        poll_hot_events(
-                            db, env=env, scope=scope, trade_date=trade_date,
-                            hot_pairs=event_lanes["HOT"], now_et=now_et,
-                            quote_reader=lambda sym, exch: get_quote(
-                                sym, exch, env=env, max_age_sec=5, timeout_sec=.11),
-                            seen=event_seen, live_clock=lambda: datetime.now(NY),
-                        )
-                    else:
-                        event_seen.clear()
-                except Exception as exc:
-                    LOG.warning("[US_HOT_EVENT][UNAVAILABLE] error=%s action=NO_ORDER", type(exc).__name__)
+            if ws_on and event_worker is None:
+                # Dedicated collector IPC and local SQLite connection. The
+                # main thread retains the native minute client and its quota.
+                def session_valid():
+                    if continuous:
+                        return epoch_verified and time.monotonic() < next_epoch_check
+                    return os.getppid() == parent_pid
+                event_worker = threading.Thread(
+                    name="us-hot-quote-observer", daemon=True, target=_run_hot_quote_observer,
+                    kwargs=dict(stop=event_stop, session_valid=session_valid, env=env, scope=scope,
+                                trade_date=trade_date, pairs=pairs, continuous=continuous,
+                                quote_reader=lambda sym, exch: get_quote(
+                                    sym, exch, env=env, max_age_sec=5, timeout_sec=.11),
+                                path=store_path(env=env, account_scope=scope, trade_date=trade_date)))
+                event_worker.start()
             if time.monotonic() < next_poll:
                 time.sleep(min(1.0, next_poll - time.monotonic()))
                 continue
@@ -1030,6 +1059,9 @@ def run_observer(*, env: str, trade_date: str, scope: str,
                 LOG.warning("[US_OPENING_OBSERVER][BAR_UNAVAILABLE] symbol=%s error=%s",
                             symbol, type(exc).__name__)
     finally:
+        event_stop.set()
+        if event_worker is not None:
+            event_worker.join(timeout=2.0)
         db.close()
     return 0
 
