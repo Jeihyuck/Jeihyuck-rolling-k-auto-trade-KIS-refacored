@@ -97,3 +97,18 @@ def test_disabled_by_default_and_real_is_not_enabled(monkeypatch):
     monkeypatch.setenv("KR_WS_SHARED_QUOTE_ENABLED", "1")
     assert shared.enabled("practice")
     assert not shared.enabled("real")
+
+
+def test_nonblocking_canonical_read_preserves_timestamp_and_never_fetches(monkeypatch):
+    key = "fixture-" + uuid.uuid4().hex
+    at = time.time()
+    try:
+        assert shared.read_cached(appkey=key, code="003490") is None
+        assert shared.read_or_fetch(appkey=key, code="003490", fetch=lambda: _quote(receipt=at))[0] == "FETCH"
+        assert shared.read_cached(appkey=key, code="003490")["received_at"] == at
+        assert shared.read_cached(appkey=key+"-other", code="003490") is None
+        assert shared.read_cached(appkey=key, code="012750") is None
+        monkeypatch.setattr(shared.time, "time", lambda: at+6)
+        assert shared.read_cached(appkey=key, code="003490") is None
+    finally:
+        _cleanup(key)

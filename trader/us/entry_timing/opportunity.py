@@ -94,6 +94,8 @@ def opening_coverage(bars: list[dict], trade_date: str) -> dict:
 def _opening_static_features(open_bars: list[dict], trade_date: str, min_opening_bars: int):
     """Exact original opening geometry and native VWAP calculation."""
     coverage = opening_coverage(open_bars, trade_date)
+    if coverage["observed_1m"] < min_opening_bars:
+        return coverage, None
     volume = sum(b["volume"] for b in open_bars)
     have_amount = (len(open_bars) >= min_opening_bars
                    and all(b.get("turnover") is not None for b in open_bars))
