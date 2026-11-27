@@ -140,14 +140,18 @@ def test_same_price_new_native_receipt_refreshes_hint_and_suspect_revokes(tmp_pa
 def test_hint_limit_applies_after_waiting_and_evidence_filter(tmp_path):
     from trader.us.entry_timing.hot_event_evaluator import read_hot_retry_hints
     td="2026-11-25"
+    manifest=observer.publish_preminute_candidates(env="practice",scope="scope:epoch",trade_date=td,
+        candidates=[(10,s,"NYSE",None,{"position_state":"NOT_HELD","entry_style":"ENTRY_PULLBACK"})
+                    for s in ("AAA","BBB","CCC","DDD","EEE","BAD")],now_epoch=90,base=tmp_path)
+    generation=manifest["generation"]
     db=observer.open_store(observer.store_path(env="practice",account_scope="scope:epoch",trade_date=td,base=tmp_path))
     try:
-        rows=[(td,s,"NYSE","g","valid",at,at-1,"READY")
+        rows=[(td,s,"NYSE",generation,"valid",at,at-1,"READY")
               for s,at in [("AAA",97),("BBB",99),("CCC",99),("DDD",99),("EEE",99)]]
-        rows += [(td,"BAD","NYSE","g","future",99,100,"READY")]
+        rows += [(td,"BAD","NYSE",generation,"future",99,100,"READY")]
         db.executemany("INSERT INTO hot_retry_events VALUES (?,?,?,?,?,?,?,?)",rows)
         db.commit()
-        got=read_hot_retry_hints(env="practice",scope="scope:epoch",trade_date=td,generation="g",
+        got=read_hot_retry_hints(env="practice",scope="scope:epoch",trade_date=td,generation=generation,
             waiting={("AAA","NYSE"),("BAD","NYSE")},now_epoch=100,base=tmp_path)
         assert got=={("AAA","NYSE")}
     finally:
@@ -274,6 +278,10 @@ def test_identical_republication_keeps_only_fresh_cross_tick_hot_hint(tmp_path,m
         assert hints(second,epoch+5)==set()  # quote age is six seconds
         changed=publish(epoch+2,pivot=101)
         assert changed["generation"]!=second["generation"]
+        assert hints(changed,epoch+2)==set()
+        assert hints(second,epoch+2)==set()  # superseded generation still has a fresh quote
+        manifest_path=observer.priority_manifest_path(**scope)
+        manifest_path.unlink()
         assert hints(changed,epoch+2)==set()
         expired=publish(epoch+183,pivot=101)
         assert expired["generation"]!=changed["generation"]
