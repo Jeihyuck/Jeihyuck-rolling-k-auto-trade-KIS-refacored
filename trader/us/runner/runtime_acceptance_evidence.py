@@ -125,6 +125,7 @@ def summarize_runtime(lines,*,expected_sha):
                 wake_uncertain+=1
         values=[]
         workload=Counter()
+        policy_workload=Counter()
         policy=degraded=unknown=0
         for key in sorted(keys & set(ended)-set(failed)):
             row=ended[key]
@@ -138,6 +139,7 @@ def summarize_runtime(lines,*,expected_sha):
                     and row.get("sell_liveness_status")=="OK" and row.get("entry_liveness_status")=="OK"
                     and row.get("reconcile_liveness_status") in {"OK","PENDING_SETTLEMENT"}):
                 policy+=1
+                policy_workload[tuple(row[f] for f in _WORKLOAD)]+=1
                 continue
             if (row.get("status") not in _NORMAL or row.get("classification")!="success"
                     or row.get("runtime_integrity_status")!="OK"
@@ -160,7 +162,8 @@ def summarize_runtime(lines,*,expected_sha):
                           "degraded":degraded,"unknown":unknown,"failed":len(keys & set(failed)),
                           "missing_result":len(keys & missing),"mean_sec":mean(values) if values else None,
                           "p50_sec":percentile(.5),"p95_sec":percentile(.95),"max_sec":max(values) if values else None,
-                          "workload":{"/".join(map(str,k)):v for k,v in sorted(workload.items())}}
+                          "workload":{"/".join(map(str,k)):v for k,v in sorted(workload.items())},
+                          "policy_workload":{"/".join(map(str,k)):v for k,v in sorted(policy_workload.items())}}
     blockers=[]
     if not re.fullmatch("[0-9a-f]{40}",str(expected_sha)): blockers.append("EXPECTED_SHA_INVALID")
     if malformed or conflicts or orphan or ambiguous: blockers.append("LOG_SCOPE_OR_IDENTITY_CONFLICT")
@@ -191,6 +194,11 @@ def compare_runtime(baseline,candidate,*,min_samples=20):
         # candidates or a missing protective lane is not a speedup.
         if b["workload"]!=c["workload"]:
             blockers.append(session+":NONCOMPARABLE_WORKLOAD")
+        # Policy-blocked ticks are separate, but cannot disappear from the
+        # like-for-like comparison of workload populations.
+        if (b["policy_blocked"]!=c["policy_blocked"]
+                or b["policy_workload"]!=c["policy_workload"]):
+            blockers.append(session+":NONCOMPARABLE_POLICY_WORKLOAD")
         if c["mean_sec"] is None or c["mean_sec"]>60:
             blockers.append(session+":MEAN_TICK_OVER_60_OR_UNKNOWN")
     return {"status":"PASS_LOG_TIMING_ONLY" if not blockers else "NOT_PROVEN",
