@@ -78,3 +78,31 @@ def test_protective_wakeup_is_separate_and_cannot_pad_or_hide_normal_work(case):
     assert am["attempted"]==am["normal"]==20
     assert am["total_attempted"]==21 and am["protective_wakeup_attempted"]==1
     assert report["operational_go"] is False
+
+
+@pytest.mark.parametrize("case", ["same", "missing", "different_workload"])
+def test_policy_blocked_population_cannot_disappear_from_timing_comparison(case):
+    def with_policy(sha, positions):
+        lines = list(rows(sha))
+        for session in ("am", "afternoon"):
+            scope = dict(trade_date="2026-11-25", session=session, run_id="run-"+session,
+                         tick_id="policy-1", code_sha=sha, native_practice=True,
+                         account_digest="d"*64)
+            data = dict(status="OK", runtime_integrity_status="POLICY_ENTRY_BLOCKED",
+                        sell_liveness_status="OK", entry_liveness_status="OK",
+                        reconcile_liveness_status="OK", tick_total_ms=50000,
+                        entry_can_proceed=False, exit_can_proceed=True,
+                        positions_evaluated=positions, raw_watchlist_candidates=30,
+                        intent_generation_attempted=0, orders_routed=1, fills_api_count=2)
+            lines.append("[US400_RUNTIME][ATTEMPT] payload="+json.dumps(scope))
+            lines.append("[US400_RUNTIME][RESULT] payload="+json.dumps(result_evidence(scope,data,wall_sec=50)))
+        return lines
+    baseline=summarize_runtime(with_policy("a"*40,12),expected_sha="a"*40)
+    candidate=summarize_runtime(list(rows("b"*40)) if case=="missing" else
+                                with_policy("b"*40,2 if case=="different_workload" else 12),
+                                expected_sha="b"*40)
+    report=compare_runtime(baseline,candidate)
+    assert baseline["sessions"]["am"]["policy_blocked"]==1
+    assert (report["status"]=="PASS_LOG_TIMING_ONLY")== (case=="same")
+    assert ("am:NONCOMPARABLE_POLICY_WORKLOAD" in report["blockers"]) == (case!="same")
+    assert report["operational_go"] is False
