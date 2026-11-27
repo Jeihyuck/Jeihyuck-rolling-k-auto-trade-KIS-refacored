@@ -438,7 +438,7 @@ def _kis_env() -> str:
 
 
 def _tp_decision_fresh_for_native_http(
-    intent: dict, *, now_utc=None, max_age_sec: float = 30.0,
+    intent: dict, *, now_utc=None, max_age_sec: float = 90.0,
 ) -> tuple[bool, str]:
     """Do not POST a queued old TP based on a prior Tick's executable price.
 
@@ -460,8 +460,11 @@ def _tp_decision_fresh_for_native_http(
         check_at = now_utc or _dt.now(_tz.utc)
         if decision_at.tzinfo is None or check_at.tzinfo is None:
             return False, "US_TP_DECISION_TIME_UNVERIFIED"
+        limit = float(max_age_sec)
+        if not 5.0 <= limit <= 90.0:
+            return False, "US_TP_DECISION_AGE_CONFIG_INVALID"
         age = (check_at - decision_at).total_seconds()
-        if not (0 <= age <= max(1.0, float(max_age_sec))):
+        if not (0 <= age <= limit):
             return False, "US_TP_DECISION_EXPIRED_BEFORE_HTTP"
     except (ValueError, TypeError, OverflowError):
         return False, "US_TP_DECISION_TIME_UNVERIFIED"
@@ -3295,9 +3298,9 @@ def route_order(
         ):
             try:
                 _tp_max_age = float(os.getenv(
-                    "US_TP_PRE_HTTP_MAX_DECISION_AGE_SEC", "30"
+                    "US_TP_PRE_HTTP_MAX_DECISION_AGE_SEC", "90"
                 ))
-                if not (5.0 <= _tp_max_age <= 120.0):
+                if not (5.0 <= _tp_max_age <= 90.0):
                     raise ValueError("max age outside safe bound")
             except (TypeError, ValueError, OverflowError):
                 raise KisUSPreSubmitError("US_TP_DECISION_AGE_CONFIG_INVALID") from None
@@ -3514,13 +3517,30 @@ def route_order(
                 symbol_upper, side, intent["submit_attempt_id"], failure_code,
                 type(exc).__name__, type(exc.__cause__).__name__,
             )
+            # Report a bounded allowlist of nested authority reasons. The
+            # outer guard remains the stable failure code for repair policy.
+            _authority_reason = "UNKNOWN"
+            _known_authority_causes = {
+                "US_STAGE4_WRITER_NOT_READY", "US_STAGE4_WRITER_STALE",
+                "US_STAGE4_WRITER_GENERATION_MISMATCH", "US_STAGE4_WRITER_TIMESTAMP_UNVERIFIED",
+                "US_STAGE4_WORKER_PROCESS_DEAD", "US_STAGE4_WRITER_DATABASE_UNAVAILABLE",
+                "US_STAGE4_RECONCILE_NOT_VERIFIED", "US_STAGE4_WRITER_POLICY_NOT_ARMED",
+                "US_STAGE4_WORKER_GENERATION_NOT_CONFIGURED",
+                "US_RESERVED_SUBMIT_AUTHORITY_STALE", "US_SUBMIT_AUTHORITY_IDENTITY_MISSING",
+                "RESERVATION_AUTHORITY_MISSING",
+            }
+            if exc.__cause__ is not None and str(exc.__cause__) in _known_authority_causes:
+                _authority_reason = str(exc.__cause__)
+            logger.info("[US_ORDER][PRE_IO_AUTHORITY_DETAIL] symbol=%s side=%s code=%s cause=%s",
+                        symbol_upper, side, failure_code, _authority_reason)
             integrity_error = str(exc)
             abort_journal_ok = False
             try:
                 append_order_event(
                     "BROKER_SUBMIT_ABORTED_PRE_IO", intent, context=context,
                     broker_status=failure_code,
-                    raw_response={"error_code": failure_code, "stage": "BEFORE_HTTP"},
+                    raw_response={"error_code": failure_code, "stage": "BEFORE_HTTP",
+                                  "authority_reason": _authority_reason},
                     require_db=_require_native_submit_journal,
                 )
                 abort_journal_ok = True

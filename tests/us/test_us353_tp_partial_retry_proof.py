@@ -137,3 +137,38 @@ def test_v3_all_tp_stages_allow_exact_verified_cancelled_partial_only(stage):
     for bad_qty in (1, 2, 4, 6, 10):
         evidence["qty"] = bad_qty
         assert not proven_partial_tp_remainder(**evidence)
+
+
+@pytest.mark.parametrize("contradiction", [
+    None, "missing_abort", "other_attempt", "broker_number", "positive_fill",
+    "positive_attempt_fill", "unknown_post", "matched_replay",
+])
+def test_partial_retry_after_proven_pre_http_abort_and_local_replay(contradiction):
+    evidence = proof()
+    abandoned = {"client_order_key": "aborted-order", "attempt_id": "aborted-attempt",
+                 "requested_qty": 3, "cumulative_filled_qty": 0,
+                 "attempt_state": "ABANDONED_PRE_SUBMIT", "authoritative": True}
+    evidence["prior_attempts"].append(abandoned)
+    base = {"client_order_key": "aborted-order", "submit_attempt_id": "aborted-attempt",
+            "cumulative_filled_qty": 0}
+    events = [
+        {**base, "event_type": "BROKER_SUBMIT_ABORTED_PRE_IO"},
+        {**base, "event_type": "JOURNAL_REPLAY_STARTED", "payload": {}},
+        {**base, "event_type": "JOURNAL_REPLAY_UNRESOLVED", "payload": {"broker_status": "NO_MATCH"}},
+    ]
+    if contradiction == "missing_abort":
+        events.pop(0)
+    elif contradiction == "other_attempt":
+        events[-1]["submit_attempt_id"] = "other"
+    elif contradiction == "broker_number":
+        events[-1]["canonical_broker_order_no"] = "123"
+    elif contradiction == "positive_fill":
+        events[-1]["cumulative_filled_qty"] = 1
+    elif contradiction == "positive_attempt_fill":
+        abandoned["cumulative_filled_qty"] = 1
+    elif contradiction == "unknown_post":
+        events.append({**base, "event_type": "BROKER_SUBMIT_RESULT_UNKNOWN"})
+    elif contradiction == "matched_replay":
+        events[-1]["payload"]["broker_status"] = "MATCHED"
+    evidence["prior_events"] = events
+    assert proven_partial_tp_remainder(**evidence) is (contradiction is None)

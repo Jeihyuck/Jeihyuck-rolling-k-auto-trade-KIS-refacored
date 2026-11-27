@@ -40,7 +40,7 @@ def build_us_close_five_axis_audit(report: dict) -> dict:
     # selected. The audit may say AUDIT_INCOMPLETE only because 5W1H is missing.
     if not chain or order_n is None or broker_n is None or broker_conflicts is None:
         broker_status = "UNVERIFIED"
-    elif broker_conflicts:
+    elif broker_conflicts or broker_n > order_n:
         broker_status = "CONFLICT"
     elif not order_n:
         broker_status = "NO_ORDERS_OBSERVED"
@@ -61,8 +61,13 @@ def build_us_close_five_axis_audit(report: dict) -> dict:
     verified_policies = sum(
         _nonnegative_int(verdicts.get(v)) or 0 for v in ("EXPECTED", "VERIFIED")
     )
-    if not chain or order_n is None or (order_n and not verdicts):
+    verdict_numbers = [_nonnegative_int(v) for v in verdicts.values()]
+    verdict_total = (sum(verdict_numbers) if all(v is not None for v in verdict_numbers)
+                     else None)
+    if not chain or order_n is None or verdict_total is None or (order_n and not verdicts):
         policy_status = "UNVERIFIED"
+    elif verdict_total > order_n:
+        policy_status = "CONFLICT"
     elif not order_n:
         policy_status = "NO_ORDERS_OBSERVED"
     elif pending or verified_policies != order_n:
@@ -83,7 +88,11 @@ def build_us_close_five_axis_audit(report: dict) -> dict:
          and str(row.get("side") or "").upper() == "SELL"]
         if isinstance(trades, list) else None
     )
-    if sells is None:
+    malformed_trade = (isinstance(trades, list) and any(
+        not isinstance(row, dict) or str(row.get("side") or "").upper() not in {"BUY", "SELL"}
+        for row in trades
+    ))
+    if sells is None or malformed_trade:
         economics_status = "UNVERIFIED"
         authoritative = None
     else:
@@ -116,7 +125,7 @@ def build_us_close_five_axis_audit(report: dict) -> dict:
     )
     if recovery.get("available") is not True:
         historical_status = "UNVERIFIED"
-    elif historical is None or historical_tp is None:
+    elif historical is None or historical_tp is None or prior_claims is None:
         historical_status = "UNVERIFIED"
     elif historical or historical_tp or (prior_claims or 0):
         historical_status = "PENDING_EVIDENCE"

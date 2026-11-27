@@ -49,12 +49,30 @@ def proven_partial_tp_remainder(*, claim, current_attempt, prior_attempts,
                 events = [event for event in prior_events if event.get("client_order_key") == key]
                 allowed = {"BROKER_SUBMIT_ABORTED_PRE_IO", "BROKER_SUBMIT_ABORTED_BEFORE_BOUNDARY",
                            "BROKER_SUBMIT_STARTED", "BROKER_CLAIM_PREPARED"}
-                if (order or not events
+                if (order or not events or int(attempt.get("cumulative_filled_qty") or 0) != 0
                         or not any(e.get("event_type") in {"BROKER_SUBMIT_ABORTED_PRE_IO",
-                                                          "BROKER_SUBMIT_ABORTED_BEFORE_BOUNDARY"} for e in events)
-                        or any(e.get("event_type") not in allowed
-                               or str(e.get("submit_attempt_id") or "") != str(attempt["attempt_id"])
-                               for e in events)):
+                                                          "BROKER_SUBMIT_ABORTED_BEFORE_BOUNDARY"} for e in events)):
+                    return False
+                # The worker can observe a durable pre-HTTP abort while
+                # emitting local replay STARTED/NO_MATCH. Only the exact
+                # abandoned attempt with zero fills and no native order
+                # identity may use this exception; NO_MATCH alone is never proof.
+                for event in events:
+                    if (str(event.get("submit_attempt_id") or "") != str(attempt["attempt_id"])
+                            or str(event.get("canonical_broker_order_no") or "").strip()
+                            or str(event.get("raw_broker_order_no") or "").strip()
+                            or int(event.get("cumulative_filled_qty") or 0) != 0):
+                        return False
+                    kind = event.get("event_type")
+                    if kind in allowed:
+                        continue
+                    payload = event.get("payload") or {}
+                    if not isinstance(payload, dict):
+                        return False
+                    if kind == "JOURNAL_REPLAY_STARTED" and not payload.get("broker_status"):
+                        continue
+                    if kind == "JOURNAL_REPLAY_UNRESOLVED" and payload.get("broker_status") == "NO_MATCH":
+                        continue
                     return False
                 continue
             if not order:

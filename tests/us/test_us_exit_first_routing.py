@@ -787,3 +787,58 @@ def test_protective_sell_reaches_router_before_slow_buy_only_budget_lookup(monke
     assert times["sell_broker_boundary"] < times["buy_budget_started"]
     assert result["exit_routed_before_entry"] == 1
     assert result["orders"][0]["status"] == "ACK"
+
+
+def _jit_tp_candidate(symbol, qty=2):
+    return {"symbol": symbol, "side": "SELL", "strategy_owner": "US_STANDARD",
+            "position_lifecycle_id": "cycle-" + symbol, "qty": qty,
+            "reason": "TAKE_PROFIT_TP1", "client_order_key": "US_PC_old_" + symbol,
+            "meta": {"profit_capture_stage": "tp1", "tp_threshold_fraction": "0.03",
+                     "tp_pending_deferred_to_claim": True,
+                     "source_entry_contract_sha256": "contract-" + symbol}}
+
+
+def test_four_selected_tp_revalidated_at_each_serial_route_turn(monkeypatch):
+    from copy import deepcopy
+    trace = []
+    candidates = [_jit_tp_candidate(s) for s in ("ABBV", "CME", "PG", "ICE")]
+
+    def revalidate(candidate):
+        sym = candidate["symbol"]
+        trace.append(("decision", sym))
+        fresh = deepcopy(candidate)
+        fresh["client_order_key"] = "US_PC_fresh_" + sym
+        return fresh
+
+    def route(intent, **kwargs):
+        trace.append(("submit", intent["symbol"]))
+        assert intent["client_order_key"] == "US_PC_fresh_" + intent["symbol"]
+        # No broker or DB; explicit pre-claim test result.
+        return {"status": "BLOCKED", "intent": intent, "broker_submit": False}
+
+    monkeypatch.setattr("trader.us.execution.order_router.route_order", route)
+    route_exit_orders_immediately(candidates, buy_daily_notional=0.0,
+        position_count=4, effective_budget=1000.0, signal_only=False,
+        kis_order_allowed=True, current_position_symbols={c["symbol"] for c in candidates},
+        tp_revalidate=revalidate)
+    assert trace == [(action, symbol) for symbol in ("ABBV", "CME", "PG", "ICE")
+                     for action in ("decision", "submit")]
+
+
+def test_jit_tp_changed_identity_or_qty_never_routes(monkeypatch):
+    from copy import deepcopy
+    from trader.us.runner.trade_tick_runner import _refresh_selected_native_tp
+    candidate = _jit_tp_candidate("ABBV")
+    assert _refresh_selected_native_tp(candidate, lambda _: None) is None
+    for field, value in (("position_lifecycle_id", "other-cycle"),
+                         ("strategy_owner", "TQQQ_INFINITE"), ("qty", 3)):
+        fresh = deepcopy(candidate)
+        fresh[field] = value
+        assert _refresh_selected_native_tp(candidate, lambda _: fresh) is None
+    for field, value in (("profit_capture_stage", "tp2"),
+                         ("source_entry_contract_sha256", "other-contract")):
+        fresh = deepcopy(candidate)
+        fresh["meta"][field] = value
+        assert _refresh_selected_native_tp(candidate, lambda _: fresh) is None
+    stop = {"symbol": "DHR", "side": "SELL", "qty": 1, "exit_type": "hard_stop"}
+    assert _refresh_selected_native_tp(stop, lambda _: (_ for _ in ()).throw(AssertionError())) is stop

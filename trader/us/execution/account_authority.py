@@ -9,9 +9,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 import os
+import logging
 from typing import Any
 
 from sqlalchemy import text
+
+logger = logging.getLogger(__name__)
 
 
 class AuthorityUnavailable(RuntimeError):
@@ -266,24 +269,26 @@ class AccountExecutionAuthority:
                   AND c.trading_epoch_id=:epoch
                 FOR SHARE OF r, a, c
             """), {**self.scope, "attempt": attempt_id}).mappings().one_or_none()
-            if (
-                row is None
-                or str(row["state"]) != "RESERVED"
-                or str(row["strategy_owner"]) != strategy_owner.upper()
-                or str(row["symbol"]) != symbol.upper()
-                or str(row["side"]) != side.upper()
-                or int(row["requested_qty"]) != int(qty)
-                or int(row["attempt_qty"]) != int(qty)
-                or str(row["client_order_key"]) != client_order_key
-                or str(row["active_attempt_id"]) != attempt_id
-                or str(row["claim_owner"]) != strategy_owner.upper()
-                or str(row["action_state"]) != "IN_FLIGHT"
-                # Exactly one first attempt may cross KIS native HTTP. If
-                # an ACK was lost or a client attempts an implicit retry,
-                # the durable CREATED->SUBMITTED transition fences it.
-                or str(row["attempt_state"]) != "CREATED"
-                or row["authoritative"] is not False
-            ):
+            # Keep the same fences; expose ONLY mismatch field names, not
+            # credentials, broker numbers, raw DB values or SQL exceptions.
+            mismatches = []
+            if row is None:
+                mismatches.append("scope_or_join_missing")
+            else:
+                expected = {"state":"RESERVED", "strategy_owner":strategy_owner.upper(),
+                    "symbol":symbol.upper(), "side":side.upper(),
+                    "client_order_key":client_order_key, "active_attempt_id":attempt_id,
+                    "claim_owner":strategy_owner.upper(), "action_state":"IN_FLIGHT",
+                    "attempt_state":"CREATED"}
+                mismatches.extend(k for k,v in expected.items() if str(row[k]) != v)
+                for k in ("requested_qty","attempt_qty"):
+                    if int(row[k]) != int(qty):
+                        mismatches.append(k)
+                if row["authoritative"] is not False:
+                    mismatches.append("authoritative")
+            if mismatches:
+                logger.warning("[US_ACCOUNT_AUTHORITY][SUBMIT_FENCED] symbol=%s side=%s mismatches=%s",
+                               symbol.upper(), side.upper(), ",".join(mismatches))
                 raise AuthorityUnavailable("US_RESERVED_SUBMIT_AUTHORITY_STALE")
 
     def release_lease(self, *, lease: Lease) -> None:

@@ -66,6 +66,28 @@ def test_live_tp_decision_time_is_not_stale_tick_start(symbol):
     ) == (False, "US_TP_DECISION_EXPIRED_BEFORE_HTTP")
 
 
+@pytest.mark.parametrize("limit", [91, 120, float("inf"), float("nan"), 0])
+def test_tp_decision_config_cannot_relax_approved_90_second_ceiling(limit):
+    intent = _make_tp(live=False)[0]
+    assert _tp_decision_fresh_for_native_http(
+        intent, now_utc=TICK_START + timedelta(seconds=1), max_age_sec=limit
+    ) == (False, "US_TP_DECISION_AGE_CONFIG_INVALID")
+
+
+def test_tp_decision_90_second_boundary_and_rollback():
+    intent = _make_tp(live=False)[0]
+    assert _tp_decision_fresh_for_native_http(
+        intent, now_utc=TICK_START + timedelta(seconds=90)
+    ) == (True, "US_TP_DECISION_FRESH")
+    for seconds in (91, -1):
+        assert _tp_decision_fresh_for_native_http(
+            intent, now_utc=TICK_START + timedelta(seconds=seconds)
+        ) == (False, "US_TP_DECISION_EXPIRED_BEFORE_HTTP")
+    assert _tp_decision_fresh_for_native_http(
+        intent, now_utc=TICK_START + timedelta(seconds=31), max_age_sec=30
+    ) == (False, "US_TP_DECISION_EXPIRED_BEFORE_HTTP")
+
+
 def test_replay_keeps_injected_clock_separate_from_live_wall_clock():
     intents = _make_tp(live=False)
     assert len(intents) == 1
@@ -164,9 +186,13 @@ class _RowSet:
 
 
 class _PreIoDb:
-    def __init__(self, *, intent_attempt="attempt-1", include_broker_possible=False):
+    def __init__(self, *, intent_attempt="attempt-1", include_broker_possible=False, replay_status=None, replay_order_no="", replay_attempt="attempt-1", fills_exist=False):
         self.intent_attempt = intent_attempt
         self.include_broker_possible = include_broker_possible
+        self.replay_status = replay_status
+        self.replay_order_no = replay_order_no
+        self.replay_attempt = replay_attempt
+        self.fills_exist = fills_exist
         self.updated = []
         self.stage_released = False
         self.committed = False
@@ -185,6 +211,14 @@ class _PreIoDb:
             if self.include_broker_possible:
                 rows.append({"event_type": "BROKER_CALL_STARTED",
                              "submit_attempt_id": "attempt-1"})
+            if self.replay_status is not None:
+                rows.extend([
+                    {"event_type": "JOURNAL_REPLAY_STARTED", "submit_attempt_id": self.replay_attempt,
+                     "payload": {"broker_status": ""}},
+                    {"event_type": "JOURNAL_REPLAY_UNRESOLVED", "submit_attempt_id": self.replay_attempt,
+                     "payload": {"broker_status": self.replay_status},
+                     "canonical_broker_order_no": self.replay_order_no},
+                ])
             return _RowSet(rows=rows)
         if "from us_execution_attempts a" in sql:
             return _RowSet(rows=[{
@@ -198,6 +232,8 @@ class _PreIoDb:
             }])
         if "from us_orders" in sql:
             return _RowSet(one=None)
+        if "from us_fills" in sql:
+            return _RowSet(one=1 if self.fills_exist else None)
         if "select status, meta" in sql and "from us_order_intents" in sql:
             if self.updated:
                 return _RowSet(one={"status": "BLOCKED", "meta": {"pre_io_abort_attempt_id": self.intent_attempt}})
@@ -230,7 +266,7 @@ def _run_proven_abort(db, *, mark_failure=None):
             "tp1_order_key": "US_PC_TEST_NOVA",
             "tp1_pending": True,
             "tp1_done": False,
-            "meta": {"last_status": "PENDING"},
+            "meta": {"last_status": "AMBIGUOUS_ACK" if db.replay_status is not None else "PENDING"},
         }
     }
     def mark_stage(*args, **kwargs):
@@ -279,3 +315,27 @@ def test_pre_http_abort_intent_and_stage_roll_back_together_on_failure():
         _run_proven_abort(db, mark_failure=RuntimeError("injected_stage_failure"))
     assert db.rolled_back and not db.committed
     assert len(db.updated) == 1  # transaction rollback, not a committed UPDATE
+
+
+def test_proven_unsent_tp_survives_local_replay_no_match():
+    # Reconstructed 11/25 ABBV/CME/ICE/U evidence, not native KIS replay.
+    db = _PreIoDb(replay_status="NO_MATCH")
+    result, mark = _run_proven_abort(db)
+    assert result is True
+    assert db.committed and len(db.updated) == 1
+    mark.assert_called_once()
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"replay_status": "AMBIGUOUS"},
+    {"replay_status": "NO_MATCH", "replay_order_no": "30592"},
+    {"replay_status": "NO_MATCH", "replay_attempt": "other-attempt"},
+    {"replay_status": "NO_MATCH", "fills_exist": True},
+    {"replay_status": "NO_MATCH", "include_broker_possible": True},
+])
+def test_replay_diagnostics_cannot_clear_broker_or_foreign_evidence(kwargs):
+    db = _PreIoDb(**kwargs)
+    result, mark = _run_proven_abort(db)
+    assert result is False
+    assert not db.updated
+    mark.assert_not_called()
