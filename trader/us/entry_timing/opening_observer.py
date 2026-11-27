@@ -745,7 +745,8 @@ def start_prep_observer(*, env: str, scope: str, trade_date: str, rows: list[dic
              "--continuous"],
             env={**os.environ, "KIS_ENV":"practice", "DRY_RUN":"1",
                  "ALLOW_REAL_ORDER":"0", "US_KIS_ORDER_ALLOWED":"0",
-                 "TRADING_REGION":"US", "US_ORDER_ARMED":"0"},
+                 "TRADING_REGION":"US", "US_ORDER_ARMED":"0",
+                 "LIVE_TRADING_ENABLED":"0", "US_LIVE_TRADING_ENABLED":"0"},
             stdin=subprocess.DEVNULL, stdout=stream, stderr=stream,
             close_fds=True, start_new_session=True,
         )
@@ -763,6 +764,8 @@ def run_observer(*, env: str, trade_date: str, scope: str,
     os.environ.update({
         "KIS_ENV": "practice", "DRY_RUN": "1", "ALLOW_REAL_ORDER": "0",
         "US_KIS_ORDER_ALLOWED": "0", "TRADING_REGION": "US",
+        "US_ORDER_ARMED": "0", "LIVE_TRADING_ENABLED": "0",
+        "US_LIVE_TRADING_ENABLED": "0",
     })
     from trader.us.market_calendar import is_us_trading_day, regular_close_time_for_date
     from datetime import date
