@@ -480,6 +480,49 @@ def remaining_idle_watch(watch, attempted_identity, result):
             and row["identity"]["symbol"]!=attempted_identity["symbol"]]
 
 
+def remaining_profit_idle_watch(watch, attempted_identity, result):
+    """Retain unrelated read-only alerts after a verified SELL-only wakeup.
+
+    Every later child still revalidates live positions, Stage4, and claims.
+    Unknown/incomplete outcomes stop accelerated wakeups for this slot.
+    """
+    if (not isinstance(result,dict) or result.get("protective_wakeup") is not True
+            or result.get("protective_wakeup_kind")!="profit"
+            or result.get("exit_route_reconcile_required") is not False
+            or result.get("manual_reconcile_required")!=0
+            or result.get("entry_intents")!=0 or result.get("buy_orders")!=0
+            or holding_identity(attempted_identity)!=attempted_identity
+            or not isinstance(result.get("orders"),list)):
+        return []
+    orders=result["orders"]
+    excluded={attempted_identity["symbol"]}
+    if result.get("status")=="OK_NO_TRADE":
+        if (orders or result.get("reason")!="protective_profit_wakeup_no_trade"
+                or not result.get("orders_sent")==result.get("orders_ack")==result.get("exit_intents")==0):
+            return []
+    elif result.get("status")=="OK_EXIT_ORDERS_SENT":
+        if (not orders or result.get("reason")!="protective_profit_wakeup_routed"
+                or not len(orders)==result.get("orders_sent")==result.get("orders_ack")==result.get("exit_intents")):
+            return []
+        identities={holding_identity(row.get("identity"))["symbol"]:row["identity"]
+                    for row in watch if isinstance(row,dict) and holding_identity(row.get("identity"))}
+        routed=set()
+        for order in orders:
+            if not isinstance(order,dict) or order.get("status")!="ACK" or order.get("requires_reconcile"):
+                return []
+            intent=order.get("intent")
+            identity=holding_identity(intent)
+            if (not identity or intent.get("side")!="SELL" or identity["symbol"] in routed
+                    or identities.get(identity["symbol"])!=identity):
+                return []
+            routed.add(identity["symbol"])
+        excluded.update(routed)
+    else:
+        return []
+    return [row for row in watch if isinstance(row,dict) and holding_identity(row.get("identity"))
+            and row["identity"]["symbol"] not in excluded]
+
+
 def preserve_confirmed_soft_state(position,trade_date):
     """Accelerated profit evaluation must never advance/reset confirmation."""
     proof=_confirmed_soft_snapshot(position,trade_date,fresh_resolver=True)
