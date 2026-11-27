@@ -25,7 +25,7 @@ from trader.kr.opening_bar_contract import (
 from trader.runtime_paths import repo_root
 from trader.time_utils import now_kst
 from trader.kr.entry_priority_queue import CandidateSchedule, observer_collection_priorities
-from trader.kr.opening_intelligence import analyze_opening, ObservationPromotion
+from trader.kr.opening_intelligence import analyze_opening, ObservationPromotion, ColdDiscovery
 
 logger = logging.getLogger(__name__)
 
@@ -342,7 +342,8 @@ def _current_batch_coverage(stored, fetched, observed_at):
 
 def run_once(*, kis, codes: list[str], observed_at: datetime,
              sleep_between: float = 0.8, refresh_clock=None,
-             observation_styles: dict[str, str] | None = None) -> dict:
+             observation_styles: dict[str, str] | None = None,
+             discovery_only: bool = False) -> dict:
     """No order methods are called; all I/O is read-only KIS and local proofs."""
     observed_at = observed_at.astimezone(KST)
     if not dtime(9, 0) <= observed_at.time() <= dtime(15, 5):
@@ -390,7 +391,7 @@ def run_once(*, kis, codes: list[str], observed_at: datetime,
                 and _repair_opening_due(code)
             )
             conflict_due = (
-                observed_at.time() >= dtime(9, 30)
+                not discovery_only and observed_at.time() >= dtime(9, 30)
                 and bool(unresolved) and _repair_conflict_due(code)
             )
             # Prioritize current native data before optional historical repair.
@@ -399,7 +400,7 @@ def run_once(*, kis, codes: list[str], observed_at: datetime,
                 opening_coverage, (stored or {}).get("bars") or [], observed_at,
             )
             recent_anchor = recent_anchor or _stale_minute_anchor(opening_coverage, observed_at)
-            if recent_anchor and recent_anchor not in anchors and _recent_repair_due(code):
+            if not discovery_only and recent_anchor and recent_anchor not in anchors and _recent_repair_due(code):
                 anchors.append(recent_anchor)
                 logger.info("[KR][OPENING_OBSERVER][RECENT_GAP_REPAIR] code=%s anchor=%s", code, recent_anchor)
             if repair_due:
@@ -526,7 +527,7 @@ def run_once(*, kis, codes: list[str], observed_at: datetime,
             # unobserved original minutes. A full proof needs no extra read.
             if (coverage["reason"] == "OPENING_BARS_MISSING_OR_INCOMPLETE"
                     and not coverage.get("native_post_open_window_ready")
-                    and repair_due):
+                    and repair_due and not discovery_only):
                 try:
                     repair_at = (refresh_clock().astimezone(KST) if refresh_clock else observed_at)
                     minute_requests += 1
@@ -724,13 +725,14 @@ def main() -> None:
     schedule = CandidateSchedule(max_batch=6, hot_sec=max(45, int(configured_period)),
                                  warm_sec=max(180, int(configured_period)))
     promotion = ObservationPromotion()
+    cold_discovery = ColdDiscovery()
     last_capacity_warning_key = None
     last_idle_key = None
     last_idle_logged_at = 0.0
     scope = get_account_key(env="practice")
     logger.info(
         "[KR][OPENING_OBSERVER][COLLECTOR_BOOT] date=%s module=%s interval_sec=%s planner_wake_sec=%.1f hot_period_sec=%s warm_period_sec=%s "
-        "collection_scope=VERIFIED_PB1_HOT_WARM_ONLY",
+        "collection_scope=VERIFIED_HOT_WARM_WITH_BOUNDED_PREP_COLD",
         today, __file__, args.interval_sec, planner_wake_sec, schedule.periods["hot"], schedule.periods["warm"],
     )
     while True:
@@ -757,9 +759,9 @@ def main() -> None:
                 codes, kis = candidate_codes, candidate_kis
                 logger.info("[KR][OPENING_OBSERVER][PREP_READY] final30=%s role=READ_ONLY", len(codes))
             # COLD remains in the signed Final30 universe and continues to
-            # receive low-cost PB1 pre-minute evaluation; it does NOT consume
-            # native 1-minute REST calls. Only verified observation or execution
-            # HOT/WARM candidates receive native collection.
+            # receive low-cost PB1 pre-minute evaluation. Native collection
+            # remains HOT/WARM first; bounded PREP-only discovery uses spare
+            # capacity with the same low-priority broker admission controls.
             if os.getenv("KR_DYNAMIC_COLLECTION_PRIORITY_ENABLED", "1") == "1":
                 priority = promotion.apply(priority, now)
             native_priority = {**priority, "cold": []}
@@ -783,6 +785,16 @@ def main() -> None:
                 )
             last_capacity_warning_key = warning_key
             selected = schedule.select(native_priority, now)
+            discovery_only = False
+            if (not selected and os.getenv("KR_DYNAMIC_COLLECTION_PRIORITY_ENABLED", "1") == "1"
+                    and os.getenv("KR_COLD_DISCOVERY_ENABLED", "1") == "1"
+                    and os.getenv("KR_PB1_KIS_OBSERVER_BUDGET_ENABLED") == "1"
+                    and os.getenv("KR_SHARED_HTTP_BUDGET_ENABLED") == "1"):
+                cold = cold_discovery.select(priority, schedule, now)
+                if cold:
+                    selected = [cold]
+                    discovery_only = True
+                    logger.info("[KR][OPENING_OBSERVER][COLD_DISCOVERY] code=%s spare_slot=1 order_authorization=0", cold)
             if not selected:
                 if priority["state"] in {"PB1_ACTIVE", "PREP_COLLECTION_ACTIVE"} and (priority["hot"] or priority["warm"]):
                     # A nonempty verified shortlist with nothing due is not
@@ -815,13 +827,14 @@ def main() -> None:
             last_idle_key = None
             logger.info(
                 "[KR][OPENING_OBSERVER][QUEUE] source=%s hot=%s warm=%s cold=%s "
-                "selected=%s full_universe=%s order_authorization=0 native_collection_scope=HOT_WARM_ONLY",
+                "selected=%s full_universe=%s order_authorization=0 native_collection_scope=%s",
                 priority["state"], len(priority["hot"]), len(priority["warm"]),
-                len(priority["cold"]), selected, len(codes),
+                len(priority["cold"]), selected, len(codes), "PREP_COLD_DISCOVERY" if discovery_only else "HOT_WARM_ONLY",
             )
             result = run_once(kis=kis, codes=selected, observed_at=now,
                               refresh_clock=now_kst,
-                              observation_styles=priority.get("observation_styles"))
+                              observation_styles=priority.get("observation_styles"),
+                              discovery_only=discovery_only)
             for code, outcome in result.get("symbol_outcomes", {}).items():
                 promotion.observe(code, outcome.get("opening_intelligence") or {})
                 tier = next(
