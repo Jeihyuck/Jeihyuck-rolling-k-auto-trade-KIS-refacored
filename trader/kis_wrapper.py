@@ -2865,20 +2865,6 @@ class KisAPI:
                 )
                 return ws_quote
 
-        # Reuse an already received canonical J-market snapshot without
-        # waiting for a producer. Keep native refresh and KODEX paths separate.
-        # A cache miss takes the existing endpoint gate/retry path unchanged.
-        if (not native_rest_only and not entry_refresh and not diag_mode
-                and retry_cap is not None and c != "122630"
-                and len(c) == 6 and c.isascii() and c.isdigit()):
-            from trader.marketdata import kr_rest_shared
-            if kr_rest_shared.enabled(getattr(self, "env", None)):
-                shared = kr_rest_shared.read_cached(appkey=str(APP_KEY or ""), code=c)
-                if shared is not None:
-                    logger.info("[KR_REST_SHARED][DIRECT_QUOTE_HIT] code=%s age_sec=%.3f",
-                                c, shared["age_sec"])
-                    return shared
-
         # Never report a cached quote as an independent native REST result.
         cache_key = ("inquire-price", c)
         cached = price_cache.get(cache_key) if not native_rest_only else None
