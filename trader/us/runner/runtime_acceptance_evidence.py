@@ -9,7 +9,8 @@ from statistics import mean
 _MARKERS={"ATTEMPT":"[US400_RUNTIME][ATTEMPT] payload=",
           "RESULT":"[US400_RUNTIME][RESULT] payload=",
           "FAILURE":"[US400_RUNTIME][FAILURE] payload="}
-_WORKLOAD=("position_count","raw_watchlist_candidates","intent_generation_attempted")
+_WORKLOAD = ("positions_evaluated", "raw_watchlist_candidates", "intent_generation_attempted",
+             "orders_routed", "fills_api_count")
 _NORMAL={"OK","OK_ORDERS_SENT","OK_ENTRY_ORDERS_SENT","OK_EXIT_ORDERS_SENT",
          "OK_EXIT_POSITION_CLOSED","OK_RECONCILED","NO_ENTRY_INTENTS","OK_NO_TRADE"}
 
@@ -42,6 +43,7 @@ def result_evidence(scope,result,*,wall_sec):
 
 def summarize_runtime(lines,*,expected_sha):
     records={k:{} for k in _MARKERS}
+    account_digests = set()
     malformed=conflicts=0
     for line in lines:
         for kind,marker in _MARKERS.items():
@@ -54,6 +56,10 @@ def summarize_runtime(lines,*,expected_sha):
                     raise ValueError("missing_identity")
                 if row.get("code_sha")!=expected_sha or row.get("native_practice") is not True:
                     raise ValueError("unverified_scope")
+                digest = row.get("account_digest")
+                if not isinstance(digest, str) or not re.fullmatch("[0-9a-f]{64}", digest):
+                    raise ValueError("unverified_account")
+                account_digests.add(digest)
                 prior=records[kind].get(key)
                 if prior is not None and prior!=row:
                     conflicts+=1
@@ -103,17 +109,20 @@ def summarize_runtime(lines,*,expected_sha):
             return round(values[math.ceil(p*len(values))-1],3) if values else None
         sessions[session]={"attempted":len(keys),"normal":len(values),"policy_blocked":policy,
                           "degraded":degraded,"unknown":unknown,"failed":len(keys & set(failed)),
-                          "missing_result":len(keys & missing),"mean_sec":round(mean(values),3) if values else None,
+                          "missing_result":len(keys & missing),"mean_sec":mean(values) if values else None,
                           "p50_sec":percentile(.5),"p95_sec":percentile(.95),"max_sec":max(values) if values else None,
                           "workload":{"/".join(map(str,k)):v for k,v in sorted(workload.items())}}
     blockers=[]
     if not re.fullmatch("[0-9a-f]{40}",str(expected_sha)): blockers.append("EXPECTED_SHA_INVALID")
     if malformed or conflicts or orphan or ambiguous: blockers.append("LOG_SCOPE_OR_IDENTITY_CONFLICT")
     if any(k[1] not in {"am","afternoon"} for k in started): blockers.append("UNSUPPORTED_SESSION")
+    if len(account_digests) != 1:
+        blockers.append("ACCOUNT_SCOPE_UNVERIFIED")
     if missing: blockers.append("INCOMPLETE_ATTEMPT_POPULATION")
     if any(r["degraded"] or r["unknown"] or r["failed"] for r in sessions.values()):
         blockers.append("DEGRADED_OR_FAILED_ATTEMPTS")
-    return {"expected_sha":expected_sha,"sessions":sessions,"malformed":malformed,
+    return {"account_digest": next(iter(account_digests)) if len(account_digests) == 1 else None,
+            "expected_sha":expected_sha,"sessions":sessions,"malformed":malformed,
             "conflicts":conflicts,"orphan":len(orphan),"ambiguous":len(ambiguous),"blockers":blockers}
 
 
@@ -121,6 +130,8 @@ def compare_runtime(baseline,candidate,*,min_samples=20):
     blockers=list(baseline["blockers"])+list(candidate["blockers"])
     if baseline["expected_sha"]==candidate["expected_sha"]:
         blockers.append("BASELINE_CANDIDATE_SHA_IDENTICAL")
+    if baseline["account_digest"] != candidate["account_digest"]:
+        blockers.append("BASELINE_CANDIDATE_ACCOUNT_MISMATCH")
     for session in ("am","afternoon"):
         b,c=baseline["sessions"][session],candidate["sessions"][session]
         if b["normal"]<min_samples or c["normal"]<min_samples:

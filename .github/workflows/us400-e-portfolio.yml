@@ -1,7 +1,7 @@
 name: US400-E focused portfolio guard acceptance
 on:
   pull_request:
-    branches: [fix/us-20261126-hot-only-tp90-integrated]
+    branches: [dual-agent, fix/us-20261126-hot-only-tp90-integrated]
     paths:
       - 'trader/us/portfolio_profit_guard_store.py'
       - 'tests/us/test_us_20261123_portfolio_guard_pg_lifecycle.py'

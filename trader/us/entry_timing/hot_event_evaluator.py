@@ -1,5 +1,6 @@
 """Bounded HOT price opportunity evaluation: no broker routing or authority."""
 from __future__ import annotations
+from datetime import datetime, timedelta
 import hashlib
 import json
 import logging
@@ -96,6 +97,24 @@ def poll_hot_events(db, *, env, scope, trade_date, hot_pairs, now_et,
                 prep=candidate["prep"],feature_scope=(scope,symbol,exchange,"US_STANDARD"),
                 min_rr=min_rr,max_stop_distance=max_stop,
             )
+            finished = live_clock().astimezone(ny) if live_clock else at
+            quote_latency = finished.timestamp() - received
+            latest_bar = decision.get("facts", {}).get("last_completed_bar")
+            close_latency = None
+            if latest_bar:
+                bar_open = datetime.fromisoformat(latest_bar)
+                if bar_open.tzinfo is not None:
+                    close_latency = (finished - (bar_open + timedelta(minutes=1))).total_seconds()
+            LOG.info(
+                "[US_HOT_EVENT][LATENCY] symbol=%s generation=%s state=%s "
+                "received_to_evaluated_sec=%.3f bar_close_to_evaluated_sec=%s",
+                symbol, generation, decision["state"], quote_latency, close_latency,
+            )
+            if (finished < at or finished.date() != day or finished.time() >= regular_close_time_for_date(day)
+                    or finished.timestamp() > expires or not 0 <= quote_latency <= 5):
+                revoke_hint(symbol, exchange, finished)
+                continue
+            at = finished
             # A local latest-state hint, not an order, does not carry a price
             # or executable decision. The canonical engine must independently
             # recalculate the strategy, size, risk and router permissions.

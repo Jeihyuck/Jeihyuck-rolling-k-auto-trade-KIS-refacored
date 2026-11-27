@@ -362,6 +362,18 @@ def test_continuous_collection_rebind_requires_exact_recovered_prep_contract(tmp
     lanes,status=collection_priorities(**kw,allow_prep_rebind=True)
     assert status=="PREP_REBIND_UNVERIFIED" and not sum(lanes.values(),[])
 
+    # The scored file and independent PREP contract may be replaced on
+    # different ticks. A still-fresh execution file cannot validate either.
+    for broken_source in (cfile, pfile):
+        cfile.write_text(json.dumps(contract))
+        pfile.write_text(json.dumps({"trade_date": DAY, "env": "practice", "final30_scored": rows}))
+        broken_source.write_text("{")
+        lanes, status = collection_priorities(**kw, allow_prep_rebind=True)
+        assert status == "PREP_REBIND_UNVERIFIED" and not any(lanes.values())
+        broken_source.unlink()
+        lanes, status = collection_priorities(**kw, allow_prep_rebind=True)
+        assert status == "PREP_REBIND_UNVERIFIED" and not any(lanes.values())
+
 
 def test_promoted_hot_gets_next_hot_slot_without_using_warm_cold_quota():
     pairs = _pairs(14)

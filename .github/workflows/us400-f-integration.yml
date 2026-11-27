@@ -1,7 +1,7 @@
 name: US400-F focused integration evidence acceptance
 on:
   pull_request:
-    branches: [fix/us-20261126-hot-only-tp90-integrated]
+    branches: [dual-agent, fix/us-20261126-hot-only-tp90-integrated]
     paths:
       - 'trader/us/runner/runtime_acceptance_evidence.py'
       - 'trader/us/runner/trade_session_runner.py'

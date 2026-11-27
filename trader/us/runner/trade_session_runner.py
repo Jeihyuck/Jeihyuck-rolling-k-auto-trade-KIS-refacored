@@ -2191,7 +2191,8 @@ def run_trade_session(
                 _acceptance_scope = {
                     "trade_date": str(trade_date), "session": session,
                     "run_id": str(session_run_id), "tick_id": str(tick_id),
-                    "code_sha": str(os.getenv("US_PINNED_CODE_SHA") or ""),
+                    "code_sha": _verified_code_sha or "",
+                    "account_digest": session_account_scope.get("account_digest"),
                     "native_practice": bool(env == "practice" and not offline
                         and not force_now and not resolved_signal_only and kis_order_allowed),
                 }

@@ -707,10 +707,11 @@ def collection_priorities(*, env, scope, trade_date, pairs, now_epoch=None,
             if state == "VALID":
                 return merge_collection_priorities(lanes, fallback), "VALID"
             return fallback, prep_state
-        if changed:
-            return {"HOT":[],"WARM":[],"COLD":[]}, "PREP_REBIND_UNVERIFIED"
+        if changed or allow_prep_rebind:
+            return {"HOT": [], "WARM": [], "COLD": []}, "PREP_REBIND_UNVERIFIED"
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
-        pass
+        if allow_prep_rebind:
+            return {"HOT": [], "WARM": [], "COLD": []}, "PREP_REBIND_UNVERIFIED"
     return lanes, state
 
 

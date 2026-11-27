@@ -167,3 +167,28 @@ def test_hot_collection_hysteresis_is_bounded_and_does_not_retain_removed_symbol
     assert publish(["AAA","BBB","CCC","FFF","DDD","GGG"],1030)=={"AAA","BBB","CCC","FFF"}
     # Expired manifests never keep a previous rank over the fresh desired one.
     assert publish(["AAA","BBB","CCC","DDD","FFF","GGG"],1300)=={"AAA","BBB","CCC","DDD"}
+
+def test_quote_expiring_during_evaluation_revokes_ready_hint(tmp_path, monkeypatch):
+    from datetime import timedelta
+    from trader.us.entry_timing import opportunity
+
+    now = datetime(2026, 11, 25, 10, 10, tzinfo=ZoneInfo("America/New_York"))
+    scope = dict(env="practice", scope="scope:epoch", trade_date=now.date().isoformat(), base=tmp_path)
+    observer.publish_preminute_candidates(**scope, now_epoch=now.timestamp()-1,
+        candidates=[(10, "AAA", "NYSE", None, {"position_state": "NOT_HELD", "entry_style": "ENTRY_PULLBACK"})])
+    monkeypatch.setattr(opportunity, "effective_mode", lambda: "ENFORCE")
+    monkeypatch.setattr(opportunity, "evaluate_price_opportunity", lambda **kwargs:
+        {"state": "READY", "reason": "test", "facts": {}})
+    db = observer.open_store(observer.store_path(env=scope["env"], account_scope=scope["scope"],
+        trade_date=scope["trade_date"], base=tmp_path))
+    try:
+        q = {"bid": 100, "ask": 101, "last": 100, "received_at": now.timestamp()-2, "collector_generation": "g"}
+        options = dict(**scope, hot_pairs=[("AAA", "NYSE")], now_et=now,
+                       quote_reader=lambda *args: q, seen={})
+        assert len(poll_hot_events(db, **options)) == 1
+        q["ask"] = 100.5
+        clock = iter([now, now + timedelta(seconds=4)])
+        assert poll_hot_events(db, **options, live_clock=lambda: next(clock)) == []
+        assert db.execute("SELECT count(*) FROM hot_retry_events").fetchone()[0] == 0
+    finally:
+        db.close()

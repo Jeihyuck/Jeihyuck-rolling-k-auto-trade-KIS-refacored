@@ -1,7 +1,7 @@
 name: US400-B focused protective execution acceptance
 on:
   pull_request:
-    branches: [fix/us-20261126-hot-only-tp90-integrated]
+    branches: [dual-agent, fix/us-20261126-hot-only-tp90-integrated]
     paths:
       - 'trader/us/db/repos.py'
       - 'trader/us/runner/trade_tick_runner.py'
