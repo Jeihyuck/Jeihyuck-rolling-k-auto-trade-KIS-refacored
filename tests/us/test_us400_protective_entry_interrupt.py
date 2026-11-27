@@ -47,7 +47,7 @@ def test_hard_stop_poll_only_verified_fresh_unique_swing(monkeypatch,case):
 
 
 @pytest.mark.parametrize("case",["valid","stale","no_permission","wrong_family","wrong_symbol",
-                                 "pending","expired_after_evaluate","permission_after_pending"])
+                                 "pending","expired_after_evaluate","permission_after_pending","wrong_cycle","wrong_account","wrong_type","scope_conflict"])
 def test_interrupt_requires_canonical_hard_stop_and_pending_gate(monkeypatch,case):
     from trader.us import market_calendar
     from trader.us.runner import protective_entry_interrupt as guard
@@ -55,14 +55,21 @@ def test_interrupt_requires_canonical_hard_stop_and_pending_gate(monkeypatch,cas
     monkeypatch.setattr(market_calendar,"now_ny",lambda:datetime(2026,11,25,11,tzinfo=ZoneInfo("America/New_York")))
     active=[case!="no_permission"]
     calls=[]
-    snap={"symbol":"ABC","exit_quote_evidence":{"asof_epoch":time.time()-(10 if case=="stale" else 0)}}
+    identity=dict(symbol="ABC",strategy_owner="US_STANDARD",position_lifecycle_id="l",
+                  position_cycle_id="l",portfolio_epoch_id="p",trading_epoch_id="e",broker_account_hash="a")
+    snap={**identity,"exit_quote_evidence":{"asof_epoch":time.time()-(10 if case=="stale" else 0)}}
     ctx=SimpleNamespace(broker_submit_allowed=lambda:active[0])
     def evaluate(snapshot,clock):
         calls.append("canonical")
         if case=="expired_after_evaluate":
             snapshot["exit_quote_evidence"]["asof_epoch"]-=10
-        return [{"side":"SELL","symbol":"XYZ" if case=="wrong_symbol" else "ABC",
-                 "family":"TAKE_PROFIT" if case=="wrong_family" else "HARD_STOP"}]
+        intent={**identity,"side":"SELL","symbol":"XYZ" if case=="wrong_symbol" else "ABC",
+                "family":"TAKE_PROFIT" if case=="wrong_family" else "HARD_STOP",
+                "exit_type":"persistent_soft_stop_full_exit" if case=="wrong_type" else "hard_stop"}
+        if case=="wrong_cycle": intent.update(position_cycle_id="new",position_lifecycle_id="new")
+        if case=="wrong_account": intent["broker_account_hash"]="other"
+        if case=="scope_conflict": intent["meta"]={"broker_account_hash":"other"}
+        return [intent]
     def suppress(intents):
         calls.append("pending")
         if case=="permission_after_pending": active[0]=False
@@ -127,3 +134,47 @@ def test_idle_route_exception_is_uncertain_and_never_retried():
     result=route_idle_hard_stop_once([intent],route=route)
     assert calls==[[intent]]
     assert result["orders"]==[{"status":"BROKER_SUBMIT_RESULT_UNKNOWN","requires_reconcile":True,"intent":intent}]
+
+
+def test_idle_batch_checks_35_holdings_in_three_ipc_calls(monkeypatch):
+    from trader.us import market_calendar
+    from trader.marketdata import us_ws_collector
+    from trader.us.runner.protective_entry_interrupt import make_idle_hard_stop_poll
+    monkeypatch.setattr(market_calendar,"now_ny",lambda:datetime(2026,11,25,11,tzinfo=ZoneInfo("America/New_York")))
+    watch=[]
+    for i in range(35):
+        identity=dict(symbol=f"A{i}",strategy_owner="US_STANDARD",position_lifecycle_id=f"l{i}",
+                      position_cycle_id=f"l{i}",portfolio_epoch_id="p",trading_epoch_id="e",broker_account_hash="a")
+        watch.append(dict(identity=identity,exchange="NASDAQ",entry=100,hard=.06))
+    calls=[]
+    def quotes(pairs,**kwargs):
+        calls.append(pairs)
+        return {p:dict(last=93 if p[0]=="A34" else 100,received_at=time.time(),
+                       source="KIS_WEBSOCKET_COLLECTOR",collector_generation="g") for p in pairs}
+    monkeypatch.setattr(us_ws_collector,"get_quotes_many",quotes)
+    monkeypatch.setattr(us_ws_collector,"get_quote",lambda *a,**kw:pytest.fail("individual IPC"))
+    poll=make_idle_hard_stop_poll(watch,trade_date="2026-11-25",env="practice")
+    assert poll()==watch[-1]["identity"]
+    assert [len(p) for p in calls]==[16,16,3]
+
+
+@pytest.mark.parametrize("case",["valid","stale","wrong_pair","duplicate","no_generation"])
+def test_quote_many_provenance_and_freshness(monkeypatch,case):
+    from trader.marketdata import us_ws_collector as ws
+    monkeypatch.setattr(ws,"enabled",lambda:True)
+    monkeypatch.setattr(ws,"_account_identity",lambda env:"identity")
+    class Service:
+        def subscribe_us(self,s,e): return True
+        def get_fresh_quote(self,market,s,*,max_age_sec):
+            return dict(last=100,received_at=time.time()-(10 if case=="stale" else 0))
+    def send(env,request,*,timeout_sec):
+        result=ws._reply({**request,"env":env,"identity":"identity"},env=env,generation="g",service=Service())
+        if case=="wrong_pair": result["quotes"][0]["symbol"]="WRONG"
+        if case=="duplicate": result["quotes"][1]=dict(result["quotes"][0])
+        if case=="no_generation": result["generation"]=""
+        return result
+    monkeypatch.setattr(ws,"_send_request",send)
+    pairs=[("ABC","NASDAQ"),("DEF","NYSE")]
+    result=ws.get_quotes_many(pairs,env="practice")
+    assert set(result)==(set(pairs) if case=="valid" else set())
+    if result: assert all(q["collector_generation"]=="g" for q in result.values())
