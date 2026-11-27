@@ -169,3 +169,53 @@ def test_soft_stop_completion_can_only_follow_the_matching_reason():
     source = inspect.getsource(PB1Engine._plan_exit_event)
     assert 'str(exit_eval.primary_reason or "").upper() != "KR_PB1_SOFT_STOP_3PCT"' in source
     assert 'exit_execution_meta_update.pop("kr_paper_stop36_soft_done", None)' in source
+
+
+def test_active_profit_hold_preserves_first_stop36_tick_and_next_tick_sells(monkeypatch):
+    """Regression: active profit HOLD formerly replaced the stop counter."""
+    db = _new_db()
+    kis = RetryableSellKis()
+    monkeypatch.setattr(
+        "trader.kr.us_profit_execution_router.evaluate_active_kr_tp",
+        lambda **kw: {"action": "HOLD", "reason": "TP_THRESHOLD_NOT_MET"},
+    )
+    try:
+        engine, pos = _setup(monkeypatch, db, kis, mark=96.8)
+        engine.run_id = "stop36-observation-1"
+        first = _tick(engine, pos, mark=96.8)
+        assert first.get("submitted", 0) == 0
+        assert first["condition_details"]["paper_stop36"]["soft_breach_count"] == 1
+        assert kis.sell_quantities == []
+        observed = _stored(db, pos)["position_meta"]
+        assert observed["kr_paper_stop36_breach_ticks"] == 1
+        assert observed["kr_paper_stop36_last_tick"] == "stop36-observation-1"
+        assert not observed.get("kr_paper_stop36_soft_done")
+
+        # Reload durable observation state, not an invented second tick.
+        pos["position_meta"] = dict(observed)
+        engine.run_id = "stop36-observation-2"
+        second = _tick(engine, pos, mark=96.8)
+        assert second["decision_reason"] == "KR_PB1_SOFT_STOP_3PCT"
+        assert second.get("submitted") == 1
+        assert kis.sell_quantities == [10]
+        assert not _stored(db, pos)["position_meta"].get("kr_paper_stop36_soft_done")
+    finally:
+        db.dispose()
+
+
+def test_active_profit_hold_preserves_recovery_reset(monkeypatch):
+    db = _new_db()
+    kis = RetryableSellKis()
+    monkeypatch.setattr(
+        "trader.kr.us_profit_execution_router.evaluate_active_kr_tp",
+        lambda **kw: {"action": "HOLD", "reason": "TP_THRESHOLD_NOT_MET"},
+    )
+    try:
+        engine, pos = _setup(monkeypatch, db, kis, mark=98.0, prior_soft_tick=True)
+        engine.run_id = "stop36-recovered"
+        result = _tick(engine, pos, mark=98.0)
+        assert result.get("submitted", 0) == 0
+        assert _stored(db, pos)["position_meta"]["kr_paper_stop36_breach_ticks"] == 0
+        assert kis.sell_quantities == []
+    finally:
+        db.dispose()

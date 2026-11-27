@@ -13981,6 +13981,10 @@ class PB1Engine:
             ordered_reasons = [final_reason]
 
         _paper_stop36_signal = False
+        # Stop observations must survive a later TP/runner HOLD replacement.
+        # Only observation/counter fields originate here; fill completion
+        # remains solely with broker-confirmed claim settlement.
+        _paper_stop36_observation: dict[str, Any] = {}
         conds["paper_stop36"] = {
             "eligible": False, "reason": "PAPER_SWING_ROUTE_NOT_APPLIED",
             "is_order_authorization": False,
@@ -14076,6 +14080,7 @@ class PB1Engine:
                     paper_decision, entry_price=float(avg), mark=float(mark or 0.0),
                 )
                 if paper_decision.eligible:
+                    _paper_stop36_observation = dict(paper_decision.update_meta)
                     # Keep legacy diagnostic threshold for forensic comparison.
                     # The separate paper route remains the actual authority.
                     conds["legacy_stop_loss_pct"] = dict(conds["stop_loss_pct"])
@@ -14222,7 +14227,10 @@ class PB1Engine:
                     _router_sell_pct,
                     qty,
                 )
-                _meta_update = dict(horizon_result.get("update_meta") or {})
+                _meta_update = {
+                    **dict(horizon_result.get("update_meta") or {}),
+                    **_paper_stop36_observation,
+                }
                 exit_execution_meta_update = dict(_meta_update)
                 for completion_flag in (
                     "tp1_done", "tp2_done", "core_tp1_done",
