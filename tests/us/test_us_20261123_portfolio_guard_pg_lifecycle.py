@@ -90,6 +90,7 @@ def store(monkeypatch):
                 position_cycle_id text,
                 account_id text,
                 client_order_key text,
+                order_no text,
                 qty integer,
                 meta jsonb
             );
@@ -220,8 +221,8 @@ def test_pg_native_post_ack_fill_completion_and_stage2_no_double_sell(store):
         conn.execute(text("""
             INSERT INTO public.us_fills
             (client_order_key,symbol,side,env,trading_epoch_id,
-             portfolio_epoch_id,position_cycle_id,account_id,qty,meta)
-            VALUES (:key,'KO','SELL','practice',:epoch,:port,:cycle,:account,2,
+             portfolio_epoch_id,position_cycle_id,account_id,order_no,qty,meta)
+            VALUES (:key,'KO','SELL','practice',:epoch,:port,:cycle,:account,'00032121',2,
                     CAST(:meta AS jsonb))
         """), {
             "key":action["action_key"],"epoch":EPOCH,"port":PORT,
@@ -420,3 +421,43 @@ def test_pg_signed_trading_basis_triggers_and_cannot_reuse_net_hwm(store):
         )).mappings().one()
         assert state["accounting_method"] == TRADING_ACCOUNTING_METHOD
         assert state["high_water_pnl_usd"] == Decimal("100")
+
+
+@pytest.mark.parametrize("conflict",["foreign_order","missing_order","regression","wrong_symbol"])
+def test_pg_guard_fill_cannot_complete_wrong_or_regressed_native_order(store,conflict):
+    engine,now=store
+    with engine.begin() as conn:
+        _record(conn,pnl=100,qty=10,bid=100,now=now,snap="baseline",sold=0)
+        planned=_record(conn,pnl=75,qty=10,bid=95,now=now+timedelta(seconds=1),snap="trigger",sold=0)
+        key=planned["intents"][0]["action_key"]
+        conn.execute(text("""INSERT INTO public.us_orders
+            (client_order_key,side,env,trading_epoch_id,portfolio_epoch_id,position_cycle_id,
+             account_id,symbol,order_no,status,qty_filled,meta)
+            VALUES (:key,'SELL','practice',:epoch,:port,:cycle,:account,:sym,'32121','FILLED',2,
+                    CAST(:meta AS jsonb))"""),
+            dict(key=key,epoch=EPOCH,port=PORT,cycle=CYCLE,account=ACCOUNT,
+                 sym="PG" if conflict=="wrong_symbol" else "KO",
+                 meta=json.dumps({"portfolio_guard_action_key":key})))
+        conn.execute(text("""INSERT INTO public.us_fills
+            (client_order_key,symbol,side,env,trading_epoch_id,portfolio_epoch_id,position_cycle_id,
+             account_id,order_no,qty,meta)
+            VALUES (:key,'KO','SELL','practice',:epoch,:port,:cycle,:account,:no,:qty,
+                    CAST(:meta AS jsonb))"""),
+            dict(key=key,epoch=EPOCH,port=PORT,cycle=CYCLE,account=ACCOUNT,
+                 no={"foreign_order":"55555","missing_order":None}.get(conflict,"00032121"),
+                 qty=1 if conflict=="regression" else 2,
+                 meta=json.dumps({"fill_evidence_type":"KIS_ORDER_CUMULATIVE_ACTUAL","is_synthetic":False})))
+        if conflict=="regression":
+            conn.execute(text("UPDATE public.us_portfolio_guard_actions SET state='PARTIAL', cumulative_verified_fill_qty=2"))
+    if conflict=="wrong_symbol":
+        with pytest.raises(PortfolioGuardUnavailable,match="SCOPE_MISMATCH"):
+            with engine.begin() as conn:
+                _record(conn,pnl=50,qty=8,bid=70,now=now+timedelta(seconds=2),snap="next",sold=2)
+    else:
+        with engine.begin() as conn:
+            result=_record(conn,pnl=50,qty=8,bid=70,now=now+timedelta(seconds=2),snap="next",sold=2)
+            assert result["state"]=="BLOCKED" and not result["intents"]
+    with engine.connect() as conn:
+        rows=conn.execute(text("SELECT state,cumulative_verified_fill_qty FROM public.us_portfolio_guard_actions")).all()
+        assert len(rows)==1 and rows[0][0]!="COMPLETE"
+        assert rows[0][1]==(2 if conflict=="regression" else 0)

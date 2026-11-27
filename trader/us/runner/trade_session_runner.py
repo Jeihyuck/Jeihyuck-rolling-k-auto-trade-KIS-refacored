@@ -2319,11 +2319,15 @@ def run_trade_session(
                     # Read-only acceptance record, no additional DB/KIS I/O.
                     # Preserve missing values as null rather than inventing a
                     # zero workload or a completed phase.
-                    from trader.us.runner.runtime_acceptance_evidence import result_evidence
-                    logger.info("[US400_RUNTIME][RESULT] payload=%s", json.dumps(
-                        result_evidence(_acceptance_scope, tick_result,
-                                        wall_sec=time_mod.monotonic()-_acceptance_started),
-                        sort_keys=True, allow_nan=False))
+                    try:
+                        from trader.us.runner.runtime_acceptance_evidence import result_evidence
+                        logger.info("[US400_RUNTIME][RESULT] payload=%s", json.dumps(
+                            result_evidence(_acceptance_scope, tick_result,
+                                            wall_sec=time_mod.monotonic()-_acceptance_started),
+                            sort_keys=True, allow_nan=False))
+                    except Exception:
+                        # Missing evidence fails the read-only gate, never the trading tick.
+                        logger.warning("[US400_RUNTIME][EVIDENCE_UNAVAILABLE]", exc_info=True)
                     results.append(tick_result)
                     final_tick = tick_result
                     tick_completed += 1

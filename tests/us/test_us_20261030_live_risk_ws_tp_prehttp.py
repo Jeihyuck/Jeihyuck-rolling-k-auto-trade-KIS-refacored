@@ -556,6 +556,10 @@ def test_pg_us353_native_tp_claim_reserve_http_gate_and_exact_abort(
         "position_lifecycle_id": cycle, "strategy_owner": "US_STANDARD",
         "tp_pending_deferred_to_claim": True,
     }
+    assert not repos.reserve_us_profit_capture_stage_after_claim(
+        **dict(args, stage="tp2"), qty=5, notional_usd=500, limit_price_usd=100,
+        intent_meta=dict(claim_meta, profit_capture_stage="tp2"),
+    ), "a TP1 claim cannot reserve TP2"
     assert repos.reserve_us_profit_capture_stage_after_claim(
         **args, qty=5, notional_usd=500, limit_price_usd=100,
         intent_meta=claim_meta,
@@ -582,6 +586,16 @@ def test_pg_us353_native_tp_claim_reserve_http_gate_and_exact_abort(
         })
 
     assert event("BROKER_SUBMIT_STARTED", "started")
+    assert repos.verify_us_tp_claim_stage_at_http_boundary(**args)
+    with pg_engine.begin() as conn:
+        conn.execute(text("""UPDATE us_profit_capture_lifecycle SET requested_qty=4
+          WHERE trade_date=:td AND symbol='GILD' AND stage='tp1' AND position_lifecycle_id=:cycle
+        """), {"td": td, "cycle": cycle})
+    assert not repos.verify_us_tp_claim_stage_at_http_boundary(**args), "quantity drift must fence HTTP"
+    with pg_engine.begin() as conn:
+        conn.execute(text("""UPDATE us_profit_capture_lifecycle SET requested_qty=5
+          WHERE trade_date=:td AND symbol='GILD' AND stage='tp1' AND position_lifecycle_id=:cycle
+        """), {"td": td, "cycle": cycle})
     assert repos.verify_us_tp_claim_stage_at_http_boundary(**args)
     assert not repos.release_us_profit_capture_pre_http_abort(
         trade_date=td, symbol="GILD", stage="tp1",
@@ -1350,3 +1364,21 @@ def test_intraday_quote_age_is_measured_after_each_delayed_read(monkeypatch):
     result = overlay.read_us_live_intraday_returns(Provider(), _completed_prices(), [])
     assert result["quality"] == "OK"
     assert all(q["age_sec"] == 0 for q in result["quotes"].values())
+
+
+@pytest.mark.parametrize("bad", [{"suspect": True}, {"asof_epoch": 0, "received_at": 1000.0},
+                                  {"asof_epoch": float("nan")}])
+def test_native_benchmark_recovery_preserves_freshness_and_isolates_symbol(monkeypatch, bad):
+    from trader.us.data_provider import USDataProvider
+    monkeypatch.setattr(overlay.time, "time", lambda: 1000.0)
+    provider = USDataProvider(env="practice", offline=True)
+    calls = []
+    def quote(symbol, exchange, *, max_quote_age_sec=None):
+        calls.append((symbol, max_quote_age_sec))
+        return dict(_live_quote(99, 1000.0), **(bad if symbol == "QQQ" else {}))
+    monkeypatch.setattr(provider, "get_current_price", quote)
+    result = overlay.read_us_live_intraday_returns(provider, _completed_prices(), [], max_age_sec=5)
+    assert calls == [("SPY",5),("QQQ",5),("SMH",5)]
+    assert result["quality"] == "UNKNOWN" and result["returns"]["qqq"] is None
+    assert result["returns"]["spy"] == pytest.approx(-.01)
+    assert result["returns"]["smh"] == pytest.approx(-.01)
