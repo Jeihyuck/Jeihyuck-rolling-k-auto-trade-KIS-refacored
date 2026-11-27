@@ -188,6 +188,8 @@ def make_hard_stop_poll(snapshots, *, excluded_symbols, trade_date, env, context
         batch,cursor = _bounded_quotes(candidates,cursor,env,
             pair=lambda item:(item[1],item[2]))
         for (pos,symbol,exchange,entry,hard,soft),q in batch:
+            if symbol in excluded_symbols:
+                continue
             try:
                 price = _breached_quote(q,entry,hard)
                 family="HARD_STOP"
@@ -213,6 +215,39 @@ def make_hard_stop_poll(snapshots, *, excluded_symbols, trade_date, env, context
                 continue
         return None
     return poll
+
+
+def make_protective_checkpoint(poll, *, on_snapshot, excluded_symbols, monotonic=None):
+    """Cooperative main-writer check at existing safe stage boundaries.
+
+    This cannot interrupt a blocking DB call or start another writer. It
+    checks at most once per five seconds and suppresses repeated evaluation
+    of the same symbol during this stage; the canonical route decides.
+    """
+    if poll is None:
+        return None
+    clock=monotonic or time.monotonic
+    next_due=clock()
+    def check():
+        nonlocal next_due
+        if clock()<next_due:
+            return
+        next_due=clock()+5.0
+        try:
+            snapshot=poll()
+            if not isinstance(snapshot,dict):
+                return
+            symbol=str(snapshot.get("symbol") or "").upper()
+            if not symbol or symbol in excluded_symbols:
+                return
+            # Once attempted, leave the final route to the canonical
+            # pending/reconciliation gates. No duplicate early submission.
+            excluded_symbols.add(symbol)
+            on_snapshot(snapshot)
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception("[US_EXIT][PROTECTIVE_CHECKPOINT_UNAVAILABLE]")
+    return check
 
 
 def _bounded_quotes(candidates,cursor,env,*,pair):

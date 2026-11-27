@@ -909,7 +909,9 @@ def _build_final30_symbol_map_for_trend(*, trade_date: str, locked_watchlist_cac
         return {}, False, "missing_or_stale", rows
 
 
-def _update_position_trends_for_tick(*, positions: list[dict], provider: Any, trade_date: str, now: datetime, locked_watchlist_cache: list[dict] | None = None, watchlist_cache_source: str | None = None) -> tuple[list[dict], dict, list[dict] | None, str | None]:
+def _update_position_trends_for_tick(*, positions: list[dict], provider: Any, trade_date: str, now: datetime, locked_watchlist_cache: list[dict] | None = None, watchlist_cache_source: str | None = None, protective_checkpoint=None) -> tuple[list[dict], dict, list[dict] | None, str | None]:
+    if protective_checkpoint is not None:
+        protective_checkpoint()
     final30_map, final30_ok, final30_quality, loaded_rows = _build_final30_symbol_map_for_trend(trade_date=trade_date, locked_watchlist_cache=locked_watchlist_cache, watchlist_cache_source=watchlist_cache_source)
     if locked_watchlist_cache is None and loaded_rows:
         locked_watchlist_cache = loaded_rows
@@ -921,6 +923,8 @@ def _update_position_trends_for_tick(*, positions: list[dict], provider: Any, tr
     from trader.us.market_calendar import previous_completed_us_session
     expected_metrics_as_of = previous_completed_us_session(trade_date).isoformat()
     for pos in positions or []:
+        if protective_checkpoint is not None:
+            protective_checkpoint()
         symbol = str(pos.get("symbol") or "").upper().strip()
         if not symbol:
             continue
@@ -1041,6 +1045,8 @@ def _update_position_trends_for_tick(*, positions: list[dict], provider: Any, tr
         pos["ma50"] = trend.get("ma50")
         pos["rs_20d"] = trend.get("rs_20d")
         counts[str(trend.get("trend_state") or "UNKNOWN")] = counts.get(str(trend.get("trend_state") or "UNKNOWN"), 0) + 1
+    if protective_checkpoint is not None:
+        protective_checkpoint()
     return positions, counts, locked_watchlist_cache, watchlist_cache_source
 
 
@@ -3260,7 +3266,7 @@ def run_trade_tick(
             _exit_observer_supported = (
                 "on_sell_ready" in _exit_inspect.signature(_gen_exit_from_snapshots).parameters
             )
-            def _gen_pb1_observed(snapshots, *, include_trend_time, phase):
+            def _gen_pb1_observed(snapshots, *, include_trend_time, phase, evaluation_now=None):
                 kwargs = dict(
                     prepared_snapshots=snapshots, include_trend_time=include_trend_time,
                 )
@@ -3270,7 +3276,7 @@ def run_trade_tick(
                     )
                 else:
                     logger.info("[US_EXIT][OBSERVATION_UNSUPPORTED] phase=%s", phase)
-                return _gen_exit_from_snapshots([], provider=None, now=now, **kwargs)
+                return _gen_exit_from_snapshots([], provider=None, now=evaluation_now or now, **kwargs)
 
             _pb1_positions = exclude_non_standard(current_positions)
             _pb1_symbol_counts: dict[str, int] = {}
@@ -3321,9 +3327,10 @@ def run_trade_tick(
                 setattr(tick_context, "_sell_selected_ready_by_symbol", {})
                 setattr(tick_context, "_sell_selected_trace_id_by_symbol", {})
 
-            def _on_snapshot_ready_for_pilot(snapshot: dict) -> None:
+            def _on_snapshot_ready_for_pilot(snapshot: dict, evaluation_now=None) -> None:
                 _new_intents = _gen_pb1_observed(
                     [snapshot], include_trend_time=False, phase="safety",
+                    evaluation_now=evaluation_now,
                 )
                 _earlier_sells = any(
                     str(i.get("side") or "").upper() == "SELL"
@@ -3402,7 +3409,7 @@ def run_trade_tick(
                     attach_standard_sell_evidence(
                         _eligible[0], next(p for p in current_positions
                                            if str(p.get("symbol") or "").upper() == _sym),
-                        decision_at=now.isoformat(),
+                        decision_at=(evaluation_now or now).isoformat(),
                         code_sha=str(os.getenv("US_PINNED_CODE_SHA") or os.getenv("GITHUB_SHA") or "UNKNOWN"),
                     )
                 except Exception as _proof_exc:
@@ -3489,6 +3496,25 @@ def run_trade_tick(
                 safety_exit_intents = []
             safety_sell_symbols = {str(i.get("symbol") or "").upper() for i in safety_exit_intents or [] if str(i.get("side") or "").upper() == "SELL"}
             trend_targets = [p for p in exit_snapshots if str(p.get("symbol") or "").upper() not in safety_sell_symbols]
+            _trend_checkpoint=None
+            if (_early_pilot_enabled and not _early_pilot_stream_incomplete and _stage4_mode
+                    and not _profit_wakeup and not force_now and session in {"am","afternoon"}
+                    and os.getenv("WSL_RUN_MARKET","").upper()=="US"
+                    and os.getenv("US_WS_COLLECTOR_ENABLED","0")=="1"
+                    and os.getenv("US_ENTRY_PROTECTIVE_INTERRUPT_ENABLED","1")=="1"
+                    and tick_context.broker_submit_allowed()):
+                from trader.us.runner.protective_entry_interrupt import (
+                    make_hard_stop_poll,make_protective_checkpoint,
+                )
+                from trader.us.market_calendar import now_ny as _protective_clock
+                _trend_excluded=set(safety_sell_symbols)|_early_pilot_attempted_symbols
+                _trend_excluded.update(sym for sym,count in _pb1_symbol_counts.items() if count!=1)
+                _trend_poll=make_hard_stop_poll(
+                    exit_snapshots,excluded_symbols=_trend_excluded,trade_date=trade_date,
+                    env=env,context=tick_context,allow_confirmed_soft=True)
+                _trend_checkpoint=make_protective_checkpoint(
+                    _trend_poll,excluded_symbols=_trend_excluded,
+                    on_snapshot=lambda snap:_on_snapshot_ready_for_pilot(snap,evaluation_now=_protective_clock()))
             try:
                 trend_targets, trend_state_counts, locked_watchlist_cache, watchlist_cache_source = _update_position_trends_for_tick(
                     positions=trend_targets,
@@ -3497,10 +3523,18 @@ def run_trade_tick(
                     now=now,
                     locked_watchlist_cache=locked_watchlist_cache,
                     watchlist_cache_source=watchlist_cache_source,
+                    **({"protective_checkpoint":_trend_checkpoint} if _trend_checkpoint else {}),
                 )
             except Exception as _trend_exc:
                 _profit_eval_incomplete=True
                 logger.warning("[US_POSITION][TREND_STATE][TICK_WARN] err=%s", _trend_exc)
+            if _trend_checkpoint:
+                # Include every newly observed canonical safety candidate.
+                # Do not evaluate competing trend SELLs for these symbols.
+                safety_exit_intents=list(_pilot_safety_intents)
+                safety_sell_symbols={str(i.get("symbol") or "").upper() for i in safety_exit_intents
+                                     if str(i.get("side") or "").upper()=="SELL"}
+                trend_targets=[p for p in trend_targets if str(p.get("symbol") or "").upper() not in safety_sell_symbols]
             if trend_targets:
                 try:
                     trend_exit_intents = _gen_pb1_observed(
