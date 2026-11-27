@@ -1,0 +1,38 @@
+name: US400-F focused integration evidence acceptance
+on:
+  pull_request:
+    branches: [dual-agent, fix/us-20261126-hot-only-tp90-integrated, 'fix/us-rebuild-*']
+    paths:
+      - 'trader/us/runner/runtime_acceptance_evidence.py'
+      - 'trader/us/runner/trade_session_runner.py'
+      - 'scripts/us400_runtime_acceptance.py'
+      - 'tests/us/test_us400_f_runtime_acceptance.py'
+      - '.github/workflows/us400-f-integration.yml'
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  focused-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONPATH: .
+      KIS_ENV: practice
+      DRY_RUN: '1'
+      US_ORDER_ARMED: '0'
+      KIS_HTTP_BLOCK: '1'
+      PBCORE_DB_URL: ''
+      DATABASE_URL: ''
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install -r requirements.txt pytest
+      - run: |
+          python -m pytest -q --junitxml=/tmp/us400-f.xml tests/us/test_us400_f_runtime_acceptance.py tests/us/test_us_stage4_latency_acceptance_20261023.py tests/us/test_us_close_five_axis_20261120.py
+          python -c 'import xml.etree.ElementTree as E; c=list(E.parse("/tmp/us400-f.xml").iter("testcase")); assert len(c)>=12 and all(x.find("skipped") is None for x in c)'

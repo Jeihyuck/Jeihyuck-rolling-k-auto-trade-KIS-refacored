@@ -132,3 +132,34 @@ def test_confirmed_new_buy_reentry_same_day_is_new_lifecycle_not_prior_tp(pg_eng
     assert row["soft_stop_breach_count"] == 0
     with pytest.raises(RuntimeError, match="US_LIFECYCLE_IDENTITY_CONFLICT"):
         repos.save_us_position_lifecycle_atomic("KO", "2026-10-12", closing)
+
+
+def test_atomic_soft_stop_real_postgres_parity_and_preserves_other_leaves(pg_engine, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from trader.us.db import repos
+    monkeypatch.setattr(repos, "_us_state_epoch_id", lambda *_a, **_k: "atomic-epoch")
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda *_a, **_k: "atomic-epoch")
+    initial={"state":{"lifecycle":_lifecycle(high=123),
+                      "profit_capture":{"tp1_done":True},
+                      "soft_stop_execution":{"soft_stop_partial_done":True}}}
+    for sym in ("PARITY_OLD","PARITY_NEW"):
+        assert repos.save_us_position_risk_state(sym,"2026-10-12",initial,require_durable=True)
+    now=datetime(2026,10,12,15,tzinfo=timezone.utc)
+    cases=[(-.04,96,.03,None),(-.05,95,.03,None),(.01,101,.03,None),
+           (-.04,96,.03,"PB1_STOP_3_6_V1"),(-.05,95,.03,"PB1_STOP_3_6_V1"),
+           (-.045,95.5,.04,"NEXT_REVISION")]
+    for i,(pnl,price,threshold,revision) in enumerate(cases):
+        kwargs=dict(trade_date="2026-10-12",pnl_pct=pnl,current_price=price,
+                    now=now+timedelta(minutes=5*i),soft_stop_pct=threshold,policy_revision=revision)
+        before=repos.update_us_soft_stop_risk_state(symbol="PARITY_OLD",**kwargs)
+        after=repos.update_us_soft_stop_risk_state_atomic(symbol="PARITY_NEW",**kwargs)
+        assert before["soft_stop_breach_count"]==after["soft_stop_breach_count"]
+        assert before["state"]==after["state"]
+        for field in ("lowest_price_since_breach","last_price","last_pnl_pct"):
+            assert (None if before[field] is None else float(before[field]))==(None if after[field] is None else float(after[field]))
+        for field in ("first_soft_stop_seen_at","last_soft_stop_seen_at"):
+            def normalized(value):
+                return datetime.fromisoformat(value) if isinstance(value,str) else value
+            assert normalized(before[field])==normalized(after[field])
+    assert after["state"]["lifecycle"]["high_watermark"]==123
+    assert after["state"]["soft_stop_execution"]["soft_stop_partial_done"] is True

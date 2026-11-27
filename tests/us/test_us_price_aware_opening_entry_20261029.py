@@ -505,3 +505,67 @@ def test_shared_opening_and_rolling_feature_adapter_preserves_live_decision(tmp_
     assert evaluate_price_opportunity(**kwargs,feature_scope=scope)["reason"]=="recent_minute_bars_stale"
     clear_feature_cache()
 
+
+def test_shared_v3_atr_matches_original_and_invalidates_bad_bar(tmp_path, monkeypatch):
+    from trader.marketdata.feature_reuse import clear_feature_cache
+    from trader.us.pb1.swing_runner_exit_v3 import (cached_chandelier_from_verified_bars,
+        chandelier_from_verified_completed_bars)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("WSL_RUN_MARKET","US")
+    monkeypatch.setenv("KIS_ENV","practice")
+    monkeypatch.setenv("US_SHARED_NATIVE_FEATURES_ENABLED","1")
+    start=datetime(2026,8,1)
+    rows=[{"trade_date":(start+timedelta(days=i)).date().isoformat(),"complete":True,
+           "source":"KIS_DAILY_VERIFIED","adjustment_basis":"RAW",
+           "high":101+i*.1,"low":99+i*.1,"close":100+i*.1} for i in range(60)]
+    kw=dict(decision_date=DAY,atr_period=14,lookback=22,multiplier=3.0,ratchet=True)
+    scope=("acct:epoch","ABC","NASDAQ","US_STANDARD","life","cycle","portfolio","contract")
+    clear_feature_cache()
+    original=chandelier_from_verified_completed_bars(rows,**kw)
+    assert original["valid"]
+    assert cached_chandelier_from_verified_bars(rows,scope=scope,**kw)==original
+    clear_feature_cache()
+    assert cached_chandelier_from_verified_bars(rows,scope=scope,**kw)==original
+    corrected=copy.deepcopy(rows)
+    corrected[-1]["high"]+=2
+    assert cached_chandelier_from_verified_bars(corrected,scope=scope,**kw)==chandelier_from_verified_completed_bars(corrected,**kw)
+    corrected[-1]["source"]="UNVERIFIED"
+    assert cached_chandelier_from_verified_bars(corrected,scope=scope,**kw)=={"valid":False,"reason":"BAR_SOURCE_UNVERIFIED"}
+    clear_feature_cache()
+
+
+@pytest.mark.parametrize("ratchet",[True,False])
+def test_incremental_v3_atr_append_parity_and_correction(tmp_path,monkeypatch,ratchet):
+    from trader.marketdata.feature_reuse import clear_feature_cache
+    from trader.us.pb1 import swing_runner_exit_v3 as v3
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("WSL_RUN_MARKET","US")
+    monkeypatch.setenv("KIS_ENV","practice")
+    monkeypatch.setenv("US_SHARED_NATIVE_FEATURES_ENABLED","1")
+    start=datetime(2026,8,1)
+    rows=[{"trade_date":(start+timedelta(days=i)).date().isoformat(),"complete":True,
+           "source":"KIS_DAILY_VERIFIED","adjustment_basis":"RAW",
+           "high":101+i*.1+(i%7)*.4,"low":99+i*.1-(i%5)*.3,"close":100+i*.1}
+          for i in range(60)]
+    kw=dict(decision_date=DAY,atr_period=14,lookback=22,multiplier=3.0,ratchet=ratchet)
+    scope=("acct:epoch","ABC","NASDAQ","US_STANDARD","life","cycle","portfolio","contract")
+    original=v3.chandelier_from_verified_completed_bars
+    expected=[original(rows[:n],**kw) for n in (40,41,48,60)]
+    clear_feature_cache()
+    assert v3.cached_chandelier_from_verified_bars(rows[:40],scope=scope,**kw)==expected[0]
+    def forbidden(*args,**kwargs):
+        raise AssertionError("verified append must not recompute the original prefix")
+    monkeypatch.setattr(v3,"chandelier_from_verified_completed_bars",forbidden)
+    for n,want in zip((41,48,60),expected[1:]):
+        clear_feature_cache()  # exercise durable shared prefix, not local LRU
+        assert v3.cached_chandelier_from_verified_bars(rows[:n],scope=scope,**kw)==want
+    monkeypatch.setattr(v3,"chandelier_from_verified_completed_bars",original)
+    corrected=copy.deepcopy(rows)
+    corrected[10]["high"]+=2
+    clear_feature_cache()
+    assert v3.cached_chandelier_from_verified_bars(corrected,scope=scope,**kw)==original(corrected,**kw)
+    for changed in (corrected[1:],corrected[:-2],corrected+[dict(corrected[-1])],
+                    corrected+[dict(corrected[-1],trade_date=DAY)]):
+        clear_feature_cache()
+        assert v3.cached_chandelier_from_verified_bars(changed,scope=scope,**kw)==original(changed,**kw)
+    clear_feature_cache()
