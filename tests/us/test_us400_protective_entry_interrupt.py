@@ -428,3 +428,32 @@ def test_protective_checkpoint_uses_main_thread_and_bounded_cadence():
     assert polled==[0,5,10]
     assert handled==[("ABC",threading.get_ident()),("DEF",threading.get_ident())]
     assert excluded=={"ABC","DEF"}
+
+
+@pytest.mark.parametrize("case",["valid","hard_priority","blocked","unknown","other_identity","buy","missing_proof"])
+def test_active_entry_profit_signal_requires_clean_serial_followup(monkeypatch,case):
+    from trader.us.runner import protective_entry_interrupt as guard
+    from types import SimpleNamespace
+    identity=dict(symbol="ABC",strategy_owner="US_STANDARD",position_lifecycle_id="l",
+                  position_cycle_id="l",portfolio_epoch_id="p",trading_epoch_id="e",broker_account_hash="a")
+    watch=[{"identity":identity,"profit":{"up":[110]}}]
+    signal={"kind":"profit","identity":dict(identity)}
+    if case=="other_identity": signal["identity"]["broker_account_hash"]="foreign"
+    monkeypatch.setattr(guard,"make_idle_hard_stop_poll",lambda *a,**kw:lambda:signal)
+    ctx=SimpleNamespace(broker_submit_allowed=lambda:case!="blocked",remaining_sec=lambda:30)
+    hard={"symbol":"DEF"} if case=="hard_priority" else None
+    poll=guard.make_entry_protective_poll(lambda:hard,watch,trade_date="2026-11-25",env="practice",context=ctx)
+    snap=poll()
+    if case=="hard_priority":
+        assert snap==hard
+        return
+    if case=="blocked":
+        assert snap is None
+        return
+    result=dict(orders=[],entry_intents=0,exit_intents=0,orders_sent=0,
+                manual_reconcile_required=0,exit_route_reconcile_required=False,
+                exit_route_liveness_failure=False,entry_degraded_reason="PROTECTIVE_PROFIT_ENTRY_INTERRUPTED")
+    if case=="unknown": result["exit_route_reconcile_required"]=True
+    if case=="buy": result["entry_intents"]=1
+    if case=="missing_proof": result.pop("exit_route_liveness_failure")
+    assert guard.validated_entry_profit_followup(snap,watch=watch,result=result)==(signal if case=="valid" else None)

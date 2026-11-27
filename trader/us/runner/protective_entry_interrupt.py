@@ -610,3 +610,46 @@ def profit_wakeup_result(orders, intents, *, trade_date, session, position_count
         sell_decisions_detail=decisions,sell_notional_routed=_routed_sell_notional(orders),
         exit_route_reconcile_required=uncertain,manual_reconcile_required=int(uncertain),
         unresolved_ack_count=ack,reconcile_liveness_status="RECONCILE_REQUIRED" if uncertain else "PENDING_SETTLEMENT" if ack else "OK")
+
+
+def make_entry_protective_poll(hard_poll, watch, *, trade_date, env, context):
+    """Read-only profit signal during BUY evaluation; hard/soft have priority.
+
+    A profit alert cancels the read-only worker and requests a later serial
+    SELL-only child. It never routes a second writer or invents a SELL intent.
+    """
+    profit_watch=[w for w in watch if isinstance(w,dict) and w.get("profit")]
+    profit_poll=make_idle_hard_stop_poll(profit_watch,trade_date=trade_date,env=env)
+    if profit_poll is None:
+        return hard_poll
+    def poll():
+        if not context.broker_submit_allowed() or context.remaining_sec()<10:
+            return None
+        hard=hard_poll() if hard_poll is not None else None
+        if hard is not None:
+            return hard
+        signal=profit_poll()
+        identity,kind=split_wakeup(signal)
+        if kind=="profit" and identity is not None:
+            return {"_entry_profit_wakeup":signal}
+        return None
+    return poll
+
+
+def validated_entry_profit_followup(snapshot, *, watch, result):
+    """Only a known no-order exit permits immediate serial profit re-evaluation."""
+    if not isinstance(snapshot,dict) or set(snapshot)!={"_entry_profit_wakeup"}:
+        return None
+    signal=snapshot["_entry_profit_wakeup"]
+    identity,kind=split_wakeup(signal)
+    if (kind!="profit" or identity is None
+            or not any(isinstance(w,dict) and w.get("identity")==identity for w in watch)
+            or not isinstance(result,dict)
+            or result.get("orders")!=[] or result.get("entry_intents")!=0
+            or result.get("exit_intents")!=0 or result.get("orders_sent")!=0
+            or result.get("manual_reconcile_required")!=0
+            or result.get("exit_route_reconcile_required") is not False
+            or result.get("exit_route_liveness_failure") is not False
+            or result.get("entry_degraded_reason")!="PROTECTIVE_PROFIT_ENTRY_INTERRUPTED"):
+        return None
+    return signal
