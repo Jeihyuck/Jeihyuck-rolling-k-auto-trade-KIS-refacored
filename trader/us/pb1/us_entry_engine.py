@@ -1253,6 +1253,8 @@ def generate_entry_intents(
                         style=_family, trade_date=_resolve_us_trade_date(now),
                         now_et=_op_now, verified_bars=_observed_bars,
                         quote=_opportunity_quote, prep=entry_meta or {},
+                        feature_scope=(_scope, str(symbol).upper(), str(exchange).upper(), "US_STANDARD")
+                            if _scope else None,
                         min_rr=float(os.getenv("US_OPPORTUNITY_MIN_REFERENCE_RR", "1.5")),
                         max_stop_distance=float(os.getenv("US_OPPORTUNITY_MAX_STOP_DISTANCE", "0.025")),
                     )

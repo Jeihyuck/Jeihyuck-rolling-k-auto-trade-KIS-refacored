@@ -91,6 +91,35 @@ def opening_coverage(bars: list[dict], trade_date: str) -> dict:
     }
 
 
+def _opening_static_features(open_bars: list[dict], trade_date: str, min_opening_bars: int):
+    """Exact original opening geometry and native VWAP calculation."""
+    coverage = opening_coverage(open_bars, trade_date)
+    volume = sum(b["volume"] for b in open_bars)
+    have_amount = (len(open_bars) >= min_opening_bars
+                   and all(b.get("turnover") is not None for b in open_bars))
+    vwap = (sum(b["turnover"] for b in open_bars) / volume
+            if have_amount and volume > 0 else None)
+    mid = sum(b["close"] for b in open_bars) / len(open_bars) if open_bars else None
+    if vwap is not None and mid is not None and not (0.75 <= vwap / mid <= 1.25):
+        vwap = None
+    return coverage, vwap
+
+
+def opening_static_features(bars, trade_date, min_opening_bars, *, feature_scope=None):
+    opening = [b for b in bars if "T09:30:00" <= b["time_et"][10:19] < "T10:00:00"]
+    if not feature_scope:
+        return _opening_static_features(opening, trade_date, min_opening_bars)
+    from trader.marketdata.feature_reuse import cached_native_features
+    # The full exact opening operand set is bound, not just count/last time.
+    # A late correction or conflict removal changes the key. Current quote,
+    # clock/age, position, stop and order decision are never memoized.
+    return cached_native_features(
+        market="US", scope=feature_scope, trade_date=trade_date,
+        settings=("US_OPENING_STATIC_V1", min_opening_bars),
+        rows=opening, compute=lambda rows: _opening_static_features(rows, trade_date, min_opening_bars),
+    )
+
+
 def _decision(state: str, reason: str, *, style: str, facts: dict,
               price: float | None = None, max_entry_price: float | None = None,
               stop_reference: float | None = None, target_reference: float | None = None,
@@ -116,6 +145,7 @@ def evaluate_price_opportunity(
     prep: dict | None = None, min_opening_bars: int = 30,
     min_rr: float = 1.5, max_stop_distance: float = 0.025,
     max_spread: float = 0.003, max_chase: float = 0.008,
+    feature_scope: tuple[str, ...] | None = None,
 ) -> dict:
     """Evaluate whether the *current entry price* deserves a BUY candidate.
 
@@ -173,26 +203,12 @@ def evaluate_price_opportunity(
     if (now_et.hour, now_et.minute) < (10, 0):
         return _decision("WATCH", "opening_window_collecting", style=style, facts=facts)
 
-    coverage = opening_coverage(verified_bars, trade_date)
+    coverage, _vwap = opening_static_features(
+        verified_bars, trade_date, min_opening_bars, feature_scope=feature_scope)
     facts["opening"] = coverage
     facts["reference_path"] = "OPENING_RANGE"
     if coverage["observed_1m"] < min_opening_bars:
         return _decision("WAIT", "opening_minute_bars_insufficient", style=style, facts=facts)
-
-    # Native KIS minute turnover/volume only. Sparse last-price samples,
-    # missing turnover, or anomalous value units do not produce fake VWAP.
-    _open_bars = [
-        b for b in verified_bars
-        if "T09:30:00" <= b["time_et"][10:19] < "T10:00:00"
-    ]
-    _volume = sum(b["volume"] for b in _open_bars)
-    _have_amount = (len(_open_bars) >= min_opening_bars
-                    and all(b.get("turnover") is not None for b in _open_bars))
-    _vwap = (sum(b["turnover"] for b in _open_bars) / _volume
-             if _have_amount and _volume > 0 else None)
-    _mid = sum(b["close"] for b in _open_bars) / len(_open_bars) if _open_bars else None
-    if _vwap is not None and _mid is not None and not (0.75 <= _vwap / _mid <= 1.25):
-        _vwap = None
     facts["opening_vwap"] = round(_vwap, 6) if _vwap is not None else None
     facts["vwap_provenance"] = "KIS_NATIVE_MINUTE_AMOUNT_AND_VOLUME" if _vwap is not None else "UNKNOWN"
 
