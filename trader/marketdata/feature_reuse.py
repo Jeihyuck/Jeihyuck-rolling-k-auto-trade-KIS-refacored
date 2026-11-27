@@ -56,13 +56,16 @@ def clear_feature_cache():
         _hits = _misses = 0
 
 
-def shared_native_features(*, market, scope, trade_date, settings, rows, compute, base):
+def shared_native_features(*, market, scope, trade_date, settings, rows, compute, base, advance=None):
     """Bounded same-host, cross-process reuse of pure JSON feature outputs.
 
     One row per exact scoped formula; corrections/removals change the operand
     hash. Never cache a quote, position, decision, risk or broker authority.
     Unavailable/locked/corrupt cache falls back to the original calculation.
     Caller must use a private runtime directory and return JSON-only features.
+    Optional advance(previous, rows, prefix_count) may reuse exact append-only
+    history. It returns None to require a full computation. A correction,
+    truncation, changed formula or invalid cache must never reuse prefix state.
     """
     import logging
     import os
@@ -101,27 +104,52 @@ def shared_native_features(*, market, scope, trade_date, settings, rows, compute
             os.close(fd)
     except (OSError, ValueError, TypeError, AttributeError):
         return compute(rows)
+    prior = None
     try:
         with closing(sqlite3.connect(path, timeout=.025)) as db:
             db.execute("PRAGMA busy_timeout=25")
             db.execute("""CREATE TABLE IF NOT EXISTS native_features (
                 slot TEXT PRIMARY KEY, operand_hash TEXT NOT NULL,
                 payload TEXT NOT NULL, checksum TEXT NOT NULL, updated REAL NOT NULL)""")
-            row = db.execute("SELECT payload,checksum FROM native_features WHERE slot=? AND operand_hash=?",
-                             (slot,digest)).fetchone()
+            row = db.execute("SELECT payload,checksum,operand_hash FROM native_features WHERE slot=?",
+                             (slot,)).fetchone()
             if row and len(row[0]) <= 65536 and sha256(row[0].encode()).hexdigest() == row[1]:
                 try:
-                    value = json.loads(row[0])
-                    log.debug("[NATIVE_FEATURES][SHARED_HIT] market=%s lookup_ms=%.3f",
-                              market,(time.monotonic()-started)*1000)
-                    return value
+                    decoded = json.loads(row[0])
+                    if advance is None:
+                        if row[2] == digest:
+                            log.debug("[NATIVE_FEATURES][SHARED_HIT] market=%s lookup_ms=%.3f",
+                                      market,(time.monotonic()-started)*1000)
+                            return decoded
+                    elif isinstance(decoded, dict) and decoded.get("append_schema") == 1:
+                        count = decoded.get("rows_count")
+                        if (type(count) is int and isinstance(rows, list)
+                                and 0 < count <= len(rows) and "value" in decoded
+                                and sha256(encode(rows[:count]).encode()).hexdigest() == row[2]):
+                            if count == len(rows) and row[2] == digest:
+                                log.debug("[NATIVE_FEATURES][SHARED_HIT] market=%s lookup_ms=%.3f",
+                                          market,(time.monotonic()-started)*1000)
+                                return decoded["value"]
+                            if count < len(rows):
+                                prior = (decoded["value"], count)
                 except (ValueError, TypeError):
                     pass
     except (OSError, sqlite3.Error):
         return compute(rows)
-    value = compute(rows)
+    value = None
+    if prior is not None:
+        try:
+            value = advance(prior[0], rows, prior[1])
+        except (ValueError, TypeError, KeyError, IndexError, ArithmeticError):
+            value = None
+        if value is not None:
+            log.debug("[NATIVE_FEATURES][APPEND_REUSE] market=%s prior_rows=%d appended_rows=%d lookup_ms=%.3f",
+                      market, prior[1], len(rows)-prior[1], (time.monotonic()-started)*1000)
+    if value is None:
+        value = compute(rows)
     try:
-        payload = encode(value)
+        payload = encode(value if advance is None else
+                         {"append_schema":1,"rows_count":len(rows),"value":value})
         if len(payload) > 65536:
             return value
         with closing(sqlite3.connect(path, timeout=.025)) as db:

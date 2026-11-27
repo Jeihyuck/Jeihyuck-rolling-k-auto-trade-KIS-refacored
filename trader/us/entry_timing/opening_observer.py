@@ -522,6 +522,30 @@ def publish_preminute_candidates(
                              if r["symbol"] in event_inputs},
     }
     path = priority_manifest_path(env=env, scope=scope, trade_date=trade_date, base=base)
+    if prep_contract is None:
+        # A new canonical tick may publish exactly the same execution shortlist.
+        # Retain the previous event namespace only while its manifest is fresh
+        # and every strategy-owned input and ordered lane is unchanged. The
+        # event reader still requires a fresh (<=5s) native quote and the full
+        # canonical WAIT/READY, risk and order gates. Never revive an expired
+        # generation, or carry an event across candidate/strategy changes.
+        try:
+            if path.stat().st_size <= 65536:
+                prior_event = json.loads(path.read_text(encoding="utf-8"))
+                identity_keys = ("schema", "env", "owner", "trade_date",
+                    "scope_sha256", "is_order_authorization", "hot", "warm",
+                    "cold", "desired_hot", "hot_event_inputs")
+                prior_created = float(prior_event["created_epoch"])
+                prior_expires = float(prior_event["expires_epoch"])
+                prior_generation = prior_event["generation"]
+                if (isinstance(prior_generation, str) and prior_generation
+                        and all(k in prior_event and prior_event[k] == payload[k] for k in identity_keys)
+                        and prior_event["is_order_authorization"] is False
+                        and math.isfinite(prior_created) and math.isfinite(prior_expires)
+                        and prior_created < epoch <= prior_expires <= prior_created + 180.00001):
+                    payload["generation"] = prior_generation
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
+            pass
     if prep_contract is not None:
         from datetime import date
         from trader.us.market_calendar import is_us_trading_day, regular_close_time_for_date
