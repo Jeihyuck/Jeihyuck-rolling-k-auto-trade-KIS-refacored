@@ -19,7 +19,7 @@ def test_hot_event_reevaluates_only_changed_native_evidence(tmp_path,monkeypatch
         calls.append(kw) or {"state":"WAIT","reason":"opening_minute_bars_insufficient","facts":{},
                               "broker_authorized":False})
     seen={}
-    quote={"bid":99.9,"ask":100,"last":100,"received_at":now.timestamp()-1,"collector_generation":"g1"}
+    quote={"bid":99.9,"ask":100,"last":100,"received_at":now.timestamp()-1,"collector_generation":"g1","source":"KIS_WEBSOCKET_COLLECTOR"}
     kw=dict(env="practice",scope="scope:epoch",trade_date=td,hot_pairs=[pairs[0],pairs[2]],now_et=now,
             quote_reader=lambda *a:dict(quote),seen=seen,base=tmp_path)
     try:
@@ -49,7 +49,7 @@ def test_real_hot_evaluator_never_creates_ready_before_30_native_bars(tmp_path,m
         result=poll_hot_events(db,env="practice",scope="scope:epoch",trade_date=td,
             hot_pairs=[("AAA","NYSE")],now_et=now,
             quote_reader=lambda *a:{"bid":99.9,"ask":100,"last":100,"received_at":now.timestamp()-1,
-                                    "collector_generation":"g1"},seen={},base=tmp_path)
+                                    "collector_generation":"g1","source":"KIS_WEBSOCKET_COLLECTOR"},seen={},base=tmp_path)
         assert len(result)==1
         assert result[0]["decision"]["state"]=="WAIT"
         assert result[0]["decision"]["reason"]=="opening_minute_bars_insufficient"
@@ -76,7 +76,7 @@ def test_ready_event_handoff_only_retries_waited_candidate_once(tmp_path,monkeyp
         event=poll_hot_events(db,env="practice",scope="scope:epoch",trade_date=td,
             hot_pairs=[("AAA","NASDAQ")],now_et=now,
             quote_reader=lambda *a:{"bid":99.9,"ask":100,"last":100,"received_at":now.timestamp()-1,
-                                    "collector_generation":"g1"},seen={},base=tmp_path)
+                                    "collector_generation":"g1","source":"KIS_WEBSOCKET_COLLECTOR"},seen={},base=tmp_path)
         assert len(event)==1 and not event[0]["is_order_authorization"]
         kw=dict(env="practice",scope="scope:epoch",trade_date=td,
                 generation=manifest["generation"],now_epoch=now.timestamp(),base=tmp_path)
@@ -109,7 +109,7 @@ def test_same_price_new_native_receipt_refreshes_hint_and_suspect_revokes(tmp_pa
         candidates=[(10,"AAA","NYSE",None,{"position_state":"NOT_HELD","entry_style":"ENTRY_PULLBACK"})],
         now_epoch=now.timestamp()-1,base=tmp_path)
     db = observer.open_store(observer.store_path(env="practice",account_scope="scope:epoch",trade_date=td,base=tmp_path))
-    quote = {"bid":99.9,"ask":100,"last":100,"received_at":now.timestamp()-1,"collector_generation":"g1"}
+    quote = {"bid":99.9,"ask":100,"last":100,"received_at":now.timestamp()-1,"collector_generation":"g1","source":"KIS_WEBSOCKET_COLLECTOR"}
     kw = dict(env="practice",scope="scope:epoch",trade_date=td,hot_pairs=[("AAA","NYSE")],
               quote_reader=lambda *a:dict(quote),seen={},base=tmp_path)
     read = dict(env="practice",scope="scope:epoch",trade_date=td,generation=manifest["generation"],
@@ -122,6 +122,14 @@ def test_same_price_new_native_receipt_refreshes_hint_and_suspect_revokes(tmp_pa
         quote["received_at"] = later.timestamp()-1
         assert len(poll_hot_events(db,now_et=later,**kw)) == 1
         assert read_hot_retry_hints(now_epoch=later.timestamp(),**read) == {("AAA","NYSE")}
+        # A REST/cache or missing-source payload cannot be relabeled native.
+        for source in ("REST", None):
+            quote["source"] = source
+            assert poll_hot_events(db,now_et=later,**kw) == []
+            assert read_hot_retry_hints(now_epoch=later.timestamp(),**read) == set()
+            quote["source"] = "KIS_WEBSOCKET_COLLECTOR"
+            assert len(poll_hot_events(db,now_et=later,**kw)) == 1
+            assert read_hot_retry_hints(now_epoch=later.timestamp(),**read) == {("AAA","NYSE")}
         quote["suspect"] = True
         assert poll_hot_events(db,now_et=later,**kw) == []
         assert read_hot_retry_hints(now_epoch=later.timestamp(),**read) == set()
@@ -182,7 +190,7 @@ def test_quote_expiring_during_evaluation_revokes_ready_hint(tmp_path, monkeypat
     db = observer.open_store(observer.store_path(env=scope["env"], account_scope=scope["scope"],
         trade_date=scope["trade_date"], base=tmp_path))
     try:
-        q = {"bid": 100, "ask": 101, "last": 100, "received_at": now.timestamp()-2, "collector_generation": "g"}
+        q = {"bid": 100, "ask": 101, "last": 100, "received_at": now.timestamp()-2, "collector_generation": "g", "source": "KIS_WEBSOCKET_COLLECTOR"}
         options = dict(**scope, hot_pairs=[("AAA", "NYSE")], now_et=now,
                        quote_reader=lambda *args: q, seen={})
         assert len(poll_hot_events(db, **options)) == 1
