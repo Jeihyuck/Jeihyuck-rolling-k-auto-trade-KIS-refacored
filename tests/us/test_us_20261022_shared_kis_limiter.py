@@ -55,3 +55,34 @@ def test_shared_pacing_requires_valid_scope_and_interval(tmp_path):
             "test", min_interval_sec=0,
             root=str(tmp_path), sleep_with_budget=_budget_sleep,
         )
+
+
+def test_observer_defers_without_consuming_shared_slot(tmp_path):
+    scope = "observer-background"
+    kwargs = dict(min_interval_sec=5.0, root=str(tmp_path))
+    wait_for_shared_slot(scope, sleep_with_budget=_budget_sleep, **kwargs)
+    slot_file = next(tmp_path.glob("*.slot"))
+    original = slot_file.read_text()
+    def forbidden_sleep(_):
+        pytest.fail("background request must not wait with account lock")
+    with pytest.raises(SharedLimiterUnavailable, match="background_deferred"):
+        wait_for_shared_slot(scope, sleep_with_budget=forbidden_sleep,
+                             defer_if_busy=True, **kwargs)
+    assert slot_file.read_text() == original
+
+
+def test_observer_defers_when_execution_holds_shared_lock(tmp_path):
+    import fcntl
+    import hashlib
+    scope = "observer-lock"
+    path = tmp_path / (hashlib.sha256(scope.encode()).hexdigest() + ".slot")
+    with path.open("w+") as held:
+        fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        def forbidden_sleep(_):
+            pytest.fail("observer must not wait behind execution")
+        with pytest.raises(SharedLimiterUnavailable, match="background_deferred"):
+            wait_for_shared_slot(scope, min_interval_sec=1.0, root=str(tmp_path),
+                                 sleep_with_budget=forbidden_sleep, defer_if_busy=True)
+        assert path.read_text() == ""
+    assert wait_for_shared_slot(scope, min_interval_sec=1.0, root=str(tmp_path),
+                                sleep_with_budget=_budget_sleep, defer_if_busy=True) > 0
