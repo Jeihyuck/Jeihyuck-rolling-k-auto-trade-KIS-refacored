@@ -635,3 +635,35 @@ def test_rolling_native_feature_slide_exact_parity(tmp_path,monkeypatch,change):
         assert calls==([15] if change in {"slide","min_removed","multi_slide"} else [15,min(len(newer),15)])
     finally:
         clear_feature_cache()
+
+
+def test_shared_feature_payload_modes_are_isolated(tmp_path):
+    """Changing reuse mode must not return a cached state envelope as a feature."""
+    from itertools import permutations
+    from trader.marketdata.feature_reuse import shared_native_features
+
+    for order in permutations(("exact", "append", "window")):
+        calls = []
+        kwargs = dict(market="US",
+                      scope=("acct:epoch", "-".join(order), "NASDAQ", "US_STANDARD"),
+                      trade_date=DAY, settings=("SAME_FORMULA",),
+                      base=tmp_path, rows=[{"close": 100}])
+
+        def read(mode):
+            def compute(rows):
+                calls.append(mode)
+                return {"close": rows[-1]["close"]}
+
+            extra = {}
+            if mode == "append":
+                extra["advance"] = lambda *args: pytest.fail("not an append")
+            elif mode == "window":
+                extra["slide"] = lambda *args: pytest.fail("not a slide")
+            return shared_native_features(**kwargs, compute=compute, **extra)
+
+        for mode in order:
+            assert read(mode) == {"close": 100}
+        assert calls == list(order)
+        for mode in reversed(order):
+            assert read(mode) == {"close": 100}
+        assert calls == list(order)

@@ -81,10 +81,15 @@ def shared_native_features(*, market, scope, trade_date, settings, rows, compute
         return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
     if market not in {"US", "KR"} or not scope or not all(scope):
         return compute(rows)
+    # The payload contracts for exact, append and sliding-window reuse are
+    # different. Never decode a state envelope as a plain feature result.
+    if advance is not None and slide is not None:
+        return compute(rows)
+    cache_kind = "append-v1" if advance is not None else "window-v1" if slide is not None else "exact-v1"
     try:
         if date.fromisoformat(trade_date).isoformat() != trade_date:
             return compute(rows)
-        identity = encode([market, list(scope), trade_date, list(settings)])
+        identity = encode([market, list(scope), trade_date, list(settings), cache_kind])
         digest = sha256(encode(rows).encode()).hexdigest()
         slot = sha256(identity.encode()).hexdigest()
         # One private account/day DB, not one unbounded file per bar version.
@@ -106,8 +111,6 @@ def shared_native_features(*, market, scope, trade_date, settings, rows, compute
         return compute(rows)
     prior = None
     prior_window = None
-    if advance is not None and slide is not None:
-        return compute(rows)
     try:
         with closing(sqlite3.connect(path, timeout=.025)) as db:
             db.execute("PRAGMA busy_timeout=25")
