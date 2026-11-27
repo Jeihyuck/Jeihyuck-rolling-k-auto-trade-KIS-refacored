@@ -101,6 +101,15 @@ def _publish(path, row, code):
                 log.warning("[KR_REST_SHARED][CLEANUP_FAIL] code=%s", code)
 
 
+def read_cached(*, appkey, code):
+    """Nonblocking read of the same immutable native snapshot; no fetch or lock."""
+    try:
+        _, cache_path = _paths(appkey, code)
+        return _read(cache_path, code)
+    except (OSError, ValueError, TypeError):
+        return None
+
+
 def read_or_fetch(*, appkey, code, fetch, max_join_sec=0.15, defer_on_busy=False):
     """Return (status, quote) with at most one leader per symbol.
 

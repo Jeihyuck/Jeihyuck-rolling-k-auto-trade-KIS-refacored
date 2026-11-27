@@ -2871,6 +2871,18 @@ class KisAPI:
         if cached:
             return cached
 
+        # Reuse the exact canonical native price cache across processes.
+        # Explicit source probes and selected order-bound refreshes remain independent.
+        if (not native_rest_only and retry_cap is not None
+                and len(c) == 6 and c.isascii() and c.isdigit() and c != "122630"):
+            from trader.marketdata import kr_rest_shared
+            if kr_rest_shared.enabled(getattr(self, "env", None)):
+                shared = kr_rest_shared.read_cached(appkey=str(APP_KEY or ""), code=c)
+                if shared is not None:
+                    logger.info("[KR_REST_SHARED][DIRECT_QUOTE_HIT] code=%s age_sec=%.3f",
+                                c, shared["age_sec"])
+                    return shared
+
         # Legacy endpoint gate: wait within a bounded budget instead of
         # converting a local throttle/cooldown directly into price_unavailable.
         gate = get_kis_gate()

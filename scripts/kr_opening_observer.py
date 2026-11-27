@@ -23,7 +23,7 @@ from trader.kr.opening_bar_contract import (
 )
 from trader.runtime_paths import repo_root
 from trader.time_utils import now_kst
-from trader.kr.entry_priority_queue import CandidateSchedule, collection_priorities
+from trader.kr.entry_priority_queue import CandidateSchedule, observer_collection_priorities
 
 logger = logging.getLogger(__name__)
 
@@ -725,7 +725,7 @@ def main() -> None:
             continue
         cycle_started = time.monotonic()
         try:
-            priority = collection_priorities(date=today, account_scope=scope, now=now,
+            priority = observer_collection_priorities(date=today, account_scope=scope, now=now,
                                              final30_file=args.final30_file)
             if priority["state"] == "INVALID_PREP":
                 logger.warning("[KR][OPENING_OBSERVER][WAIT_PREP] verified_final30=0 action=RETRY_SAME_DAY_READ_ONLY")
@@ -741,8 +741,8 @@ def main() -> None:
                 logger.info("[KR][OPENING_OBSERVER][PREP_READY] final30=%s role=READ_ONLY", len(codes))
             # COLD remains in the signed Final30 universe and continues to
             # receive low-cost PB1 pre-minute evaluation; it does NOT consume
-            # native 1-minute REST calls. Only actual HOT/WARM BUY candidates
-            # are eligible for high-frequency native collection.
+            # native 1-minute REST calls. Only verified observation or execution
+            # HOT/WARM candidates receive native collection.
             native_priority = {**priority, "cold": []}
             health = schedule.diagnostics(
                 native_priority, now, interval_sec=planner_wake_sec,
@@ -765,7 +765,7 @@ def main() -> None:
             last_capacity_warning_key = warning_key
             selected = schedule.select(native_priority, now)
             if not selected:
-                if priority["state"] == "PB1_ACTIVE" and (priority["hot"] or priority["warm"]):
+                if priority["state"] in {"PB1_ACTIVE", "PREP_COLLECTION_ACTIVE"} and (priority["hot"] or priority["warm"]):
                     # A nonempty verified shortlist with nothing due is not
                     # a collection-target outage. Keep per-symbol due periods.
                     time.sleep(min(5.0, planner_wake_sec))
