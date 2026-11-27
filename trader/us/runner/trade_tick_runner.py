@@ -971,7 +971,12 @@ def _update_position_trends_for_tick(*, positions: list[dict], provider: Any, tr
             else:
                 from trader.us.db.price_daily_repo import load_recent_us_daily_bars
                 rows = load_recent_us_daily_bars(symbol=symbol, before_date=trade_date, limit=int(os.getenv("US_DAILY_REQUIRED_BARS", "260")))
-                daily = _compute_completed_daily_metrics(list(rows or []), trade_date)
+                from trader.us.runner.daily_feature_cache import reuse_daily_metrics
+                daily = reuse_daily_metrics(
+                    list(rows or []), trade_date, position=pos,
+                    row_date=_row_date, row_close=_row_close,
+                    original=_compute_completed_daily_metrics,
+                )
                 if str(daily.get("daily_metrics_as_of") or "") != expected_metrics_as_of:
                     daily["daily_history_quality"] = "STALE"
                 else:
