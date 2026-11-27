@@ -317,3 +317,25 @@ def test_profit_wakeup_keeps_verified_forward_contract_without_soft_confirmation
     assert p["risk_state"]["state"]["lifecycle"]=={"lifecycle_id":"l"}
     assert p["soft_stop_breach_count"]==0 and "soft_stop_execution" not in p["risk_state"]["state"]
     assert row["soft_stop_breach_count"]==1 and row["state"]["soft_stop_execution"]=={"old":True}
+
+
+@pytest.mark.parametrize("overrun", [False, True])
+def test_idle_poll_overhead_does_not_extend_normal_slot(monkeypatch, overrun):
+    from trader.us.runner import trade_session_runner as session
+    clock = [0.0]
+    sleeps = []
+    polls = []
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += seconds
+    def poll():
+        polls.append(clock[0])
+        clock[0] += 8 if overrun else 2
+        return {"symbol": "ABC"} if overrun else None
+    monkeypatch.setattr(session.time_mod, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(session.time_mod, "sleep", sleep)
+    monkeypatch.setattr(session, "write_heartbeat_file", lambda *a, **kw: None)
+    assert session.sleep_with_heartbeat("am", "run", 1, 12, protective_poll=poll) is None
+    assert polls == [5]
+    assert sleeps == ([5] if overrun else [5, 5])
+    assert clock[0] == (13 if overrun else 12)
