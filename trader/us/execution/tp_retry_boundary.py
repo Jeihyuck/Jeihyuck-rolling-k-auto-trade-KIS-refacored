@@ -145,50 +145,80 @@ def _release_certificate_row(conn, row: dict, scope: dict) -> bool:
     return True
 
 
-def repair_tp_retries_at_boundary(*, trade_date: str, phase: str) -> dict:
-    # trade_session_runner's production opening boundary is named AM_START.
+def repair_tp_retries_at_boundary(*, trade_date: str, phase: str,
+                                   budget_sec: float = 20.0) -> dict:
+    # Only AM_START / CLOSE. No historical retry loop in the trading tick.
     if str(phase).upper() not in {"AM", "AM_START", "CLOSE"}:
         return {"status": "SKIPPED_NOT_BOUNDARY", "released": 0}
     from trader.us.db.repos import _get_engine_or_none, _us_execution_claim_scope
+    from datetime import date
+    import time
     result = {"status": "OK", "released": 0, "unverified": [], "checked": 0}
     try:
+        deadline = time.monotonic() + max(0.1,min(30.0,float(budget_sec)))
         engine = _get_engine_or_none()
         scope = _us_execution_claim_scope()
         if (engine is None or scope.get("env") != "practice"
                 or not scope.get("trading_epoch_id") or not scope.get("account_id")):
             raise RuntimeError("TP_BOUNDARY_DURABLE_SCOPE_UNAVAILABLE")
+        # Read the candidate identities without locking the whole historical
+        # population. Each repair owns exactly one short transaction.
         with engine.begin() as conn:
-            # Existing retry lineage is retained, including all prior keys.
-            rows = conn.execute(text("""
+            conn.execute(text("SET LOCAL lock_timeout='1000ms'"))
+            conn.execute(text("SET LOCAL statement_timeout='5000ms'"))
+            rows = [dict(row) for row in conn.execute(text("""
                 SELECT * FROM us_profit_capture_lifecycle
                 WHERE trade_date<=:td AND trading_epoch_id=:epoch
                   AND stage_status IN ('NOT_TRIGGERED','PENDING')
                   AND client_order_key IS NOT NULL AND client_order_key<>''
                   AND symbol<>'TQQQ'
-                  AND COALESCE(state->'meta'->>'last_evidence_type','')
-                      NOT IN ('ROUTER_ABORTED_BEFORE_CLAIM','BROKER_SUBMIT_ABORTED_PRE_IO')
-                ORDER BY trade_date,symbol,stage FOR UPDATE
-            """), {"td": trade_date, "epoch": scope["trading_epoch_id"]}).mappings().all()
-            for raw in rows:
-                row = dict(raw)
-                result["checked"] += 1
-                # A per-row savepoint avoids committing a half-repaired intent.
-                try:
-                    with conn.begin_nested():
-                        released = _release_certificate_row(conn, row, scope)
-                except Exception as exc:
-                    result["unverified"].append({"symbol": row["symbol"], "stage": row["stage"],
-                        "source_trade_date": str(row["trade_date"]),
-                        "reason": "REPAIR_ROLLED_BACK:" + type(exc).__name__})
-                    continue
+                  AND (stage_status='PENDING' OR COALESCE(state->'meta'->>'last_evidence_type','')
+                      NOT IN ('ROUTER_ABORTED_BEFORE_CLAIM','BROKER_SUBMIT_ABORTED_PRE_IO'))
+                ORDER BY trade_date,symbol,stage
+            """), {"td": trade_date, "epoch": scope["trading_epoch_id"]}).mappings().all()]
+        result["candidate_count"] = len(rows)
+        # Deterministic rotation on subsequent boundaries avoids starvation.
+        if rows:
+            offset=(date.fromisoformat(trade_date).toordinal()*2 + int(str(phase).upper()=="CLOSE")) % len(rows)
+            rows=rows[offset:]+rows[:offset]
+        for row in rows:
+            detail={"symbol":row["symbol"],"stage":row["stage"],
+                    "source_trade_date":str(row["trade_date"])}
+            if time.monotonic() >= deadline:
+                result["unverified"].append({**detail,"reason":"DEFERRED_BOUNDARY_BUDGET"})
+                continue
+            result["checked"] += 1
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text("SET LOCAL lock_timeout='1000ms'"))
+                    conn.execute(text("SET LOCAL statement_timeout='5000ms'"))
+                    if _us_execution_claim_scope() != scope:
+                        raise RuntimeError("TP_BOUNDARY_SCOPE_CHANGED")
+                    locked=conn.execute(text("""
+                        SELECT * FROM us_profit_capture_lifecycle
+                        WHERE trade_date=:td AND symbol=:sym AND stage=:stage
+                          AND position_lifecycle_id=:cycle
+                          AND client_order_key=:key AND trading_epoch_id=:epoch
+                        FOR UPDATE
+                    """), {"td":str(row["trade_date"]),"sym":row["symbol"],"stage":row["stage"],
+                           "cycle":row["position_lifecycle_id"],"key":row["client_order_key"],
+                           "epoch":scope["trading_epoch_id"]}).mappings().one_or_none()
+                    if locked is None or dict(locked) != row:
+                        released=False
+                        reason="CANDIDATE_CHANGED_REPROVE_NEXT_BOUNDARY"
+                    else:
+                        released=_release_certificate_row(conn, dict(locked), scope)
+                        reason="NO_DURABLE_UNSENT_CERTIFICATE"
+                # Increment only after the transaction actually commits.
                 if released:
                     result["released"] += 1
                 else:
-                    result["unverified"].append({"symbol": row["symbol"], "stage": row["stage"],
-                        "source_trade_date": str(row["trade_date"]), "reason": "NO_DURABLE_UNSENT_CERTIFICATE"})
+                    result["unverified"].append({**detail,"reason":reason})
+            except Exception as exc:
+                result["unverified"].append({**detail,"reason":"REPAIR_ROLLED_BACK:"+type(exc).__name__})
         if result["unverified"]:
             result["status"] = "RETRY_FENCES_RETAINED"
     except Exception as exc:
-        result.update(status="UNAVAILABLE", released=0, error=type(exc).__name__)
+        result.update(status="UNAVAILABLE", error=type(exc).__name__)
     logger.warning("[US_TP_RETRY][BOUNDARY] phase=%s result=%s", phase, result)
     return result

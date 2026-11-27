@@ -415,3 +415,31 @@ def test_completed_daily_copy_isolates_nested_provenance():
     copied["rows"][0]["close"] = -1
     copied["rows"].clear()
     assert flat["rows"] == [{"close": 100.0, "xymd": "20261123"}]
+
+
+@pytest.mark.skipif(not os.getenv("PBCORE_TEST_POSTGRES_URL"), reason="requires disposable PostgreSQL")
+def test_tp_boundary_budget_retains_every_unexamined_candidate(pg_engine, monkeypatch):
+    from sqlalchemy import text
+    from trader.us.db import repos
+    from trader.us.execution.tp_retry_boundary import repair_tp_retries_at_boundary
+    epoch,account,cycle="budget-epoch","budget-account","original-cycle"
+    monkeypatch.setattr(repos,"_active_us_epoch",lambda *a,**kw:epoch)
+    monkeypatch.setattr(repos,"_us_state_epoch_id",lambda *a,**kw:epoch)
+    monkeypatch.setattr(repos,"_us_execution_claim_scope",lambda:{"env":"practice","account_id":account,"trading_epoch_id":epoch})
+    for symbol in ("KO","PG"):
+        _seed_boundary_case(pg_engine,symbol=symbol,contradiction=None,epoch=epoch,account=account,
+                           cycle=cycle,key=f"US_PC_2026-11-11_{symbol}_{cycle}_TAKE_PROFIT_TP2")
+    # The real SQL read still executes; only the budget clock is injected.
+    import time
+    calls=[0]
+    def clock():
+        calls[0]+=1
+        return 0.0 if calls[0]==1 else 31.0
+    monkeypatch.setattr(time,"monotonic",clock)
+    result=repair_tp_retries_at_boundary(trade_date="2026-11-18",phase="AM_START",budget_sec=.1)
+    assert result["released"]==0 and result["checked"]==0
+    assert result["candidate_count"]==2
+    assert {x["symbol"] for x in result["unverified"]}=={"KO","PG"}
+    assert all(x["reason"]=="DEFERRED_BOUNDARY_BUDGET" for x in result["unverified"])
+    with pg_engine.connect() as conn:
+        assert set(conn.execute(text("SELECT status FROM us_order_intents")).scalars())=={"PENDING"}
