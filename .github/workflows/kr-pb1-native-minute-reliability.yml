@@ -46,6 +46,9 @@ on:
       - "tests/test_pr121_mail_degraded_delivery.py"
       - "scripts/wsl/kr-entry-timing-activation.sh"
       - "tests/kr/test_kr_pb1_minute_*.py"
+      - "tests/kr/test_kr_prep_collection_20261127.py"
+      - "tests/kr/test_kr_practice_readonly_auth.py"
+      - "scripts/kr_assert_no_skips.py"
       - "tests/kr/test_kr_20261124_recurring_execution.py"
       - "tests/kr/test_kr_20261124_closed_cycle_claim_recovery.py"
       - "trader/kr/closed_cycle_claim_recovery.py"
@@ -59,6 +62,19 @@ jobs:
   minute-native-proof:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: kr_ci
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d kr_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     env:
       STRATEGY_ENV: practice
       KIS_ENV: practice
@@ -69,6 +85,7 @@ jobs:
       DISABLE_LIVE_TRADING: "1"
       NO_TRADE: "1"
       PYTHONPATH: "."
+      PBCORE_TEST_POSTGRES_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/kr_ci
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -77,7 +94,7 @@ jobs:
       - name: Install offline dependencies
         run: |
           python -m pip install -r requirements.txt
-          python -m pip install pytest pytest-mock
+          python -m pip install pytest pytest-mock psycopg2-binary
       - name: Compile and shell-validate modified runtime
         run: |
           python -m py_compile trader/kr/entry_priority_queue.py trader/kr/kis_observer_budget.py \
@@ -86,8 +103,11 @@ jobs:
           bash -n scripts/wsl/kr-entry-timing-activation.sh scripts/wsl/run-kr-am.sh scripts/wsl/run-kr-afternoon.sh
       - name: Native minute offline incident & integration regressions
         run: |
-          python -m pytest -q \
+          python -m pytest -q -rs --junitxml="$RUNNER_TEMP/kr-native-minute.xml" \
             tests/kr/test_kr_pb1_minute_priority_queue.py \
+            tests/kr/test_kr_prep_collection_20261127.py \
+            tests/kr/test_kr_practice_readonly_auth.py \
+            tests/kr/test_kr_assert_no_skips.py \
             tests/kr/test_kr_pb1_minute_native_conflicts.py \
             tests/kr/test_kr_pb1_kis_observer_budget.py \
             tests/kr/test_kr_ws_shared_20261126.py \
@@ -119,3 +139,4 @@ jobs:
             tests/kr/test_kr_pb1_minute_20261125_adaptive_entry.py \
             tests/test_kr_mail_execution_evidence_20261111.py \
             tests/test_pr121_mail_degraded_delivery.py::test_health_distinguishes_degraded_delivery_from_mail_failure
+          python scripts/kr_assert_no_skips.py "$RUNNER_TEMP/kr-native-minute.xml"

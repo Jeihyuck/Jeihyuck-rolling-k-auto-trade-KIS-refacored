@@ -31,7 +31,13 @@ def isolated_engine(request):
         return
     url = os.getenv("PBCORE_TEST_POSTGRES_URL")
     if not url:
+        if os.getenv("GITHUB_ACTIONS") == "true":
+            pytest.fail("Required isolated PostgreSQL CI service not configured")
         pytest.skip("isolated PostgreSQL test database not configured")
+    target = sa.engine.make_url(url)
+    if (target.host not in {"localhost", "127.0.0.1", "::1"}
+            or target.database != "kr_ci" or target.get_backend_name() != "postgresql"):
+        pytest.fail("Refuse non-local or non-disposable PostgreSQL test database")
     schema_name = "kr359_" + uuid4().hex
     admin = sa.create_engine(url)
     with admin.begin() as conn:
@@ -97,12 +103,12 @@ def test_native_sell_failure_rolls_back_fill_then_replays_once(monkeypatch, fail
 
 
 
+@pytest.mark.parametrize("isolated_engine", ["postgres"], indirect=True)
 def test_concurrent_native_sell_reconciliation_rejects_stale_watermark_and_applies_once(
     monkeypatch, isolated_engine,
 ):
     engine = isolated_engine
-    if engine.dialect.name != "postgresql":
-        pytest.skip("row-level FOR UPDATE concurrency is PostgreSQL-only")
+    assert engine.dialect.name == "postgresql", "requires actual PostgreSQL row locks"
     pos, order_id = _accepted_sell(
         engine, code="251970", ordered_qty=17, pre_qty=17,
         avg_price=68400.0, odno="0000040226", order_key="pr359-concurrent-sell",
@@ -324,11 +330,11 @@ def test_tp_stage_journal_database_failure_isolated_by_nested_savepoint(monkeypa
         outer_savepoint.rollback()
 
 
+@pytest.mark.parametrize("isolated_engine", ["postgres"], indirect=True)
 def test_kr401_native_partial_cancel_preserves_position_and_releases_stage(monkeypatch, isolated_engine):
     """Real PG repos/reconcile_today with a synthetic native KIS GET response."""
     engine = isolated_engine
-    if engine.dialect.name != "postgresql":
-        pytest.skip("TP durable journal requires PostgreSQL")
+    assert engine.dialect.name == "postgresql", "requires actual PostgreSQL TP journal"
     from trader.account_state import get_account_key
     from trader.kr.us_standard_profit_parity import build_new_swing_parity_contract
     from trader.kr.us_profit_stage_journal import reserve_tp_stage, load_frozen_stage_states
@@ -396,11 +402,11 @@ def test_kr401_native_partial_cancel_preserves_position_and_releases_stage(monke
 
 
 @pytest.mark.parametrize("filled,simultaneous", [(0, False), (10, False), (10, True)])
+@pytest.mark.parametrize("isolated_engine", ["postgres"], indirect=True)
 def test_kr401_terminal_cancel_releases_real_claim_without_new_fill(monkeypatch, isolated_engine, filled, simultaneous):
     """Native zero-fill or already stored individual-fill terminal proof."""
     engine = isolated_engine
-    if engine.dialect.name != "postgresql":
-        pytest.skip("TP durable journal requires PostgreSQL")
+    assert engine.dialect.name == "postgresql", "requires actual PostgreSQL TP journal"
     from trader.account_state import get_account_key
     from trader.kr.us_standard_profit_parity import build_new_swing_parity_contract
     from trader.kr.us_profit_stage_journal import reserve_tp_stage, load_frozen_stage_states
