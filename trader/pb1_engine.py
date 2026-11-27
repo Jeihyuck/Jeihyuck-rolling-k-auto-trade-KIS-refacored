@@ -16602,6 +16602,10 @@ class PB1Engine:
                 needed.append(code)
         return needed
 
+    def _kr_protection_checkpoint(self):
+        monitor = getattr(self, "_kr_protective_yield_monitor", None)
+        return monitor.check(now=now_kst(), monotonic=time.monotonic()) if monitor else None
+
     def _compute_candidates_from_codes(self, codes: list[str]) -> list[CandidateFeature]:
         # ── [KR][PB1] scope guard + batch OHLCV preload ─────────────────────
         # 한국장 PB1 trade 모드일 때 final30 코드 전체를 단일 DB 커넥션으로
@@ -16641,6 +16645,8 @@ class PB1Engine:
             "VCP": {"scanned": 0, "ok": 0, "reasons": []},
         }
         for raw_code in codes or []:
+            if self._kr_protection_checkpoint():
+                break  # caller discards partial shortlist; no BUY submitted
             code = str(raw_code or "").zfill(6)
             if not code:
                 continue
@@ -19042,9 +19048,65 @@ class PB1Engine:
             self._log_tick_price_cache_summary()
             return self._finalize_run_result(status="OK_NO_TRADE", notes="PORTFOLIO_FULL")
 
+        # Cooperative protective preemption, only before the BUY boundary.
+        # Existing order authority and reconciliation remain unchanged.
+        self._kr_protective_yield_monitor = None
+        if (
+            self.env == "practice" and self.STRATEGY_NAME == "pb1_pullback_close"
+            and self.phase in {"entry", "pm_entry"} and self.trading_day
+            and self.intended_live and not self.dry_run and not self.force_block_live
+            and not engine_compute_only and not compute_only_full_run
+            and not diag_compute_only and not diag_full_exec and not minervini_only
+            and entry_allowed and order_allowed
+            and exit_pass_ok and getattr(self, "_kr_post_exit_reconcile_ok", True)
+            and getattr(self, "_kr_infinite_submit_attempted", None) is False
+            and os.getenv("KR_PB1_PROTECTIVE_WAKE_ENABLED", "1") == "1"
+            and os.getenv("PB1_PENDING_RECONCILE_ONLY", "0") != "1"
+        ):
+            from trader.kr.reconcile_lanes_257 import exit_pass_proves_zero_sell
+            from trader.kr.quote_wake import ProtectiveYield, make_protective_target
+            _zero_sell, _ = exit_pass_proves_zero_sell(
+                exit_pass_ok=exit_pass_ok,
+                exit_summary=getattr(self, "_exit_summary_payload", None),
+            )
+            if _zero_sell:
+                _hint_now = now_kst()
+                _hints = [hint for ev in getattr(self, "_exit_evaluations", []) or []
+                          if (hint := make_protective_target(ev, _hint_now))]
+                if _hints:
+                    self._kr_protective_yield_monitor = ProtectiveYield(_hints)
+
+        def _yield_to_kr_protection():
+            hit = self._kr_protection_checkpoint()
+            if not hit:
+                return None
+            reason = "KR_PROTECTIVE_REEVALUATION_REQUIRED"
+            logger.warning(
+                "[KR][PROTECTIVE_YIELD] code=%s action=END_ENTRY_BEFORE_SUBMIT "
+                "order_authorization=0", hit["code"],
+            )
+            blocked = Counter({reason: 1})
+            _emit_entry_summary([], [], blocked)
+            _emit_entry_decision("SKIP", reason=reason, ok_setups=0, blocked_by=blocked)
+            _set_run_summary_payload(
+                scanned=0, setup_ok=0, relax_ok=0, score_ok=0, risk_ok=0,
+                sized_ok=0, buyable_ok=0, order_candidates=0, submitted=0,
+                api_submitted=0, blocked_reasons_counter=blocked,
+                no_trade_reason=reason,
+            )
+            self._log_tick_price_cache_summary()
+            return self._finalize_run_result(status="OK_NO_TRADE", notes=reason)
+
+        _yield_result = _yield_to_kr_protection()
+        if _yield_result is not None:
+            return _yield_result
+
         _deferred_entry_scan = getattr(self, "_kr_deferred_entry_scan", None)
         if callable(_deferred_entry_scan) and self.phase == "entry":
             _deferred_entry_scan()
+        _yield_result = _yield_to_kr_protection()
+        if _yield_result is not None:
+            return _yield_result
 
         entry_pass_ok = True
         entry_pass_buys = 0
@@ -19299,6 +19361,9 @@ class PB1Engine:
                 t_pb1_start = time.monotonic()
                 scan_input_codes = [str(m.get("code") or "").zfill(6) for m in scan_members if m.get("code")]
                 candidates = self._compute_candidates_from_codes(scan_input_codes)
+                _yield_result = _yield_to_kr_protection()
+                if _yield_result is not None:
+                    return _yield_result
                 self._reject_summary_candidates = list(candidates or [])
                 dt_pb1_filter = time.monotonic() - t_pb1_start
                 dt_minervini = 0.0
@@ -21579,6 +21644,9 @@ class PB1Engine:
                     order_ready=cf.code in orderable_code_set,
                     reasons=[str(reason) for reason in (cf.reasons or [cf.features.get("final_entry_reason_code") or "ENTRY_CONDITION_NOT_MET"]) if str(reason)],
                 )
+            _yield_result = _yield_to_kr_protection()
+            if _yield_result is not None:
+                return _yield_result
             self._log_fail_reason_breakdown(candidates, note="post_filter")
             _emit_entry_summary(setup_ok_codes, orderable_candidates, drop_reason_counter)
             if not candidates or ok_count == 0:
