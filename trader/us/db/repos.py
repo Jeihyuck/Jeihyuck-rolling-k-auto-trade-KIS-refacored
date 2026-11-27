@@ -1903,7 +1903,17 @@ def load_us_order_events(trade_date: str, session_run_id: str | None = None) -> 
         for row in rows:
             item = dict(row)
             payload = _parse_json_meta(item.pop("payload", {}))
+            # Preserve original typed SQL identity separately: historical JSON
+            # metadata may contain conflicting values, and must never erase
+            # the proof columns used for exact BUY ACK recovery.
+            durable_identity = {k: item.get(k) for k in (
+                "event_type", "trade_date", "client_order_key", "submit_attempt_id",
+                "symbol", "side", "requested_qty", "account_id", "trading_epoch_id",
+                "portfolio_epoch_id", "position_cycle_id", "position_lifecycle_id",
+                "canonical_broker_order_no", "raw_broker_order_no",
+            ) if item.get(k) is not None}
             item.update(payload)
+            item["_durable_order_event_identity"] = durable_identity
             item["timestamp"] = str(item.get("timestamp") or "")
             result.append(item)
         return result
