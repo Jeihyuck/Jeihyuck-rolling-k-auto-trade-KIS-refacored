@@ -569,3 +569,34 @@ def test_incremental_v3_atr_append_parity_and_correction(tmp_path,monkeypatch,ra
         clear_feature_cache()
         assert v3.cached_chandelier_from_verified_bars(changed,scope=scope,**kw)==original(changed,**kw)
     clear_feature_cache()
+
+
+@pytest.mark.parametrize("change",["append","correction","gap","missing_amount","scope"])
+def test_incremental_opening_geometry_vwap_parity_and_invalidation(tmp_path,monkeypatch,change):
+    from trader.us.entry_timing import opportunity
+    from trader.marketdata.feature_reuse import clear_feature_cache
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("WSL_RUN_MARKET","US")
+    monkeypatch.setenv("KIS_ENV","practice")
+    monkeypatch.setenv("US_SHARED_NATIVE_FEATURES_ENABLED","1")
+    scope=("acct:epoch","ABC","NASDAQ","US_STANDARD")
+    rows=copy.deepcopy([r for r in sample_bars() if "T09:30:00" <= r["time_et"][10:19] < "T10:00:00"])
+    assert len(rows)==30
+    original=opportunity._opening_static_features
+    calls=[]
+    def counted(bars,day,n):
+        calls.append(len(bars))
+        return original(bars,day,n)
+    monkeypatch.setattr(opportunity,"_opening_static_features",counted)
+    clear_feature_cache()
+    try:
+        assert opportunity.opening_static_features(rows[:20],DAY,30,feature_scope=scope)==original(rows[:20],DAY,30)
+        clear_feature_cache()
+        if change=="correction": rows[0]["high"]+=1
+        if change=="gap": rows.pop(3)
+        if change=="missing_amount": rows[-1]["turnover"]=None
+        if change=="scope": scope=("other:epoch",*scope[1:])
+        assert opportunity.opening_static_features(rows,DAY,30,feature_scope=scope)==original(rows,DAY,30)
+        assert calls==([20] if change in {"append","missing_amount"} else [20,len(rows)])
+    finally:
+        clear_feature_cache()
