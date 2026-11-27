@@ -1565,7 +1565,14 @@ def prepare_exit_position_snapshots(
                         raise ValueError("invalid_entry_exit_contract")
                     frozen_risk_cfg = contract_exit_config(pos)
                     pnl_pct_for_state = (current_price - entry_price_for_state) / entry_price_for_state
-                    risk_state = update_us_soft_stop_risk_state(
+                    _risk_writer = update_us_soft_stop_risk_state
+                    if (os.getenv("WSL_RUN_MARKET", "").upper() == "US"
+                            and os.getenv("KIS_ENV", "").strip().lower() == "practice"
+                            and os.getenv("US_ORDER_ARMED", "0").strip().lower() in {"1", "true", "yes", "on"}
+                            and os.getenv("US_ATOMIC_SOFT_STOP_ENABLED", "1") == "1"):
+                        from trader.us.db.repos import update_us_soft_stop_risk_state_atomic
+                        _risk_writer = update_us_soft_stop_risk_state_atomic
+                    risk_state = _risk_writer(
                         symbol=symbol,
                         trade_date=_trade_date_from_key(resolve_us_trade_date_key(now)),
                         pnl_pct=pnl_pct_for_state,

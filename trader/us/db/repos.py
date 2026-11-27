@@ -4303,6 +4303,73 @@ def mark_us_position_exit_stage(
     save_us_position_risk_state(sym, td, risk)
     logger.info("[US_POSITION][TREND_STAGE] symbol=%s stage=%s status=%s pending=%s done=%s order_key=%s lifecycle_id=%s", sym, stg, status_upper, trend.get(f"{stg}_pending"), trend.get(f"{stg}_done"), order_key, lifecycle_id)
 
+def update_us_soft_stop_risk_state_atomic(
+    *, symbol: str, trade_date: str, pnl_pct: float, current_price: float,
+    now: datetime, soft_stop_pct: float, policy_revision: str | None = None,
+) -> dict:
+    """One durable UPSERT: preserve unrelated JSON leaves and concurrent counts.
+
+    Same per-day counter semantics as update_us_soft_stop_risk_state. No
+    cache, no guessed epoch, no retry on ambiguous commit. Only use in the
+    armed US practice snapshot path; never increase the evaluation frequency
+    or change the confirmation threshold here.
+    """
+    if not all(math.isfinite(float(x)) for x in (pnl_pct, current_price, soft_stop_pct)):
+        raise ValueError("US_SOFT_STOP_ATOMIC_INPUT_INVALID")
+    if float(current_price) <= 0 or float(soft_stop_pct) <= 0:
+        raise ValueError("US_SOFT_STOP_ATOMIC_INPUT_INVALID")
+    sym = _risk_state_key(symbol, trade_date)[1]
+    if not sym:
+        raise ValueError("US_SOFT_STOP_ATOMIC_SYMBOL_INVALID")
+    engine = _get_engine_or_none()
+    if engine is None or engine.dialect.name != "postgresql":
+        raise RuntimeError("US_SOFT_STOP_DURABLE_STATE_WRITE_FAILED")
+    observed = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    breached = float(pnl_pct) <= -float(soft_stop_pct)
+    revision = str(policy_revision or "")
+    with engine.begin() as conn:
+        _ensure_us_position_risk_state_table(conn)
+        epoch = _active_us_epoch(conn, required=True)
+        if not epoch:
+            raise RuntimeError("US_SOFT_STOP_DURABLE_EPOCH_UNVERIFIED")
+        result = conn.execute(text("""
+            INSERT INTO us_position_risk_state AS old
+                (trading_epoch_id, trade_date, symbol, soft_stop_breach_count,
+                 first_soft_stop_seen_at, last_soft_stop_seen_at,
+                 lowest_price_since_breach, last_price, last_pnl_pct, state, updated_at)
+            VALUES (:epoch, :td, :symbol, CASE WHEN :breached THEN 1 ELSE 0 END,
+                    CASE WHEN :breached THEN CAST(:at AS timestamptz) ELSE NULL END,
+                    CASE WHEN :breached THEN CAST(:at AS timestamptz) ELSE NULL END,
+                    CASE WHEN :breached THEN :price ELSE NULL END,
+                    :price, :pnl, CASE WHEN :revision <> '' THEN
+                      jsonb_build_object('soft_stop_policy_revision', CAST(:revision AS text))
+                      ELSE '{}'::jsonb END, NOW())
+            ON CONFLICT (trading_epoch_id, trade_date, symbol) DO UPDATE SET
+                soft_stop_breach_count = CASE WHEN NOT :breached THEN 0
+                    WHEN :revision <> '' AND COALESCE(old.state->>'soft_stop_policy_revision','') <> :revision THEN 1
+                    ELSE old.soft_stop_breach_count + 1 END,
+                first_soft_stop_seen_at = CASE WHEN NOT :breached THEN NULL
+                    WHEN :revision <> '' AND COALESCE(old.state->>'soft_stop_policy_revision','') <> :revision THEN CAST(:at AS timestamptz)
+                    ELSE COALESCE(old.first_soft_stop_seen_at, CAST(:at AS timestamptz)) END,
+                last_soft_stop_seen_at = CASE WHEN :breached THEN CAST(:at AS timestamptz) ELSE NULL END,
+                lowest_price_since_breach = CASE WHEN NOT :breached THEN NULL
+                    WHEN :revision <> '' AND COALESCE(old.state->>'soft_stop_policy_revision','') <> :revision THEN :price
+                    ELSE LEAST(COALESCE(old.lowest_price_since_breach,:price),:price) END,
+                last_price = :price, last_pnl_pct = :pnl,
+                state = COALESCE(old.state,'{}'::jsonb) || CASE WHEN :revision <> '' THEN
+                    jsonb_build_object('soft_stop_policy_revision', CAST(:revision AS text))
+                    ELSE '{}'::jsonb END,
+                updated_at = NOW()
+            RETURNING *
+        """), {"epoch": str(epoch), "td": trade_date, "symbol": sym,
+                 "breached": breached, "at": observed, "price": float(current_price),
+                 "pnl": float(pnl_pct), "revision": revision}).mappings().one()
+        saved = dict(result)
+    logger.info("[US_RISK_STATE][ATOMIC_SOFT_STOP] symbol=%s trade_date=%s count=%s action=%s",
+                sym, trade_date, saved.get("soft_stop_breach_count"), "increment" if breached else "reset")
+    return _normalize_risk_state(sym, trade_date, saved)
+
+
 def update_us_soft_stop_risk_state(
     *,
     symbol: str,
