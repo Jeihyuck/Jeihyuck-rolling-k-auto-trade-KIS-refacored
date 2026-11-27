@@ -21,11 +21,14 @@ def wait_for_shared_slot(
     account_scope: str, *, min_interval_sec: float,
     sleep_with_budget: Callable[[float], bool],
     root: str | None = None,
+    defer_if_busy: bool = False,
 ) -> float:
     """Reserve the next KIS HTTP start window across OS processes.
 
     Caller still enforces its endpoint-level limiter. Holding this flock
     covers waiting and writing the timestamp, never the actual HTTP call.
+    Opportunistic market-data readers must not hold the lock while waiting.
+    They defer without consuming a slot when the account is busy.
     """
     if not account_scope or not callable(sleep_with_budget):
         raise SharedLimiterUnavailable("shared_KIS_limiter_scope_missing")
@@ -52,6 +55,8 @@ def wait_for_shared_slot(
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
+                if defer_if_busy:
+                    raise SharedLimiterUnavailable("shared_KIS_background_deferred")
                 if not sleep_with_budget(0.03):
                     raise SharedLimiterUnavailable("shared_KIS_limiter_lock_budget_exceeded")
         try:
@@ -65,6 +70,8 @@ def wait_for_shared_slot(
             if not (0 < previous <= now):
                 previous = 0.0
             needed = max(0.0, interval - (now - previous)) if previous else 0.0
+            if needed and defer_if_busy:
+                raise SharedLimiterUnavailable("shared_KIS_background_deferred")
             if needed and not sleep_with_budget(needed):
                 raise SharedLimiterUnavailable("shared_KIS_limiter_tick_budget_exceeded")
             slot = time.monotonic()
