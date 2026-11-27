@@ -1075,7 +1075,9 @@ class USDataProvider:
         try:
             if ctx is not None:
                 ctx.count("quote_http_calls")
-            result = self._get_client().get_us_price(symbol, exchange)
+            from trader.marketdata.us_rest_shared import read_price
+            shared_status, result = read_price(self._get_client(), symbol, exchange)
+            logger.info("[US_DATA][REST_SHARED] symbol=%s status=%s", symbol, shared_status)
             if self._stage_cancelled():
                 from trader.us.execution.kis_us_client import KisUSTemporaryError
                 raise KisUSTemporaryError("entry stage cancelled after KIS price lookup")
