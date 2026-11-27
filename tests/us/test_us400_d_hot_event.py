@@ -316,3 +316,34 @@ def test_collection_only_warm_promotion_cannot_emit_or_consume_execution_hot_hin
             waiting={("EEE","NYSE")},now_epoch=now.timestamp())==set()
     finally:
         db.close()
+
+
+def test_dynamic_collection_rank_requires_distinct_fresh_evidence_and_preserves_execution_scope():
+    from trader.us.entry_timing.hot_event_evaluator import CollectionRankState
+    rank=CollectionRankState()
+    h=[(s,"NYSE") for s in ("AAA","BBB","CCC","DDD")]
+    w=[("EEE","NYSE"),("FFF","NYSE")]
+    lanes={"HOT":h,"WARM":w,"COLD":[("GGG","NYSE")]}
+    def obs(at,weak=True):
+        return {h[-1]:dict(state="PRICE_WAIT" if weak else "READY",received=at,receipt_id=("g",at)),
+                w[0]:dict(state="READY",received=at,receipt_id=("g",at))}
+    assert rank.update(lanes,"g1",obs(100),100) is None
+    assert rank.update(lanes,"g1",obs(100),101) is None
+    assert rank.update(lanes,"g1",obs(102),102)==(h[-1],w[0])
+    promoted=rank.apply(lanes,"g1",103)
+    assert promoted["HOT"]==h[:3]+[w[0]]
+    assert promoted["WARM"]==[h[-1],w[1]]
+    assert promoted["COLD"]==lanes["COLD"] and lanes["HOT"]==h
+    assert rank.apply(lanes,"g2",103)==lanes
+    assert rank.apply(lanes,"g1",108)==lanes
+    assert rank.update(lanes,"g1",obs(104,False),104) is None
+    assert rank.apply(lanes,"g1",104)==lanes
+
+
+def test_dynamic_collection_does_not_demote_missing_native_evidence():
+    from trader.us.entry_timing.hot_event_evaluator import CollectionRankState
+    rank=CollectionRankState()
+    lanes={"HOT":[("AAA","NYSE")],"WARM":[("BBB","NYSE")],"COLD":[]}
+    for at in (100,102):
+        assert rank.update(lanes,"g",{("BBB","NYSE"):dict(state="READY",received=at,receipt_id=("g",at))},at) is None
+    assert rank.apply(lanes,"g",102)==lanes
