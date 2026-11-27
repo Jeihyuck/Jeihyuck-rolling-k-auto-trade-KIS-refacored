@@ -66,6 +66,28 @@ def test_live_tp_decision_time_is_not_stale_tick_start(symbol):
     ) == (False, "US_TP_DECISION_EXPIRED_BEFORE_HTTP")
 
 
+@pytest.mark.parametrize("limit", [91, 120, float("inf"), float("nan"), 0])
+def test_tp_decision_config_cannot_relax_approved_90_second_ceiling(limit):
+    intent = _make_tp(live=False)[0]
+    assert _tp_decision_fresh_for_native_http(
+        intent, now_utc=TICK_START + timedelta(seconds=1), max_age_sec=limit
+    ) == (False, "US_TP_DECISION_AGE_CONFIG_INVALID")
+
+
+def test_tp_decision_90_second_boundary_and_rollback():
+    intent = _make_tp(live=False)[0]
+    assert _tp_decision_fresh_for_native_http(
+        intent, now_utc=TICK_START + timedelta(seconds=90)
+    ) == (True, "US_TP_DECISION_FRESH")
+    for seconds in (91, -1):
+        assert _tp_decision_fresh_for_native_http(
+            intent, now_utc=TICK_START + timedelta(seconds=seconds)
+        ) == (False, "US_TP_DECISION_EXPIRED_BEFORE_HTTP")
+    assert _tp_decision_fresh_for_native_http(
+        intent, now_utc=TICK_START + timedelta(seconds=31), max_age_sec=30
+    ) == (False, "US_TP_DECISION_EXPIRED_BEFORE_HTTP")
+
+
 def test_replay_keeps_injected_clock_separate_from_live_wall_clock():
     intents = _make_tp(live=False)
     assert len(intents) == 1
