@@ -347,3 +347,51 @@ def test_dynamic_collection_does_not_demote_missing_native_evidence():
     for at in (100,102):
         assert rank.update(lanes,"g",{("BBB","NYSE"):dict(state="READY",received=at,receipt_id=("g",at))},at) is None
     assert rank.apply(lanes,"g",102)==lanes
+
+
+def test_independent_collection_refresh_uses_canonical_native_evidence_without_writing_hints(tmp_path,monkeypatch):
+    from datetime import timedelta
+    from trader.us.entry_timing import opportunity
+    from trader.us.entry_timing.hot_event_evaluator import CollectionRankState,refresh_collection_rank
+    monkeypatch.setattr(opportunity,"effective_mode",lambda:"ENFORCE")
+    now=datetime(2026,11,25,10,10,tzinfo=ZoneInfo("America/New_York"))
+    epoch=now.timestamp()
+    scope=dict(env="practice",scope="scope:epoch",trade_date=now.date().isoformat(),base=tmp_path)
+    syms=("AAA","BBB","CCC","DDD","EEE")
+    pairs=[(s,"NYSE") for s in syms]
+    manifest=observer.publish_preminute_candidates(**scope,now_epoch=epoch-1,
+        candidates=[(20-i,s,"NYSE",None,{"position_state":"NOT_HELD","entry_style":"ENTRY_PULLBACK","pivot_price":100+i})
+                    for i,s in enumerate(syms)])
+    lanes,state=observer.load_preminute_priority(**scope,pairs=pairs,now_epoch=epoch)
+    assert state=="VALID"
+    rank=CollectionRankState()
+    db=observer.open_store(observer.store_path(env=scope["env"],account_scope=scope["scope"],
+        trade_date=scope["trade_date"],base=tmp_path))
+    evaluations=[]
+    def decision(**kw):
+        evaluations.append(kw)
+        return {"state":"READY" if kw["prep"]["pivot_price"]==104 else "WAIT",
+                "reason":"test" if kw["prep"]["pivot_price"]==104 else "reversal_not_confirmed"}
+    monkeypatch.setattr(opportunity,"evaluate_price_opportunity",decision)
+    try:
+        clock=[now]
+        batch_calls=[]
+        def quotes(items):
+            batch_calls.append(tuple(items))
+            return {pair:{"bid":99.9,"ask":100,"last":100,"received_at":clock[0].timestamp()-1,
+                          "collector_generation":"g","source":"KIS_WEBSOCKET_COLLECTOR"} for pair in items}
+        def refresh(at):
+            clock[0]=at
+            return refresh_collection_rank(db,**scope,rank=rank,lanes=lanes,now_et=at,
+                       quote_many=quotes,live_clock=lambda:clock[0])
+        assert refresh(now) is None
+        assert refresh(now+timedelta(seconds=2))==(pairs[3],pairs[4])
+        assert rank.apply(lanes,manifest["generation"],epoch+2)["HOT"]==pairs[:3]+[pairs[4]]
+        assert len(batch_calls)==2 and all(len(x)==5 for x in batch_calls)
+        assert len(evaluations)==10
+        assert db.execute("SELECT count(*) FROM hot_retry_events").fetchone()[0]==0
+        current,state=observer.load_preminute_priority(**scope,pairs=pairs,now_epoch=epoch+2)
+        assert current==lanes and state=="VALID"
+        assert rank.apply(lanes,manifest["generation"],epoch+7)==lanes
+    finally:
+        db.close()
