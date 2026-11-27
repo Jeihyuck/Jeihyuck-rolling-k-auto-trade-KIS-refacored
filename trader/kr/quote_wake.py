@@ -210,3 +210,35 @@ def wait_for_quote_wake(*, targets, state, seconds, session_end, now, monotonic,
         remaining = min(deadline-monotonic(), (session_end-now()).total_seconds())
         if remaining > 0:
             sleep(min(1.0, remaining))
+
+
+class ProtectiveYield:
+    """Cooperative read-only checkpoint; never interrupt an in-flight order.
+
+    The single writer abandons only the not-yet-submitted entry computation,
+    settles the tick normally, then runs a fresh authoritative tick.
+    """
+    def __init__(self, targets, *, probe=probe_protective_targets, interval=1.0):
+        self.targets = tuple(targets[:10])
+        self.probe = probe
+        self.interval = max(1.0, float(interval))
+        self.next_poll = float("-inf")
+        self.hit = None
+
+    def check(self, *, now, monotonic):
+        if self.hit is not None:
+            return self.hit
+        if not self.targets or monotonic < self.next_poll:
+            return None
+        self.next_poll = monotonic + self.interval
+        try:
+            hit = self.probe(self.targets, now)
+            if (isinstance(hit, dict)
+                    and hit.get("kind") == "PROTECTIVE_HARD_STOP_HINT"
+                    and hit.get("is_order_authorization") is False
+                    and hit.get("code") in {t["code"] for t in self.targets}):
+                self.hit = hit
+        except Exception:
+            # Optional WS hints cannot break the normal broker/entry flow.
+            pass
+        return self.hit
