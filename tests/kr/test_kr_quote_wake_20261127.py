@@ -88,3 +88,26 @@ def test_wrong_symbol_probe_does_not_consume_dedupe():
         probe=lambda t, n: {"code": "012750", "latest_bar_ts": t["latest_bar_ts"]},
     ) is None
     assert not state.seen
+
+
+def test_incomplete_local_quote_uses_existing_shared_owner(monkeypatch):
+    from trader.marketdata import kis_ws_price, kr_ws_shared
+    quote = dict(source="KIS_WEBSOCKET",source_identity="KIS_WS_PARSED_SYMBOL",
+                 market="KR",symbol="251970",last=79800,bid=79700,ask=79800,
+                 received_at=datetime.now(KST).timestamp())
+    class Service:
+        current = {**quote, "ask": None}
+        def get_fresh_quote(self, *args, **kwargs):
+            return self.current
+    service = Service()
+    calls = []
+    def shared(svc, code, **kw):
+        calls.append((code,kw))
+        return True, quote
+    monkeypatch.setattr(kis_ws_price,"get_kis_ws_price_service",lambda:service)
+    monkeypatch.setattr(kr_ws_shared,"read_owner_quote",shared)
+    assert w._local_quote("251970") == quote
+    assert calls[0][1]["required_fields"] == ("last","bid","ask")
+    service.current = quote
+    assert w._local_quote("251970") == quote
+    assert len(calls) == 1
