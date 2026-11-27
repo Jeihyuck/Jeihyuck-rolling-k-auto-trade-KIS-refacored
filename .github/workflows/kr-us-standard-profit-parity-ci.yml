@@ -97,7 +97,9 @@ jobs:
             tests/kr/test_kr_close_reporting_20261111.py \
             tests/test_kr_mail_execution_evidence_20261111.py \
             tests/test_market_log_mail_e2e.py \
-            tests/kr/test_kr_20261012_marketcap_sell_liveness.py
+            tests/kr/test_kr_20261012_marketcap_sell_liveness.py \
+            tests/kr/test_kr_exit_feature_reuse_20261127.py \
+            tests/kr/test_kr257_paper_stop36_e2e.py
           python scripts/kr_assert_no_skips.py "$RUNNER_TEMP/kr-profit-parity.xml"
       - name: KR operating runner script syntax
         run: bash -n scripts/wsl/run-kr-am.sh scripts/wsl/run-kr-afternoon.sh scripts/wsl/run-kr-close.sh scripts/wsl/diagnose-kr-no-runs-20261111.sh scripts/wsl/send-market-log-mail.sh

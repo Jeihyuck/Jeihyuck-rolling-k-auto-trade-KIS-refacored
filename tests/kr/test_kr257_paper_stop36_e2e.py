@@ -86,6 +86,11 @@ def test_soft_stop_two_tick_trigger_submits_exact_half_once_and_waits_for_claim(
     result = _tick(engine, pos, mark=96.8)
     assert result.get("submitted") == 1
     assert result["decision_reason"] == "KR_PB1_SOFT_STOP_3PCT"
+    evidence = result["condition_details"]["paper_stop36"]
+    assert evidence["eligible"] and evidence["soft_confirmed"]
+    assert evidence["soft_breach_count"] == 2
+    assert not evidence["same_day_soft_guard_blocked"]
+    assert abs(result["condition_details"]["stop_loss_pct"]["threshold"] + .06) < 1e-9
     assert kis.sell_quantities == [10]
     order = _order(db)
     assert int(order["qty"]) == 10
@@ -132,6 +137,8 @@ def test_hard_stop_six_percent_submits_full_quantity_immediately(monkeypatch):
     engine, pos = _setup(monkeypatch, db, kis, mark=94.0)
     result = _tick(engine, pos, mark=94.0)
     assert result["decision_reason"] == "EXIT_HARD_STOP"
+    assert result["condition_details"]["paper_stop36"]["hard_touched"]
+    assert result["condition_details"]["stop_loss_pct"]["hit"]
     assert result.get("submitted") == 1
     assert kis.sell_quantities == [20]
     assert _order(db)["request_json"]["exit_stage"] == "FULL_EXIT"

@@ -13979,6 +13979,10 @@ class PB1Engine:
             ordered_reasons = [final_reason]
 
         _paper_stop36_signal = False
+        conds["paper_stop36"] = {
+            "eligible": False, "reason": "PAPER_SWING_ROUTE_NOT_APPLIED",
+            "is_order_authorization": False,
+        }
         _router_qty: int | None = None
         _router_full_exit = False
         _router_sell_pct = None
@@ -14052,7 +14056,7 @@ class PB1Engine:
                 and position_book == "SWING_BOOK"
                 and code != "122630"
             ):
-                from trader.kr.paper_stop36_policy import evaluate_kr_pb1_paper_stop36
+                from trader.kr.paper_stop36_policy import evaluate_kr_pb1_paper_stop36, paper_stop36_evidence
                 paper_decision = evaluate_kr_pb1_paper_stop36(
                     pos, mark=float(mark or 0.0), env=self.env,
                     strategy_owner=self.STRATEGY_NAME,
@@ -14066,7 +14070,20 @@ class PB1Engine:
                     int(paper_decision.soft_confirmed),
                     paper_decision.soft_breach_count, paper_decision.sell_qty,
                 )
+                conds["paper_stop36"] = paper_stop36_evidence(
+                    paper_decision, entry_price=float(avg), mark=float(mark or 0.0),
+                )
                 if paper_decision.eligible:
+                    # Keep legacy diagnostic threshold for forensic comparison.
+                    # The separate paper route remains the actual authority.
+                    conds["legacy_stop_loss_pct"] = dict(conds["stop_loss_pct"])
+                    conds["stop_loss_pct"] = {
+                        **conds["stop_loss_pct"],
+                        "threshold": max(conds["stop_loss_pct"]["threshold"],
+                                         conds["paper_stop36"]["effective_hard_threshold"]),
+                        "hit": bool(stop_hit or paper_decision.hard_touched),
+                        "source": "LEGACY_OR_PAPER_SWING_HARD",
+                    }
                     horizon_result = dict(horizon_result or {
                         "exit_ok": False, "reason": "NO_SWING_EXIT",
                         "qty": 0, "sell_pct": None,
@@ -14445,6 +14462,13 @@ class PB1Engine:
         soft_blocked, holding_minutes, min_hold_minutes = same_day_soft_exit_block(
             now_kst=self._now_kst, bought_at=entry_ts, exit_reason=eval_reason,
         )
+        if conds.get("paper_stop36", {}).get("eligible"):
+            conds["paper_stop36"].update({
+                "same_day_soft_guard_blocked": bool(soft_blocked),
+                "holding_minutes": holding_minutes if soft_blocked else None,
+                "min_hold_minutes": min_hold_minutes,
+                "routed_reason": eval_reason,
+            })
         if soft_blocked:
             exit_eval = replace(exit_eval, exit_ok=False)
             exit_eval_payload.update({
