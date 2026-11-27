@@ -58,3 +58,33 @@ def test_serial_idle_wake_and_dedupe():
     assert elapsed[0]==2
     assert w.wait_for_quote_wake(**args) is None
     assert elapsed[0]==12
+
+
+def test_late_probe_does_not_wake_or_consume_dedupe():
+    for deadline, session_seconds in ((2, 60), (60, 2)):
+        elapsed = [0.0]
+        state = w.QuoteWakeState()
+        def probe(t, n):
+            elapsed[0] += 3
+            return {"code": t["code"], "latest_bar_ts": t["latest_bar_ts"]}
+        assert w.wait_for_quote_wake(
+            targets=[target()], state=state, seconds=deadline,
+            session_end=NOW+timedelta(seconds=session_seconds),
+            now=lambda: NOW+timedelta(seconds=elapsed[0]),
+            monotonic=lambda: elapsed[0], sleep=lambda s: None, probe=probe,
+        ) is None
+        assert not state.seen
+
+
+def test_wrong_symbol_probe_does_not_consume_dedupe():
+    elapsed = [0.0]
+    state = w.QuoteWakeState()
+    def sleep(seconds): elapsed[0] += seconds
+    assert w.wait_for_quote_wake(
+        targets=[target()], state=state, seconds=2,
+        session_end=NOW+timedelta(minutes=1),
+        now=lambda: NOW+timedelta(seconds=elapsed[0]),
+        monotonic=lambda: elapsed[0], sleep=sleep,
+        probe=lambda t, n: {"code": "012750", "latest_bar_ts": t["latest_bar_ts"]},
+    ) is None
+    assert not state.seen
