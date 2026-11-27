@@ -1,0 +1,213 @@
+"""Bounded HOT price opportunity evaluation: no broker routing or authority."""
+from __future__ import annotations
+from datetime import datetime, timedelta
+import hashlib
+import json
+import logging
+import math
+import os
+
+LOG = logging.getLogger(__name__)
+
+
+def poll_hot_events(db, *, env, scope, trade_date, hot_pairs, now_et,
+                    quote_reader, seen, base="runtime/private", live_clock=None):
+    from trader.us.entry_timing.opening_observer import priority_manifest_path, load_bars
+    from trader.us.entry_timing.opportunity import evaluate_price_opportunity, effective_mode
+    from trader.us.market_calendar import regular_close_time_for_date, is_us_trading_day
+    from datetime import date
+    from zoneinfo import ZoneInfo
+    ny=ZoneInfo("America/New_York")
+    if env != "practice" or not scope or len(hot_pairs)>4 or now_et.tzinfo is None:
+        return []
+    now_et=now_et.astimezone(ny)
+    day=date.fromisoformat(trade_date)
+    if (now_et.date()!=day or not is_us_trading_day(day)
+            or (now_et.hour,now_et.minute)<(10,0)
+            or now_et.time()>=regular_close_time_for_date(day)
+            or effective_mode()!="ENFORCE"):
+        return []
+    path=priority_manifest_path(env=env,scope=scope,trade_date=trade_date,base=base)
+    try:
+        if path.stat().st_size>65536:
+            return []
+        payload=json.loads(path.read_text(encoding="utf-8"))
+        created,expires=float(payload["created_epoch"]),float(payload["expires_epoch"])
+        if (payload.get("schema")!="US_PREMINUTE_PRIORITY_V1"
+                or payload.get("env")!=env or payload.get("owner")!="US_STANDARD"
+                or payload.get("trade_date")!=trade_date
+                or payload.get("is_order_authorization") is not False
+                or payload.get("scope_sha256")!=hashlib.sha256((env+":"+scope).encode()).hexdigest()
+                or not (math.isfinite(created) and math.isfinite(expires))
+                or not created<=now_et.timestamp()<=expires<=created+180.00001):
+            return []
+        inputs=payload["hot_event_inputs"]
+        generation=payload["generation"]
+        if not isinstance(generation,str) or not generation:
+            return []
+        listed={(x["symbol"],x["exchange"]) for lane in ("hot","warm","cold") for x in payload[lane]}
+        if not isinstance(inputs,dict):
+            return []
+    except (OSError,ValueError,TypeError,KeyError,AttributeError):
+        return []
+    eligible={pair for pair in hot_pairs if pair in listed and pair[0]!="TQQQ"}
+    for key in list(seen):
+        if key not in eligible:
+            seen.pop(key,None)
+    results=[]
+    def revoke_hint(symbol, exchange, at):
+        # Invalid native evidence must not leave a previously READY hint live.
+        # Never delete a newer observation or a different manifest generation.
+        db.execute("""DELETE FROM hot_retry_events WHERE trade_date=? AND symbol=?
+            AND exchange=? AND manifest_generation=? AND observed_epoch<=?""",
+            (trade_date,symbol,exchange,generation,at.timestamp()))
+        db.commit()
+        seen.pop((symbol,exchange),None)
+    for symbol,exchange in sorted(eligible):
+        candidate=inputs.get(symbol)
+        if not isinstance(candidate,dict):
+            continue
+        at=now_et
+        try:
+            q=quote_reader(symbol,exchange) or {}
+            at=live_clock().astimezone(ny) if live_clock else now_et
+            if at.date()!=day or at.time()>=regular_close_time_for_date(day) or at.timestamp()>expires:
+                break
+            received=float(q["received_at"])
+            age=at.timestamp()-received
+            bid,ask,last=(float(q[k]) for k in ("bid","ask","last"))
+            if (not q.get("collector_generation") or not all(map(math.isfinite,(received,bid,ask,last)))
+                    or not 0<=age<=5 or not 0<bid<=ask or last<=0
+                    or q.get("stale") or q.get("suspect")):
+                revoke_hint(symbol,exchange,at)
+                continue
+            bars=load_bars(db,trade_date=trade_date,symbol=symbol,owner="US_STANDARD")
+            min_rr=float(os.getenv("US_OPPORTUNITY_MIN_REFERENCE_RR","1.5"))
+            max_stop=float(os.getenv("US_OPPORTUNITY_MAX_STOP_DISTANCE","0.025"))
+            signature=hashlib.sha256(json.dumps(
+                [generation,candidate,bars,bid,ask,last,received,q["collector_generation"],min_rr,max_stop],
+                sort_keys=True,separators=(",",":"),allow_nan=False).encode()).hexdigest()
+            key=(symbol,exchange)
+            if seen.get(key)==signature:
+                continue
+            decision=evaluate_price_opportunity(
+                style=candidate["family"],trade_date=trade_date,now_et=at,
+                verified_bars=bars,quote={"source":"KIS_WEBSOCKET_COLLECTOR","last":last,
+                                          "bid":bid,"ask":ask,"age_sec":age},
+                prep=candidate["prep"],feature_scope=(scope,symbol,exchange,"US_STANDARD"),
+                min_rr=min_rr,max_stop_distance=max_stop,
+            )
+            finished = live_clock().astimezone(ny) if live_clock else at
+            quote_latency = finished.timestamp() - received
+            latest_bar = decision.get("facts", {}).get("last_completed_bar")
+            close_latency = None
+            if latest_bar:
+                bar_open = datetime.fromisoformat(latest_bar)
+                if bar_open.tzinfo is not None:
+                    close_latency = (finished - (bar_open + timedelta(minutes=1))).total_seconds()
+            LOG.info(
+                "[US_HOT_EVENT][LATENCY] symbol=%s generation=%s state=%s "
+                "received_to_evaluated_sec=%.3f bar_close_to_evaluated_sec=%s",
+                symbol, generation, decision["state"], quote_latency, close_latency,
+            )
+            if (finished < at or finished.date() != day or finished.time() >= regular_close_time_for_date(day)
+                    or finished.timestamp() > expires or not 0 <= quote_latency <= 5):
+                revoke_hint(symbol, exchange, finished)
+                continue
+            at = finished
+            # A local latest-state hint, not an order, does not carry a price
+            # or executable decision. The canonical engine must independently
+            # recalculate the strategy, size, risk and router permissions.
+            db.execute("""INSERT INTO hot_retry_events
+                (trade_date,symbol,exchange,manifest_generation,event_id,observed_epoch,quote_received_epoch,state)
+                VALUES (?,?,?,?,?,?,?,?)
+                ON CONFLICT(trade_date,symbol,exchange) DO UPDATE SET
+                    manifest_generation=excluded.manifest_generation,event_id=excluded.event_id,
+                    observed_epoch=excluded.observed_epoch,quote_received_epoch=excluded.quote_received_epoch,
+                    state=excluded.state
+                WHERE excluded.observed_epoch>=hot_retry_events.observed_epoch
+                """,(trade_date,symbol,exchange,generation,signature,at.timestamp(),received,decision["state"]))
+            db.commit()
+            seen[key]=signature
+            event={"symbol":symbol,"exchange":exchange,"observed_at_epoch":at.timestamp(),
+                   "quote_received_epoch":received,"decision":decision,"is_order_authorization":False}
+            results.append(event)
+            LOG.info("[US_HOT_EVENT][EVALUATED] symbol=%s state=%s reason=%s quote_age_sec=%.3f latest_completed=%s action=NO_ORDER",
+                     symbol,decision["state"],decision["reason"],age,
+                     decision.get("facts",{}).get("last_completed_bar"))
+        except (ValueError,TypeError,KeyError,AttributeError,OSError):
+            revoke_hint(symbol,exchange,at)
+            continue
+    return results
+
+
+def read_hot_retry_hints(*, env, scope, trade_date, generation, waiting,
+                         now_epoch, base="runtime/private"):
+    """Bounded read-only hints for a currently eligible, previously WAIT symbol."""
+    import sqlite3
+    from contextlib import closing
+    from trader.us.entry_timing.opening_observer import store_path
+    if env!="practice" or not scope or not generation or not waiting or len(waiting)>30:
+        return set()
+    try:
+        path=store_path(env=env,account_scope=scope,trade_date=trade_date,base=base)
+        if not path.is_file():
+            return set()
+        pairs=sorted((symbol,exchange) for symbol,exchange in waiting if symbol!="TQQQ")
+        if not pairs:
+            return set()
+        # Apply eligibility before LIMIT, otherwise newer unrelated hints can
+        # starve a canonical WAIT candidate. The input is bounded to Final30.
+        pair_filter=" OR ".join("(symbol=? AND exchange=?)" for _ in pairs)
+        params=[part for pair in pairs for part in pair]
+        with closing(sqlite3.connect("file:"+str(path.resolve())+"?mode=ro",uri=True,timeout=.025)) as db:
+            rows=db.execute("""SELECT symbol,exchange,observed_epoch,quote_received_epoch,event_id
+                FROM hot_retry_events WHERE trade_date=? AND manifest_generation=? AND state='READY'
+                AND observed_epoch BETWEEN ? AND ? AND quote_received_epoch BETWEEN ? AND ?
+                AND observed_epoch>=quote_received_epoch AND observed_epoch-quote_received_epoch<=5
+                AND length(event_id)>0 AND ("""+pair_filter+""")
+                ORDER BY observed_epoch DESC,symbol,exchange LIMIT 4""",
+                (trade_date,generation,now_epoch-5,now_epoch,now_epoch-5,now_epoch,*params)).fetchall()
+        return {(symbol,exchange) for symbol,exchange,at,received,event_id in rows
+                if (symbol,exchange) in waiting and symbol!="TQQQ"
+                and event_id and 0<=now_epoch-at<=5 and 0<=at-received<=5
+                and 0<=now_epoch-received<=5}
+    except (OSError,ValueError,TypeError,sqlite3.Error):
+        return set()
+
+
+def candidate_pair(candidate):
+    from trader.us.symbols import normalize_us_exchange
+    try:
+        return (str(candidate[1]).strip().upper(),normalize_us_exchange(candidate[2]))
+    except (ValueError,TypeError,IndexError):
+        return None
+
+
+def iter_candidates_with_hot_retries(candidates, *, waiting, ready_reader):
+    """Re-evaluate only a previously WAIT eligible candidate, once per tick.
+
+    Normal ranking and rank_final30 never change; no new symbols are injected.
+    No sleeps and no second engine or submitter. Existing per-tick cash,
+    candidate caps, cancellation and canonical order gates still apply.
+    """
+    ranked=list(enumerate(candidates))
+    retried=set()
+    def ready_retries():
+        if not waiting or len(retried)>=4:
+            return []
+        hints=ready_reader(set(waiting)-retried)
+        selected=[]
+        for rank,candidate in ranked:
+            key=candidate_pair(candidate)
+            if key in hints and key in waiting and key not in retried:
+                retried.add(key)
+                waiting.discard(key)
+                selected.append((rank,candidate))
+                if len(retried)>=4:
+                    break
+        return selected
+    for rank,candidate in ranked:
+        yield from ready_retries()
+        yield rank,candidate
+    yield from ready_retries()

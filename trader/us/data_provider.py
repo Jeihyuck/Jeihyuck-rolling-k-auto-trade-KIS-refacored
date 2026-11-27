@@ -1353,6 +1353,58 @@ class USDataProvider:
             symbol, exchange, trade_date=trade_date, required_bars=required_bars, allow_http_sync=allow_http_sync
         ).get("rows", [])
 
+    def recover_benchmark_previous_close(self, symbol: str, *, trade_date: str) -> dict | None:
+        """One bounded native read for a missing/stale SPY/QQQ/SMH close.
+
+        Read-only; no synthetic offline prices, DB write, current-session
+        candle, generic fallback or authorization. An ambiguous exact-day
+        response is rejected. The live quote is fetched AFTER recovery.
+        """
+        import math
+        import time
+        from trader.us.dates import canonical_us_bar_date
+        from trader.us.market_calendar import previous_completed_us_session
+        from trader.us.symbols import resolve_quote_exchange
+        sym = str(symbol).upper()
+        ctx = self._tick_context
+        if (sym not in {"SPY", "QQQ", "SMH"} or self._offline
+                or self._env != "practice" or self._stage_cancelled()
+                or ctx is None or not ctx.has_budget(15.0)):
+            return None
+        expected = previous_completed_us_session(trade_date)
+        key = (sym, expected.isoformat())
+        attempts = getattr(ctx, "_benchmark_close_recovery", None)
+        if attempts is None:
+            attempts = {}
+            ctx._benchmark_close_recovery = attempts
+        if key in attempts:
+            return attempts[key]
+        attempts[key] = None  # one attempt per symbol/day/tick, including failure
+        try:
+            stage = self.fork_for_stage(stage_deadline=time.monotonic()+4.0,
+                                        cancel_event=self._stage_cancel_event)
+            rows = stage._get_client().get_us_daily_price(
+                sym, resolve_quote_exchange(sym), count=10,
+                as_of_date=expected.strftime("%Y%m%d"))
+            exact = [row for row in rows if isinstance(row, dict)
+                     and canonical_us_bar_date(row.get("xymd") or row.get("date")) == expected]
+            closes = set()
+            for row in exact:
+                close = float(row.get("clos") or row.get("close") or row.get("last") or 0)
+                if not math.isfinite(close) or close <= 0:
+                    return None
+                closes.add(close)
+            if len(closes) != 1 or self._stage_cancelled() or not ctx.has_budget(1.0):
+                return None
+            result = {"close": closes.pop(), "date": expected.strftime("%Y%m%d"),
+                      "source": "KIS_NATIVE_DAILY_EXACT_COMPLETED"}
+            attempts[key] = result
+            return result
+        except Exception as exc:
+            logger.warning("[US_BENCHMARK][CLOSE_RECOVERY_FAILED] symbol=%s type=%s",
+                           sym, type(exc).__name__)
+            return None
+
     def get_daily_prices(self, symbol: str, exchange: str, count: int = 120, as_of_date: str | None = None) -> list[dict]:
         """일봉 데이터 조회 (xymd 기준 오름차순 정렬, KIS → DB fallback).
 

@@ -1903,7 +1903,17 @@ def load_us_order_events(trade_date: str, session_run_id: str | None = None) -> 
         for row in rows:
             item = dict(row)
             payload = _parse_json_meta(item.pop("payload", {}))
+            # Preserve original typed SQL identity separately: historical JSON
+            # metadata may contain conflicting values, and must never erase
+            # the proof columns used for exact BUY ACK recovery.
+            durable_identity = {k: item.get(k) for k in (
+                "event_type", "trade_date", "client_order_key", "submit_attempt_id",
+                "symbol", "side", "requested_qty", "account_id", "trading_epoch_id",
+                "portfolio_epoch_id", "position_cycle_id", "position_lifecycle_id",
+                "canonical_broker_order_no", "raw_broker_order_no",
+            ) if item.get(k) is not None}
             item.update(payload)
+            item["_durable_order_event_identity"] = durable_identity
             item["timestamp"] = str(item.get("timestamp") or "")
             result.append(item)
         return result
@@ -3702,6 +3712,12 @@ def _proven_us_tp_partial_retry(conn, params, stage_row, claim, intent_meta):
     )
 
 
+def _tp_claim_action_matches_stage(action: object, stage: str) -> bool:
+    """Match only the two explicit durable TP action spellings, never another stage."""
+    normalized = str(action or "").strip().lower()
+    return stage in {"tp1", "tp2", "tp3"} and normalized in {stage, f"take_profit_{stage}"}
+
+
 def reserve_us_profit_capture_stage_after_claim(
     *, trade_date: str, symbol: str, stage: str, position_lifecycle_id: str,
     client_order_key: str, attempt_id: str, action_key: str, qty: int,
@@ -3797,7 +3813,8 @@ def reserve_us_profit_capture_stage_after_claim(
                 or str(claim[0].get("attempt_state") or "") != "CREATED"
                 or str(claim[0].get("client_order_key") or "") != key
                 or str(claim[0].get("lifecycle_id") or "") != cycle
-                or int(claim[0].get("requested_qty") or 0) < int(qty)):
+                or not _tp_claim_action_matches_stage(claim[0].get("action"), stg)
+                or int(claim[0].get("requested_qty") or 0) != int(qty)):
             return False
         prior_stage = stage_row or (historical[0] if historical else None)
         if int(claim[0].get("filled_qty_before_attempt") or 0) > 0 and (
@@ -3952,7 +3969,12 @@ def verify_us_tp_claim_stage_at_http_boundary(
                 or str(claim["active_attempt_id"] or "") != params["attempt"]
                 or str(claim["lifecycle_id"] or "") != params["cycle"]
                 or str(claim["client_order_key"] or "") != params["key"]
-                or str(claim["attempt_state"] or "") not in {"CREATED", "SUBMITTED"}):
+                or str(claim["attempt_state"] or "") not in {"CREATED", "SUBMITTED"}
+                or not _tp_claim_action_matches_stage(claim.get("action"), epoch_params["stage"])):
+            return False
+        # A native submit may only consume the exact reserved TP remainder.
+        stage_remaining = int(stage_row.get("requested_qty") or 0) - int(stage_row.get("cumulative_filled_qty") or 0)
+        if stage_remaining <= 0 or stage_remaining != int(claim.get("requested_qty") or 0):
             return False
         if (int(claim.get("filled_qty_before_attempt") or 0) > 0
                 and int(stage_row.get("cumulative_filled_qty") or 0) <= 0):
@@ -9145,6 +9167,36 @@ def has_pending_order_for_symbol_side(
     except Exception as exc:
         logger.error("[US_ORDERS][PENDING_SYMBOL_SIDE][ERROR] %s", exc)
         return False
+
+
+def load_pending_order_symbols_for_side(*, symbols: list[str], side: str,
+                                        trade_date: str, include_statuses: set[str]) -> set[str]:
+    """One fresh, active-epoch durable pending-order read for a routing batch.
+
+    No memory fallback, no stale cache, no silent False on database failure.
+    The caller must still recheck canonical execution claims at native submit.
+    """
+    requested = sorted({str(x or "").strip().upper() for x in symbols if str(x or "").strip()})
+    if not requested:
+        return set()
+    side_u = str(side or "").strip().upper()
+    if side_u not in {"BUY", "SELL"} or not trade_date or not include_statuses:
+        raise ValueError("pending_order_batch_scope_invalid")
+    engine = _get_engine_or_none()
+    if engine is None:
+        raise RuntimeError("pending_order_batch_db_unavailable")
+    with engine.begin() as conn:
+        epoch = _active_us_epoch(conn, required=True)
+        if not epoch:
+            raise RuntimeError("pending_order_batch_epoch_unavailable")
+        rows = conn.execute(text("""
+            SELECT DISTINCT symbol FROM us_orders
+            WHERE symbol = ANY(:symbols) AND side=:side AND trade_date=:td
+              AND status = ANY(:statuses) AND dry_run=FALSE
+              AND trading_epoch_id=:epoch_id
+        """), {"symbols": requested, "side": side_u, "td": trade_date,
+               "statuses": sorted(include_statuses), "epoch_id": epoch}).scalars().all()
+    return {str(symbol).strip().upper() for symbol in rows}
 
 
 def find_recent_sell_ack(symbol: str, trade_date: str | None = None) -> dict | None:

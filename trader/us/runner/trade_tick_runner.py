@@ -472,17 +472,78 @@ def _journal_has_unrecovered_buy_ack(trade_date: str) -> bool:
         # commit before every POST.  Keep exit evaluation/reconciliation alive;
         # any real submit is fail-closed at that final boundary.
         return False
-    grouped: dict[str, list[dict]] = {}
+    # A recovery event must carry the same economic BUY identity. JSON
+    # metadata cannot override typed durable columns or another attempt.
+    from trader.us.utils.order_no import normalize_us_order_no
+
+    def sources(event):
+        durable=event.get("_durable_order_event_identity")
+        meta=event.get("meta")
+        return [event, durable if isinstance(durable,dict) else {},
+                meta if isinstance(meta,dict) else {}]
+
+    def one(rows, names, *, upper=False, order_no=False):
+        values=set()
+        for row in rows:
+            for key in names:
+                value=row.get(key)
+                if value is None or str(value).strip()=="":
+                    continue
+                value=str(value).strip()
+                if order_no:
+                    value=normalize_us_order_no(value)
+                if upper:
+                    value=value.upper()
+                if value:
+                    values.add(value)
+        if len(values)>1:
+            raise ValueError("conflicting_buy_ack_identity")
+        return next(iter(values),"")
+    
+    def kind(event):
+        durable=event.get("_durable_order_event_identity") or {}
+        # A contradictory payload cannot hide a typed BUY ACK.
+        return (str(durable.get("event_type") or event.get("event_type") or ""),
+                str(durable.get("side") or event.get("side") or "").upper())
+
+    def identity(event):
+        rows=sources(event)
+        try:
+            # These two must not conflict with SQL identity; event_type is
+            # compared only within one event, never between ACK and recovery.
+            one(rows[:2],("event_type",))
+            if one(rows[:2],("side",),upper=True)!="BUY":
+                return None
+            key=one(rows,("client_order_key",))
+            number=one(rows[:2],("canonical_broker_order_no","raw_broker_order_no","broker_order_no"),order_no=True)
+            if not key or not number or number=="0":
+                return None
+            return (key,number,one(rows,("submit_attempt_id",)),
+                    one(rows,("account_id","broker_account_hash")),
+                    one(rows,("trading_epoch_id",)),one(rows,("portfolio_epoch_id",)),
+                    one(rows,("position_cycle_id",)),one(rows,("position_lifecycle_id",)),
+                    one(rows,("strategy_owner",),upper=True),
+                    one(rows,("symbol",),upper=True),one(rows[:2],("trade_date",)),
+                    one(rows[:2],("requested_qty","qty")),
+                    one(rows,("entry_exit_contract_sha256",)),
+                    one(rows,("source_entry_contract_sha256",)))
+        except (ValueError,TypeError):
+            return None
+
+    recovered_types={"DB_ACK_PERSISTED","JOURNAL_REPLAY_DB_ACK_RESTORED"}
+    recovered=set()
     for event in events:
-        key = str(event.get("client_order_key") or "").strip()
-        if key:
-            grouped.setdefault(key, []).append(event)
-    recovered_types = {"DB_ACK_PERSISTED", "JOURNAL_REPLAY_DB_ACK_RESTORED"}
-    for order_events in grouped.values():
-        types = {str(event.get("event_type") or "") for event in order_events}
-        side = str(order_events[-1].get("side") or "").upper()
-        if side == "BUY" and "BROKER_ACK_RECEIVED" in types and not (types & recovered_types):
-            return True
+        typ,side=kind(event)
+        if side=="BUY" and typ in recovered_types:
+            scope=identity(event)
+            if scope is not None:
+                recovered.add(scope)
+    for event in events:
+        typ,side=kind(event)
+        if side=="BUY" and typ in {"BROKER_ACK_RECEIVED","BROKER_ACK_RECOVERED"}:
+            scope=identity(event)
+            if scope is None or scope not in recovered:
+                return True
     return False
 
 
@@ -567,6 +628,42 @@ def _suppress_pending_sell_exit_intents(
     except Exception:
         return [] if strict else exit_intents
     statuses = {"SUBMITTED", "ACK", "PENDING", "PARTIALLY_FILLED", "RECONCILE_PENDING", "ACK_DB_FAILED"}
+    # Native practice submits use one scoped durable snapshot rather than
+    # one transaction per SELL intent. No cache across batches or ticks.
+    # A failed DB read is UNKNOWN, not evidence of no pending order.
+    batch_pending = None
+    native_batch = (
+        str(env).lower() == "practice"
+        and os.getenv("KIS_ENV", "").strip().lower() == "practice"
+        and os.getenv("WSL_RUN_MARKET", "").upper() == "US"
+        and os.getenv("US_ORDER_ARMED", "0").strip().lower() in {"1", "true", "yes", "on"}
+        and os.getenv("US_PENDING_SELL_BATCH_ENABLED", "1") == "1"
+    )
+    if native_batch:
+        requested = sorted({str(i.get("symbol") or "").strip().upper()
+                            for i in exit_intents
+                            if str(i.get("side") or "").upper() == "SELL"
+                            and str(i.get("symbol") or "").strip()
+                            and _standard_lifecycle(i) not in historical_fenced})
+        if requested:
+            from trader.us.db.repos import load_pending_order_symbols_for_side
+            started = time.monotonic()
+            try:
+                batch_pending = load_pending_order_symbols_for_side(
+                    symbols=requested, side="SELL", trade_date=trade_date,
+                    include_statuses=statuses,
+                )
+                logger.info("[US_EXIT][PENDING_SELL_BATCH] symbols=%d pending=%d elapsed_ms=%.2f",
+                            len(requested), len(batch_pending), (time.monotonic()-started)*1000)
+            except Exception as exc:
+                # A fresh account/epoch DB check is mandatory for native
+                # execution. Do not substitute the permissive old bool helper.
+                # Keep non-SELL intents; no orders/claims are changed here.
+                logger.error("[US_EXIT][PENDING_SELL_BATCH_UNVERIFIED] symbols=%d error=%s",
+                             len(requested), type(exc).__name__)
+                return [i for i in exit_intents if str(i.get("side") or "").upper() != "SELL"]
+        else:
+            batch_pending = set()
     kept: list[dict] = []
     for intent in exit_intents:
         if str(intent.get("side") or "").upper() != "SELL":
@@ -582,7 +679,8 @@ def _suppress_pending_sell_exit_intents(
             )
             continue
         try:
-            pending = bool(symbol) and has_pending_order_for_symbol_side(symbol=symbol, side="SELL", trade_date=trade_date, include_statuses=statuses)
+            pending = (symbol in batch_pending if batch_pending is not None
+                       else bool(symbol) and has_pending_order_for_symbol_side(symbol=symbol, side="SELL", trade_date=trade_date, include_statuses=statuses))
         except Exception as exc:
             logger.warning("[US_EXIT][INTENT_SUPPRESS_CHECK_WARN] symbol=%s err=%s", symbol, exc)
             if strict:

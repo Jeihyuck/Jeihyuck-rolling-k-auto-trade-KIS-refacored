@@ -111,15 +111,56 @@ def opening_static_features(bars, trade_date, min_opening_bars, *, feature_scope
     opening = [b for b in bars if "T09:30:00" <= b["time_et"][10:19] < "T10:00:00"]
     if not feature_scope:
         return _opening_static_features(opening, trade_date, min_opening_bars)
-    from trader.marketdata.feature_reuse import cached_native_features
-    # The full exact opening operand set is bound, not just count/last time.
-    # A late correction or conflict removal changes the key. Current quote,
-    # clock/age, position, stop and order decision are never memoized.
-    return cached_native_features(
-        market="US", scope=feature_scope, trade_date=trade_date,
-        settings=("US_OPENING_STATIC_V1", min_opening_bars),
-        rows=opening, compute=lambda rows: _opening_static_features(rows, trade_date, min_opening_bars),
+    # Exact operands, formula version and account/owner scope are mandatory.
+    # Return the same tuple contract whether computed locally or shared.
+    result = _reuse_us_static_features(
+        scope=feature_scope, trade_date=trade_date,
+        settings=("US_OPENING_STATIC_V1", min_opening_bars), rows=opening,
+        compute=lambda rows: list(_opening_static_features(rows, trade_date, min_opening_bars)),
     )
+    return tuple(result)
+
+
+def _reuse_us_static_features(*, scope, trade_date, settings, rows, compute):
+    import os
+    from trader.marketdata.feature_reuse import cached_native_features, shared_native_features
+    def shared_or_compute(operands):
+        if (os.getenv("US_SHARED_NATIVE_FEATURES_ENABLED", "1") == "1"
+                and os.getenv("WSL_RUN_MARKET", "").upper() == "US"
+                and os.getenv("KIS_ENV", "practice").lower() == "practice"
+                and len(scope) == 4 and scope[3] == "US_STANDARD"):
+            return shared_native_features(
+                market="US", scope=scope, trade_date=trade_date,
+                settings=settings, rows=operands, compute=compute,
+                base="runtime/private/native-features")
+        return compute(operands)
+    return cached_native_features(
+        market="US", scope=scope, trade_date=trade_date, settings=settings,
+        rows=rows, compute=shared_or_compute)
+
+
+def _recent_static_features(rows):
+    tail = rows[-4:]
+    return {
+        "recent_volume": sum(b["volume"] for b in tail[-2:]),
+        "prior_volume": sum(b["volume"] for b in tail[:2]),
+        "rising_closes": tail[-1]["close"] > tail[-2]["close"] > tail[-3]["close"],
+        "higher_lows": tail[-1]["low"] >= tail[-2]["low"] >= tail[-3]["low"],
+        "local_trough": min(b["low"] for b in rows),
+        "stop": min(b["low"] for b in tail[-3:]),
+    }
+
+
+def recent_static_features(bars, trade_date, *, feature_scope=None):
+    # Only a completed native bar entering/leaving the rolling 15-bar window,
+    # or a correction within it, invalidates these exact operands.
+    rows = bars[-15:]
+    if not feature_scope:
+        return _recent_static_features(rows)
+    return _reuse_us_static_features(
+        scope=feature_scope, trade_date=trade_date,
+        settings=("US_RECENT_STATIC_V1", 15, 4, 3),
+        rows=rows, compute=_recent_static_features)
 
 
 def _decision(state: str, reason: str, *, style: str, facts: dict,
@@ -247,8 +288,10 @@ def evaluate_price_opportunity(
     facts["last_completed_bar"] = tail[-1]["time_et"]
     facts["recent_closes"] = [b["close"] for b in tail]
     facts["recent_lows"] = [b["low"] for b in tail]
-    recent_volume = sum(b["volume"] for b in tail[-2:])
-    prior_volume = sum(b["volume"] for b in tail[:2])
+    # Cache only native completed-bar geometry, never price or decision age.
+    _static_recent = recent_static_features(verified_bars, trade_date, feature_scope=feature_scope)
+    recent_volume = _static_recent["recent_volume"]
+    prior_volume = _static_recent["prior_volume"]
     facts["recent_2m_volume"] = recent_volume
     facts["prior_2m_volume"] = prior_volume
     last_close = tail[-1]["close"]
@@ -256,15 +299,15 @@ def evaluate_price_opportunity(
         return _decision("WAIT", "live_price_far_from_completed_bar", style=style,
                          facts=facts, price=fresh_price)
 
-    rising_closes = tail[-1]["close"] > tail[-2]["close"] > tail[-3]["close"]
-    higher_lows = tail[-1]["low"] >= tail[-2]["low"] >= tail[-3]["low"]
+    rising_closes = _static_recent["rising_closes"]
+    higher_lows = _static_recent["higher_lows"]
     volume_confirmed = recent_volume > 0 and prior_volume > 0 and recent_volume >= 0.8 * prior_volume
     facts.update(rising_closes=rising_closes, higher_lows=higher_lows,
                  volume_confirmed=volume_confirmed)
     opening_high = coverage["opening_high"]
     opening_low = coverage["opening_low"]
     # The high/low are from actual broker bars; NOT tick-sample extrema.
-    local_trough = min(b["low"] for b in verified_bars[-15:])
+    local_trough = _static_recent["local_trough"]
     facts["local_trough"] = local_trough
 
     if style == "ENTRY_BREAKOUT":
@@ -293,7 +336,7 @@ def evaluate_price_opportunity(
         facts["phase"] = "CONFIRM"
         target = opening_high
 
-    stop = min(b["low"] for b in tail[-3:])
+    stop = _static_recent["stop"]
     entry = ask
     if entry <= stop:
         return _decision("WAIT", "stop_geometry_invalid", style=style, facts=facts, price=fresh_price)
