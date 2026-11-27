@@ -62,7 +62,8 @@ def _release_certificate_row(conn, row: dict, scope: dict) -> bool:
         return False
     events = conn.execute(text("""
         SELECT event_type, submit_attempt_id, account_id, position_lifecycle_id,
-               canonical_broker_order_no, payload, trade_date, trading_epoch_id
+               canonical_broker_order_no, raw_broker_order_no, cumulative_filled_qty,
+               symbol, side, profit_capture_stage, payload, trade_date, trading_epoch_id
           FROM us_order_events WHERE client_order_key=:key
     """), params).mappings().all()
     if not events or any(str(e.get("trading_epoch_id") or "") != params["epoch"]
@@ -83,10 +84,18 @@ def _release_certificate_row(conn, row: dict, scope: dict) -> bool:
         return False
     for e in events:
         payload = e.get("payload") or {}
+        if not isinstance(payload, dict):
+            return False
+        account_columns = (e.get("account_id"), payload.get("broker_account_hash"))
         if (e.get("event_type") != CERTIFICATE or not e.get("submit_attempt_id")
-                or (e.get("account_id") or payload.get("broker_account_hash")) != params["account"]
+                or not any(account_columns)
+                or any(value and str(value) != params["account"] for value in account_columns)
                 or e.get("position_lifecycle_id") != params["cycle"]
-                or e.get("canonical_broker_order_no")
+                or str(e.get("canonical_broker_order_no") or "").strip()
+                or str(e.get("raw_broker_order_no") or "").strip()
+                or int(e.get("cumulative_filled_qty") or 0) != 0
+                or e.get("symbol") != params["sym"] or e.get("side") != "SELL"
+                or e.get("profit_capture_stage") != params["stage"]
                 or payload.get("symbol") != params["sym"] or payload.get("side") != "SELL"
                 or payload.get("profit_capture_stage") != params["stage"]
                 or payload.get("strategy_owner") != "US_STANDARD"
@@ -106,7 +115,9 @@ def _release_certificate_row(conn, row: dict, scope: dict) -> bool:
     """), params).mappings().one_or_none()
     if intent_row:
         im = intent_row.get("meta") or {}
-        declared_account = intent_row.get("account_id") or im.get("broker_account_hash")
+        if not isinstance(im, dict):
+            return False
+        declared_accounts = (intent_row.get("account_id"), im.get("broker_account_hash"))
         declared_cycle = str(im.get("position_lifecycle_id") or "")
         if declared_cycle:
             from trader.us.profit_capture import tp_stage_lifecycle_from_order_proof
@@ -119,7 +130,7 @@ def _release_certificate_row(conn, row: dict, scope: dict) -> bool:
                 or intent_row.get("symbol") != params["sym"] or intent_row.get("side") != "SELL"
                 or intent_row.get("trading_epoch_id") != params["epoch"]
                 or intent_row.get("status") not in {"PENDING", "BLOCKED"}
-                or (declared_account and declared_account != params["account"])
+                or any(value and str(value) != params["account"] for value in declared_accounts)
                 or (declared_cycle and declared_cycle != params["cycle"])
                 or im.get("strategy_owner", "US_STANDARD") != "US_STANDARD"):
             return False
