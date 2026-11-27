@@ -44,7 +44,7 @@ IMPLEMENTED = source changed, CI/runtime not yet certified. OPEN = required outs
 |36|P0|Verified equity/cash/flows and valuation; UNKNOWN not fabricated|OPEN|
 |37|P1|Swing V3 U case causal replay; keep existing policy|REVIEW|
 |38|P0|CLOSE five independent axes truthful, no fabricated PASS|OPEN|
-|39|P0|Tick latency, duplicate reads, SELL priority, one submitter|PARTIAL; US phase evidence, KR direct canonical cache read, scoped static US feature reuse; common priority budget, independent protective scheduling and measured acceptance open|
+|39|P0|Tick latency, duplicate reads, SELL priority, one submitter|PARTIAL; US phase evidence, scoped static US feature reuse, durable atomic soft-stop write; common priority budget, independent protective scheduling and measured acceptance open|
 |40|P0|Latest HEAD all CI, exact WSL SHA/config, real practice lifecycle evidence|OPEN|
 |41|P0|Exchange calendar holiday and early close scheduler, observer and order cutoff|PARTIAL observer holiday/early-close cutoff and AM/PM session deadline clamped; scheduler and native order boundary WSL acceptance open|
 ## Nonnegotiable
@@ -111,3 +111,10 @@ KR numbers supplied by operator for Nov27: previous average 99.4s, #401 after av
 
 ## Operator scope clarification — US-only PR400
 US implementation and US operating acceptance are mandatory. KR #401 is a reference and must remain unchanged; KR regression checks protect compatibility only. Restore KR-only changed files exactly to current base. Shared helpers may be used by US without migrating KR callers. KR operational speed, PREP, strategy changes, and KR native evidence are outside this PR. This supersedes earlier KR implementation/operating acceptance wording. All US P0 execution, lifecycle, data, performance and close requirements remain.
+
+### US-only follow-up actual implementation
+- a7a6041f: reverted KR-only `trader/kis_wrapper.py`, `trader/marketdata/kr_rest_shared.py`, `tests/kr/test_kr_rest_shared_20261126.py` to exact dual-agent #401 blobs. Common new helpers retained for US. No KR strategy work.
+- Re-measured original 11/25 ET logs: AM 420 and PM 408 position snapshot outcomes; AM mean total 3.031s, risk 1.327s, HWM 1.703s, quote 0.001s; PM mean total 3.044s, risk 1.338s, HWM 1.706s, quote <0.001s. HWM NOOP 393 AM and 390 PM. Nested risk/HWM durations are inside state/total, not additional wall time. 35 AM and 34 PM ticks; snapshot total per tick ~36.4/36.5s, within ~84s exit evaluation, not its complete root cause. No claim of 30s achieved.
+- c984b6db: practice armed US snapshot uses new atomic soft-stop PostgreSQL UPSERT, preserving unrelated state JSON and per-day breach/reset/revision semantics, with explicit rollback US_ATOMIC_SOFT_STOP_ENABLED=0. Removes separate stale read/second DB transaction for this path. Missing DB raises, no memory fallback in new helper. No changes to stop threshold/confirmation count/cadence. Existing nonarmed and nonpractice behavior unchanged. Fake DB tests added.
+- a8d8c181: added disposable real PostgreSQL parity test comparing original vs new state updates including revision reset and immutable HWM/TP/partial leaves. Reservation mismatch field names and allowlisted nested pre-HTTP Stage4/authority reason diagnostics. No relaxation of guards. Not a root-cause fix for historical reservation failures.
+- Still required: current-head CI including actual PG parity; verify atomic path against current scoped lifecycle and WSL timings; HWM and original-contract bottleneck, independent SELL and bounded BUY event processing, DHR/KO/TMO original-day KIS proof, all remaining SST/Stage4/partial-retry/portfolio/close gates. No operational DB writes, orders, deploy or merge. Previous d00659d4 17 success/2 skipped applies only to pre-change head.
