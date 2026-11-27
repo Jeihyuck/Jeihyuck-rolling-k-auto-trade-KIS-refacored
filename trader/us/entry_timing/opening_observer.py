@@ -73,6 +73,13 @@ def open_store(path: Path) -> sqlite3.Connection:
         response_ids_json TEXT NOT NULL,
         PRIMARY KEY (trade_date,symbol,owner,minute_et,resolved_epoch)
     );
+    CREATE TABLE IF NOT EXISTS hot_retry_events (
+        trade_date TEXT NOT NULL, symbol TEXT NOT NULL, exchange TEXT NOT NULL,
+        manifest_generation TEXT NOT NULL, event_id TEXT NOT NULL,
+        observed_epoch REAL NOT NULL, quote_received_epoch REAL NOT NULL,
+        state TEXT NOT NULL,
+        PRIMARY KEY (trade_date,symbol,exchange)
+    );
     CREATE TABLE IF NOT EXISTS quote_samples (
         trade_date TEXT NOT NULL, symbol TEXT NOT NULL, owner TEXT NOT NULL,
         received_epoch REAL NOT NULL, last REAL NOT NULL, source TEXT NOT NULL,
@@ -424,6 +431,32 @@ def publish_preminute_candidates(
         seen.add(sym)
         ranked.append({"symbol": sym, "exchange": exchange, "score": score_value,
                        "position_state": str(meta.get("position_state") or "")})
+    # Event evaluation only uses strategy-owned preminute metadata.
+    # Never infer an entry family from PREP rank or publish an order intent.
+    from trader.us.pb1.us_explain import normalize_us_entry_style
+    event_inputs = {}
+    if prep_contract is None:
+        for candidate in candidates:
+            if not isinstance(candidate, (tuple, list)) or len(candidate) < 5:
+                continue
+            sym = str(candidate[1] or "").strip().upper()
+            meta = candidate[4] if isinstance(candidate[4], dict) else {}
+            if (sym not in seen or sym in event_inputs
+                    or str(meta.get("strategy_owner") or "US_STANDARD").upper() != "US_STANDARD"
+                    or str(meta.get("position_state") or "") != "NOT_HELD"):
+                continue
+            family = normalize_us_entry_style(meta.get("entry_style_selected") or meta.get("entry_style"))
+            if family not in {"ENTRY_PULLBACK","ENTRY_MOMENTUM","ENTRY_BREAKOUT"}:
+                continue
+            fields = {}
+            for key in ("breakout_pivot_price","pivot_price","timing_target_reference"):
+                try:
+                    value = float(meta.get(key))
+                    if math.isfinite(value) and value > 0:
+                        fields[key] = value
+                except (ValueError, TypeError, OverflowError):
+                    pass
+            event_inputs[sym] = {"family":family,"prep":fields}
     # First prioritize new candidates; retained/add BUY candidates are still
     # eligible for WARM collection and are not treated as global excludes.
     ranked.sort(key=lambda row: row["position_state"] == "HELD")
@@ -439,6 +472,8 @@ def publish_preminute_candidates(
         "warm": [{"symbol": x["symbol"], "exchange": x["exchange"]} for x in warm],
         "cold": [{"symbol": x["symbol"], "exchange": x["exchange"]} for x in ranked[len(hot)+len(warm):]],
         "is_order_authorization": False,
+        "hot_event_inputs": {r["symbol"]: event_inputs[r["symbol"]] for r in ranked
+                             if r["symbol"] in event_inputs},
     }
     path = priority_manifest_path(env=env, scope=scope, trade_date=trade_date, base=base)
     if prep_contract is not None:
@@ -798,6 +833,8 @@ def run_observer(*, env: str, trade_date: str, scope: str,
     interval = max(6.0, float(min_interval_sec))
     start = time.monotonic()
     next_poll = 0.0
+    next_event_poll = 0.0
+    event_seen = {}
     pointer = 0
     priority_offsets = {"HOT": 0, "WARM": 0, "COLD": 0}
     last_priority_state = None
@@ -830,6 +867,28 @@ def run_observer(*, env: str, trade_date: str, scope: str,
             if (now_et.hour, now_et.minute) < (9, 25):
                 time.sleep(2.0)
                 continue
+            # Evaluate up to four HOT symbols between native minute slots.
+            # This process never owns trading or submission authority.
+            if (ws_on and (now_et.hour, now_et.minute) >= (10, 0)
+                    and time.monotonic() >= next_event_poll):
+                next_event_poll = time.monotonic() + 1.0
+                try:
+                    from trader.us.entry_timing.hot_event_evaluator import poll_hot_events
+                    event_lanes, event_state = collection_priorities(
+                        env=env, scope=scope, trade_date=trade_date, pairs=pairs,
+                        now_epoch=time.time(), allow_prep_rebind=continuous)
+                    if event_state in {"VALID","PREP_VALID"}:
+                        poll_hot_events(
+                            db, env=env, scope=scope, trade_date=trade_date,
+                            hot_pairs=event_lanes["HOT"], now_et=now_et,
+                            quote_reader=lambda sym, exch: get_quote(
+                                sym, exch, env=env, max_age_sec=5, timeout_sec=.11),
+                            seen=event_seen, live_clock=lambda: datetime.now(NY),
+                        )
+                    else:
+                        event_seen.clear()
+                except Exception as exc:
+                    LOG.warning("[US_HOT_EVENT][UNAVAILABLE] error=%s action=NO_ORDER", type(exc).__name__)
             if time.monotonic() < next_poll:
                 time.sleep(min(1.0, next_poll - time.monotonic()))
                 continue
