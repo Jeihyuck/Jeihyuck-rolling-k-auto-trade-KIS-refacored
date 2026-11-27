@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from functools import lru_cache
 from math import isfinite
+import os
 
 from trader.kr.opening_bar_contract import KST, clean_completed_bars
 from trader.kr.entry_opportunity_v2 import MIN_RR, MAX_RISK, MIN_DEPTH
@@ -108,6 +109,7 @@ class ObservationPromotion:
         self.snapshot_key = None
         self.hot = []
         self.warm = []
+        self.cold = []
         self.facts = {}
 
     def observe(self, code, facts):
@@ -120,10 +122,11 @@ class ObservationPromotion:
             self.facts.clear()
             return priority
         key = (priority.get("code_sha"), priority.get("final30_digest"),
-               tuple(priority["hot"]), tuple(priority["warm"]), now.date())
+               tuple(priority["hot"]), tuple(priority["warm"]), tuple(priority.get("cold", [])), now.date())
         if self.snapshot_key != key:
             self.snapshot_key = key
             self.hot, self.warm = list(priority["hot"]), list(priority["warm"])
+            self.cold = list(priority.get("cold", []))
             self.last_swap = None
             # Even an overlapping symbol may have different owner geometry
             # after a PREP snapshot or code revision changes. Do not carry
@@ -145,4 +148,65 @@ class ObservationPromotion:
                 self.hot[self.hot.index(outgoing)] = incoming
                 self.warm[self.warm.index(incoming)] = outgoing
                 self.last_swap = now
-        return {**priority, "hot": list(self.hot), "warm": list(self.warm)}
+            elif os.getenv("KR_COLD_DISCOVERY_ENABLED", "1") == "1":
+                incoming = next((c for c in self.cold
+                                 if c != "122630" and fresh_near(c)), None)
+                outgoing = next((c for c in reversed(self.warm) if not fresh_near(c)), None)
+                if incoming and (outgoing or len(self.warm) < 5):
+                    self.cold.remove(incoming)
+                    if outgoing:
+                        self.warm[self.warm.index(outgoing)] = incoming
+                        self.cold.append(outgoing)
+                    else:
+                        self.warm.append(incoming)
+                    self.last_swap = now
+        return {**priority, "hot": list(self.hot), "warm": list(self.warm),
+                "cold": list(self.cold)}
+
+
+class ColdDiscovery:
+    """At most one reclaim-style PREP-only discovery every three minutes.
+
+    Never takes an already-due HOT/WARM slot; the actual HTTP calls must
+    still pass the existing observer and cross-process broker priority budgets.
+    The result is observation evidence only, never an executable candidate.
+    """
+    def __init__(self):
+        self.last_probe = None
+        self.last_attempt = {}
+        self.scope = None
+
+    def select(self, priority, schedule, now):
+        if (priority.get("state") != "PREP_COLLECTION_ACTIVE"
+                or priority.get("is_order_authorization") is not False
+                or not (priority.get("hot") or priority.get("warm"))):
+            return None
+        scope = (now.date(), priority.get("code_sha"), priority.get("final30_digest"))
+        if self.scope != scope:
+            self.scope = scope
+            self.last_attempt.clear()
+            # Keep the global rate bound even across snapshot replacements.
+        if self.last_probe is not None and (now-self.last_probe).total_seconds() < 180:
+            return None
+        for tier in ("hot", "warm"):
+            for code in priority.get(tier, []):
+                last = schedule.last_attempt.get(code)
+                if (last is None or (now-last).total_seconds() >
+                        schedule.periods[tier] - 20):
+                    return None
+        styles = priority.get("observation_styles") or {}
+        eligible = []
+        for code in priority.get("cold", []):
+            style = str(styles.get(code) or "").upper().removeprefix("ENTRY_")
+            if (code == "122630" or not any(style == f or style.startswith(f+"_")
+                                            for f in ("PULLBACK", "MOMENTUM"))):
+                continue
+            last = self.last_attempt.get(code)
+            if last is None or (now-last).total_seconds() >= 1800:
+                eligible.append(code)
+        if not eligible:
+            return None
+        chosen = min(eligible, key=lambda c: (
+            c in self.last_attempt, self.last_attempt.get(c, now), c))
+        self.last_attempt[chosen] = self.last_probe = now
+        return chosen
