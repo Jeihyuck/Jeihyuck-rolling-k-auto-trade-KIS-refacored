@@ -33,6 +33,17 @@ def _endpoint_label(method: str, path: str) -> str:
     return f"{method.upper()}_{tail}"
 
 
+def _urgent_kis_request(method: str, path: str, headers: dict) -> bool:
+    """Exact registry identity; never infer SELL from the shared order URL."""
+    tr_id = str(headers.get("tr_id") or "").upper()
+    for name in ("us_sell_order", "us_order_cancel", "us_fills_today"):
+        tr = get_tr_info(name)
+        if (tr["method"] == method and tr["path"] == path.split("?")[0]
+                and tr["tr_id"] == tr_id):
+            return True
+    return False
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None:
@@ -1518,7 +1529,7 @@ class KisUSClient:
         else:
             return (0.7, 0.7)  # trading 기본
 
-    def _apply_rate_limit(self, path: str) -> None:
+    def _apply_rate_limit(self, path: str, *, urgent: bool = False) -> None:
         """API 호출 전 rate limiting 적용."""
         endpoint_key = path.split("?")[0]  # query string 제거
         last_time = self._last_request_time.get(endpoint_key, 0.0)
@@ -1548,6 +1559,7 @@ class KisUSClient:
                         float(os.getenv("US_SHARED_KIS_HTTP_MIN_INTERVAL_SEC", "0.35")),
                     ),
                     sleep_with_budget=self._sleep_with_budget,
+                    urgent=urgent,
                     **({"defer_if_busy": True} if (
                         os.getenv("US_OPENING_OBSERVER_READ_ONLY") == "1"
                         and path.split("?")[0] == "/uapi/overseas-price/v1/quotations/inquire-time-itemchartprice"
@@ -1607,7 +1619,11 @@ class KisUSClient:
         
         for attempt in range(1, max_attempts + 1):
             try:
-                self._apply_rate_limit(path)
+                if (os.getenv("US_SHARED_KIS_LIMITER_ENABLED", "0") == "1"
+                        and _urgent_kis_request("GET", path, headers)):
+                    self._apply_rate_limit(path, urgent=True)
+                else:
+                    self._apply_rate_limit(path)
                 
                 url = self._base_url + path
                 record_kis_http_call("GET", path)
@@ -1714,7 +1730,11 @@ class KisUSClient:
         for attempt in range(1, max_attempts + 1):
             http_attempted = False
             try:
-                self._apply_rate_limit(path)
+                if (os.getenv("US_SHARED_KIS_LIMITER_ENABLED", "0") == "1"
+                        and _urgent_kis_request("POST", path, headers)):
+                    self._apply_rate_limit(path, urgent=True)
+                else:
+                    self._apply_rate_limit(path)
                 
                 url = self._base_url + path
                 timeout = self._request_budget()
