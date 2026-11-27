@@ -47,7 +47,10 @@ def test_live_tp_uses_actual_decision_clock_not_stale_tick_start(symbol):
         intent, now_utc=DECIDED + timedelta(seconds=28),
     ) == (True, "US_TP_DECISION_FRESH")
     assert _tp_decision_fresh_for_native_http(
-        intent, now_utc=DECIDED + timedelta(seconds=31),
+        intent, now_utc=DECIDED + timedelta(seconds=90),
+    ) == (True, "US_TP_DECISION_FRESH")
+    assert _tp_decision_fresh_for_native_http(
+        intent, now_utc=DECIDED + timedelta(seconds=91),
     ) == (False, "US_TP_DECISION_EXPIRED_BEFORE_HTTP")
 
 
