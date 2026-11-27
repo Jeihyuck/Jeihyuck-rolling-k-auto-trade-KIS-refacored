@@ -766,8 +766,14 @@ def _session_end_dt(session: str, now: datetime) -> datetime:
     """당일 session 종료 시각 (NY timezone datetime)."""
     from zoneinfo import ZoneInfo
     NY_TZ = ZoneInfo("America/New_York")
+    from trader.us.market_calendar import regular_close_time_for_date
+    local = now.astimezone(NY_TZ)
     h, m = _SESSION_END_TIMES.get(session, (16, 0))
-    return now.replace(hour=h, minute=m, second=0, microsecond=0).astimezone(NY_TZ)
+    end = local.replace(hour=h, minute=m, second=0, microsecond=0)
+    if session in {"am", "afternoon"}:
+        close = regular_close_time_for_date(local.date())
+        end = min(end, local.replace(hour=close.hour, minute=close.minute, second=0, microsecond=0))
+    return end
 
 
 _TICK_LATENCY_STAGE_KEYS = (
