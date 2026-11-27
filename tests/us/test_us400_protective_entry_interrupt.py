@@ -382,3 +382,28 @@ def test_profit_wakeup_keeps_only_unattempted_exact_holdings(case):
     expected=watch[1:] if case=="no_trade" else watch[2:] if case=="ack" else []
     assert remaining_profit_idle_watch(watch,identity("ABC"),result)==expected
     assert len(watch)==3
+
+
+@pytest.mark.parametrize("failure",["raise","malformed"])
+def test_idle_protective_ipc_failure_does_not_starve_other_holdings(monkeypatch,failure):
+    from trader.us import market_calendar
+    from trader.marketdata import us_ws_collector
+    from trader.us.runner.protective_entry_interrupt import make_idle_hard_stop_poll
+    monkeypatch.setattr(market_calendar,"now_ny",lambda:datetime(2026,11,25,11,tzinfo=ZoneInfo("America/New_York")))
+    watch=[dict(identity=dict(symbol=f"A{i}",strategy_owner="US_STANDARD",position_lifecycle_id=f"l{i}",
+             position_cycle_id=f"l{i}",portfolio_epoch_id="p",trading_epoch_id="e",broker_account_hash="a"),
+             exchange="NASDAQ",entry=100,hard=.06) for i in range(35)]
+    calls=[]
+    def quotes(pairs,**kwargs):
+        calls.append(pairs)
+        if len(calls)==1:
+            if failure=="raise":
+                raise OSError("collector reconnect")
+            return None
+        return {p:dict(last=93 if p[0]=="A34" else 100,received_at=time.time(),
+                       source="KIS_WEBSOCKET_COLLECTOR",collector_generation="g") for p in pairs}
+    monkeypatch.setattr(us_ws_collector,"get_quotes_many",quotes)
+    monkeypatch.setattr(us_ws_collector,"get_quote",lambda *a,**kw:pytest.fail("individual IPC"))
+    poll=make_idle_hard_stop_poll(watch,trade_date="2026-11-25",env="practice")
+    assert poll()==watch[-1]["identity"]
+    assert [len(p) for p in calls]==[16,16,3]

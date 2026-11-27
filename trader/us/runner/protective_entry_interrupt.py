@@ -234,10 +234,20 @@ def _bounded_quotes(candidates,cursor,env,*,pair):
         cursor=(cursor+size)%len(candidates)
         remaining_count-=size
         pairs=[pair(item) for item in chunk]
-        if size==1:
-            quotes={pairs[0]:get_quote(*pairs[0],env=env,max_age_sec=5,timeout_sec=min(.15,remaining))}
-        else:
-            quotes=get_quotes_many(pairs,env=env,max_age_sec=5,timeout_sec=min(.2,remaining))
+        try:
+            if size==1:
+                quotes={pairs[0]:get_quote(*pairs[0],env=env,max_age_sec=5,timeout_sec=min(.15,remaining))}
+            else:
+                quotes=get_quotes_many(pairs,env=env,max_age_sec=5,timeout_sec=min(.2,remaining))
+            if not isinstance(quotes,dict):
+                quotes={}
+        except (OSError,ValueError,TypeError,RuntimeError):
+            # Collector failure for one batch is not evidence of a safe
+            # holding. Keep the bounded rotation alive for other symbols;
+            # never manufacture a quote or retry this IPC in the same poll.
+            import logging
+            logging.getLogger(__name__).warning("[US_EXIT][PROTECTIVE_IPC_BATCH_UNAVAILABLE] symbols=%d",size)
+            quotes={}
         selected.extend((item,quotes.get(p)) for item,p in zip(chunk,pairs))
     return selected,cursor
 
