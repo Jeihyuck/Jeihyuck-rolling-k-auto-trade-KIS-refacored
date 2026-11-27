@@ -95,6 +95,39 @@ def current_day_unfilled_evidence(payload, *, day, codes):
             for code, (count, qty) in totals.items()}
 
 
+def missing_order_id_evidence(payload, *, day, code, qty, limit_price):
+    """Candidate list for human review, NEVER order identity or absence proof.
+
+    Even one matching native row cannot establish that this particular local
+    attempt produced it. Missing matches also cannot prove non-submission.
+    """
+    unknown = {"state": "MISSING_ORDER_ID_NATIVE_HISTORY_UNVERIFIED",
+               "candidate_order_numbers": [], "recovery_authorized": False}
+    check = current_day_unfilled_evidence(payload, day=day, codes={code})
+    if check[code]["state"] == "CURRENT_DAY_UNFILLED_UNVERIFIED":
+        return unknown
+    try:
+        price = Decimal(str(limit_price))
+        if not price.is_finite() or price <= 0 or int(qty) <= 0:
+            return unknown
+        candidates = []
+        for row in payload["output1"]:
+            if row["pdno"] != code or row["sll_buy_dvsn_cd"] != "02":
+                continue
+            requested = Decimal(str(row.get("ord_qty")))
+            native_price = Decimal(str(row.get("ord_unpr")))
+            if not requested.is_finite() or not native_price.is_finite():
+                return unknown
+            if requested == qty and native_price == price:
+                candidates.append(str(row["odno"]))
+        return {"state": "MISSING_ORDER_ID_MATCH_REVIEW_REQUIRED" if candidates
+                         else "MISSING_ORDER_ID_NO_MATCH_NOT_ABSENCE_PROOF",
+                "candidate_order_numbers": sorted(candidates),
+                "candidate_count": len(candidates), "recovery_authorized": False}
+    except (ArithmeticError, ValueError, TypeError, KeyError):
+        return unknown
+
+
 def fresh_original_balance_quantities(kis):
     """Fail closed on a normalized empty/stub, stale or incomplete raw balance.
 
@@ -153,7 +186,8 @@ def collect(*, engine, kis, now, code=None, trade_date=None):
             claims.c.env == "practice", claims.c.market == "KR",
             claims.c.strategy_owner == "PB1", claims.c.account_id == account_hash,
             claims.c.trading_epoch_id == scope.trading_epoch_id,
-            claims.c.action.like("BUY_ENTRY:%"), claims.c.trade_date < today,
+            claims.c.action.like("BUY_ENTRY:%"),
+            claims.c.trade_date <= today if trade_date == today else claims.c.trade_date < today,
             claims.c.action_state == "UNCERTAIN", claims.c.active_attempt_id.is_not(None),
         )
         if code:
@@ -183,8 +217,9 @@ def collect(*, engine, kis, now, code=None, trade_date=None):
                         strategy="pb1_pullback_close", scope=scope)):
                 continue
             odno = str(order.get("kis_odno") or "")
-            if len(odno) != 10 or not odno.isascii() or not odno.isdigit():
-                continue
+            # Missing broker ID is precisely the lost-ACK case. Do not
+            # silently omit it; only exact verified local ownership enters
+            # the read-only candidate report, not an automatic recovery.
             db_qty = conn.execute(sa.select(sa.func.coalesce(sa.func.sum(fills.c.qty), 0)).where(
                 fills.c.order_id == order["order_id"], fills.c.env == scope.env,
                 fills.c.trading_epoch_id == scope.trading_epoch_id, fills.c.side == "BUY",
@@ -305,7 +340,7 @@ def collect(*, engine, kis, now, code=None, trade_date=None):
         if isinstance(day, str):
             day = date.fromisoformat(day)
         symbol = str(order["code"])
-        odno = str(order["kis_odno"])
+        odno = str(order.get("kis_odno") or "")
         try:
             if day in failures:
                 raise RuntimeError("ORIGINAL_DAY_QUERY_ALREADY_FAILED")
@@ -318,8 +353,13 @@ def collect(*, engine, kis, now, code=None, trade_date=None):
                 except Exception as exc:
                     failures[day] = type(exc).__name__
                     raise
-            proof = exact_buy_evidence(daily[day], day=day, code=symbol, odno=odno,
-                                       qty=int(order["qty"]))
+            if len(odno) == 10 and odno.isascii() and odno.isdigit():
+                proof = exact_buy_evidence(daily[day], day=day, code=symbol, odno=odno,
+                                           qty=int(order["qty"]))
+            else:
+                proof = missing_order_id_evidence(
+                    daily[day], day=day, code=symbol, qty=int(order["qty"]),
+                    limit_price=order.get("limit_price"))
         except Exception as exc:
             proof = {"state": "NATIVE_QUERY_FAILED", "error_type": type(exc).__name__}
         proofs.append({**proof, "code": symbol, "odno": odno,
@@ -333,7 +373,7 @@ def collect(*, engine, kis, now, code=None, trade_date=None):
     current_orders = None
     if codes:
         try:
-            current_orders = _daily_ccld_all_pages_for_date(kis, today)
+            current_orders = daily[today] if today in daily else _daily_ccld_all_pages_for_date(kis, today)
         except Exception:
             pass
     unfilled = current_day_unfilled_evidence(current_orders, day=today, codes=codes)
@@ -342,7 +382,9 @@ def collect(*, engine, kis, now, code=None, trade_date=None):
         proof["fresh_balance_proven"] = balance_ok
         proof["current_holding_qty"] = quantities.get(proof["code"], 0) if balance_ok else None
         proof["recovery_authorized"] = False
-        proof["reason"] = "EXACT_CYCLE_AND_CURRENT_UNFILLED_REVIEW_REQUIRED_NO_WRITE"
+        proof["reason"] = ("MISSING_BROKER_ID_REQUIRES_ORIGINAL_ACK_OR_INDEPENDENT_IDENTITY_NO_WRITE"
+                           if not proof.get("odno") else
+                           "EXACT_CYCLE_AND_CURRENT_UNFILLED_REVIEW_REQUIRED_NO_WRITE")
     return {"version": "KR_HISTORICAL_BUY_NATIVE_EVIDENCE_V4", "env": scope.env,
             "trading_epoch_id": scope.trading_epoch_id, "cases": proofs,
             "days_queried": len(daily) + len(failures), "orders_submitted": 0, "db_rows_modified": 0}
