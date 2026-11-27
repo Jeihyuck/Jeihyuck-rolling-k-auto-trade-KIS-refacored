@@ -119,3 +119,22 @@ def test_practice_shell_defaults_inherit_existing_cap_and_observer_profile(monke
                                     KR_SHARED_HTTP_BUDGET_ENABLED="1").stdout
     finally:
         budget._path("practice", key).unlink(missing_ok=True)
+
+
+def test_ordinary_market_read_honors_critical_lease_without_bypass(monkeypatch):
+    monkeypatch.setenv("KR_SHARED_HTTP_RPS_PRACTICE","10")
+    key = "test-" + uuid.uuid4().hex
+    try:
+        assert budget.acquire(environment="practice",appkey=key,priority=True,
+                              observer=False,max_wait_sec=1.0)[0]
+        # The normal 0.1-second aggregate gap is shorter than this lease.
+        # A competing non-observer market-data request must not take it.
+        granted, reason, _ = budget.acquire(environment="practice",appkey=key,
+                    priority=False,observer=False,max_wait_sec=.20)
+        assert not granted and reason == "DEADLINE"
+        assert budget.acquire(environment="practice",appkey=key,priority=True,
+                              observer=False,max_wait_sec=1.0)[0]
+        assert budget.acquire(environment="practice",appkey=key,priority=False,
+                              observer=False,max_wait_sec=1.5)[0]
+    finally:
+        budget._path("practice",key).unlink(missing_ok=True)
