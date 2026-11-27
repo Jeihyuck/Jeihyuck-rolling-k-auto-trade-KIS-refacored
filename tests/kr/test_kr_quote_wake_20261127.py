@@ -148,3 +148,37 @@ def test_protection_poll_precedes_entry_and_does_not_consume_buy_dedupe():
     assert result == hint
     assert elapsed[0] == 0
     assert not state.seen
+
+
+def test_protective_yield_throttles_and_latches_only_valid_hint():
+    calls = []
+    hint = {"code":"251970","kind":"PROTECTIVE_HARD_STOP_HINT","is_order_authorization":False}
+    results = iter([None, {**hint,"code":"012750"}, hint])
+    def probe(targets,now):
+        calls.append(now)
+        return next(results)
+    monitor = w.ProtectiveYield([{"code":"251970"}],probe=probe)
+    assert monitor.check(now=NOW,monotonic=0) is None
+    assert monitor.check(now=NOW,monotonic=.5) is None
+    assert monitor.check(now=NOW,monotonic=1) is None
+    assert monitor.check(now=NOW,monotonic=2) == hint
+    assert monitor.check(now=NOW,monotonic=2.1) == hint
+    assert len(calls) == 3
+
+
+def test_protective_yield_resume_is_clean_pb1_only(monkeypatch):
+    from trader.pb1_runner import _kr_protective_yield_resume
+    monkeypatch.setenv("KR_PB1_PROTECTIVE_WAKE_ENABLED","1")
+    monkeypatch.setenv("PB1_PENDING_RECONCILE_ONLY","0")
+    metrics = {"tick_result_reason":"KR_PROTECTIVE_REEVALUATION_REQUIRED",
+               "kr_infinite_decision":"WAIT","api_submitted":0,"buy_orders":0,"sell_orders":0}
+    args = dict(env="practice",strategy="pb1_pullback_close",session_kind="am",
+                status="OK_NO_TRADE",metrics=metrics)
+    assert _kr_protective_yield_resume(**args)
+    for key,value in (("api_submitted",1),("sell_orders",1),("kr_infinite_decision","BUY"),
+                      ("warning_counts",{"timeout_count":1}),("degraded",True)):
+        assert not _kr_protective_yield_resume(**{**args,"metrics":{**metrics,key:value}})
+    assert not _kr_protective_yield_resume(**{**args,"env":"real"})
+    assert not _kr_protective_yield_resume(**{**args,"status":"BLOCKED_RECONCILE"})
+    monkeypatch.setenv("PB1_PENDING_RECONCILE_ONLY","1")
+    assert not _kr_protective_yield_resume(**args)
