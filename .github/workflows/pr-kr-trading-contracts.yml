@@ -131,7 +131,8 @@ jobs:
           pytest tests/kr/test_kr_final_order_invariants.py -q
           pytest tests/test_watchlist_scored_roundtrip.py -q
           pytest tests/test_kr_prep_market_benchmark_runtime.py -q
-          pytest tests/kr -q
+          pytest tests/kr -q -rs --junitxml="$RUNNER_TEMP/kr-contract-full.xml"
+          python scripts/kr_assert_no_skips.py "$RUNNER_TEMP/kr-contract-full.xml"
 
       - name: Check KR legacy regime removal
         run: bash scripts/check_kr_legacy_regime.sh
