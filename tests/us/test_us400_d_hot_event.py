@@ -280,11 +280,11 @@ def test_identical_republication_keeps_only_fresh_cross_tick_hot_hint(tmp_path,m
         assert changed["generation"]!=second["generation"]
         assert hints(changed,epoch+2)==set()
         assert hints(second,epoch+2)==set()  # superseded generation still has a fresh quote
-        manifest_path=observer.priority_manifest_path(**scope)
-        manifest_path.unlink()
-        assert hints(changed,epoch+2)==set()
         expired=publish(epoch+183,pivot=101)
         assert expired["generation"]!=changed["generation"]
+        assert hints(expired,epoch+183)==set()
+        manifest_path=observer.priority_manifest_path(**scope)
+        manifest_path.unlink()
         assert hints(expired,epoch+183)==set()
     finally:
         db.close()
