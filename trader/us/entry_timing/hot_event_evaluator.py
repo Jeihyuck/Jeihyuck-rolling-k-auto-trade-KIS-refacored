@@ -41,6 +41,9 @@ def poll_hot_events(db, *, env, scope, trade_date, hot_pairs, now_et,
                 or not created<=now_et.timestamp()<=expires<=created+180.00001):
             return []
         inputs=payload["hot_event_inputs"]
+        generation=payload["generation"]
+        if not isinstance(generation,str) or not generation:
+            return []
         listed={(x["symbol"],x["exchange"]) for lane in ("hot","warm","cold") for x in payload[lane]}
         if not isinstance(inputs,dict):
             return []
@@ -71,7 +74,7 @@ def poll_hot_events(db, *, env, scope, trade_date, hot_pairs, now_et,
             min_rr=float(os.getenv("US_OPPORTUNITY_MIN_REFERENCE_RR","1.5"))
             max_stop=float(os.getenv("US_OPPORTUNITY_MAX_STOP_DISTANCE","0.025"))
             signature=hashlib.sha256(json.dumps(
-                [candidate,bars,bid,ask,last,q["collector_generation"],min_rr,max_stop],
+                [generation,candidate,bars,bid,ask,last,q["collector_generation"],min_rr,max_stop],
                 sort_keys=True,separators=(",",":"),allow_nan=False).encode()).hexdigest()
             key=(symbol,exchange)
             if seen.get(key)==signature:
@@ -83,6 +86,19 @@ def poll_hot_events(db, *, env, scope, trade_date, hot_pairs, now_et,
                 prep=candidate["prep"],feature_scope=(scope,symbol,exchange,"US_STANDARD"),
                 min_rr=min_rr,max_stop_distance=max_stop,
             )
+            # A local latest-state hint, not an order, does not carry a price
+            # or executable decision. The canonical engine must independently
+            # recalculate the strategy, size, risk and router permissions.
+            db.execute("""INSERT INTO hot_retry_events
+                (trade_date,symbol,exchange,manifest_generation,event_id,observed_epoch,quote_received_epoch,state)
+                VALUES (?,?,?,?,?,?,?,?)
+                ON CONFLICT(trade_date,symbol,exchange) DO UPDATE SET
+                    manifest_generation=excluded.manifest_generation,event_id=excluded.event_id,
+                    observed_epoch=excluded.observed_epoch,quote_received_epoch=excluded.quote_received_epoch,
+                    state=excluded.state
+                WHERE excluded.observed_epoch>=hot_retry_events.observed_epoch
+                """,(trade_date,symbol,exchange,generation,signature,at.timestamp(),received,decision["state"]))
+            db.commit()
             seen[key]=signature
             event={"symbol":symbol,"exchange":exchange,"observed_at_epoch":at.timestamp(),
                    "quote_received_epoch":received,"decision":decision,"is_order_authorization":False}
@@ -93,3 +109,66 @@ def poll_hot_events(db, *, env, scope, trade_date, hot_pairs, now_et,
         except (ValueError,TypeError,KeyError,AttributeError,OSError):
             continue
     return results
+
+
+def read_hot_retry_hints(*, env, scope, trade_date, generation, waiting,
+                         now_epoch, base="runtime/private"):
+    """Bounded read-only hints for a currently eligible, previously WAIT symbol."""
+    import sqlite3
+    from contextlib import closing
+    from trader.us.entry_timing.opening_observer import store_path
+    if env!="practice" or not scope or not generation or not waiting or len(waiting)>30:
+        return set()
+    try:
+        path=store_path(env=env,account_scope=scope,trade_date=trade_date,base=base)
+        if not path.is_file():
+            return set()
+        with closing(sqlite3.connect("file:"+str(path.resolve())+"?mode=ro",uri=True,timeout=.025)) as db:
+            rows=db.execute("""SELECT symbol,exchange,observed_epoch,quote_received_epoch,event_id
+                FROM hot_retry_events WHERE trade_date=? AND manifest_generation=? AND state='READY'
+                AND observed_epoch BETWEEN ? AND ? AND quote_received_epoch BETWEEN ? AND ?
+                ORDER BY observed_epoch DESC LIMIT 4""",
+                (trade_date,generation,now_epoch-5,now_epoch,now_epoch-5,now_epoch)).fetchall()
+        return {(symbol,exchange) for symbol,exchange,at,received,event_id in rows
+                if (symbol,exchange) in waiting and symbol!="TQQQ"
+                and event_id and 0<=now_epoch-at<=5 and 0<=at-received<=5
+                and 0<=now_epoch-received<=5}
+    except (OSError,ValueError,TypeError,sqlite3.Error):
+        return set()
+
+
+def candidate_pair(candidate):
+    from trader.us.symbols import normalize_us_exchange
+    try:
+        return (str(candidate[1]).strip().upper(),normalize_us_exchange(candidate[2]))
+    except (ValueError,TypeError,IndexError):
+        return None
+
+
+def iter_candidates_with_hot_retries(candidates, *, waiting, ready_reader):
+    """Re-evaluate only a previously WAIT eligible candidate, once per tick.
+
+    Normal ranking and rank_final30 never change; no new symbols are injected.
+    No sleeps and no second engine or submitter. Existing per-tick cash,
+    candidate caps, cancellation and canonical order gates still apply.
+    """
+    ranked=list(enumerate(candidates))
+    retried=set()
+    def ready_retries():
+        if not waiting or len(retried)>=4:
+            return []
+        hints=ready_reader(set(waiting)-retried)
+        selected=[]
+        for rank,candidate in ranked:
+            key=candidate_pair(candidate)
+            if key in hints and key in waiting and key not in retried:
+                retried.add(key)
+                waiting.discard(key)
+                selected.append((rank,candidate))
+                if len(retried)>=4:
+                    break
+        return selected
+    for rank,candidate in ranked:
+        yield from ready_retries()
+        yield rank,candidate
+    yield from ready_retries()

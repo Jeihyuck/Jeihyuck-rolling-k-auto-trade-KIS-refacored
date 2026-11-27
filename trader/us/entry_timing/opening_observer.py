@@ -73,6 +73,13 @@ def open_store(path: Path) -> sqlite3.Connection:
         response_ids_json TEXT NOT NULL,
         PRIMARY KEY (trade_date,symbol,owner,minute_et,resolved_epoch)
     );
+    CREATE TABLE IF NOT EXISTS hot_retry_events (
+        trade_date TEXT NOT NULL, symbol TEXT NOT NULL, exchange TEXT NOT NULL,
+        manifest_generation TEXT NOT NULL, event_id TEXT NOT NULL,
+        observed_epoch REAL NOT NULL, quote_received_epoch REAL NOT NULL,
+        state TEXT NOT NULL,
+        PRIMARY KEY (trade_date,symbol,exchange)
+    );
     CREATE TABLE IF NOT EXISTS quote_samples (
         trade_date TEXT NOT NULL, symbol TEXT NOT NULL, owner TEXT NOT NULL,
         received_epoch REAL NOT NULL, last REAL NOT NULL, source TEXT NOT NULL,

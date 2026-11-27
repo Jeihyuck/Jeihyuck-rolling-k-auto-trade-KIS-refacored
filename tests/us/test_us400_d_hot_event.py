@@ -57,3 +57,40 @@ def test_real_hot_evaluator_never_creates_ready_before_30_native_bars(tmp_path,m
         assert result[0]["is_order_authorization"] is False
     finally:
         db.close()
+
+
+def test_ready_event_handoff_only_retries_waited_candidate_once(tmp_path,monkeypatch):
+    from trader.us.entry_timing import opportunity
+    from trader.us.entry_timing.hot_event_evaluator import read_hot_retry_hints,iter_candidates_with_hot_retries
+    monkeypatch.setattr(opportunity,"effective_mode",lambda:"ENFORCE")
+    now=datetime(2026,11,25,10,10,tzinfo=ZoneInfo("America/New_York"))
+    td=now.date().isoformat()
+    candidates=[(10,"AAA","NASD",None,{"position_state":"NOT_HELD","entry_style":"ENTRY_PULLBACK"}),
+                (9,"BBB","NYSE",None,{"position_state":"NOT_HELD","entry_style":"ENTRY_PULLBACK"})]
+    manifest=observer.publish_preminute_candidates(env="practice",scope="scope:epoch",trade_date=td,
+        candidates=candidates,now_epoch=now.timestamp()-1,base=tmp_path)
+    db=observer.open_store(observer.store_path(env="practice",account_scope="scope:epoch",trade_date=td,base=tmp_path))
+    monkeypatch.setattr(opportunity,"evaluate_price_opportunity",lambda **kw:
+        {"state":"READY","reason":"test_only","facts":{},"broker_authorized":False})
+    try:
+        event=poll_hot_events(db,env="practice",scope="scope:epoch",trade_date=td,
+            hot_pairs=[("AAA","NASDAQ")],now_et=now,
+            quote_reader=lambda *a:{"bid":99.9,"ask":100,"last":100,"received_at":now.timestamp()-1,
+                                    "collector_generation":"g1"},seen={},base=tmp_path)
+        assert len(event)==1 and not event[0]["is_order_authorization"]
+        kw=dict(env="practice",scope="scope:epoch",trade_date=td,
+                generation=manifest["generation"],now_epoch=now.timestamp(),base=tmp_path)
+        waiting=set()
+        def reader(keys): return read_hot_retry_hints(waiting=keys,**kw)
+        iterator=iter_candidates_with_hot_retries(candidates,waiting=waiting,ready_reader=reader)
+        assert next(iterator)==(0,candidates[0])
+        waiting.add(("AAA","NASDAQ"))
+        assert next(iterator)==(0,candidates[0])
+        waiting.add(("AAA","NASDAQ"))  # repeated WAIT cannot retry again
+        assert list(iterator)==[(1,candidates[1])]
+        assert read_hot_retry_hints(waiting=waiting,**dict(kw,generation="different"))==set()
+        assert read_hot_retry_hints(waiting=waiting,**dict(kw,now_epoch=now.timestamp()+6))==set()
+        assert read_hot_retry_hints(waiting=waiting,**dict(kw,scope="foreign"))==set()
+        assert read_hot_retry_hints(waiting={("BBB","NYSE")},**kw)==set()
+    finally:
+        db.close()
