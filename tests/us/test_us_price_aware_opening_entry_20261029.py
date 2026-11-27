@@ -375,16 +375,15 @@ def _independent_native_window():
 
 
 @pytest.mark.parametrize("family", ["ENTRY_PULLBACK", "ENTRY_MOMENTUM"])
-def test_independent_5_plus_3_allows_verified_reclaim_without_opening(family):
+def test_independent_5_plus_3_does_not_authorize_us_without_opening(family):
     bars = _independent_native_window()
     result = evaluate_price_opportunity(style=family, trade_date=DAY,
         now_et=datetime(2026, 10, 28, 10, 8, tzinfo=NY), verified_bars=bars,
         quote=sample_quote(99, 98.98, 99))
-    assert result["state"] == "READY", result
-    assert result["facts"]["reference_path"] == "POST_OPENING_5_PLUS_3"
+    assert result["state"] == "WAIT", result
+    assert result["reason"] == "opening_minute_bars_insufficient"
+    assert result["facts"]["reference_path"] == "OPENING_RANGE"
     assert result["facts"]["opening"]["observed_1m"] == 0
-    assert result["facts"]["opening_vwap"] is None
-    assert result["risk_reward_reference"] >= 1.5
     assert result["broker_authorized"] is False
 
 

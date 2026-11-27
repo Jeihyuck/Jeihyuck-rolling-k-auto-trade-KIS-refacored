@@ -385,7 +385,7 @@ def priority_manifest_path(*, env: str, scope: str, trade_date: str,
 
 def publish_preminute_candidates(
     *, env: str, scope: str, trade_date: str, candidates: list[tuple],
-    now_epoch: float | None = None, hot_limit: int = 5, warm_limit: int = 5,
+    now_epoch: float | None = None, hot_limit: int = 4, warm_limit: int = 8,
     base: str | Path = "runtime/private",
 ) -> dict:
     """Publish a non-authorizing, pre-1m shortlist without KIS network I/O.
@@ -427,8 +427,8 @@ def publish_preminute_candidates(
     # First prioritize new candidates; retained/add BUY candidates are still
     # eligible for WARM collection and are not treated as global excludes.
     ranked.sort(key=lambda row: row["position_state"] == "HELD")
-    hot = ranked[:max(0, min(5, int(hot_limit)))]
-    warm = ranked[len(hot):len(hot) + max(0, min(5, int(warm_limit)))]
+    hot = ranked[:max(0, min(4, int(hot_limit)))]
+    warm = ranked[len(hot):len(hot) + max(0, min(8, int(warm_limit)))]
     payload = {
         "schema": "US_PREMINUTE_PRIORITY_V1", "env": env,
         "owner": "US_STANDARD", "trade_date": trade_date,
@@ -437,6 +437,7 @@ def publish_preminute_candidates(
         "generation": str(os.getpid()) + ":" + str(epoch),
         "hot": [{"symbol": x["symbol"], "exchange": x["exchange"]} for x in hot],
         "warm": [{"symbol": x["symbol"], "exchange": x["exchange"]} for x in warm],
+        "cold": [{"symbol": x["symbol"], "exchange": x["exchange"]} for x in ranked[len(hot)+len(warm):]],
         "is_order_authorization": False,
     }
     path = priority_manifest_path(env=env, scope=scope, trade_date=trade_date, base=base)
@@ -467,7 +468,7 @@ def load_preminute_priority(
 ) -> tuple[dict[str, list[tuple[str, str]]], str]:
     """Return validated HOT/WARM/COLD, or explicit MISSING/STALE/INVALID."""
     available = {sym: exch for sym, exch in pairs}
-    fallback = {"HOT": [], "WARM": [], "COLD": list(pairs)}
+    fallback = {"HOT": [], "WARM": [], "COLD": []}
     path = priority_manifest_path(env=env, scope=scope, trade_date=trade_date, base=base)
     try:
         if not path.is_file():
@@ -495,7 +496,7 @@ def load_preminute_priority(
             return fallback, "STALE"
         lanes: dict[str, list[tuple[str, str]]] = {"HOT": [], "WARM": [], "COLD": []}
         selected = set()
-        for lane, cap in (("HOT", 5), ("WARM", 5)):
+        for lane, cap in (("HOT", 4), ("WARM", 8), ("COLD", 30)):
             rows = payload.get(lane.lower())
             if not isinstance(rows, list) or len(rows) > cap:
                 return fallback, "INVALID"
@@ -508,7 +509,6 @@ def load_preminute_priority(
                     return fallback, "INVALID"
                 selected.add(sym)
                 lanes[lane].append((sym, exch))
-        lanes["COLD"] = [p for p in pairs if p[0] not in selected]
         return lanes, "VALID"
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
         return fallback, "INVALID"
@@ -518,13 +518,18 @@ def next_priority_pair(
     lanes: dict[str, list[tuple[str, str]]],
     *, slot: int, offsets: dict[str, int],
 ) -> tuple[tuple[str, str], str] | None:
-    """Native minute REST is HOT-only; WARM/COLD are discovery, not polling."""
-    lane = lanes.get("HOT") or []
-    if not lane or len(lane) > 5:
+    """V2 baseline 4:1:1; unused slots may serve HOT, never expand COLD budget."""
+    if any(len(lanes.get(tier) or []) > cap for tier, cap in (("HOT", 4), ("WARM", 8), ("COLD", 30))):
         return None
-    pos = offsets.get("HOT", 0)
-    offsets["HOT"] = pos + 1
-    return lane[pos % len(lane)], "HOT"
+    schedule = ("HOT", "HOT", "HOT", "HOT", "WARM", "COLD")
+    preferred = schedule[slot % len(schedule)]
+    tier = preferred if lanes.get(preferred) else "HOT"
+    lane = lanes.get(tier) or []
+    if not lane:
+        return None
+    pos = offsets.get(tier, 0)
+    offsets[tier] = pos + 1
+    return lane[pos % len(lane)], tier
 
 
 def collect_hot_minutes(client, db, *, symbol, exchange, trade_date,
@@ -673,7 +678,7 @@ def run_observer(*, env: str, trade_date: str, scope: str,
             except (OSError, ValueError, RuntimeError) as exc:
                 LOG.warning("[US_OPENING_OBSERVER][WS_MISS] symbol=%s error=%s",
                             symbol, type(exc).__name__)
-            if not fetch_enabled or tier != "HOT":
+            if not fetch_enabled:
                 continue
             try:
                 def _still_hot():
@@ -682,12 +687,12 @@ def run_observer(*, env: str, trade_date: str, scope: str,
                     live = datetime.now(NY)
                     return (epoch_verified and live.date().isoformat() == trade_date
                             and live.time() < close_time and state == "VALID"
-                            and (symbol, exchange) in current["HOT"])
-                repair_due = time.monotonic() >= next_repair_by_symbol.get(symbol, 0.0)
+                            and (symbol, exchange) in current[tier])
+                repair_due = tier == "HOT" and time.monotonic() >= next_repair_by_symbol.get(symbol, 0.0)
                 if repair_due:
                     next_repair_by_symbol[symbol] = time.monotonic() + 120.0
                 result = collect_hot_minutes(client, db, symbol=symbol, exchange=exchange,
-                    trade_date=trade_date, repair_due=repair_due, still_hot=_still_hot)
+                    trade_date=trade_date, repair_due=repair_due, still_hot=_still_hot, max_pages=4 if tier == "HOT" else 1)
                 LOG.info("[US_OPENING_OBSERVER][BAR_UPDATE] symbol=%s new_rows=%d requests=%d "
                          "source=KIS_OVERSEAS_1M action=NO_ORDER", symbol, result["changed"], result["requests"])
             except Exception as exc:
