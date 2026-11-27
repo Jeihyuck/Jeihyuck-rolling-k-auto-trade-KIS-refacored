@@ -111,3 +111,40 @@ def test_incomplete_local_quote_uses_existing_shared_owner(monkeypatch):
     service.current = quote
     assert w._local_quote("251970") == quote
     assert len(calls) == 1
+
+
+def test_protective_wake_is_owner_stop_hint_not_order_authorization():
+    evaluation = {"code":"251970","exit_policy_family":"SWING_STAGED_EXIT",
+                  "exit_ok":False,"signal_hit":False,"orderable_qty":12,
+                  "current_price":10000,"condition_details":{"paper_stop36":
+                  {"eligible":True,"effective_hard_stop":9400}}}
+    hint = w.make_protective_target(evaluation,NOW)
+    assert hint and hint["is_order_authorization"] is False
+    for changes in ({"code":"122630"},{"exit_policy_family":"DAY_TRADE"},
+                    {"signal_hit":True},{"current_price":9400},
+                    {"order_skip_reasons":["SAME_DAY_SOFT_EXIT_MIN_HOLD"]}):
+        assert w.make_protective_target({**evaluation,**changes},NOW) is None
+    quote = dict(source="KIS_WEBSOCKET",source_identity="KIS_WS_PARSED_SYMBOL",
+                 market="KR",symbol="251970",last=9390,received_at=NOW.timestamp())
+    result = w.probe_protective_targets([hint],NOW,read_quote=lambda c:quote)
+    assert result == {"code":"251970","kind":"PROTECTIVE_HARD_STOP_HINT",
+                      "is_order_authorization":False}
+    for changes in ({"symbol":"012750"},{"received_at":NOW.timestamp()-6},
+                    {"last":9500},{"source":"KIS_REST_INQUIRE_PRICE",
+                    "source_identity":"AUTHENTICATED_REST_REQUEST_BOUND"}):
+        assert w.probe_protective_targets([hint],NOW,read_quote=lambda c:{**quote,**changes}) is None
+
+
+def test_protection_poll_precedes_entry_and_does_not_consume_buy_dedupe():
+    elapsed=[0.]
+    state=w.QuoteWakeState()
+    hint={"code":"251970","kind":"PROTECTIVE_HARD_STOP_HINT","is_order_authorization":False}
+    result=w.wait_for_quote_wake(
+        targets=[target()],protective_targets=[hint],state=state,
+        seconds=10,session_end=NOW+timedelta(minutes=1),now=lambda:NOW,
+        monotonic=lambda:elapsed[0],sleep=lambda n:elapsed.__setitem__(0,elapsed[0]+n),
+        probe=lambda *a: (_ for _ in ()).throw(AssertionError("BUY probe must not run first")),
+        protective_probe=lambda *a:hint)
+    assert result == hint
+    assert elapsed[0] == 0
+    assert not state.seen
