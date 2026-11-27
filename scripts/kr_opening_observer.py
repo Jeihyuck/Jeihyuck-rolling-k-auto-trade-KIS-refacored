@@ -739,7 +739,9 @@ def main() -> None:
         now = now_kst()
         if now.date().isoformat() != today or now.time() > dtime(15, 5):
             break
-        if now.time() < dtime(9, 0):
+        preopen = now.time() < dtime(9, 0)
+        if preopen and (now.time() < dtime(8, 55)
+                        or os.getenv("KR_PREOPEN_OBSERVER_READY_ENABLED", "1") != "1"):
             time.sleep(2.0)
             continue
         cycle_started = time.monotonic()
@@ -757,7 +759,14 @@ def main() -> None:
                 candidate_codes = final30_codes(trade_date=today, filename=args.final30_file)
                 candidate_kis = KisAPI(kis_env="practice")
                 codes, kis = candidate_codes, candidate_kis
-                logger.info("[KR][OPENING_OBSERVER][PREP_READY] final30=%s role=READ_ONLY", len(codes))
+                logger.info("[KR][OPENING_OBSERVER][PREP_READY] final30=%s role=READ_ONLY preopen=%s",
+                            len(codes), int(preopen))
+            if preopen:
+                # Validate the same-day scope and initialize the existing
+                # read-only authenticated client before 09:00. No minute,
+                # orderbook, order or new WS subscription is made here.
+                time.sleep(2.0)
+                continue
             # COLD remains in the signed Final30 universe and continues to
             # receive low-cost PB1 pre-minute evaluation. Native collection
             # remains HOT/WARM first; bounded PREP-only discovery uses spare
