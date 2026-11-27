@@ -351,6 +351,28 @@ def read_us_live_intraday_returns(
     if trade_date:
         from trader.us.market_calendar import previous_completed_us_session
         expected_close_date = previous_completed_us_session(trade_date).strftime("%Y%m%d")
+    # Recover only the missing exact previous-close observation. Do not
+    # refresh all daily history, alter PREP, or use today's unfinished candle.
+    # Finish bounded close reads before acquiring executable live quotes.
+    recovered = {}
+    if fetch_allowed and expected_close_date:
+        from trader.us.data_provider import USDataProvider
+        if isinstance(provider, USDataProvider):
+            for sym in symbols:
+                previous = _num(completed_returns.get(f"{sym.lower()}_previous_close"))
+                day = str(completed_returns.get(f"{sym.lower()}_previous_close_date") or "")
+                if previous is not None and math.isfinite(previous) and previous > 0 and day == expected_close_date:
+                    continue
+                try:
+                    obs = provider.recover_benchmark_previous_close(sym, trade_date=trade_date)
+                    if isinstance(obs, dict):
+                        close = _num(obs.get("close"))
+                        if (close is not None and math.isfinite(close) and close > 0
+                                and obs.get("date") == expected_close_date
+                                and obs.get("source") == "KIS_NATIVE_DAILY_EXACT_COMPLETED"):
+                            recovered[sym] = close
+                except Exception as exc:
+                    warnings.append(f"benchmark_close_recovery_failed:{sym}:{type(exc).__name__}")
     for sym in symbols:
         q: dict = {}
         if fetch_allowed:
@@ -380,6 +402,8 @@ def read_us_live_intraday_returns(
         ), None)
         previous = _num(completed_returns.get(f"{sym.lower()}_previous_close"))
         completed_date = str(completed_returns.get(f"{sym.lower()}_previous_close_date") or "")
+        if sym in recovered:
+            previous, completed_date = recovered[sym], expected_close_date
         # Do not replace a present invalid/old source timestamp by a newer
         # receipt timestamp; the native quote's own age is authoritative.
         received = _num(q.get("asof_epoch") if q.get("asof_epoch") is not None
@@ -408,6 +432,8 @@ def read_us_live_intraday_returns(
             "source": source or "UNKNOWN",
             "last": current if valid else None,
             "previous_close": previous if valid else None,
+            "previous_close_source": ("KIS_NATIVE_DAILY_EXACT_COMPLETED" if sym in recovered
+                                      else "COMPLETED_MARKET_CONTEXT") if valid else "UNKNOWN",
         }
         if not valid:
             warnings.append(f"live_intraday_quote_unverified:{sym}")
