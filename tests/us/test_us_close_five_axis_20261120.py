@@ -160,3 +160,36 @@ def test_legacy_cross_source_findings_unchanged_for_healthy_source_counts():
     report["unique_broker_order_count"] = 11
     # Existing independent cross-source findings remain independent.
     assert audit_us_close_report(report)["five_axis_requires_verification"] is True
+
+
+@pytest.mark.parametrize("order_count,verified_count", [(0, 1), (11, 12)])
+def test_broker_verified_count_exceeding_population_is_conflict(order_count, verified_count):
+    report = _report()
+    report["order_chain_verification"].update(
+        order_count=order_count, kis_broker_chain_verified_count=verified_count)
+    assert build_us_close_five_axis_audit(report)["axes"]["broker_execution"]["status"] == "CONFLICT"
+
+
+@pytest.mark.parametrize("verdicts,expected", [
+    ({"EXPECTED": 11, "IMPLEMENTATION_BUG": 1}, "CONFLICT"),
+    ({"EXPECTED": 11, "PENDING_EVIDENCE": "unknown"}, "UNVERIFIED"),
+    ({"EXPECTED": 11}, "VERIFIED"),
+])
+def test_policy_population_requires_consistent_counts(verdicts, expected):
+    report = _report()
+    report["order_chain_verification"]["policy_verdict_counts"] = verdicts
+    assert build_us_close_five_axis_audit(report)["axes"]["buy_policy_and_strategy"]["status"] == expected
+
+
+def test_malformed_trade_row_cannot_disappear_from_economic_axis():
+    report = _report()
+    report["trade_pnl_analysis"]["trade_details"].append({"filled_qty": 1})
+    assert build_us_close_five_axis_audit(report)["axes"]["economic_settlement"]["status"] == "UNVERIFIED"
+
+
+def test_missing_prior_claim_breakdown_cannot_report_historical_clear():
+    report = _report()
+    report["broker_recovery_health"].update(
+        historical_recovery_unresolved=0, historical_tp_unresolved_count=0,
+        execution_claim_source_date_breakdown_available=False)
+    assert build_us_close_five_axis_audit(report)["axes"]["historical_unresolved"]["status"] == "UNVERIFIED"
