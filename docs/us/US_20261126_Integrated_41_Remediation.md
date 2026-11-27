@@ -1,23 +1,25 @@
-# US 2026-11-26 integrated remediation (41 items)
+# PR400 — 41-item remediation ledger (2026-11-27 V2 supersession)
+
+**The operator-approved FINAL V2 overrides previous HOT5/WARM5, HOT-only polling, and US independent 5+3 production entry instructions. Historical notes below describe prior revisions, not current policy. Existing SELL/SST/recovery/portfolio requirements and TP 90s remain.**
 Base 851fe3b9100287ea73ca39a7be690f34f5a05643. User explicitly approved TP decision maximum age 90 seconds instead of 30. User checklist [x] denotes requested scope, not completed validation. Practice only. No deployment, merge, live orders or DB mutations.
 ## Scope and acceptance
 IMPLEMENTED = source changed, CI/runtime not yet certified. OPEN = required outstanding. REVIEW = strategy research, no activation without approval.
 | ID | Priority | Task and acceptance | Status |
 |---|---|---|---|
-|01|P0|No Final30 native minute polling; COLD zero native REST|IMPLEMENTED observer path; audit all callers|
-|02|P0|HOT maximum 5, enforce on publisher and reader|IMPLEMENTED|
-|03|P0|WARM max 5 quote discovery only, backfill on HOT promotion|PARTIAL caps/no minute polling; bounded opening/conflict backfill for HOT incl promotions; live response unverified|
-|04|P0|Expired/invalid/missing shortlist never polls Final30; independent refresh|PARTIAL no fallback polling; independent priority refresh open|
-|05|P0|Independent verified post-opening 5+3 path for eligible pullback/reclaim; breakout retains opening high|IMPLEMENTED independent consecutive post-open 5+3 path, causal peak/trough, fresh ask/risk gates; synthetic tests added|
+|01|P0|V2 bounded valid-manifest HOT/WARM/COLD 4:1:1; no invalid-manifest bulk fallback|CODE updated; actual API quota/latency unverified|
+|02|P0|US HOT4, WARM8 publisher/reader limits|CODE updated|
+|03|P0|WARM official minutes, bounded COLD, HOT promotion backfill|PARTIAL tier schedule and HOT backfill; dynamic promotion open|
+|04|P0|Separate PREP COLLECTION_PRIORITY and short-lived execution shortlist; no erroneous bulk fallback|PARTIAL PREP contract/day scoped manifest and fallback added; independent dynamic refresh open|
+|05|P0|US 30 completed opening bars remain mandatory; independent 5+3 research only; preserve KR #401|CODE US fallback removed and negative tests; KR regression pending|
 |06|P0|Verify overseas KIS continuation, bounded targeted historical backfill|PARTIAL authenticated KIS page API, monotone KEYB, max four HOT pages, no synthetic bars; native read unverified|
-|07|P0|Latest completed bar gap/stale recovery, deadline priority|PARTIAL latest-first polling and targeted opening/conflict repair; stale/deadline priority not complete|
+|07|P0|Latest completed bar gap/stale recovery and deadline priority|PARTIAL elapsed opening and recent four minute target recovery added; deadline scheduling open|
 |08|P0|Conflict quarantine and three distinct authenticated native observations >=60s apart, >=120s total, preserve history|IMPLEMENTED durable conflict quarantine, 3 distinct HTTP responses >=60s apart and >=120s span; synthetic tests added|
 |09|P0|Freeze completed-minute eligibility at request start|IMPLEMENTED observer path|
-|10|P0|Independent market-session observer; AM/PM continuity, no overlap|PARTIAL detached day/epoch-scoped singleton through AM/PM, close/holiday exit; independent shortlist refresh and WSL proof open|
-|11|P0|SPY QQQ SMH independent verified data recovery; retain crash gate|OPEN|
-|12|P1|Per-symbol poll/age/gap/conflict/API budget diagnostics|OPEN|
-|13|P1|HOT final decision <=60s measured objective, independent priority refresh|OPEN|
-|14|P1|KR adaptive V3 separate causal replay and economics, no automatic policy activation|REVIEW|
+|10|P0|Independent full-session observer, AM/PM continuity, no overlap|PARTIAL day-scoped singleton and pre-open subscription path; actual 09:25 launcher and WSL proof open|
+|11|P0|SPY QQQ SMH independent verified data recovery; retain crash gate|PARTIAL benchmark prewarm and per-quote age fix; independent refresh/recovery of previous close open|
+|12|P1|Per-symbol poll/age/gap/conflict/API budget diagnostics|PARTIAL opening intelligence and shared REST transport logs; full telemetry open|
+|13|P1|HOT final decision <=60s and quote range event P95 <=5s|OPEN independent rank refresh and bounded consumer scheduling|
+|14|P1|US 5+3 and KR Adaptive V3 economic replay, no unauthorized policy activation|REVIEW|
 |15|P1|Final30 eligible candidate replenishment without relaxing scores|REVIEW|
 |16|P1|Defensive eligible candidate replenishment; no risk bypass|REVIEW|
 |17|P0|AMGN data-failure recovery, fresh final risk evaluation; actual crash block expected|OPEN|
@@ -42,13 +44,13 @@ IMPLEMENTED = source changed, CI/runtime not yet certified. OPEN = required outs
 |36|P0|Verified equity/cash/flows and valuation; UNKNOWN not fabricated|OPEN|
 |37|P1|Swing V3 U case causal replay; keep existing policy|REVIEW|
 |38|P0|CLOSE five independent axes truthful, no fabricated PASS|OPEN|
-|39|P0|Tick latency and duplicate reads; SELL priority, single native submitter|OPEN|
+|39|P0|Tick latency, duplicate reads, SELL priority, one submitter|PARTIAL shared single-flight core reused from #401 for canonical US quotes; shared priority budget and measured latency open|
 |40|P0|Latest HEAD all CI, exact WSL SHA/config, real practice lifecycle evidence|OPEN|
 |41|P0|Exchange calendar holiday and early close scheduler, observer and order cutoff|PARTIAL observer holiday/early-close cutoff and AM/PM session deadline clamped; scheduler and native order boundary WSL acceptance open|
 ## Nonnegotiable
 Preserve PREP ranking, owner isolation, -3/-6 stops, TP thresholds, TQQQ Infinite, account/cycle/duplicate fences, verified executable quote and market crash checks. 90s is TP decision freshness only; do not change separate quote freshness, BUY signal TTL, worker leases, or all order timeouts. Re-evaluate actual owner policy and quantity after expiry; no timestamp rewriting. Verify runtime env US_TP_PRE_HTTP_MAX_DECISION_AGE_SEC=90 or no override. Default rollback explicit value 30. Separate unknown order from proven no POST, do not infer from missing order number alone. Protect SELL budget and no concurrent native submitter. KR references #367 #395 #396 #398; US #390 #397. Use native US KIS endpoint spec, no KR timestamp parameter copy.
 ## Required tests / release gates
-Offline: HOT-only calls with valid/stale/invalid/empty manifests, 5 cap and WARM/COLD zero; request-start completion; missing/conflict/5+3; session switch/early close; 4 simultaneous TP candidates fresh per-symbol; 90s inclusive 91s reject plus live quote threshold and stale/future/unknown timestamps; DHR/KO prior action exact proof; PRE-HTTP atomicity and ambiguous POST crash/race; partial/cancel/retry and owner/qty; restart SST; signed portfolio policy and close axes. All latest-head CI. Do not declare tests passed before observed results. Practice acceptance after deploy only: WSL SHA/config, actual observer age/calls, qualifying BUY/SELL and fills, all close axes. No forced trades. Thanksgiving/early close means actual later trading evidence not available in this change. Historical unresolved records report separately. Draft until required code and offline acceptance complete; no automatic merge.
+Offline: valid-manifest HOT4/WARM8/COLD 4:1:1; stale/invalid/empty never bulk poll; PREP manifest scope and preopen expiry; request-start completion; missing/conflict; US incomplete opening blocks even with 5+3; KR 5+3 preserved; session switch/early close; 4 simultaneous TP candidates fresh per-symbol; 90s inclusive 91s reject plus live quote threshold and stale/future/unknown timestamps; DHR/KO prior action exact proof; PRE-HTTP atomicity and ambiguous POST crash/race; partial/cancel/retry and owner/qty; restart SST; signed portfolio policy and close axes. All latest-head CI. Do not declare tests passed before observed results. Practice acceptance after deploy only: WSL SHA/config, actual observer age/calls, qualifying BUY/SELL and fills, all close axes. No forced trades. Thanksgiving/early close means actual later trading evidence not available in this change. Historical unresolved records report separately. Draft until required code and offline acceptance complete; no automatic merge.
 
 
 ## 11/26 follow-up implementation and evidence
@@ -60,3 +62,22 @@ Offline: HOT-only calls with valid/stale/invalid/empty manifests, 5 cap and WARM
 - 31fbbfe2/07bc6da0/036073f2: day-scoped observer continuity, epoch check, process lock, holiday and early close; synthetic singleton/calendar tests. HOT TTL fail-closed still applies; no claim of uninterrupted minute polling when shortlist invalid.
 - Previous head a5580801: US Historical TP Original-Day Proof offline contract job success, native KIS read-only job SKIPPED; US Four Strategy Contract CI success. These are not latest-head acceptance.
 - All current tests must finish on final HEAD; no merge or deployment. Remaining P0s include independent priority refresh/latency, index recovery, original BUY/SELL chain acceptance, DHR/KO/TMO native proof, reservation/Stage4 liveness, partial retry and historical recovery boundaries, signed portfolio guard, close axes and actual WSL execution.
+
+
+## FINAL V2 follow-up, 2026-11-27
+Latest base #401 5aa3c047 integrated as merge commit 90e9a065 (no overlapping changed paths at integration). Four previous failing workflows shared one regression test; each reported 4485 passed, 1 failed, 2 skipped. Same-batch conflicting minute remains quarantined; a single unattested reread now correctly does not publish an authoritative row. No test weakening of quarantine. Later full CI still required.
+
+| V2 ID | Required scope | Actual implementation / remaining |
+|---|---|---|
+|V2-01|PREP COLLECTION_PRIORITY distinct from EXECUTION_PRIORITY|PARTIAL: US PREP publish after completed DB run, original rank and exact Final30/contract hash, account+epoch+day, validity to exchange close; valid empty execution shortlist remains empty; KR PREP integration and dynamic ranking/verified quantity/holdings evidence outstanding.|
+|V2-02|Open collection and pre-open warmup|PARTIAL: US session-independent observer and early subscription, HOT4/WARM8 4:1:1, invalid scope empty; actual 09:25 launcher/first bar SLA not verified.|
+|V2-03|Opening range intelligence and provisional price|PARTIAL: shared read-only analysis and US observer logging, native completed bar/turnover and conflict checks, explicit support/target/cap/tick formula. Actual strategy-owned provisional price adapter and KR hook outstanding; do not infer executable price.|
+|V2-04|Dynamic promotion, backfill, hysteresis|PARTIAL: elapsed opening and recent four missing minutes, bounded HOT repair; independent dynamic promotion, hysteresis and deadline admission outstanding.|
+|V2-05|Shared data layer|PARTIAL: extracted #401 REST single-flight core for KR and US canonical prices; original receipt retained, no error cache, protective/native proof bypass; benchmark prewarm and per-quote age fix. Shared WS day ownership, shared priority API budget, full market recovery and operational metrics outstanding.|
+|V2-06|Bounded event-driven final re-evaluation|OPEN: no parallel order authority or direct observer order.|
+|V2-07|Strategy preservation|PARTIAL: US mandatory 30 restored; KR #401 merged base retained; latest KR/US regression pending.|
+|V2-08|Operational data evidence|PARTIAL: opening analysis and REST logs; unified structured telemetry and report wiring outstanding.|
+|V2-09|Causal replay and opportunity loss|OPEN: 20 trading days target, actual native evidence and economic comparison missing.|
+|V2-10|Activation/rollback and performance|OPEN: explicit US REST sharing rollback US_REST_SHARED_QUOTE_ENABLED=0; all feature controls, real practice/latency, WSL and CI outstanding.|
+
+New commits: a4ced7ab policy+regression, 57004491 PREP manifest, d481ba99 opening intelligence and gaps, efefc510 shared REST, ec3ff112 benchmarks and protective quote isolation. Existing DHR/KO/TMO, exact historical proofs, reservation/Stage4, full SST and partial retry, portfolio and CLOSE gates remain mandatory. No broker order, operating DB mutation, WSL deployment, or merge into dual-agent. Draft until all required source work and current-head offline acceptance complete. Operational acceptance and any practice activation must be separately evidenced.
