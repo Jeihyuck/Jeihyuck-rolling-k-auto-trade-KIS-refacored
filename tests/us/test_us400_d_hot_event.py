@@ -243,3 +243,40 @@ def test_hot_quote_evaluated_while_native_minute_request_waits(tmp_path, monkeyp
     assert observer.run_observer(env="practice", trade_date="2026-11-25", scope="scope:epoch",
         parent_pid=123, watchlist=[{"symbol": "AAA", "exchange": "NYSE"}], max_runtime_sec=5) == 0
     assert observed.is_set() and halt.is_set()
+
+
+def test_identical_republication_keeps_only_fresh_cross_tick_hot_hint(tmp_path,monkeypatch):
+    from trader.us.entry_timing import opportunity
+    from trader.us.entry_timing.hot_event_evaluator import read_hot_retry_hints
+    monkeypatch.setattr(opportunity,"effective_mode",lambda:"ENFORCE")
+    monkeypatch.setattr(opportunity,"evaluate_price_opportunity",lambda **kw:
+        {"state":"READY","reason":"test_only","facts":{},"broker_authorized":False})
+    now=datetime(2026,11,25,10,10,tzinfo=ZoneInfo("America/New_York"))
+    epoch=now.timestamp()
+    td=now.date().isoformat()
+    scope=dict(env="practice",scope="scope:epoch",trade_date=td,base=tmp_path)
+    def publish(at, family="ENTRY_PULLBACK", pivot=100):
+        return observer.publish_preminute_candidates(**scope,now_epoch=at,
+            candidates=[(10,"AAA","NYSE",None,{"position_state":"NOT_HELD",
+                         "entry_style":family,"pivot_price":pivot})])
+    first=publish(epoch-1)
+    db=observer.open_store(observer.store_path(env="practice",account_scope="scope:epoch",trade_date=td,base=tmp_path))
+    try:
+        assert len(poll_hot_events(db,**scope,hot_pairs=[("AAA","NYSE")],now_et=now,
+            quote_reader=lambda *a:{"bid":99.9,"ask":100,"last":100,"received_at":epoch-1,
+                        "collector_generation":"g","source":"KIS_WEBSOCKET_COLLECTOR"},seen={}))==1
+        second=publish(epoch+1)
+        assert second["generation"]==first["generation"]
+        def hints(manifest, at):
+            return read_hot_retry_hints(**scope,generation=manifest["generation"],
+                       waiting={("AAA","NYSE")},now_epoch=at)
+        assert hints(second,epoch+1)=={("AAA","NYSE")}
+        assert hints(second,epoch+5)==set()  # quote age is six seconds
+        changed=publish(epoch+2,pivot=101)
+        assert changed["generation"]!=second["generation"]
+        assert hints(changed,epoch+2)==set()
+        expired=publish(epoch+183,pivot=101)
+        assert expired["generation"]!=changed["generation"]
+        assert hints(expired,epoch+183)==set()
+    finally:
+        db.close()
