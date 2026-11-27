@@ -229,22 +229,123 @@ def _bounded_quotes(candidates,cursor,env,*,pair):
     return selected,cursor
 
 
-def _breached_quote(q, entry, hard):
+def _fresh_collector_quote(q):
     if (not isinstance(q,dict) or q.get("source") != "KIS_WEBSOCKET_COLLECTOR"
             or not q.get("collector_generation") or q.get("stale") or q.get("suspect")):
         return None
     last, received = float(q["last"]), float(q["received_at"])
-    if (not math.isfinite(last) or last<=0 or not 0<=time.time()-received<=5
-            or (last-entry)/entry > -hard):
+    if not math.isfinite(last) or last<=0 or not 0<=time.time()-received<=5:
         return None
     return last,received
 
 
+def _breached_quote(q,entry,hard):
+    valid=_fresh_collector_quote(q)
+    if valid is None or (valid[0]-entry)/entry > -hard:
+        return None
+    return valid
+
+
+def profit_watch_levels(position, entry):
+    """Advisory only: frozen TP and verified peak price thresholds.
+
+    This cannot authorize a SELL. The child reruns the existing complete
+    SELL lane, including stage truth, defense arbitration and portfolio guard.
+    """
+    from trader.us.entry_exit_contract import (
+        extract_us_entry_exit_contract, contract_exit_config, contract_profit_capture,
+        US_SWING_V3_CONTRACT_VERSION,
+    )
+    from trader.us.profit_capture import authoritative_broker_avg
+    try:
+        reference=float(position.get("resolved_current_price") or 0)
+        if not math.isfinite(reference) or reference<=0:
+            return None
+        up,down=[],[]
+        pc=contract_profit_capture(position)
+        if pc.get("enabled",True) and pc.get("partial_exit_allowed") is True:
+            try:
+                avg,_=authoritative_broker_avg(position)
+                avg=float(avg)
+                for stage in pc.get("stages") or []:
+                    flag=str(stage.get("flag") or "")
+                    meta=position.get("meta") or {}
+                    if flag and not position.get(flag) and not meta.get(flag):
+                        threshold=float(stage["threshold_fraction"])
+                        if 0<threshold<1:
+                            up.append(avg*(1+threshold))
+            except (ValueError,TypeError,KeyError,OverflowError):
+                pass
+        scope=holding_identity(position)
+        high=float(position.get("high_watermark") or 0)
+        at=datetime.fromisoformat(str(position.get("high_watermark_at") or "").replace("Z","+00:00"))
+        high_ok=(scope and position.get("high_watermark_source")=="us_position_risk_state"
+                 and position.get("high_watermark_lifecycle_id")==scope["position_lifecycle_id"]
+                 and at.tzinfo is not None and at<=datetime.now(timezone.utc)
+                 and math.isfinite(high) and high>entry>0)
+        if high_ok:
+            contract=extract_us_entry_exit_contract(position,position.get("meta"))
+            if contract.get("version")!=US_SWING_V3_CONTRACT_VERSION:
+                from trader.us.pb1.us_forward_v3_handoff import verified_forward_v3_management
+                approved=verified_forward_v3_management(position)
+                if approved:
+                    contract=approved[0]
+            gain=(high-entry)/entry
+            if contract.get("version")==US_SWING_V3_CONTRACT_VERSION:
+                policy=contract["management"]["runner_exit"]
+                if gain>=float(policy["trailing_activation"]):
+                    down.append(high*(1-float(policy["trailing_high_drawdown"])))
+                if gain>=float(policy["peak_activation"]):
+                    for key in ("partial_giveback","final_trim_giveback","max_giveback"):
+                        down.append(high-(high-entry)*float(policy[key]))
+            else:
+                cfg=contract_exit_config(position)
+                if gain>=float(cfg["trailing_activation_profit"]):
+                    down.append(high*(1-float(cfg["trailing_stop"])))
+                if gain>=float(cfg["profit_protect"]):
+                    down.append(high*.97)
+                if gain>.05:
+                    down.append(high-(high-entry)*float(cfg["giveback"]))
+        up=sorted({v for v in up if math.isfinite(v) and v>0})
+        down=sorted({v for v in down if math.isfinite(v) and v>0})
+        return {"reference":reference,"up":up,"down":down} if up or down else None
+    except (ValueError,TypeError,KeyError,AttributeError,OverflowError):
+        return None
+
+
+def profit_threshold_crossed(levels, price, *, previous=None):
+    if not isinstance(levels,dict):
+        return False
+    try:
+        before=float(levels["reference"] if previous is None else previous)
+        if not all(math.isfinite(v) and v>0 for v in (before,price)):
+            return False
+        return (any(before<float(v)<=price for v in levels.get("up",[]))
+                or any(before>float(v)>=price for v in levels.get("down",[])))
+    except (ValueError,TypeError,KeyError,OverflowError):
+        return False
+
+
+def split_wakeup(wakeup):
+    """Validate advisory kind without converting it into order authority."""
+    if isinstance(wakeup,dict) and set(wakeup)=={"kind","identity"} and wakeup["kind"]=="profit":
+        identity=wakeup["identity"]
+        if holding_identity(identity)==identity and identity is not None:
+            return identity,"profit"
+        return None,"invalid"
+    if holding_identity(wakeup)==wakeup and wakeup is not None:
+        return wakeup,"stop"
+    return None,"invalid"
+
+
 def export_idle_watch(snapshots, *, excluded_symbols, env, trade_date=None, allow_confirmed_soft=False):
-    """Private IPC only: advisory identity and threshold, no contract."""
-    return [{"identity":holding_identity(pos),"exchange":exchange,"entry":entry,"hard":hard,"soft":soft}
-            for pos,_,exchange,entry,hard,soft in _verified_candidates(snapshots,excluded_symbols,env,
-                trade_date=trade_date,allow_confirmed_soft=allow_confirmed_soft)]
+    """Private IPC only: advisory identity and thresholds, no contract."""
+    rows=[]
+    for pos,_,exchange,entry,hard,soft in _verified_candidates(snapshots,excluded_symbols,env,
+            trade_date=trade_date,allow_confirmed_soft=allow_confirmed_soft):
+        rows.append({"identity":holding_identity(pos),"exchange":exchange,"entry":entry,
+                     "hard":hard,"soft":soft,"profit":profit_watch_levels(pos,entry)})
+    return rows
 
 
 def make_idle_hard_stop_poll(watch, *, trade_date, env):
@@ -255,6 +356,7 @@ def make_idle_hard_stop_poll(watch, *, trade_date, env):
     if env!="practice" or not candidates:
         return None
     cursor=0
+    last_prices={}
     def poll():
         nonlocal cursor
         now=now_ny()
@@ -262,6 +364,7 @@ def make_idle_hard_stop_poll(watch, *, trade_date, env):
             return None
         batch,cursor=_bounded_quotes(candidates,cursor,env,
             pair=lambda item:(item["identity"]["symbol"],item["exchange"]))
+        profit_wakeup=None
         for candidate,q in batch:
             try:
                 entry,hard=float(candidate["entry"]),float(candidate["hard"])
@@ -272,9 +375,20 @@ def make_idle_hard_stop_poll(watch, *, trade_date, env):
                         or (isinstance(soft,(int,float)) and 0<soft<hard
                             and _breached_quote(q,entry,soft) is not None)):
                     return dict(candidate["identity"])
+                # A fresh positive quote can only wake the complete SELL
+                # lane; no shortcut around its TP/defense/stage arbitration.
+                valid=_fresh_collector_quote(q)
+                if valid is not None:
+                    price,_=valid
+                    symbol=candidate["identity"]["symbol"]
+                    before=last_prices.get(symbol)
+                    last_prices[symbol]=price
+                    if profit_wakeup is None and profit_threshold_crossed(
+                            candidate.get("profit"),price,previous=before):
+                        profit_wakeup={"kind":"profit","identity":dict(candidate["identity"])}
             except (ValueError,TypeError,KeyError,OverflowError):
                 continue
-        return None
+        return profit_wakeup
     return poll
 
 
@@ -347,3 +461,39 @@ def remaining_idle_watch(watch, attempted_identity, result):
     return [row for row in watch if isinstance(row,dict)
             and holding_identity(row.get("identity")) is not None
             and row["identity"]["symbol"]!=attempted_identity["symbol"]]
+
+
+def preserve_confirmed_soft_state(position,trade_date):
+    """Accelerated profit evaluation must never advance/reset confirmation."""
+    proof=_confirmed_soft_snapshot(position,trade_date,fresh_resolver=True)
+    keys=("risk_state","soft_stop_breach_count","soft_stop_triggered_today",
+          "soft_stop_partial_done","first_soft_stop_at","first_soft_stop_price")
+    position.pop("_legacy_prior_soft_stop_execution_candidate",None)
+    if proof is not None:
+        for key in keys:
+            position[key]=proof[0].get(key)
+    else:
+        # No stale or inferred soft-stop proof. Other verified HWM/trend
+        # fields retain their existing independent evidence.
+        position.update(risk_state={},soft_stop_breach_count=0,
+                        soft_stop_triggered_today=False,soft_stop_partial_done=False,
+                        first_soft_stop_at=None,first_soft_stop_price=None)
+    return position
+
+
+def profit_wakeup_result(orders, intents, *, trade_date, session, position_count, decisions, incomplete=False):
+    """Truthful terminal result for a multi-symbol SELL-only invocation."""
+    from trader.us.runner.trade_tick_runner import _routed_order_truth_counts,_routed_sell_notional
+    sent,ack,rejected,blocked=_routed_order_truth_counts(orders)
+    count=len({str(i.get("symbol") or "").upper() for i in intents if str(i.get("side") or "").upper()=="SELL"})
+    uncertain=(incomplete or any(str(o.get("status") or "").upper()!="ACK"
+               or o.get("requires_reconcile") or str((o.get("intent") or {}).get("side") or "").upper()!="SELL"
+               for o in orders) or count!=ack or sent!=ack)
+    return dict(status="WARN_RECONCILE_PENDING" if uncertain else "OK_EXIT_ORDERS_SENT" if ack else "OK_NO_TRADE",
+        reason="protective_profit_wakeup_unverified" if uncertain else "protective_profit_wakeup_routed" if ack else "protective_profit_wakeup_no_trade",
+        protective_wakeup=True,protective_wakeup_kind="profit",orders=orders,orders_sent=sent,orders_ack=ack,
+        orders_rejected=rejected,orders_blocked=blocked,entry_intents=0,buy_orders=0,exit_intents=count,
+        entry_can_proceed=False,exit_can_proceed=True,session=session,trade_date=trade_date,positions=position_count,
+        sell_decisions_detail=decisions,sell_notional_routed=_routed_sell_notional(orders),
+        exit_route_reconcile_required=uncertain,manual_reconcile_required=int(uncertain),
+        unresolved_ack_count=ack,reconcile_liveness_status="RECONCILE_REQUIRED" if uncertain else "PENDING_SETTLEMENT" if ack else "OK")

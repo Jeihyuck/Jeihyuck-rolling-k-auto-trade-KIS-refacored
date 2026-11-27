@@ -2026,6 +2026,7 @@ def run_trade_tick(
     balance_consecutive_failed_ticks: int = 0,
     tick_deadline_monotonic: float | None = None,
     protective_wakeup_identity: dict | None = None,
+    protective_wakeup_kind: str = "stop",
 ) -> dict:
     """미국장 단일 tick 실행.
 
@@ -2047,9 +2048,11 @@ def run_trade_tick(
         {"status": "OK"|"SKIP"|"ERROR"|"OK_WITH_WARNINGS", ...}
     """
     tick_started_at = time.monotonic()
+    _profit_wakeup=protective_wakeup_identity is not None and protective_wakeup_kind=="profit"
     if protective_wakeup_identity is not None:
         from trader.us.runner.protective_entry_interrupt import holding_identity
         if (holding_identity(protective_wakeup_identity) != protective_wakeup_identity
+                or protective_wakeup_kind not in {"stop","profit"}
                 or env!="practice" or os.getenv("KIS_ENV","practice").lower()!="practice"
                 or offline or force_now or signal_only or not kis_order_allowed or not exit_can_proceed
                 or session not in {"am","afternoon"}
@@ -3116,7 +3119,21 @@ def run_trade_tick(
             tick_index, phase, symbol, _exit_family(intent),
             int(observed_mono * 1_000_000_000),
         )
-    if protective_wakeup_identity is not None:
+    if _profit_wakeup:
+        from trader.us.runner.protective_entry_interrupt import holding_identity
+        _target=[p for p in current_positions if str(p.get("symbol") or "").upper()==protective_wakeup_identity["symbol"]]
+        if (not real_order_mode or not authoritative_recon or not _stage4_mode
+                or not exit_can_proceed or fills_contract_error or fills_temp_error
+                or str(_stage4_health.get("worker_state") or "")!="READY"
+                or str(_stage4_health.get("reconcile_status") or "") not in {"OK","WARN"}
+                or not tick_context.broker_submit_allowed()
+                or len(_target)!=1 or holding_identity(_target[0])!=protective_wakeup_identity
+                or _target[0].get("exit_resolution_failed")):
+            return {"status":"WARN_RECONCILE_PENDING","reason":"protective_profit_wakeup_authority_unverified",
+                    "protective_wakeup":True,"protective_wakeup_kind":"profit","orders":[],
+                    "entry_can_proceed":False,"entry_intents":0,"buy_orders":0}
+        # Continue into the exact normal SELL lane; never the BUY lane.
+    if protective_wakeup_identity is not None and not _profit_wakeup:
         # No extra soft-stop confirmations, trend updates, BUYs or TQQQ.
         # The existing reconciliation/account/session gates above run anew.
         from trader.us.runner.protective_entry_interrupt import (
@@ -3210,6 +3227,10 @@ def run_trade_tick(
             raise RuntimeError("exit_can_proceed_false")
         engine = _get_strategy_engine(env=env, offline=offline)
         is_default_pb1_engine = engine.__class__.__module__ == "trader.us.pb1.us_pb1_engine"
+        if _profit_wakeup and not is_default_pb1_engine:
+            return {"status":"WARN_RECONCILE_PENDING","reason":"protective_profit_wakeup_engine_unverified",
+                    "protective_wakeup":True,"protective_wakeup_kind":"profit","orders":[],
+                    "entry_can_proceed":False,"entry_intents":0,"buy_orders":0}
         if not is_default_pb1_engine:
             try:
                 trend_positions, trend_state_counts, locked_watchlist_cache, watchlist_cache_source = _update_position_trends_for_tick(
@@ -3429,6 +3450,7 @@ def run_trade_tick(
                     _pb1_positions, provider, now,
                     **({"on_snapshot_ready": _on_snapshot_ready_for_pilot}
                        if _early_pilot_enabled else {}),
+                    **({"advance_soft_confirmation":False} if _profit_wakeup else {}),
                 )
             except Exception as _snapshot_exc:
                 logger.warning("[US_EXIT][SNAPSHOT][WARN] err=%s", _snapshot_exc)
@@ -3788,6 +3810,7 @@ def run_trade_tick(
     # exit types -- profit, trailing, cluster, and defense trims -- stay quiet.
     exit_intents = _suppress_pending_sell_exit_intents(
         exit_intents, trade_date, env=env,
+        **({"strict":True} if _profit_wakeup else {}),
     )
     # Restore audit of the already-attempted early SELL without permitting
     # any late submission of this symbol.
@@ -3997,6 +4020,17 @@ def run_trade_tick(
                 "action=retain_completed_protective_sells",
                 type(_guard_exc).__name__,
             )
+
+    if _profit_wakeup:
+        from trader.us.runner.protective_entry_interrupt import profit_wakeup_result
+        return profit_wakeup_result(
+            list(exit_route_result.get("orders",[])),
+            list(exit_intents)+list(locals().get("_guard_intents",[]) or []),
+            trade_date=trade_date,session=session,position_count=position_count,
+            decisions=list(exit_route_result.get("decisions",[])),
+            incomplete=(_early_pilot_stream_incomplete or not locals().get("is_default_pb1_engine",False)
+                        or not tick_context.broker_submit_allowed()),
+        )
 
     # BUY-specific committed notional is loaded only after protective sells
     # have passed the existing router, durability fences and broker boundary.

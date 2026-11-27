@@ -40,6 +40,7 @@ def result_evidence(scope,result,*,wall_sec):
         out[key]=v if isinstance(v,int) and not isinstance(v,bool) and v>=0 else None
     if scope.get("tick_kind")=="protective_wakeup":
         out["protective_wakeup"]=result.get("protective_wakeup") is True
+        out["protective_wakeup_kind"]=result.get("protective_wakeup_kind","stop")
         out["reason"]=str(result.get("reason") or "UNKNOWN")
         out["exit_route_reconcile_required"]=bool(result.get("exit_route_reconcile_required"))
         out["manual_reconcile_required"]=bool(result.get("manual_reconcile_required"))
@@ -109,7 +110,16 @@ def summarize_runtime(lines,*,expected_sha):
                 (row.get("status")=="OK_NO_TRADE" and row.get("orders_sent")==row.get("orders_ack")==row.get("exit_intents")==0
                  and row.get("reason") in {"protective_wakeup_no_fresh_signal","protective_wakeup_holding_changed"})
                 or (row.get("status")=="OK_EXIT_ORDERS_SENT" and row.get("orders_sent")==row.get("orders_ack")==row.get("exit_intents")==1
-                    and row.get("reason")=="protective_wakeup_routed")):
+                    and row.get("reason")=="protective_wakeup_routed")
+                or (row.get("protective_wakeup_kind")=="profit"
+                    and row.get("status")=="OK_NO_TRADE"
+                    and row.get("orders_sent")==row.get("orders_ack")==row.get("exit_intents")==0
+                    and row.get("reason")=="protective_profit_wakeup_no_trade")
+                or (row.get("protective_wakeup_kind")=="profit"
+                    and row.get("status")=="OK_EXIT_ORDERS_SENT"
+                    and type(row.get("orders_ack")) is int and row["orders_ack"]>0
+                    and row.get("orders_sent")==row["orders_ack"]==row.get("exit_intents")
+                    and row.get("reason")=="protective_profit_wakeup_routed")):
                 wake_ok+=1
             else:
                 wake_uncertain+=1

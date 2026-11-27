@@ -2281,7 +2281,12 @@ def run_trade_session(
                             tick_deadline_monotonic=time_mod.monotonic() + child_budget_sec,
                         )
                     if _wakeup_for_tick is not None:
-                        tick_kwargs.update(protective_wakeup_identity=_wakeup_for_tick,
+                        from trader.us.runner.protective_entry_interrupt import split_wakeup
+                        _wake_identity,_wake_kind=split_wakeup(_wakeup_for_tick)
+                        if _wake_identity is None:
+                            raise ValueError("invalid_protective_wakeup_identity")
+                        tick_kwargs.update(protective_wakeup_identity=_wake_identity,
+                            protective_wakeup_kind=_wake_kind,
                             entry_can_proceed=False,tqqq_policy_override_allowed=False,
                             session_entry_allowed=False,entry_block_reason="PROTECTIVE_WAKEUP")
                     if _stage4_exit_only_fallback:
@@ -2341,8 +2346,10 @@ def run_trade_session(
                         _remaining_protective_watch = _idle_watch
                     else:
                         from trader.us.runner.protective_entry_interrupt import remaining_idle_watch
-                        _remaining_protective_watch = remaining_idle_watch(
-                            _remaining_protective_watch,_wakeup_for_tick,tick_result)
+                        _remaining_protective_watch = (
+                            remaining_idle_watch(_remaining_protective_watch,_wake_identity,tick_result)
+                            if _wake_kind=="stop" else []
+                        )
                     # Never publish incomplete market data as reusable truth.
                     # Scheduled revalidation detects upstream corrections even
                     # if a provider does not publish an explicit new version.

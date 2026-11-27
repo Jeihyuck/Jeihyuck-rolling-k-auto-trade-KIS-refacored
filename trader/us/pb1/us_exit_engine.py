@@ -1359,6 +1359,7 @@ def prepare_exit_position_snapshots(
     now: datetime | None = None,
     *,
     on_snapshot_ready=None,
+    advance_soft_confirmation: bool = True,
 ) -> list[dict]:
     from trader.us.symbols import normalize_us_exchange
     from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
@@ -1576,7 +1577,10 @@ def prepare_exit_position_snapshots(
             _state_started_mono = time.monotonic()
             committed_risk_state = None
             entry_price_for_state = _resolve_position_entry_price(pos)
-            if entry_price_for_state > 0 and current_price > 0:
+            if not advance_soft_confirmation:
+                from trader.us.runner.protective_entry_interrupt import preserve_confirmed_soft_state
+                preserve_confirmed_soft_state(pos,_trade_date_from_key(resolve_us_trade_date_key(now)))
+            if advance_soft_confirmation and entry_price_for_state > 0 and current_price > 0:
                 _risk_start_mono = time.monotonic()
                 try:
                     from trader.us.db.repos import update_us_soft_stop_risk_state

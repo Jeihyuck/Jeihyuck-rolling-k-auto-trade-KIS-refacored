@@ -247,3 +247,49 @@ def test_confirmed_soft_lane_preserves_canonical_arbitration(monkeypatch,kind,fa
         classify_family=lambda i:family,suppress=lambda i:i,route=lambda i:calls.append(i) or {"orders":[]})
     assert bool(calls)==allowed
     assert bool(selected)==allowed
+
+
+@pytest.mark.parametrize("case",["up","down","no_cross","stale","hard_priority"])
+def test_profit_crossing_only_wakes_canonical_lane(monkeypatch,case):
+    from trader.us import market_calendar
+    from trader.marketdata import us_ws_collector
+    from trader.us.runner.protective_entry_interrupt import make_idle_hard_stop_poll,split_wakeup
+    monkeypatch.setattr(market_calendar,"now_ny",lambda:datetime(2026,11,25,11,tzinfo=ZoneInfo("America/New_York")))
+    identity=dict(symbol="ABC",strategy_owner="US_STANDARD",position_lifecycle_id="l",
+                  position_cycle_id="l",portfolio_epoch_id="p",trading_epoch_id="e",broker_account_hash="a")
+    px={"up":111,"down":104,"no_cross":107,"stale":111,"hard_priority":93}[case]
+    monkeypatch.setattr(us_ws_collector,"get_quote",lambda *a,**kw:
+        dict(last=px,received_at=time.time()-(10 if case=="stale" else 0),
+             source="KIS_WEBSOCKET_COLLECTOR",collector_generation="g"))
+    poll=make_idle_hard_stop_poll([dict(identity=identity,exchange="NASDAQ",entry=100,hard=.06,
+          profit={"reference":108,"up":[110],"down":[105]})],trade_date="2026-11-25",env="practice")
+    result=poll()
+    if case in {"up","down"}:
+        assert split_wakeup(result)==(identity,"profit")
+    elif case=="hard_priority":
+        assert split_wakeup(result)==(identity,"stop")
+    else:
+        assert result is None
+
+
+def test_profit_wakeup_does_not_create_soft_confirmations(monkeypatch):
+    from trader.us.runner import protective_entry_interrupt as guard
+    monkeypatch.setattr(guard,"_confirmed_soft_snapshot",lambda *a,**kw:None)
+    p=dict(soft_stop_breach_count=9,risk_state={"soft_stop_breach_count":9},high_watermark=123,
+           soft_stop_partial_done=True,_legacy_prior_soft_stop_execution_candidate={"old":True})
+    guard.preserve_confirmed_soft_state(p,"2026-11-25")
+    assert p["soft_stop_breach_count"]==0 and p["risk_state"]=={} and p["high_watermark"]==123
+    assert not p["soft_stop_partial_done"] and "_legacy_prior_soft_stop_execution_candidate" not in p
+
+
+@pytest.mark.parametrize("case",["empty","two_ack","unknown","non_sell","missing_route"])
+def test_profit_wakeup_reports_all_outcomes_without_buy(case):
+    from trader.us.runner.protective_entry_interrupt import profit_wakeup_result
+    intents=[dict(symbol=s,side="SELL") for s in ("ABC","DEF")] if case!="empty" else []
+    orders=[dict(status="ACK",intent=i) for i in intents]
+    if case=="unknown": orders[-1]["status"]="BROKER_SUBMIT_RESULT_UNKNOWN"
+    if case=="non_sell": orders[-1]["intent"]={"symbol":"DEF","side":"BUY"}
+    if case=="missing_route": orders.pop()
+    result=profit_wakeup_result(orders,intents,trade_date="2026-11-25",session="am",position_count=2,decisions=[])
+    assert (result["status"] in {"OK_NO_TRADE","OK_EXIT_ORDERS_SENT"})==(case in {"empty","two_ack"})
+    assert result["buy_orders"]==result["entry_intents"]==0 and not result["entry_can_proceed"]
