@@ -43,3 +43,19 @@ def test_dynamic_promotion_only_observation_and_bounded():
     assert p.apply(seed,now+timedelta(seconds=1))["hot"] == ["2"]
     actual = {**seed,"state":"PB1_ACTIVE"}
     assert p.apply(actual,now)["hot"] == ["1"]
+
+
+def test_promotion_clears_facts_on_prep_revision_even_with_same_symbols():
+    now = datetime(2026,11,27,9,10,tzinfo=KST)
+    p = ObservationPromotion()
+    seed = {"state":"PREP_COLLECTION_ACTIVE","hot":["1"],"warm":["2"],"cold":["3"],
+            "code_sha":"a","final30_digest":"x","is_order_authorization":False}
+    p.apply(seed,now)
+    facts = {"state":"PROVISIONAL_RANGE","price_near_range":True,
+             "is_order_authorization":False,"observed_at":now.isoformat()}
+    p.observe("2",facts)
+    for revision in ({**seed,"final30_digest":"y"}, {**seed,"code_sha":"b"}):
+        assert p.apply(revision,now)["hot"] == ["1"]
+        assert not p.facts
+        p.observe("2",facts)
+    assert p.apply(revision,now)["hot"] == ["2"]
