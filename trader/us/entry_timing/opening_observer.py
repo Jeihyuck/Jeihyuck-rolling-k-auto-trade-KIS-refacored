@@ -574,14 +574,26 @@ def load_preminute_priority(
         return fallback, "INVALID"
 
 
+def merge_collection_priorities(execution, prep):
+    """Collection-only rank: eligible execution symbols first, then PREP.
+    
+    An empty execution shortlist is not a prohibition on observing verified
+    PREP candidates. Both manifests were scope-checked before this merge.
+    Never return a broker permission or admit a symbol outside those lists.
+    """
+    ranked = list(dict.fromkeys(
+        execution["HOT"] + execution["WARM"] +
+        prep["HOT"] + prep["WARM"] + execution["COLD"] + prep["COLD"]
+    ))[:30]
+    return {"HOT": ranked[:4], "WARM": ranked[4:12], "COLD": ranked[12:]}
+
+
 def collection_priorities(*, env, scope, trade_date, pairs, now_epoch=None,
                           base="runtime/private"):
-    """Prefer fresh execution shortlist; independently prove PREP fallback."""
+    """Keep PREP observation independent from execution eligibility."""
     kw = dict(env=env, scope=scope, trade_date=trade_date, pairs=pairs,
               now_epoch=now_epoch, base=base)
     lanes, state = load_preminute_priority(**kw)
-    if state == "VALID":
-        return lanes, state  # valid empty shortlist is not a failure
     try:
         from trader.us.path_contract import us_prep_contract_path, us_final30_scored_path
         from trader.us.prep_contract import _compute_final30_hash
@@ -595,6 +607,8 @@ def collection_priorities(*, env, scope, trade_date, pairs, now_epoch=None,
         fallback, prep_state = load_preminute_priority(**kw, prep_only=True,
                                                         verified_prep_contract=contract)
         if prep_state == "PREP_VALID":
+            if state == "VALID":
+                return merge_collection_priorities(lanes, fallback), "VALID"
             return fallback, prep_state
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
         pass
@@ -670,6 +684,58 @@ def collect_hot_minutes(client, db, *, symbol, exchange, trade_date,
     return {"requests": requests, "changed": changed}
 
 
+def start_prep_observer(*, env: str, scope: str, trade_date: str, rows: list[dict],
+                        now_et=None, base="runtime/private", log_base="runtime/logs"):
+    """Launch the existing singleton READ-ONLY observer after verified PREP.
+
+    No new broker client/order authority; the child owns its existing lock.
+    AM/PM keep their existing recovery launch in case the child died.
+    """
+    from datetime import date
+    from trader.us.market_calendar import is_us_trading_day, regular_close_time_for_date
+    import subprocess
+    import tempfile
+    now_et = now_et or datetime.now(NY)
+    day = date.fromisoformat(trade_date)
+    if (env != "practice" or now_et.tzinfo is None
+            or now_et.astimezone(NY).date() != day or not is_us_trading_day(day)
+            or now_et.astimezone(NY).time() >= regular_close_time_for_date(day)):
+        return None
+    pairs = standard_entry_pairs(rows)
+    if not pairs:
+        return None
+    key = hashlib.sha256((env + ":" + scope).encode()).hexdigest()[:20]
+    root = Path(base)
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    watchlist = root / ("us-opening-watchlist-" + key + "-" + trade_date + ".json")
+    temp_name = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=root,
+                                         delete=False) as handle:
+            temp_name = handle.name
+            json.dump([{"symbol": sym, "exchange": exch} for sym,exch in pairs], handle)
+        os.replace(temp_name, watchlist)
+    finally:
+        if temp_name:
+            Path(temp_name).unlink(missing_ok=True)
+    log_dir = Path(log_base)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    path = log_dir / ("us-opening-observer-" + trade_date + "-" + key + ".log")
+    flags = os.O_CREAT | os.O_APPEND | os.O_WRONLY | os.O_NOFOLLOW
+    with os.fdopen(os.open(path, flags, 0o600), "a", encoding="utf-8") as stream:
+        return subprocess.Popen(
+            [sys.executable, "-m", "trader.us.entry_timing.opening_observer",
+             "--env", env, "--scope", scope, "--trade-date", trade_date,
+             "--parent-pid", str(os.getpid()), "--watchlist-file", str(watchlist),
+             "--continuous"],
+            env={**os.environ, "KIS_ENV":"practice", "DRY_RUN":"1",
+                 "ALLOW_REAL_ORDER":"0", "US_KIS_ORDER_ALLOWED":"0",
+                 "TRADING_REGION":"US", "US_ORDER_ARMED":"0"},
+            stdin=subprocess.DEVNULL, stdout=stream, stderr=stream,
+            close_fds=True, start_new_session=True,
+        )
+
+
 def run_observer(*, env: str, trade_date: str, scope: str,
                  parent_pid: int, watchlist: list[dict],
                  min_interval_sec: float = 10.0,
@@ -695,7 +761,7 @@ def run_observer(*, env: str, trade_date: str, scope: str,
         LOG.warning("[US_OPENING_OBSERVER][NO_WATCHLIST] action=NO_ORDER")
         return 2
     from trader.us.execution.kis_us_client import KisUSClient
-    from trader.marketdata.us_ws_collector import get_quote, subscribe_many
+    from trader.marketdata.us_ws_collector import get_quote, subscribe_many, ensure_started
     db = open_store(store_path(env=env, account_scope=scope, trade_date=trade_date))
     client = KisUSClient(env="practice", offline=False)
     ws_on = os.getenv("US_WS_COLLECTOR_ENABLED", "0") == "1"
@@ -730,6 +796,9 @@ def run_observer(*, env: str, trade_date: str, scope: str,
             if not epoch_verified:
                 time.sleep(2.0)
                 continue
+            if (now_et.hour, now_et.minute) < (9, 25):
+                time.sleep(2.0)
+                continue
             if time.monotonic() < next_poll:
                 time.sleep(min(1.0, next_poll - time.monotonic()))
                 continue
@@ -740,6 +809,10 @@ def run_observer(*, env: str, trade_date: str, scope: str,
                 pairs=pairs, now_epoch=time.time(),
             )
             if ws_on and time.monotonic() >= next_subscription_refresh:
+                try:
+                    ensure_started(env=env, offline=False)
+                except Exception as exc:
+                    LOG.warning("[US_OPENING_OBSERVER][COLLECTOR_START_WARN] type=%s", type(exc).__name__)
                 from trader.us.symbols import resolve_quote_exchange
                 benchmark_pairs = [(sym, resolve_quote_exchange(sym)) for sym in ("SPY","QQQ","SMH")]
                 # Benchmark subscriptions are independent of the entry shortlist.

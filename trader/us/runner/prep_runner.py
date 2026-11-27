@@ -901,7 +901,9 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         try:
             from trader.us.utils.session_guard import _child_fence_scope
             from trader.db.trading_epoch import active_trading_epoch_id
-            from trader.us.entry_timing.opening_observer import publish_prep_collection_priority
+            from trader.us.entry_timing.opening_observer import (
+                publish_prep_collection_priority, start_prep_observer,
+            )
             epoch = active_trading_epoch_id(env=env, required=True)
             if not epoch:
                 raise RuntimeError("US_PREP_COLLECTION_EPOCH_UNVERIFIED")
@@ -910,6 +912,11 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
                 trade_date=trade_date, rows=final30_scored, contract=contract)
             logger.info("[US_PREP][COLLECTION_PRIORITY] hot=%s warm=%s order_authorization=0",
                         stats["hot"], stats["warm"])
+            if (os.getenv("US_OPENING_OBSERVER_ENABLED", "0") == "1"
+                    and os.getenv("US_ENTRY_OPPORTUNITY_MODE", "SHADOW").upper() in {"SHADOW","ENFORCE"}):
+                child = start_prep_observer(env=env, scope=scope, trade_date=trade_date, rows=final30_scored)
+                if child is not None:
+                    logger.info("[US_PREP][OPENING_OBSERVER_STARTED] pid=%s read_only=1", child.pid)
         except Exception as exc:
             logger.warning("[US_PREP][COLLECTION_PRIORITY_UNAVAILABLE] type=%s", type(exc).__name__)
 

@@ -281,3 +281,36 @@ def test_prep_collection_manifest_survives_preopen_ttl_and_rejects_wrong_contrac
     with pytest.raises(ValueError):
         publish_prep_collection_priority(env="practice", scope="scope:epoch", trade_date=DAY,
             rows=rows[:-1], contract=contract, now_epoch=before, base=tmp_path)
+
+
+def test_collection_manifest_merge_is_observation_only_and_preserves_caps():
+    from trader.us.entry_timing.opening_observer import merge_collection_priorities
+    pairs=_pairs(18)
+    prep={"HOT":pairs[:4],"WARM":pairs[4:12],"COLD":pairs[12:]}
+    empty={"HOT":[],"WARM":[],"COLD":[]}
+    assert merge_collection_priorities(empty,prep)==prep
+    execution={"HOT":[pairs[15]],"WARM":[pairs[16]],"COLD":[]}
+    merged=merge_collection_priorities(execution,prep)
+    assert merged["HOT"][:2]==pairs[15:17]
+    assert [len(merged[k]) for k in ("HOT","WARM","COLD")]==[4,8,6]
+    assert set(sum(merged.values(),[]))==set(pairs)
+
+
+def test_prep_launch_is_readonly_and_never_runs_on_holiday(tmp_path, monkeypatch):
+    import subprocess
+    from types import SimpleNamespace
+    from trader.us.entry_timing.opening_observer import start_prep_observer
+    calls=[]
+    monkeypatch.setattr(subprocess,"Popen",lambda *args,**kw: calls.append((args,kw)) or SimpleNamespace(pid=123))
+    rows=[{"symbol":"CL","exchange":"NYSE"}]
+    assert start_prep_observer(env="practice",scope="scope:epoch",trade_date="2026-11-26",
+        rows=rows,now_et=datetime(2026,11,26,8,30,tzinfo=NY),base=tmp_path,log_base=tmp_path) is None
+    assert not calls
+    assert start_prep_observer(env="practice",scope="scope:epoch",trade_date=DAY,
+        rows=rows,now_et=datetime(2026,10,28,8,30,tzinfo=NY),base=tmp_path,log_base=tmp_path).pid==123
+    args,kwargs=calls[0]
+    assert "--continuous" in args[0]
+    assert kwargs["start_new_session"] is True
+    assert kwargs["env"]["US_ORDER_ARMED"]=="0"
+    assert kwargs["env"]["US_KIS_ORDER_ALLOWED"]=="0"
+    assert kwargs["env"]["DRY_RUN"]=="1"
