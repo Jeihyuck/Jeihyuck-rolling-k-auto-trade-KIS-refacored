@@ -653,3 +653,49 @@ def validated_entry_profit_followup(snapshot, *, watch, result):
             or result.get("entry_degraded_reason")!="PROTECTIVE_PROFIT_ENTRY_INTERRUPTED"):
         return None
     return signal
+
+
+class BoundedTrendDailyReads:
+    """Keep the canonical writer available during a read-only daily-bar SELECT.
+
+    One outstanding read per tick. A timed-out read is never reused, and
+    cannot enqueue another read, write a risk row, or call a broker. The
+    isolated Tick process still owns the hard watchdog. Do not use for any
+    DDL, repair, transaction mutation, or provider/order method.
+    """
+    def __init__(self, checkpoint, *, timeout_sec=5.0, poll_sec=.5):
+        self.checkpoint=checkpoint
+        self.timeout_sec=max(.01,min(5.0,float(timeout_sec)))
+        self.poll_sec=max(.005,min(.5,float(poll_sec)))
+        self.abandoned=False
+
+    def read(self, loader, **kwargs):
+        import queue
+        import threading
+        if self.abandoned:
+            raise TimeoutError("trend_daily_read_already_abandoned")
+        result=queue.Queue(maxsize=1)
+        def worker():
+            try:
+                result.put((True,loader(**kwargs)))
+            except BaseException as exc:
+                result.put((False,exc))
+        deadline=time.monotonic()+self.timeout_sec
+        threading.Thread(target=worker,name="us-trend-daily-read",daemon=True).start()
+        while True:
+            self.checkpoint()
+            remaining=deadline-time.monotonic()
+            if remaining<=0:
+                self.abandoned=True
+                raise TimeoutError("trend_daily_read_deadline")
+            try:
+                ok,value=result.get(timeout=min(self.poll_sec,remaining))
+            except queue.Empty:
+                continue
+            self.checkpoint()
+            if time.monotonic()>=deadline:
+                self.abandoned=True
+                raise TimeoutError("trend_daily_read_deadline")
+            if not ok:
+                raise value
+            return value
