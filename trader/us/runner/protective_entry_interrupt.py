@@ -33,7 +33,7 @@ def make_hard_stop_poll(snapshots, *, excluded_symbols, trade_date, env, context
     from trader.us.entry_exit_contract import contract_exit_config, us_entry_exit_contract_integrity_state
     from trader.us.pb1.us_exit_router import normalize_book, normalize_horizon
     from trader.us.pb1.us_exit_engine import _resolve_position_entry_price
-    from trader.us.market_calendar import now_ny
+    from trader.us.market_calendar import now_ny, is_us_regular_market_open
     from trader.marketdata.us_ws_collector import get_quote
     from trader.us.symbols import normalize_us_exchange
     if env != "practice":
@@ -79,7 +79,7 @@ def make_hard_stop_poll(snapshots, *, excluded_symbols, trade_date, env, context
         if not context.broker_submit_allowed() or context.remaining_sec() < 10:
             return None
         now = now_ny()
-        if now.date().isoformat() != str(trade_date):
+        if now.date().isoformat() != str(trade_date) or not is_us_regular_market_open(now):
             return None
         # Bounded IPC only. Round robin across all eligible holdings, no REST
         # burst, no concurrent broker authority, and no stale fallback.
@@ -116,3 +116,30 @@ def make_hard_stop_poll(snapshots, *, excluded_symbols, trade_date, env, context
                 continue
         return None
     return poll
+
+
+def execute_hard_stop_interrupt(snapshot, *, trade_date, context, evaluate,
+                                classify_family, suppress, route):
+    """Main Tick thread only; all authority is delegated to existing gates.
+
+    A read-only alert cannot itself be routed. A fresh canonical hard-stop
+    decision for exactly this holding must survive the strict pending check.
+    No fallback order or automatic retry is allowed, including on exceptions.
+    """
+    from trader.us.market_calendar import now_ny
+    clock = now_ny()
+    if not context.broker_submit_allowed() or not snapshot_still_fresh(snapshot,trade_date,clock):
+        return [], None
+    symbol = str(snapshot.get("symbol") or "").upper()
+    def matches(intents):
+        return (len(intents) == 1 and str(intents[0].get("side") or "").upper() == "SELL"
+                and str(intents[0].get("symbol") or "").upper() == symbol
+                and classify_family(intents[0]) == "HARD_STOP")
+    intents = evaluate(snapshot,clock)
+    if not matches(intents):
+        return [], None
+    selected = suppress(intents)
+    if (not matches(selected) or not context.broker_submit_allowed()
+            or not snapshot_still_fresh(snapshot,trade_date,now_ny())):
+        return [], None
+    return selected, route(selected)

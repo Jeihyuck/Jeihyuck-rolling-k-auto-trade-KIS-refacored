@@ -4603,6 +4603,7 @@ def run_trade_tick(
                                 str(i.get("symbol") or "").upper()
                                 for i in exit_intents if str(i.get("side") or "").upper() == "SELL"
                             } | _early_pilot_attempted_symbols
+                            _excluded.update(sym for sym, count in _pb1_symbol_counts.items() if count != 1)
                             _excluded.update(
                                 str((o.get("intent") or {}).get("symbol") or o.get("symbol") or "").upper()
                                 for o in orders
@@ -4665,47 +4666,43 @@ def run_trade_tick(
                         _new_snapshot = _interrupt.snapshot
                         _sym = str(_new_snapshot.get("symbol") or "").upper()
                         logger.warning("[US_EXIT][ENTRY_INTERRUPT] symbol=%s action=cancel_buy_evaluate_canonical_hard_stop", _sym)
-                        from trader.us.market_calendar import now_ny
-                        _decision_now = now_ny()
-                        from trader.us.runner.protective_entry_interrupt import snapshot_still_fresh
-                        if (tick_context.broker_submit_allowed()
-                                and snapshot_still_fresh(_new_snapshot, trade_date, _decision_now)):
-                            _protective = _gen_exit_from_snapshots(
-                                [], provider=None, now=_decision_now,
-                                prepared_snapshots=[_new_snapshot], include_trend_time=False,
+                        from trader.us.runner.protective_entry_interrupt import execute_hard_stop_interrupt
+                        if not isinstance(getattr(tick_context, "_sell_selected_ready_by_symbol", None), dict):
+                            tick_context._sell_selected_ready_by_symbol = {}
+                            tick_context._sell_selected_trace_id_by_symbol = {}
+                        _protective, _late = execute_hard_stop_interrupt(
+                            _new_snapshot, trade_date=trade_date, context=tick_context,
+                            evaluate=lambda snap, clock: _gen_exit_from_snapshots(
+                                [], provider=None, now=clock, prepared_snapshots=[snap],
+                                include_trend_time=False,
                                 on_sell_ready=lambda intent, observed: _observe_pb1_sell(intent, observed, "entry_interrupt"),
+                            ),
+                            classify_family=_exit_family,
+                            suppress=lambda intents: _suppress_pending_sell_exit_intents(
+                                intents, trade_date, env=env, strict=True,
+                            ),
+                            route=lambda intents: route_exit_orders_immediately(
+                                intents, buy_daily_notional=buy_daily_notional,
+                                position_count=position_count, effective_budget=effective_budget,
+                                signal_only=signal_only, kis_order_allowed=kis_order_allowed,
+                                current_position_symbols=current_position_symbols,
+                                context=tick_context, kis_client=routing_kis_client,
+                            ),
+                        )
+                        if _late is not None:
+                            exit_intents.extend(_protective)
+                            orders.extend(_late.get("orders", []))
+                            exit_route_result["orders"].extend(_late.get("orders", []))
+                            exit_route_result["decisions"].extend(_late.get("decisions", []))
+                            _sent, _ack, _rejected, _blocked = _routed_order_truth_counts(exit_route_result["orders"])
+                            exit_route_result.update(
+                                sent=_sent, ack=_ack, rejected=_rejected, blocked=_blocked,
+                                sell_notional_routed=_routed_sell_notional(exit_route_result["orders"]),
+                                exit_notional_routed=_routed_sell_notional(exit_route_result["orders"]),
                             )
-                            if (len(_protective) == 1
-                                    and str(_protective[0].get("side") or "").upper() == "SELL"
-                                    and _exit_family(_protective[0]) == "HARD_STOP"
-                                    and str(_protective[0].get("symbol") or "").upper() == _sym):
-                                _protective = _suppress_pending_sell_exit_intents(
-                                    _protective, trade_date, env=env, strict=True)
-                                if len(_protective) == 1 and snapshot_still_fresh(
-                                        _new_snapshot, trade_date, now_ny()):
-                                    if not isinstance(getattr(tick_context, "_sell_selected_ready_by_symbol", None), dict):
-                                        tick_context._sell_selected_ready_by_symbol = {}
-                                        tick_context._sell_selected_trace_id_by_symbol = {}
-                                    _late = route_exit_orders_immediately(
-                                        _protective, buy_daily_notional=buy_daily_notional,
-                                        position_count=position_count, effective_budget=effective_budget,
-                                        signal_only=signal_only, kis_order_allowed=kis_order_allowed,
-                                        current_position_symbols=current_position_symbols,
-                                        context=tick_context, kis_client=routing_kis_client,
-                                    )
-                                    exit_intents.extend(_protective)
-                                    orders.extend(_late.get("orders", []))
-                                    exit_route_result["orders"].extend(_late.get("orders", []))
-                                    exit_route_result["decisions"].extend(_late.get("decisions", []))
-                                    _sent, _ack, _rejected, _blocked = _routed_order_truth_counts(exit_route_result["orders"])
-                                    exit_route_result.update(
-                                        sent=_sent, ack=_ack, rejected=_rejected, blocked=_blocked,
-                                        sell_notional_routed=_routed_sell_notional(exit_route_result["orders"]),
-                                        exit_notional_routed=_routed_sell_notional(exit_route_result["orders"]),
-                                    )
-                                    sell_notional_routed = _routed_sell_notional(orders)
-                                    routed_sent, routed_ack, routed_rejected, routed_blocked = _routed_order_truth_counts(orders)
-                                    logger.warning("[US_EXIT][ENTRY_INTERRUPT][ROUTED] symbol=%s", _sym)
+                            sell_notional_routed = _routed_sell_notional(orders)
+                            routed_sent, routed_ack, routed_rejected, routed_blocked = _routed_order_truth_counts(orders)
+                            logger.warning("[US_EXIT][ENTRY_INTERRUPT][ROUTED] symbol=%s", _sym)
                     except concurrent.futures.TimeoutError:
                         if entry_degraded_reason == "NEXT_TICK_ENTRY_DEFER_INSUFFICIENT_BUDGET":
                             logger.warning(
