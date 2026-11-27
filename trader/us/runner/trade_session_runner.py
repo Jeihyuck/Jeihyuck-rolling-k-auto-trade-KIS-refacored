@@ -2183,6 +2183,20 @@ def run_trade_session(
                     "?",
                 )
 
+                # Separate parent-side wall time from the child phase timer.
+                # Every attempted tick has an identity even if its child
+                # never returns. Acceptance must not count such failures as
+                # fast successful ticks.
+                _acceptance_started = time_mod.monotonic()
+                _acceptance_scope = {
+                    "trade_date": str(trade_date), "session": session,
+                    "run_id": str(session_run_id), "tick_id": str(tick_id),
+                    "code_sha": str(os.getenv("US_PINNED_CODE_SHA") or ""),
+                    "native_practice": bool(env == "practice" and not offline
+                        and not force_now and not resolved_signal_only and kis_order_allowed),
+                }
+                logger.info("[US400_RUNTIME][ATTEMPT] payload=%s",
+                            json.dumps(_acceptance_scope, sort_keys=True))
                 try:
                     write_heartbeat_file(session, run_id, tick_count, phase="TICK_START", last_stage=last_stage)
                     order_activity_before = _count_trade_date_order_activity(trade_date)
@@ -2302,6 +2316,14 @@ def run_trade_session(
                     elif completed_market_context is None:
                         completed_market_context_age_ticks = 0
                     completed_market_context_age_ticks += 1
+                    # Read-only acceptance record, no additional DB/KIS I/O.
+                    # Preserve missing values as null rather than inventing a
+                    # zero workload or a completed phase.
+                    from trader.us.runner.runtime_acceptance_evidence import result_evidence
+                    logger.info("[US400_RUNTIME][RESULT] payload=%s", json.dumps(
+                        result_evidence(_acceptance_scope, tick_result,
+                                        wall_sec=time_mod.monotonic()-_acceptance_started),
+                        sort_keys=True, allow_nan=False))
                     results.append(tick_result)
                     final_tick = tick_result
                     tick_completed += 1
@@ -2416,6 +2438,10 @@ def run_trade_session(
                         logger.warning("[US_SESSION][TICK_LOOP][WARN] tick=%d status=%s consecutive_errors=%d", tick_count, tick_status, consecutive_errors)
 
                 except Exception as timeout_exc:
+                    logger.info("[US400_RUNTIME][FAILURE] payload=%s", json.dumps({
+                        **_acceptance_scope, "error_type": type(timeout_exc).__name__,
+                        "wall_sec": max(0.0, time_mod.monotonic()-_acceptance_started),
+                    }, sort_keys=True, allow_nan=False))
                     from trader.us.runner.tick_process import TickProcessTimeout
                     if not isinstance(timeout_exc, TickProcessTimeout):
                         raise
