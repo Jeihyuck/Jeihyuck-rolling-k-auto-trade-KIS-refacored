@@ -257,3 +257,27 @@ def test_early_close_caps_us_trading_sessions_but_not_close_reconciliation():
     assert _session_end_dt("am", early).time() <= regular_close_time_for_date(early.date())
     assert _session_end_dt("afternoon", regular).time() > _session_end_dt("afternoon", early).time()
     assert _session_end_dt("close", early).time() == _session_end_dt("close", regular).time()
+
+
+def test_prep_collection_manifest_survives_preopen_ttl_and_rejects_wrong_contract(tmp_path):
+    from trader.us.prep_contract import _compute_final30_hash
+    from trader.us.entry_timing.opening_observer import publish_prep_collection_priority
+    import pytest
+    rows = [{"symbol": symbol, "exchange": exch, "score_final": 90-i,
+             "rank_final30": i+1} for i,(symbol,exch) in enumerate(_pairs(18))]
+    contract = {"market": "US", "env": "practice", "trade_date": DAY,
+                "contract_ok": True, "run_revision": "a"*40,
+                "final30_hash": _compute_final30_hash({"final30_scored": rows})}
+    before = datetime(2026,10,28,8,30,tzinfo=NY).timestamp()
+    publish_prep_collection_priority(env="practice", scope="scope:epoch", trade_date=DAY,
+        rows=rows, contract=contract, now_epoch=before, base=tmp_path)
+    kwargs = dict(env="practice", scope="scope:epoch", trade_date=DAY, pairs=_pairs(18),
+                  now_epoch=before+3600, base=tmp_path, prep_only=True)
+    lanes, state = load_preminute_priority(**kwargs, verified_prep_contract=contract)
+    assert state == "PREP_VALID"
+    assert list(map(len, (lanes["HOT"],lanes["WARM"],lanes["COLD"]))) == [4,8,6]
+    bad = dict(contract, run_revision="b"*40)
+    assert load_preminute_priority(**kwargs, verified_prep_contract=bad)[1] == "INVALID"
+    with pytest.raises(ValueError):
+        publish_prep_collection_priority(env="practice", scope="scope:epoch", trade_date=DAY,
+            rows=rows[:-1], contract=contract, now_epoch=before, base=tmp_path)

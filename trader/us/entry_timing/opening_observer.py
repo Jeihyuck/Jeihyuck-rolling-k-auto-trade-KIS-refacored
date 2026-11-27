@@ -386,7 +386,7 @@ def priority_manifest_path(*, env: str, scope: str, trade_date: str,
 def publish_preminute_candidates(
     *, env: str, scope: str, trade_date: str, candidates: list[tuple],
     now_epoch: float | None = None, hot_limit: int = 4, warm_limit: int = 8,
-    base: str | Path = "runtime/private",
+    base: str | Path = "runtime/private", prep_contract: dict | None = None,
 ) -> dict:
     """Publish a non-authorizing, pre-1m shortlist without KIS network I/O.
 
@@ -441,6 +441,21 @@ def publish_preminute_candidates(
         "is_order_authorization": False,
     }
     path = priority_manifest_path(env=env, scope=scope, trade_date=trade_date, base=base)
+    if prep_contract is not None:
+        from datetime import date
+        from trader.us.market_calendar import is_us_trading_day, regular_close_time_for_date
+        day = date.fromisoformat(trade_date)
+        close = datetime.combine(day, regular_close_time_for_date(day), tzinfo=NY).timestamp()
+        if not is_us_trading_day(day) or epoch >= close:
+            raise ValueError("PREP_COLLECTION_OUTSIDE_SESSION")
+        payload.update(schema="US_PREP_COLLECTION_PRIORITY_V2", market="US",
+                       kind="COLLECTION_PRIORITY", expires_epoch=close,
+                       final30_digest=prep_contract["final30_hash"],
+                       prep_contract_hash=_prep_collection_contract_hash(prep_contract),
+                       source_code_sha=prep_contract["run_revision"],
+                       selection_reason="PREP_FINAL30_EXISTING_RANK",
+                       position_and_quantity_state="PROVISIONAL_UNVERIFIED")
+        path = path.with_suffix(".prep.json")
     temp_name = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -461,15 +476,44 @@ def publish_preminute_candidates(
     return {"hot": len(hot), "warm": len(warm), "generation": payload["generation"]}
 
 
+def _prep_collection_contract_hash(contract: dict) -> str:
+    return hashlib.sha256(json.dumps(contract, sort_keys=True, separators=(",", ":"),
+                                     allow_nan=False).encode()).hexdigest()
+
+
+def publish_prep_collection_priority(*, env, scope, trade_date, rows, contract,
+                                     now_epoch=None, base="runtime/private"):
+    """Existing PREP rank, never a new scoring or order decision."""
+    from trader.us.prep_contract import _compute_final30_hash
+    if (not isinstance(contract, dict) or contract.get("market") != "US"
+            or contract.get("env") != env or contract.get("trade_date") != trade_date
+            or contract.get("contract_ok") is not True
+            or not contract.get("run_revision") or contract["run_revision"] == "unknown"
+            or contract.get("final30_hash") != _compute_final30_hash({"final30_scored": rows})):
+        raise ValueError("PREP_COLLECTION_CONTRACT_INVALID")
+    candidates = []
+    for row in sorted(rows, key=lambda x: int(x.get("rank_final30") or 999)):
+        meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+        candidates.append((row.get("score_final") or row.get("final_score") or row.get("score"),
+                           row.get("symbol"), row.get("exchange"), None,
+                           {**meta, "strategy_owner": row.get("strategy_owner") or meta.get("strategy_owner") or "US_STANDARD",
+                            "position_state": "PROVISIONAL_UNKNOWN"}))
+    return publish_preminute_candidates(env=env, scope=scope, trade_date=trade_date,
+               candidates=candidates, now_epoch=now_epoch, base=base, prep_contract=contract)
+
+
 def load_preminute_priority(
     *, env: str, scope: str, trade_date: str,
     pairs: list[tuple[str, str]], now_epoch: float | None = None,
-    base: str | Path = "runtime/private",
+    base: str | Path = "runtime/private", prep_only: bool = False,
+    verified_prep_contract: dict | None = None,
 ) -> tuple[dict[str, list[tuple[str, str]]], str]:
     """Return validated HOT/WARM/COLD, or explicit MISSING/STALE/INVALID."""
     available = {sym: exch for sym, exch in pairs}
     fallback = {"HOT": [], "WARM": [], "COLD": []}
     path = priority_manifest_path(env=env, scope=scope, trade_date=trade_date, base=base)
+    if prep_only:
+        path = path.with_suffix(".prep.json")
     try:
         if not path.is_file():
             return fallback, "MISSING"
@@ -478,7 +522,7 @@ def load_preminute_priority(
         payload = json.loads(path.read_text(encoding="utf-8"))
         epoch = time.time() if now_epoch is None else float(now_epoch)
         if (not isinstance(payload, dict)
-                or payload.get("schema") != "US_PREMINUTE_PRIORITY_V1"
+                or payload.get("schema") != ("US_PREP_COLLECTION_PRIORITY_V2" if prep_only else "US_PREMINUTE_PRIORITY_V1")
                 or payload.get("owner") != "US_STANDARD"
                 or payload.get("env") != env
                 or payload.get("trade_date") != trade_date
@@ -490,7 +534,23 @@ def load_preminute_priority(
         expires = float(payload["expires_epoch"])
         if not all(map(math.isfinite, (created, expires, epoch))):
             return fallback, "INVALID"
-        if created > epoch + 5 or expires > created + 180.0 + 1e-5:
+        if created > epoch + 5:
+            return fallback, "INVALID"
+        if prep_only:
+            from datetime import date
+            from trader.us.market_calendar import regular_close_time_for_date, is_us_trading_day
+            day = date.fromisoformat(trade_date)
+            close = datetime.combine(day, regular_close_time_for_date(day), tzinfo=NY).timestamp()
+            c = verified_prep_contract or {}
+            if (not is_us_trading_day(day) or expires != close
+                    or payload.get("market") != "US" or payload.get("kind") != "COLLECTION_PRIORITY"
+                    or c.get("contract_ok") is not True or c.get("env") != env
+                    or c.get("trade_date") != trade_date or c.get("market") != "US"
+                    or payload.get("final30_digest") != c.get("final30_hash")
+                    or payload.get("source_code_sha") != c.get("run_revision")
+                    or payload.get("prep_contract_hash") != _prep_collection_contract_hash(c)):
+                return fallback, "INVALID"
+        elif expires > created + 180.0 + 1e-5:
             return fallback, "INVALID"
         if expires < epoch:
             return fallback, "STALE"
@@ -509,9 +569,36 @@ def load_preminute_priority(
                     return fallback, "INVALID"
                 selected.add(sym)
                 lanes[lane].append((sym, exch))
-        return lanes, "VALID"
+        return lanes, "PREP_VALID" if prep_only else "VALID"
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
         return fallback, "INVALID"
+
+
+def collection_priorities(*, env, scope, trade_date, pairs, now_epoch=None,
+                          base="runtime/private"):
+    """Prefer fresh execution shortlist; independently prove PREP fallback."""
+    kw = dict(env=env, scope=scope, trade_date=trade_date, pairs=pairs,
+              now_epoch=now_epoch, base=base)
+    lanes, state = load_preminute_priority(**kw)
+    if state == "VALID":
+        return lanes, state  # valid empty shortlist is not a failure
+    try:
+        from trader.us.path_contract import us_prep_contract_path, us_final30_scored_path
+        from trader.us.prep_contract import _compute_final30_hash
+        contract = json.loads(us_prep_contract_path(trade_date).read_text(encoding="utf-8"))
+        payload = json.loads(us_final30_scored_path(trade_date).read_text(encoding="utf-8"))
+        rows = payload.get("final30_scored") or []
+        if (payload.get("trade_date") != trade_date or payload.get("env") != env
+                or contract.get("final30_hash") != _compute_final30_hash({"final30_scored": rows})
+                or set(standard_entry_pairs(rows)) != set(pairs)):
+            return lanes, state
+        fallback, prep_state = load_preminute_priority(**kw, prep_only=True,
+                                                        verified_prep_contract=contract)
+        if prep_state == "PREP_VALID":
+            return fallback, prep_state
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        pass
+    return lanes, state
 
 
 def next_priority_pair(
@@ -650,7 +737,7 @@ def run_observer(*, env: str, trade_date: str, scope: str,
                 for _i in range(0, len(pairs), 16):
                     subscribe_many(pairs[_i:_i + 16], env=env, timeout_sec=0.3)
                 next_subscription_refresh = time.monotonic() + 30.0
-            lanes, priority_state = load_preminute_priority(
+            lanes, priority_state = collection_priorities(
                 env=env, scope=scope, trade_date=trade_date,
                 pairs=pairs, now_epoch=time.time(),
             )
@@ -682,11 +769,11 @@ def run_observer(*, env: str, trade_date: str, scope: str,
                 continue
             try:
                 def _still_hot():
-                    current, state = load_preminute_priority(env=env, scope=scope,
+                    current, state = collection_priorities(env=env, scope=scope,
                         trade_date=trade_date, pairs=pairs, now_epoch=time.time())
                     live = datetime.now(NY)
                     return (epoch_verified and live.date().isoformat() == trade_date
-                            and live.time() < close_time and state == "VALID"
+                            and live.time() < close_time and state in {"VALID", "PREP_VALID"}
                             and (symbol, exchange) in current[tier])
                 repair_due = tier == "HOT" and time.monotonic() >= next_repair_by_symbol.get(symbol, 0.0)
                 if repair_due:
