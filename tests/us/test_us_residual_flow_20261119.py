@@ -430,13 +430,11 @@ def test_tp_boundary_budget_retains_every_unexamined_candidate(pg_engine, monkey
         _seed_boundary_case(pg_engine,symbol=symbol,contradiction=None,epoch=epoch,account=account,
                            cycle=cycle,key=f"US_PC_2026-11-11_{symbol}_{cycle}_TAKE_PROFIT_TP2")
     # The real SQL read still executes; only the budget clock is injected.
-    import time
     calls=[0]
     def clock():
         calls[0]+=1
         return 0.0 if calls[0]==1 else 31.0
-    monkeypatch.setattr(time,"monotonic",clock)
-    result=repair_tp_retries_at_boundary(trade_date="2026-11-18",phase="AM_START",budget_sec=.1)
+    result=repair_tp_retries_at_boundary(trade_date="2026-11-18",phase="AM_START",budget_sec=.1,clock=clock)
     assert result["released"]==0 and result["checked"]==0
     assert result["candidate_count"]==2
     assert {x["symbol"] for x in result["unverified"]}=={"KO","PG"}

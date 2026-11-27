@@ -589,8 +589,13 @@ def merge_collection_priorities(execution, prep):
 
 
 def collection_priorities(*, env, scope, trade_date, pairs, now_epoch=None,
-                          base="runtime/private"):
-    """Keep PREP observation independent from execution eligibility."""
+                          base="runtime/private", allow_prep_rebind=False):
+    """Keep PREP observation independent from execution eligibility.
+
+    A full-day observer may rebind to a newly verified same-day PREP
+    contract after recovery replaces Final30. Rebind only after checking the
+    account/epoch-scoped collection manifest; never trust a loose watchlist.
+    """
     kw = dict(env=env, scope=scope, trade_date=trade_date, pairs=pairs,
               now_epoch=now_epoch, base=base)
     lanes, state = load_preminute_priority(**kw)
@@ -601,15 +606,25 @@ def collection_priorities(*, env, scope, trade_date, pairs, now_epoch=None,
         payload = json.loads(us_final30_scored_path(trade_date).read_text(encoding="utf-8"))
         rows = payload.get("final30_scored") or []
         if (payload.get("trade_date") != trade_date or payload.get("env") != env
-                or contract.get("final30_hash") != _compute_final30_hash({"final30_scored": rows})
-                or set(standard_entry_pairs(rows)) != set(pairs)):
+                or contract.get("final30_hash") != _compute_final30_hash({"final30_scored": rows})):
             return lanes, state
-        fallback, prep_state = load_preminute_priority(**kw, prep_only=True,
+        verified_pairs = standard_entry_pairs(rows)
+        changed = set(verified_pairs) != set(pairs)
+        if changed and not allow_prep_rebind:
+            return lanes, state
+        verified_kw = {**kw, "pairs":verified_pairs}
+        fallback, prep_state = load_preminute_priority(**verified_kw, prep_only=True,
                                                         verified_prep_contract=contract)
         if prep_state == "PREP_VALID":
+            if changed:
+                # Revalidate the execution list against the NEW universe;
+                # old removed symbols cannot survive as collection targets.
+                lanes, state = load_preminute_priority(**verified_kw)
             if state == "VALID":
                 return merge_collection_priorities(lanes, fallback), "VALID"
             return fallback, prep_state
+        if changed:
+            return {"HOT":[],"WARM":[],"COLD":[]}, "PREP_REBIND_UNVERIFIED"
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
         pass
     return lanes, state
@@ -806,7 +821,7 @@ def run_observer(*, env: str, trade_date: str, scope: str,
             # retry after readiness/reconnect, not fire once and disappear.
             lanes, priority_state = collection_priorities(
                 env=env, scope=scope, trade_date=trade_date,
-                pairs=pairs, now_epoch=time.time(),
+                pairs=pairs, now_epoch=time.time(), allow_prep_rebind=continuous,
             )
             if ws_on and time.monotonic() >= next_subscription_refresh:
                 try:
@@ -854,7 +869,8 @@ def run_observer(*, env: str, trade_date: str, scope: str,
             try:
                 def _still_hot():
                     current, state = collection_priorities(env=env, scope=scope,
-                        trade_date=trade_date, pairs=pairs, now_epoch=time.time())
+                        trade_date=trade_date, pairs=pairs, now_epoch=time.time(),
+                        allow_prep_rebind=continuous)
                     live = datetime.now(NY)
                     return (epoch_verified and live.date().isoformat() == trade_date
                             and live.time() < close_time and state in {"VALID", "PREP_VALID"}

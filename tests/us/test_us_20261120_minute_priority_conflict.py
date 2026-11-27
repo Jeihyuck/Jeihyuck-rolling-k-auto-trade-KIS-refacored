@@ -314,3 +314,33 @@ def test_prep_launch_is_readonly_and_never_runs_on_holiday(tmp_path, monkeypatch
     assert kwargs["env"]["US_ORDER_ARMED"]=="0"
     assert kwargs["env"]["US_KIS_ORDER_ALLOWED"]=="0"
     assert kwargs["env"]["DRY_RUN"]=="1"
+
+
+def test_continuous_collection_rebind_requires_exact_recovered_prep_contract(tmp_path,monkeypatch):
+    import json
+    from trader.us import path_contract
+    from trader.us.prep_contract import _compute_final30_hash
+    from trader.us.entry_timing.opening_observer import collection_priorities, publish_prep_collection_priority
+    old_pairs=_pairs(8)
+    rows=[{"symbol":symbol,"exchange":exch,"score_final":90-i,"rank_final30":i+1}
+          for i,(symbol,exch) in enumerate(_pairs(18)[8:])]
+    contract={"market":"US","env":"practice","trade_date":DAY,"contract_ok":True,
+              "run_revision":"a"*40,"final30_hash":_compute_final30_hash({"final30_scored":rows})}
+    cfile=tmp_path/"contract.json"
+    pfile=tmp_path/"scored.json"
+    cfile.write_text(json.dumps(contract))
+    pfile.write_text(json.dumps({"trade_date":DAY,"env":"practice","final30_scored":rows}))
+    monkeypatch.setattr(path_contract,"us_prep_contract_path",lambda day:cfile)
+    monkeypatch.setattr(path_contract,"us_final30_scored_path",lambda day:pfile)
+    before=datetime(2026,10,28,8,30,tzinfo=NY).timestamp()
+    publish_prep_collection_priority(env="practice",scope="scope:epoch",trade_date=DAY,
+        rows=rows,contract=contract,now_epoch=before,base=tmp_path)
+    kw=dict(env="practice",scope="scope:epoch",trade_date=DAY,pairs=old_pairs,
+            now_epoch=before+3600,base=tmp_path)
+    lanes,status=collection_priorities(**kw,allow_prep_rebind=True)
+    assert status=="PREP_VALID"
+    assert set(sum(lanes.values(),[]))==set(_pairs(18)[8:])
+    assert not set(sum(lanes.values(),[])) & set(old_pairs)
+    cfile.write_text(json.dumps(dict(contract,run_revision="b"*40)))
+    lanes,status=collection_priorities(**kw,allow_prep_rebind=True)
+    assert status=="PREP_REBIND_UNVERIFIED" and not sum(lanes.values(),[])

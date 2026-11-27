@@ -146,16 +146,17 @@ def _release_certificate_row(conn, row: dict, scope: dict) -> bool:
 
 
 def repair_tp_retries_at_boundary(*, trade_date: str, phase: str,
-                                   budget_sec: float = 20.0) -> dict:
+                                   budget_sec: float = 20.0, clock=None) -> dict:
     # Only AM_START / CLOSE. No historical retry loop in the trading tick.
     if str(phase).upper() not in {"AM", "AM_START", "CLOSE"}:
         return {"status": "SKIPPED_NOT_BOUNDARY", "released": 0}
     from trader.us.db.repos import _get_engine_or_none, _us_execution_claim_scope
     from datetime import date
     import time
+    clock = clock or time.monotonic
     result = {"status": "OK", "released": 0, "unverified": [], "checked": 0}
     try:
-        deadline = time.monotonic() + max(0.1,min(30.0,float(budget_sec)))
+        deadline = clock() + max(0.1,min(30.0,float(budget_sec)))
         engine = _get_engine_or_none()
         scope = _us_execution_claim_scope()
         if (engine is None or scope.get("env") != "practice"
@@ -184,7 +185,7 @@ def repair_tp_retries_at_boundary(*, trade_date: str, phase: str,
         for row in rows:
             detail={"symbol":row["symbol"],"stage":row["stage"],
                     "source_trade_date":str(row["trade_date"])}
-            if time.monotonic() >= deadline:
+            if clock() >= deadline:
                 result["unverified"].append({**detail,"reason":"DEFERRED_BOUNDARY_BUDGET"})
                 continue
             result["checked"] += 1
