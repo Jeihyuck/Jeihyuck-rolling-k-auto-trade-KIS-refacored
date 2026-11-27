@@ -3126,7 +3126,7 @@ def run_trade_tick(
         from trader.us.pb1.us_exit_engine import generate_exit_intents
         result = {"status":"OK_NO_TRADE","reason":"protective_wakeup_no_fresh_signal",
                   "protective_wakeup":True,"orders":[],"orders_sent":0,"orders_ack":0,
-                  "entry_intents":0,"exit_intents":0,"entry_can_proceed":False,
+                  "entry_intents":0,"exit_intents":0,"buy_orders":0,"entry_can_proceed":False,
                   "exit_can_proceed":bool(exit_can_proceed),"session":session,
                   "trade_date":trade_date,"positions":position_count}
         if (not real_order_mode or not authoritative_recon or not _stage4_mode

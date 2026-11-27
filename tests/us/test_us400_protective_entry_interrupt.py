@@ -178,3 +178,20 @@ def test_quote_many_provenance_and_freshness(monkeypatch,case):
     result=ws.get_quotes_many(pairs,env="practice")
     assert set(result)==(set(pairs) if case=="valid" else set())
     if result: assert all(q["collector_generation"]=="g" for q in result.values())
+
+
+@pytest.mark.parametrize("case",["ack","no_signal","uncertain","buy","missing_proof"])
+def test_remaining_idle_watch_keeps_only_independent_unattempted_holdings(case):
+    from trader.us.runner.protective_entry_interrupt import remaining_idle_watch
+    def identity(symbol):
+        return dict(symbol=symbol,strategy_owner="US_STANDARD",position_lifecycle_id=symbol,
+                    position_cycle_id=symbol,portfolio_epoch_id="p",trading_epoch_id="e",broker_account_hash="a")
+    watch=[dict(identity=identity(s),entry=100,hard=.06,exchange="NASDAQ") for s in ("ABC","DEF","GHI")]
+    ack=case=="ack"
+    result=dict(status="OK_EXIT_ORDERS_SENT" if ack else "OK_NO_TRADE",
+                reason="protective_wakeup_routed" if ack else "protective_wakeup_no_fresh_signal",
+                protective_wakeup=case!="missing_proof",entry_intents=0,buy_orders=1 if case=="buy" else 0,
+                exit_intents=int(ack),orders_sent=int(ack),orders_ack=int(ack),
+                exit_route_reconcile_required=case=="uncertain")
+    assert remaining_idle_watch(watch,identity("ABC"),result)==(watch[1:] if case in {"ack","no_signal"} else [])
+    assert len(watch)==3

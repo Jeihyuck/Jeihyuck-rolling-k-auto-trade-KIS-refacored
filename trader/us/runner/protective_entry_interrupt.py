@@ -246,3 +246,24 @@ def route_idle_hard_stop_once(intents, *, route):
         return {"orders":[{"status":"BROKER_SUBMIT_RESULT_UNKNOWN",
                            "requires_reconcile":True,"intent":intent}
                           for intent in intents],"decisions":[]}
+
+
+def remaining_idle_watch(watch, attempted_identity, result):
+    """Only advisory hints survive; each new child independently reconciles."""
+    if (not isinstance(result,dict) or result.get("protective_wakeup") is not True
+            or result.get("exit_route_reconcile_required") or result.get("manual_reconcile_required")
+            or result.get("status") not in {"OK_NO_TRADE","OK_EXIT_ORDERS_SENT"}
+            or result.get("entry_intents")!=0 or result.get("buy_orders")!=0
+            or holding_identity(attempted_identity)!=attempted_identity):
+        return []
+    if result["status"]=="OK_EXIT_ORDERS_SENT":
+        if not (result.get("orders_sent")==result.get("orders_ack")==1
+                and result.get("exit_intents")==1 and result.get("reason")=="protective_wakeup_routed"):
+            return []
+    elif not (result.get("orders_sent")==result.get("orders_ack")==0
+              and result.get("exit_intents")==0 and result.get("reason") in
+              {"protective_wakeup_no_fresh_signal","protective_wakeup_holding_changed"}):
+        return []
+    return [row for row in watch if isinstance(row,dict)
+            and holding_identity(row.get("identity")) is not None
+            and row["identity"]["symbol"]!=attempted_identity["symbol"]]

@@ -1502,6 +1502,8 @@ def run_trade_session(
         _normal_tick_count = 0
         _protective_wakeup = None
         _protective_slot_deadline = None
+        _remaining_protective_watch = []
+        _protective_tick_count = 0
         warn_count = 0
         consecutive_errors = 0
         consecutive_tick_timeouts = 0
@@ -2184,6 +2186,10 @@ def run_trade_session(
                 _idle_watch = []
                 if _wakeup_for_tick is None:
                     _normal_tick_count += 1
+                    _protective_slot_deadline = None
+                    _remaining_protective_watch = []
+                else:
+                    _protective_tick_count += 1
                 tick_count += 1
                 tick_id = f"{session_run_id}:{tick_count}"
                 _write_active_session_state(
@@ -2331,6 +2337,12 @@ def run_trade_session(
                         tick_result.setdefault("child_pid", process_result.child_pid)
                         tick_result.setdefault("total_tick_sec", process_result.duration_sec)
                     _idle_watch = tick_result.pop("_protective_idle_watch", [])
+                    if _wakeup_for_tick is None:
+                        _remaining_protective_watch = _idle_watch
+                    else:
+                        from trader.us.runner.protective_entry_interrupt import remaining_idle_watch
+                        _remaining_protective_watch = remaining_idle_watch(
+                            _remaining_protective_watch,_wakeup_for_tick,tick_result)
                     # Never publish incomplete market data as reusable truth.
                     # Scheduled revalidation detects upstream corrections even
                     # if a provider does not publish an explicit new version.
@@ -2662,27 +2674,28 @@ def run_trade_session(
                         # overran that slot, resume normal work immediately.
                         sleep_sec=max(0.0,_protective_slot_deadline-time_mod.monotonic())
                         skipped=0
-                        _protective_slot_deadline=None
                     else:
                         sleep_sec, skipped = fixed_rate_slot(session_anchor_monotonic, _normal_tick_count, interval_sec, time_mod.monotonic())
                     skipped_slot_count += skipped
                     if skipped:
                         logger.warning("[US_TICK_LOOP][SLOTS_SKIPPED] count=%d total=%d", skipped, skipped_slot_count)
                     _idle_poll=None
-                    if (_wakeup_for_tick is None and not offline and max_ticks==0
+                    if (sleep_sec>5 and not offline and max_ticks==0
                             and not resolved_signal_only and kis_order_allowed and env=="practice"
                             and _reconcile_mode=="WORKER" and not _unreaped_child_seen
                             and bool(prep_guard_result.get("exit_can_proceed",True))
                             and os.getenv("US_DISABLE_TICK_PROCESS_ISOLATION")!="1"
                             and os.getenv("US_ENTRY_PROTECTIVE_INTERRUPT_ENABLED","1")=="1"):
                         from trader.us.runner.protective_entry_interrupt import make_idle_hard_stop_poll
-                        _idle_poll=make_idle_hard_stop_poll(_idle_watch,trade_date=trade_date,env=env)
+                        _idle_poll=make_idle_hard_stop_poll(_remaining_protective_watch,trade_date=trade_date,env=env)
                     if _idle_poll is not None:
-                        _protective_slot_deadline=time_mod.monotonic()+sleep_sec
+                        if _protective_slot_deadline is None:
+                            _protective_slot_deadline=time_mod.monotonic()+sleep_sec
                         _protective_wakeup=sleep_with_heartbeat(session,run_id,tick_count,int(sleep_sec),protective_poll=_idle_poll)
                         if _protective_wakeup is None:
                             _protective_slot_deadline=None
                     else:
+                        _protective_slot_deadline=None
                         sleep_with_heartbeat(session, run_id, tick_count, int(sleep_sec))
 
         except KeyboardInterrupt:
@@ -2745,7 +2758,7 @@ def run_trade_session(
                 )
         
         expected_to_trade = not (force_now or max_ticks > 0 or offline or resolved_signal_only)
-        if expected_to_trade and tick_count < expected_min_ticks and final_reason not in {"market_skip", "max_ticks", "force_now_single_tick", "graceful_shutdown"}:
+        if expected_to_trade and _normal_tick_count < expected_min_ticks and final_reason not in {"market_skip", "max_ticks", "force_now_single_tick", "graceful_shutdown"}:
             if final_status == "FAILED":
                 surface_reason = "early_termination_min_ticks_not_met"
                 logger.error("[US_SESSION][EARLY_TERMINATION] root_cause=%s surface_reason=%s ticks=%d expected_min_ticks=%d", root_cause or final_reason, surface_reason, tick_count, expected_min_ticks)
@@ -3307,10 +3320,12 @@ def run_trade_session(
             "endpoint_breakdown": kis_temp_errors_by_api,
             # 추가 필드
             "expected_min_ticks": expected_min_ticks,
-            "liveness_status": "FAILED" if (session in {"am", "afternoon"} and actual_is_trading_day and tick_count == 0) else ("FAILED_EARLY_TERMINATION" if (expected_min_ticks and tick_count < expected_min_ticks and final_status == "FAILED") else "OK"),
+            "normal_tick_count": _normal_tick_count,
+            "protective_tick_count": _protective_tick_count,
+            "liveness_status": "FAILED" if (session in {"am", "afternoon"} and actual_is_trading_day and tick_count == 0) else ("FAILED_EARLY_TERMINATION" if (expected_min_ticks and _normal_tick_count < expected_min_ticks and final_status == "FAILED") else "OK"),
             "last_liveness_event": _last_liveness_event,
             "has_session_finally": True,
-            "probable_liveness_cause": ("FAILED_PREP_GUARD" if str(final_reason).startswith("prep_guard") else "NO_TICK_EXECUTED") if (session in {"am", "afternoon"} and actual_is_trading_day and tick_count == 0) else ((root_cause or final_reason) if (expected_min_ticks and tick_count < expected_min_ticks and final_status == "FAILED") else ""),
+            "probable_liveness_cause": ("FAILED_PREP_GUARD" if str(final_reason).startswith("prep_guard") else "NO_TICK_EXECUTED") if (session in {"am", "afternoon"} and actual_is_trading_day and tick_count == 0) else ((root_cause or final_reason) if (expected_min_ticks and _normal_tick_count < expected_min_ticks and final_status == "FAILED") else ""),
             "root_cause": root_cause,
             "surface_reason": surface_reason,
             "received_signal": _signal_name(_received_signal),
