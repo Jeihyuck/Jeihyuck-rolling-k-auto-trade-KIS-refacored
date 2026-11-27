@@ -348,6 +348,14 @@ def test_continuous_collection_rebind_requires_exact_recovered_prep_contract(tmp
     assert status=="PREP_VALID"
     assert set(sum(lanes.values(),[]))==set(_pairs(18)[8:])
     assert not set(sum(lanes.values(),[])) & set(old_pairs)
+    # A fresh old execution manifest must not survive a half-published
+    # replacement of the PREP scored universe.
+    publish_preminute_candidates(env="practice",scope="scope:epoch",trade_date=DAY,
+        candidates=_candidates(old_pairs),now_epoch=before+3599,base=tmp_path)
+    assert load_preminute_priority(**{k:v for k,v in kw.items()})[1] == "VALID"
+    cfile.write_text(json.dumps(dict(contract,final30_hash="wrong")))
+    lanes,status=collection_priorities(**kw,allow_prep_rebind=True)
+    assert status=="PREP_REBIND_UNVERIFIED" and not sum(lanes.values(),[])
     cfile.write_text(json.dumps(dict(contract,run_revision="b"*40)))
     lanes,status=collection_priorities(**kw,allow_prep_rebind=True)
     assert status=="PREP_REBIND_UNVERIFIED" and not sum(lanes.values(),[])
