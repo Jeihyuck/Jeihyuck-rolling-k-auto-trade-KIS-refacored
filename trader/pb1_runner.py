@@ -4059,6 +4059,23 @@ def _kr_fresh_policy_wait_resume(*, env: str, strategy: str, session_kind: str,
     return not any((metrics.get("warning_counts") or {}).values())
 
 
+def _kr_protective_yield_resume(*, env, strategy, session_kind, status, metrics):
+    """Shorten idle only for a clean, completed cooperative pre-submit yield."""
+    return bool(
+        env == "practice" and strategy == "pb1_pullback_close"
+        and session_kind in {"am", "afternoon", "pm"}
+        and status == "OK_NO_TRADE"
+        and metrics.get("tick_result_reason") == "KR_PROTECTIVE_REEVALUATION_REQUIRED"
+        and metrics.get("kr_infinite_decision") == "WAIT"
+        and not metrics.get("degraded")
+        and not any((metrics.get("warning_counts") or {}).values())
+        and all(metrics.get(k) == 0 for k in ("api_submitted", "buy_orders", "sell_orders"))
+        and all(metrics.get(k, 0) == 0 for k in ("accepted","rejected","filled","buy_orders_ack","sell_orders_ack"))
+        and os.getenv("PB1_PENDING_RECONCILE_ONLY", "0") != "1"
+        and os.getenv("KR_PB1_PROTECTIVE_WAKE_ENABLED", "1") == "1"
+    )
+
+
 _WINDOW_MISMATCH_LOGGED = False
 BALANCE_STATE_OK = "OK"
 BALANCE_STATE_STALE_OK = "STALE_OK"
@@ -9362,6 +9379,19 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                     if sleep_for <= 0:
                         exit_reason = "session_end"
                         break
+                    if _kr_protective_yield_resume(
+                        env=ctx.env, strategy=last_tick_metrics.get("strategy_owner", ""),
+                        session_kind=session_kind, status=result_status, metrics=last_tick_metrics,
+                    ):
+                        # Previous tick fully settled; do not overlap or reuse
+                        # its holdings, BUY authorization or SELL observations.
+                        time_mod.sleep(min(1.0, sleep_for))
+                        logger.info("[KR][PROTECTIVE_YIELD][FRESH_SERIAL_TICK] order_authorization=0")
+                        sticky_precheck_reason = None
+                        sticky_precheck_count = 0
+                        sticky_runtime_signature = None
+                        sticky_runtime_count = 0
+                        continue
                     _entry_wakes = (
                         last_tick_metrics.get("quote_wake_targets") or []
                         if (_kr_fresh_policy_wait_resume(
