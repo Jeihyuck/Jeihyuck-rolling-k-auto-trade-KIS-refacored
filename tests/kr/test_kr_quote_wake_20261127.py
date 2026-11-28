@@ -595,3 +595,35 @@ def test_idle_protective_wake_rejects_wrong_symbol_or_order_authorization():
             protective_probe=lambda *a: invalid,
         ) is None
         assert not state.seen
+
+
+def test_concurrent_protective_watcher_covers_long_entry_but_rejects_late_probe(monkeypatch):
+    import threading
+    import time as clock
+    class FakeClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return NOW if tz is not None else NOW.replace(tzinfo=None)
+    monkeypatch.setattr(w, "datetime", FakeClock)
+    assert w.ConcurrentProtectiveYield([]).max_runtime_sec == 180.0
+    assert w.ConcurrentProtectiveYield([], max_runtime_sec=999).max_runtime_sec == 180.0
+    elapsed = [100.0]
+    monkeypatch.setattr(clock, "monotonic", lambda: elapsed[0])
+    entered, release = threading.Event(), threading.Event()
+    def late_probe(targets, now):
+        entered.set()
+        assert release.wait(2)
+        return {"kind": "PROTECTIVE_HARD_STOP_HINT", "code": "251970",
+                "is_order_authorization": False}
+    monitor = w.ConcurrentProtectiveYield([{"code": "251970"}],
+                    probe=late_probe, max_runtime_sec=1).start()
+    try:
+        assert entered.wait(2)
+        elapsed[0] += 2
+        release.set()
+        monitor._thread.join(timeout=2)
+        assert not monitor._thread.is_alive()
+        assert monitor.check(now=NOW, monotonic=elapsed[0]) is None
+    finally:
+        release.set()
+        monitor.close()
