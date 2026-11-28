@@ -192,7 +192,7 @@ def test_remaining_idle_watch_keeps_only_independent_unattempted_holdings(case):
                 reason="protective_wakeup_routed" if ack else "protective_wakeup_no_fresh_signal",
                 protective_wakeup=case!="missing_proof",entry_intents=0,buy_orders=1 if case=="buy" else 0,
                 exit_intents=int(ack),orders_sent=int(ack),orders_ack=int(ack),
-                exit_route_reconcile_required=case=="uncertain")
+                exit_route_reconcile_required=case=="uncertain",manual_reconcile_required=0)
     assert remaining_idle_watch(watch,identity("ABC"),result)==(watch[1:] if case in {"ack","no_signal"} else [])
     assert len(watch)==3
 
@@ -498,3 +498,56 @@ def test_bounded_trend_daily_read_preserves_value_and_loader_error():
     with pytest.raises(ValueError,match="native read failed"):
         reader.read(failed)
     assert not reader.abandoned
+
+
+@pytest.mark.parametrize("case", ["exact", "wrong_symbol", "duplicate_ack", "wrong_account",
+                                  "wrong_owner", "wrong_lifecycle", "missing_scope", "malformed"])
+def test_profit_wakeup_requires_one_to_one_sell_ack_scope(case):
+    from trader.us.runner.protective_entry_interrupt import profit_wakeup_result
+    def intent(s):
+        return dict(symbol=s,side="SELL",strategy_owner="US_STANDARD",position_lifecycle_id=s,
+                    position_cycle_id=s,portfolio_epoch_id="p",trading_epoch_id="e",broker_account_hash="a")
+    intents=[intent("ABC"),intent("DEF")]
+    orders=[dict(status="ACK",intent=dict(i)) for i in intents]
+    if case=="wrong_symbol":
+        orders[-1]["intent"]["symbol"]="GHI"
+    elif case=="duplicate_ack":
+        orders[-1]["intent"]=dict(intents[0])
+    elif case=="wrong_account":
+        orders[-1]["intent"]["broker_account_hash"]="other"
+    elif case=="wrong_owner":
+        orders[-1]["intent"]["strategy_owner"]="TQQQ_INFINITE"
+    elif case=="wrong_lifecycle":
+        orders[-1]["intent"]["position_lifecycle_id"]="old"
+    elif case=="missing_scope":
+        orders[-1]["intent"].pop("trading_epoch_id")
+    elif case=="malformed":
+        orders[-1]=None
+    result=profit_wakeup_result(orders,intents,trade_date="2026-11-25",session="am",
+                               position_count=2,decisions=[])
+    assert result["status"]==("OK_EXIT_ORDERS_SENT" if case=="exact" else "WARN_RECONCILE_PENDING")
+    assert result["exit_route_reconcile_required"] is (case!="exact")
+    assert result["entry_can_proceed"] is False
+
+
+@pytest.mark.parametrize("case", ["missing_reconcile", "missing_manual", "missing_identity", "manual_debt"])
+def test_idle_stop_cannot_continue_without_explicit_reconciliation_proof(case):
+    from trader.us.runner.protective_entry_interrupt import remaining_idle_watch
+    def identity(s):
+        return dict(symbol=s,strategy_owner="US_STANDARD",position_lifecycle_id=s,
+                    position_cycle_id=s,portfolio_epoch_id="p",trading_epoch_id="e",broker_account_hash="a")
+    watch=[dict(identity=identity(s),entry=100,hard=.06,exchange="NASDAQ") for s in ("ABC","DEF")]
+    result=dict(protective_wakeup=True,status="OK_NO_TRADE",reason="protective_wakeup_no_fresh_signal",
+                entry_intents=0,buy_orders=0,exit_intents=0,orders_sent=0,orders_ack=0,
+                exit_route_reconcile_required=False,manual_reconcile_required=0)
+    attempted=identity("ABC")
+    assert remaining_idle_watch(watch,attempted,result)==watch[1:]
+    if case=="missing_reconcile":
+        result.pop("exit_route_reconcile_required")
+    elif case=="missing_manual":
+        result.pop("manual_reconcile_required")
+    elif case=="missing_identity":
+        attempted=None
+    elif case=="manual_debt":
+        result["manual_reconcile_required"]=1
+    assert remaining_idle_watch(watch,attempted,result)==[]
