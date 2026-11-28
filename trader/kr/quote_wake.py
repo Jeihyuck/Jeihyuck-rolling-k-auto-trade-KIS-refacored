@@ -339,3 +339,81 @@ class ActiveEntryYield:
                 # Missing proof/IPC must leave normal submission policy intact.
                 continue
         return None
+
+
+class ConcurrentProtectiveYield:
+    """One read-only WS watcher independent of the single PB1 order writer.
+
+    The watcher cannot query the database, calculate or submit an order, or
+    carry a SELL decision. It only latches a same-day hard-stop observation;
+    the serial writer must re-evaluate holdings, risk, broker and reconciliation
+    after its current safe boundary. This cannot guarantee broker execution
+    latency during a blocked writer/order request.
+    """
+
+    def __init__(self, targets, *, probe=probe_protective_targets,
+                 interval=5.0, max_runtime_sec=90.0):
+        import threading
+        self.targets = tuple(targets[:10])
+        self.probe = probe
+        self.interval = max(0.05, min(10.0, float(interval)))
+        self.max_runtime_sec = max(0.1, min(90.0, float(max_runtime_sec)))
+        self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._thread = None
+        self.hit = None
+
+    def start(self):
+        import threading
+        if self.targets and self._thread is None and not self._stop.is_set():
+            self._thread = threading.Thread(
+                target=self._run, name="kr-pb1-readonly-stop-watch", daemon=True,
+            )
+            self._thread.start()
+        return self
+
+    def _run(self):
+        import time as clock
+        started = clock.monotonic()
+        while (not self._stop.is_set()
+               and clock.monotonic() - started < self.max_runtime_sec):
+            observed = datetime.now(KST)
+            if not time(9, 0) <= observed.time() <= time(15, 5):
+                return
+            try:
+                signal = self.probe(self.targets, observed)
+                if (isinstance(signal, dict)
+                        and signal.get("kind") == "PROTECTIVE_HARD_STOP_HINT"
+                        and signal.get("is_order_authorization") is False
+                        and signal.get("code") in {t["code"] for t in self.targets}
+                        and not self._stop.is_set()):
+                    self.hit = {**signal, "observed_at": observed.isoformat()}
+                    self._ready.set()
+                    return
+            except Exception:
+                # Optional transport observation must not affect SELL/BUY lanes.
+                pass
+            remaining = self.max_runtime_sec - (clock.monotonic() - started)
+            if remaining <= 0:
+                return
+            self._stop.wait(min(self.interval, remaining))
+
+    def check(self, *, now, monotonic):
+        if not self._ready.is_set() or self._stop.is_set():
+            return None
+        try:
+            observed = datetime.fromisoformat(self.hit["observed_at"])
+            if (now.tzinfo is None or observed.tzinfo is None
+                    or now.astimezone(KST).date() != observed.astimezone(KST).date()
+                    or not 0 <= (now - observed).total_seconds() <= 10):
+                return None
+            return self.hit
+        except (TypeError, ValueError, KeyError, AttributeError):
+            return None
+
+    def close(self):
+        self._stop.set()
+        worker = self._thread
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=0.05)
+
