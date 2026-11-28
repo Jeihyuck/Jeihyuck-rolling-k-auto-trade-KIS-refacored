@@ -2198,6 +2198,8 @@ def run_trade_session(
                 _protective_wakeup = None
                 _idle_watch = []
                 _entry_profit_followup=None
+                _active_protective_followup = None
+                _prior_protective_watch = _remaining_protective_watch
                 if _wakeup_for_tick is None:
                     _normal_tick_count += 1
                     _protective_slot_deadline = None
@@ -2335,11 +2337,27 @@ def run_trade_session(
                         tick_result = run_trade_tick(**tick_kwargs)
                     else:
                         from trader.us.runner.tick_process import run_tick_in_process, TickChildUnverifiedError
+                        _active_watch = None
+                        if (_wakeup_for_tick is None and _prior_protective_watch
+                                and env == "practice" and not force_now and max_ticks == 0
+                                and not resolved_signal_only and kis_order_allowed
+                                and _reconcile_mode == "WORKER" and not _unreaped_child_seen
+                                and bool(prep_guard_result.get("exit_can_proceed", True))
+                                and os.getenv("US_ENTRY_PROTECTIVE_INTERRUPT_ENABLED", "1") == "1"):
+                            from trader.us.runner.protective_entry_interrupt import (
+                                ActiveProtectiveWatch, make_idle_hard_stop_poll,
+                            )
+                            _active_poll = make_idle_hard_stop_poll(
+                                _prior_protective_watch, trade_date=trade_date, env=env,
+                            )
+                            if _active_poll is not None:
+                                _active_watch = ActiveProtectiveWatch(_active_poll)
                         try:
                             process_result = run_tick_in_process(
                                 run_trade_tick, kwargs=tick_kwargs, timeout_sec=tick_timeout_sec,
                                 terminate_grace_sec=float(os.getenv("US_TICK_TERMINATE_GRACE_SEC", "10")),
                                 fence_account_scope=session_account_scope,
+                                **({"observe_while_running": _active_watch} if _active_watch is not None else {}),
                             )
                         except TickChildUnverifiedError as exc:
                             _unreaped_child_seen = True
@@ -2356,6 +2374,10 @@ def run_trade_session(
                             final_reason = "tick_child_unreaped"
                             raise
                         tick_result = process_result.result
+                        if _active_watch is not None:
+                            _active_protective_followup = _active_watch.followup(
+                                tick_result, tick_result.get("_protective_idle_watch") or [],
+                            )
                         tick_result.setdefault("child_pid", process_result.child_pid)
                         tick_result.setdefault("total_tick_sec", process_result.duration_sec)
                     _idle_watch = tick_result.pop("_protective_idle_watch", [])
@@ -2713,6 +2735,15 @@ def run_trade_session(
                     skipped_slot_count += skipped
                     if skipped:
                         logger.warning("[US_TICK_LOOP][SLOTS_SKIPPED] count=%d total=%d", skipped, skipped_slot_count)
+                    if _active_protective_followup is not None:
+                        # Detection during a busy tick never starts another
+                        # writer. The reaped child has finished and the next
+                        # canonical SELL-only tick revalidates all authority.
+                        _protective_wakeup = _active_protective_followup
+                        _protective_slot_deadline = time_mod.monotonic() + sleep_sec
+                        _hot_idle_wait = None
+                        logger.info("[US_EXIT][ACTIVE_WATCH_FOLLOWUP] action=SERIAL_SELL_ONLY")
+                        continue
                     if (_entry_profit_followup is not None and _wakeup_for_tick is None
                             and sleep_sec>5 and not offline and max_ticks==0
                             and not resolved_signal_only and kis_order_allowed and env=="practice"

@@ -180,6 +180,34 @@ def _record(conn, *, pnl, qty, bid, now, snap, sold,
     )
 
 
+def test_close_reads_signed_guard_from_one_readonly_snapshot(store, monkeypatch):
+    from trader import account_state
+    from trader.us.db import repos
+    from trader.us.execution import recovery_identity
+    from trader.us.portfolio_profit_guard_store import portfolio_guard_close_health
+
+    engine, now = store
+    with engine.begin() as conn:
+        baseline = _record(conn, pnl="100", qty=10, bid="100", now=now, snap="close", sold=0)
+        assert baseline["state"] == "WATCH"
+
+    def resolve_epoch(conn, *, required):
+        assert required
+        assert conn.exec_driver_sql("SHOW transaction_read_only").scalar_one() == "on"
+        assert conn.exec_driver_sql("SHOW transaction_isolation").scalar_one() == "repeatable read"
+        return EPOCH
+
+    monkeypatch.setenv("US_PORTFOLIO_GUARD_ACTIVE", "1")
+    monkeypatch.setattr(account_state, "get_account_key", lambda **_: RAW_ACCOUNT)
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: engine)
+    monkeypatch.setattr(repos, "_active_us_epoch", resolve_epoch)
+    monkeypatch.setattr(recovery_identity, "current_us_portfolio_epoch", lambda *args, **kw: PORT)
+    result = portfolio_guard_close_health(env="practice", offline=False)
+    assert result["status"] == "WATCH"
+    assert result["orders_checked"] == 0
+    assert Decimal(result["hwm_usd"]) == Decimal("100")
+
+
 def test_pg_native_post_ack_fill_completion_and_stage2_no_double_sell(store):
     engine,now = store
     with engine.begin() as conn:

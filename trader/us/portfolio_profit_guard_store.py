@@ -30,7 +30,8 @@ class PortfolioGuardUnavailable(RuntimeError):
     pass
 
 
-def _get_policy(conn, *, account_hash: str, epoch: str, portfolio: str, now: datetime) -> tuple[dict, str] | None:
+def _get_policy(conn, *, account_hash: str, epoch: str, portfolio: str,
+                now: datetime, lock: bool = True) -> tuple[dict, str] | None:
     policy_rows = conn.execute(text("""
         SELECT policy_id,policy_version,authorization_sha256,authorization_json
         FROM public.us_portfolio_guard_policy
@@ -39,8 +40,10 @@ def _get_policy(conn, *, account_hash: str, epoch: str, portfolio: str, now: dat
           AND portfolio_epoch_id=:portfolio
           AND effective_at<=:now AND expires_at>:now
         ORDER BY signed_at DESC
-        LIMIT 2 FOR UPDATE
-    """), {"account": account_hash, "epoch": epoch, "portfolio": portfolio, "now": now}).mappings().all()
+        LIMIT 2
+    """ + (" FOR UPDATE" if lock else "")), {
+        "account": account_hash, "epoch": epoch, "portfolio": portfolio, "now": now,
+    }).mappings().all()
     if not policy_rows:
         return None
     if len(policy_rows) != 1:
@@ -1073,6 +1076,9 @@ def portfolio_guard_close_health(*, env: str, offline: bool) -> dict:
         account_hash = hashlib.sha256(raw_account.encode()).hexdigest()
         now = datetime.now(timezone.utc)
         with engine.connect() as conn:
+            # Read policy, epoch, state and fill proofs from one snapshot.
+            # Close does not acquire the policy lock used by the order path.
+            conn.exec_driver_sql("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             epoch = str(_active_us_epoch(conn, required=True))
             portfolio = current_us_portfolio_epoch(
                 conn, env="practice", account_key=raw_account,
@@ -1080,7 +1086,7 @@ def portfolio_guard_close_health(*, env: str, offline: bool) -> dict:
             )
             authorized = _get_policy(
                 conn, account_hash=account_hash, epoch=epoch,
-                portfolio=portfolio, now=now,
+                portfolio=portfolio, now=now, lock=False,
             )
             if authorized is None:
                 return {"status": "UNAUTHORIZED", "orders_checked": 0}

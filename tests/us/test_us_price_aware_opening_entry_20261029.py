@@ -602,7 +602,8 @@ def test_incremental_opening_geometry_vwap_parity_and_invalidation(tmp_path,monk
         clear_feature_cache()
 
 
-@pytest.mark.parametrize("change",["slide","min_removed","multi_slide","correction","gap","scope","truncation"])
+@pytest.mark.parametrize("change",["slide","min_removed","equal_mins","multi_slide","correction",
+                                   "gap","scope","truncation","operand_type"])
 def test_rolling_native_feature_slide_exact_parity(tmp_path,monkeypatch,change):
     from trader.us.entry_timing import opportunity
     from trader.marketdata.feature_reuse import clear_feature_cache
@@ -615,6 +616,9 @@ def test_rolling_native_feature_slide_exact_parity(tmp_path,monkeypatch,change):
     assert len(rows)==20
     if change=="min_removed":
         rows[0]["low"]=1.0
+    if change=="equal_mins":
+        rows[0]["low"]=rows[1]["low"]=1.0
+        rows[15]["volume"]=3701
     original=opportunity._recent_static_features
     calls=[]
     def counted(bars):
@@ -631,8 +635,12 @@ def test_rolling_native_feature_slide_exact_parity(tmp_path,monkeypatch,change):
         if change=="gap": newer.pop(8)
         if change=="scope": scope=("other:epoch",*scope[1:])
         if change=="truncation": newer=newer[-10:]
+        if change=="operand_type":
+            volume = newer[-2]["volume"]
+            newer[-2]["volume"] = int(volume) if type(volume) is float else float(volume)
         assert opportunity.recent_static_features(newer,DAY,feature_scope=scope)==original(newer[-15:])
-        assert calls==([15] if change in {"slide","min_removed","multi_slide"} else [15,min(len(newer),15)])
+        assert calls==([15] if change in {"slide","min_removed","equal_mins","multi_slide"}
+                       else [15,min(len(newer),15)])
     finally:
         clear_feature_cache()
 

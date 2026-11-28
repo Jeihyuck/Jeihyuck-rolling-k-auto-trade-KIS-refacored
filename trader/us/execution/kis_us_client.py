@@ -427,7 +427,8 @@ class KisUSClient:
         return rows
 
     def get_us_intraday_1m_page(self, symbol: str, exchange: str, *,
-                                before_key: str = "", count: int = 120) -> dict:
+                                before_key: str = "", count: int = 120,
+                                deadline_monotonic: float | None = None) -> dict:
         """Bounded authenticated native minute read, with continuation evidence.
 
         KIS official overseas-stock 030 specifies PINC=1/NEXT=1 and KEYB
@@ -447,17 +448,29 @@ class KisUSClient:
             if len(cursor) != 14 or not cursor.isdigit():
                 raise ValueError("invalid_native_minute_cursor")
             datetime.strptime(cursor, "%Y%m%d%H%M%S")
-        headers = self._build_headers("HHDFS76950200")
-        if cursor:
-            headers["tr_cont"] = "N"
         params = {
             "AUTH": "", "EXCD": self._resolve_quote_excd(exchange), "SYMB": symbol,
             "NMIN": "1", "PINC": "1" if cursor else "0", "NEXT": "1" if cursor else "",
             "NREC": str(max(1, min(120, int(count)))), "FILL": "", "KEYB": cursor,
         }
-        requested_at = datetime.now(timezone.utc)
-        response = self._get("/uapi/overseas-price/v1/quotations/inquire-time-itemchartprice",
-                             headers=headers, params=params, max_attempts_override=1)
+        previous_deadline = getattr(self, "_stage_deadline", None)
+        if deadline_monotonic is not None:
+            self._stage_deadline = (
+                min(previous_deadline, deadline_monotonic) if previous_deadline is not None
+                else deadline_monotonic
+            )
+        try:
+            if deadline_monotonic is not None:
+                self._request_budget()
+            headers = self._build_headers("HHDFS76950200")
+            if cursor:
+                headers["tr_cont"] = "N"
+            requested_at = datetime.now(timezone.utc)
+            response = self._get("/uapi/overseas-price/v1/quotations/inquire-time-itemchartprice",
+                                 headers=headers, params=params, max_attempts_override=1)
+        finally:
+            if deadline_monotonic is not None:
+                self._stage_deadline = previous_deadline
         observed_at = datetime.now(timezone.utc)
         if not isinstance(response, dict) or str(response.get("rt_cd")) != "0":
             raise KisUSClientError("KIS_US_1M_BAR_RESPONSE_UNVERIFIED")
