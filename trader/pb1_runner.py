@@ -4088,6 +4088,32 @@ def _kr_protective_yield_resume(*, env, strategy, session_kind, status, metrics)
     )
 
 
+def _kr_reconcile_fenced_protective_wakes(*, env, strategy, session_kind, status, metrics):
+    """Only a settled, fenced tick may wake for read-only protection.
+
+    This does not clear historical debt, authorize any order, or change the
+    next tick's reconciliation gates. Never schedule an entry quote wake here.
+    """
+    if (
+        env != "practice" or strategy != "pb1_pullback_close"
+        or session_kind not in {"am", "afternoon", "pm"}
+        or status != "BLOCKED_RECONCILE"
+        or metrics.get("tick_result_reason") not in {
+            "historical_recovery_unverified", "KR_POST_EXIT_BROKER_RECONCILE_UNVERIFIED",
+        }
+        or metrics.get("protective_fenced_zero_submit_proven") is not True
+        or metrics.get("degraded")
+        or any((metrics.get("warning_counts") or {}).values())
+        or any(metrics.get(k) != 0 for k in ("api_submitted", "buy_orders", "sell_orders"))
+        or any(metrics.get(k, 0) != 0 for k in ("accepted", "rejected", "filled", "buy_orders_ack", "sell_orders_ack"))
+        or os.getenv("PB1_PENDING_RECONCILE_ONLY", "0") == "1"
+        or os.getenv("KR_PB1_PROTECTIVE_WAKE_ENABLED", "1") != "1"
+        or os.getenv("KR_PB1_FENCED_PROTECTIVE_WAKE_ENABLED", "1") != "1"
+    ):
+        return []
+    return list(metrics.get("protective_wake_targets") or [])[:10]
+
+
 _WINDOW_MISMATCH_LOGGED = False
 BALANCE_STATE_OK = "OK"
 BALANCE_STATE_STALE_OK = "STALE_OK"
@@ -8764,7 +8790,21 @@ def run_once(
             _target = make_protective_target(_evaluation, now)
             if _target:
                 _protective_targets.append(_target)
+    # The blocked-reconcile wake path is stricter than ordinary idle wakes:
+    # do not interpret missing counters or a failed other owner as zero.
+    from trader.kr.reconcile_lanes_257 import exit_pass_proves_zero_sell
+    _zero_sell_proven, _ = exit_pass_proves_zero_sell(
+        exit_pass_ok=bool(getattr(engine_runner, "_kr_exit_pass_ok", False)),
+        exit_summary=getattr(engine_runner, "_exit_summary_payload", None),
+    )
+    _entry_summary = getattr(engine_runner, "_run_summary_payload", None) or {}
+    _fenced_zero_submit = bool(
+        engine_completed and _zero_sell_proven
+        and getattr(engine_runner, "_kr_infinite_submit_attempted", None) is False
+        and all(_entry_summary.get(k) == 0 for k in ("api_submitted", "submitted", "order_candidates"))
+    )
     metrics = {
+        "protective_fenced_zero_submit_proven": _fenced_zero_submit,
         "balance_api_calls": result.balance_api_calls if result else 0,
         "balance_cache_hits": result.balance_cache_hits if result else 0,
         "balance_tick_cache_hits": result.balance_tick_cache_hits if result else 0,
@@ -9479,7 +9519,24 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 if sleep_for <= 0:
                     exit_reason = "session_end"
                     break
-                time_mod.sleep(sleep_for)
+                _fenced_wakes = _kr_reconcile_fenced_protective_wakes(
+                    env=ctx.env, strategy=last_tick_metrics.get("strategy_owner", ""),
+                    session_kind=session_kind, status=result_status, metrics=last_tick_metrics,
+                )
+                if _fenced_wakes:
+                    # Preserve the existing BUY fence. Only a fresh hard-stop
+                    # observation can shorten idle, with one canonical writer.
+                    wake = wait_for_quote_wake(
+                        targets=[], protective_targets=_fenced_wakes,
+                        state=quote_wake_state, seconds=sleep_for,
+                        session_end=session_end_dt, now=_get_now_kst,
+                        monotonic=time_mod.monotonic, sleep=time_mod.sleep,
+                    )
+                    if wake:
+                        logger.info("[KR][PROTECTIVE_WAKE][RECONCILE_FENCED] code=%s "
+                                    "action=FRESH_SERIAL_TICK order_authorization=0", wake["code"])
+                else:
+                    time_mod.sleep(sleep_for)
                 continue
             except TickTimeoutError as exc:
                 # RECOVERABLE TIMEOUT - not fatal, just degraded
