@@ -242,3 +242,56 @@ class ProtectiveYield:
             # Optional WS hints cannot break the normal broker/entry flow.
             pass
         return self.hit
+
+
+# Only the optional daily-price bulk SELECT may use this lane. One outstanding
+# detached read per process; it cannot submit orders or mutate engine state.
+from threading import BoundedSemaphore
+_PRICE_READ_SLOT = BoundedSemaphore(1)
+
+
+def protective_daily_read(loader, *, checkpoint, poll_sec=.25):
+    """Return (completed, result), polling protection while a pure SELECT waits.
+
+    The caller must supply a private, disposable DB engine inside loader,
+    not a shared account/order repository. If a stop hint arrives, discard
+    the read result and let the sole writer finalize the zero-order tick.
+    Without a hint the original read completes/errors normally. No second
+    worker is launched while an abandoned read is still outstanding.
+    """
+    import queue
+    import threading
+
+    if checkpoint():
+        return False, None
+    if not _PRICE_READ_SLOT.acquire(blocking=False):
+        # Optional preload may be missed; never launch overlapping workers.
+        return False, None
+    output = queue.Queue(maxsize=1)
+
+    def read():
+        try:
+            output.put((True, loader()))
+        except BaseException as exc:
+            output.put((False, exc))
+        finally:
+            _PRICE_READ_SLOT.release()
+
+    try:
+        threading.Thread(target=read, name="kr-pb1-price-daily-read", daemon=True).start()
+    except BaseException:
+        _PRICE_READ_SLOT.release()
+        raise
+    interval = max(.01, min(.5, float(poll_sec)))
+    while True:
+        if checkpoint():
+            return False, None
+        try:
+            ok, result = output.get(timeout=interval)
+        except queue.Empty:
+            continue
+        if checkpoint():
+            return False, None
+        if not ok:
+            raise result
+        return True, result
