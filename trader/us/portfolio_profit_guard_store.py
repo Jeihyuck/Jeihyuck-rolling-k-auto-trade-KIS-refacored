@@ -30,7 +30,8 @@ class PortfolioGuardUnavailable(RuntimeError):
     pass
 
 
-def _get_policy(conn, *, account_hash: str, epoch: str, portfolio: str, now: datetime) -> tuple[dict, str] | None:
+def _get_policy(conn, *, account_hash: str, epoch: str, portfolio: str,
+                now: datetime, lock: bool = True) -> tuple[dict, str] | None:
     policy_rows = conn.execute(text("""
         SELECT policy_id,policy_version,authorization_sha256,authorization_json
         FROM public.us_portfolio_guard_policy
@@ -39,8 +40,10 @@ def _get_policy(conn, *, account_hash: str, epoch: str, portfolio: str, now: dat
           AND portfolio_epoch_id=:portfolio
           AND effective_at<=:now AND expires_at>:now
         ORDER BY signed_at DESC
-        LIMIT 2 FOR UPDATE
-    """), {"account": account_hash, "epoch": epoch, "portfolio": portfolio, "now": now}).mappings().all()
+        LIMIT 2
+    """ + (" FOR UPDATE" if lock else "")), {
+        "account": account_hash, "epoch": epoch, "portfolio": portfolio, "now": now,
+    }).mappings().all()
     if not policy_rows:
         return None
     if len(policy_rows) != 1:
@@ -73,6 +76,31 @@ def _action_key(
     return "US_PPG_" + hashlib.sha256(canonical(material)).hexdigest()[:32]
 
 
+def preflight_guard_native_execution_prices(native_valuations, exchange_resolver):
+    """Validate ALL order inputs before any durable stage/action reservation.
+
+    The caller must not leave PLANNED actions behind because an executable
+    price rounds to zero or exchange mapping fails after the DB transaction.
+    These prices remain advisory until the canonical per-order pre-HTTP
+    native quote, owner, pending and reservation checks succeed.
+    """
+    from decimal import ROUND_FLOOR
+    prepared = {}
+    for native in native_valuations:
+        symbol = str(native["symbol"]).upper()
+        bid = _decimal(native["mark_bid_usd"])
+        if not symbol or symbol in prepared or not bid.is_finite() or bid <= 0:
+            raise PortfolioGuardUnavailable("PORT_GUARD_EXECUTABLE_PRICE_INVALID")
+        limit = (bid * Decimal("0.998")).quantize(Decimal("0.01"), rounding=ROUND_FLOOR)
+        if not limit.is_finite() or limit <= 0:
+            raise PortfolioGuardUnavailable("PORT_GUARD_EXECUTABLE_PRICE_INVALID")
+        exchange = exchange_resolver(symbol)
+        if not isinstance(exchange, str) or not exchange.strip():
+            raise PortfolioGuardUnavailable("PORT_GUARD_EXCHANGE_UNVERIFIED")
+        prepared[symbol] = (exchange, bid, limit)
+    return prepared
+
+
 def reconcile_guard_native_order_actions(
     conn, *, policy: dict, account_hash: str, epoch: str, portfolio: str,
     episode: str,
@@ -92,7 +120,8 @@ def reconcile_guard_native_order_actions(
         SELECT a.action_key,a.symbol,a.position_cycle_id,a.target_qty,
                a.cumulative_verified_fill_qty,a.state,
                o.status AS order_status,o.qty_filled AS broker_qty_filled,
-               o.order_no,o.meta AS order_meta,o.client_order_key,
+               o.order_no,o.trade_date AS order_trade_date,
+               o.symbol AS order_symbol,o.meta AS order_meta,o.client_order_key,
                o.trading_epoch_id,o.portfolio_epoch_id,
                o.position_cycle_id AS order_cycle,
                o.account_id AS order_account
@@ -124,7 +153,9 @@ def reconcile_guard_native_order_actions(
             continue
         meta = row.get("order_meta") if isinstance(row.get("order_meta"), dict) else {}
         if (
-            str(row.get("order_account") or "") not in ("", account_hash)
+            str(row.get("order_account") or "") != account_hash
+            or row.get("order_trade_date") is None
+            or str(row.get("order_symbol") or "").upper() != row["symbol"]
             or str(row.get("order_cycle") or "") != row["position_cycle_id"]
             or str(row.get("trading_epoch_id") or "") != epoch
             or str(row.get("portfolio_epoch_id") or "") != portfolio
@@ -140,9 +171,15 @@ def reconcile_guard_native_order_actions(
             raise PortfolioGuardUnavailable("PORT_GUARD_ORDER_FILL_QTY_UNVERIFIED")
         if observed_qty < 0 or observed_qty > target:
             raise PortfolioGuardUnavailable("PORT_GUARD_NATIVE_ORDER_OVERFILLED")
-        # Only native ledger fill rows, never synthetic local ACK, can satisfy.
+        # Only native ledger fill rows for THIS broker order may satisfy.
+        # Client keys can be reused across recovery attempts; another order's
+        # fills must not complete or release a guarded exposure reduction.
+        from trader.us.utils.order_no import normalize_us_order_no
+        expected_no = normalize_us_order_no(row["order_no"])
+        if not expected_no or expected_no == "0":
+            return {"state": "BLOCKED", "reason": "GUARD_NATIVE_ORDER_NUMBER_UNVERIFIED"}
         actual = conn.execute(text("""
-            SELECT COALESCE(SUM(qty),0) AS qty
+            SELECT order_no,trade_date,qty
             FROM public.us_fills
             WHERE symbol=:symbol AND side='SELL'
               AND account_id=:account
@@ -155,8 +192,15 @@ def reconcile_guard_native_order_actions(
         """), {"symbol":row["symbol"],"epoch":epoch,
                "portfolio":portfolio,"cycle":row["position_cycle_id"],
                "account":account_hash,
-               "key":row["action_key"]}).mappings().one()
-        native_filled = int(actual["qty"] or 0)
+               "key":row["action_key"]}).mappings().all()
+        if any(normalize_us_order_no(fill["order_no"]) != expected_no
+               or fill["trade_date"] != row["order_trade_date"]
+               or int(fill["qty"] or 0) <= 0 for fill in actual):
+            return {"state":"BLOCKED","reason":"GUARD_NATIVE_FILL_ORDER_IDENTITY_CONFLICT"}
+        native_filled = sum(int(fill["qty"]) for fill in actual)
+        prior_filled = int(row["cumulative_verified_fill_qty"] or 0)
+        if native_filled < prior_filled:
+            return {"state":"BLOCKED","reason":"GUARD_NATIVE_FILL_REGRESSED"}
         if native_filled != observed_qty:
             # Even FILLED broker row is not terminal before Stage4's native
             # cumulative actual persistence is durable.
@@ -947,6 +991,11 @@ def build_authorized_portfolio_guard_intents(
             economics["method"], pnl, economics.get("confirmed_net_pnl_usd"),
             economics.get("verified_fee_fill_count"),
         )
+        # Preflight order construction BEFORE the transactional stage reserve.
+        # Pre-HTTP always obtains fresh native authority; this cannot submit.
+        preflight_prices = preflight_guard_native_execution_prices(
+            native_valuations, resolve_quote_exchange,
+        )
         snapshot_id = hashlib.sha256(canonical({
             "accounting_method": economics["method"],
             "policy_sha256": manifest_digest, "epoch": epoch,
@@ -983,10 +1032,7 @@ def build_authorized_portfolio_guard_intents(
                     or str(position.get("portfolio_epoch_id") or meta.get("portfolio_epoch_id") or "") != portfolio):
                 raise PortfolioGuardUnavailable("PORT_GUARD_ORIGINAL_POSITION_SCOPE_INVALID")
             native = next(v for v in native_valuations if v["symbol"] == p["symbol"])
-            bid = _decimal(native["mark_bid_usd"])
-            limit = (bid * Decimal("0.998")).quantize(Decimal("0.01"), rounding=ROUND_FLOOR)
-            if limit <= 0:
-                raise PortfolioGuardUnavailable("PORT_GUARD_EXECUTABLE_PRICE_INVALID")
+            exchange, bid, limit = preflight_prices[p["symbol"]]
             original_sha = str(meta.get("entry_exit_contract_sha256") or "")
             original_version = str(meta.get("entry_exit_contract_version") or "")
             if not original_sha or not original_version:
@@ -1008,7 +1054,7 @@ def build_authorized_portfolio_guard_intents(
                 "position_lifecycle_id": cycle,
             }
             output.append({
-                "symbol": p["symbol"], "exchange": resolve_quote_exchange(p["symbol"]),
+                "symbol": p["symbol"], "exchange": exchange,
                 "side": "SELL", "qty": p["qty"], "available_qty": p["qty"],
                 "limit_price": float(limit), "notional_usd": float(limit * p["qty"]),
                 "strategy": "us_portfolio_profit_guard",
@@ -1057,6 +1103,9 @@ def portfolio_guard_close_health(*, env: str, offline: bool) -> dict:
         account_hash = hashlib.sha256(raw_account.encode()).hexdigest()
         now = datetime.now(timezone.utc)
         with engine.connect() as conn:
+            # Read policy, epoch, state and fill proofs from one snapshot.
+            # Close does not acquire the policy lock used by the order path.
+            conn.exec_driver_sql("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             epoch = str(_active_us_epoch(conn, required=True))
             portfolio = current_us_portfolio_epoch(
                 conn, env="practice", account_key=raw_account,
@@ -1064,7 +1113,7 @@ def portfolio_guard_close_health(*, env: str, offline: bool) -> dict:
             )
             authorized = _get_policy(
                 conn, account_hash=account_hash, epoch=epoch,
-                portfolio=portfolio, now=now,
+                portfolio=portfolio, now=now, lock=False,
             )
             if authorized is None:
                 return {"status": "UNAUTHORIZED", "orders_checked": 0}

@@ -4,7 +4,7 @@ on:
   push:
     branches: [fix/us-broker-epoch-cycle-recovery-fence-20261104]
   pull_request:
-    branches: [dual-agent]
+    branches: [dual-agent, fix/us-rebuild-04-features-performance-20261127]
     paths:
       - ".github/workflows/us243-controlled-native-path-ci.yml"
       - "tests/us/test_us_pr243_twenty_native_http_boundary.py"

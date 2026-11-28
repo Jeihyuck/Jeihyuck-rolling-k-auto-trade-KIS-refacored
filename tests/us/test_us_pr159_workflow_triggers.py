@@ -16,6 +16,7 @@ def test_pr159_required_workflows_target_exact_stabilization_base():
     expected = {
         ".github/workflows/us-harness.yml": [
             "dual-agent",
+            "fix/us-rebuild-04-features-performance-20261127",
             "fix/us-20261126-hot-only-tp90-integrated",
             "stabilize/01-execution-state-contract-20261004",
             "stabilize/02-us-broker-recovery-20261004",

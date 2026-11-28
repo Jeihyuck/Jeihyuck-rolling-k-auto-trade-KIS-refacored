@@ -56,6 +56,7 @@ def store(monkeypatch):
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS public.us_orders (
                 id bigserial primary key,
+                trade_date date NOT NULL DEFAULT current_date,
                 client_order_key text,
                 side text,
                 env text,
@@ -82,6 +83,7 @@ def store(monkeypatch):
             );
             CREATE TABLE IF NOT EXISTS public.us_fills (
                 id bigserial primary key,
+                trade_date date NOT NULL DEFAULT current_date,
                 symbol text,
                 side text,
                 env text,
@@ -90,6 +92,7 @@ def store(monkeypatch):
                 position_cycle_id text,
                 account_id text,
                 client_order_key text,
+                order_no text,
                 qty integer,
                 meta jsonb
             );
@@ -177,6 +180,34 @@ def _record(conn, *, pnl, qty, bid, now, snap, sold,
     )
 
 
+def test_close_reads_signed_guard_from_one_readonly_snapshot(store, monkeypatch):
+    from trader import account_state
+    from trader.us.db import repos
+    from trader.us.execution import recovery_identity
+    from trader.us.portfolio_profit_guard_store import portfolio_guard_close_health
+
+    engine, now = store
+    with engine.begin() as conn:
+        baseline = _record(conn, pnl="100", qty=10, bid="100", now=now, snap="close", sold=0)
+        assert baseline["state"] == "WATCH"
+
+    def resolve_epoch(conn, *, required):
+        assert required
+        assert conn.exec_driver_sql("SHOW transaction_read_only").scalar_one() == "on"
+        assert conn.exec_driver_sql("SHOW transaction_isolation").scalar_one() == "repeatable read"
+        return EPOCH
+
+    monkeypatch.setenv("US_PORTFOLIO_GUARD_ACTIVE", "1")
+    monkeypatch.setattr(account_state, "get_account_key", lambda **_: RAW_ACCOUNT)
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: engine)
+    monkeypatch.setattr(repos, "_active_us_epoch", resolve_epoch)
+    monkeypatch.setattr(recovery_identity, "current_us_portfolio_epoch", lambda *args, **kw: PORT)
+    result = portfolio_guard_close_health(env="practice", offline=False)
+    assert result["status"] == "WATCH"
+    assert result["orders_checked"] == 0
+    assert Decimal(result["hwm_usd"]) == Decimal("100")
+
+
 def test_pg_native_post_ack_fill_completion_and_stage2_no_double_sell(store):
     engine,now = store
     with engine.begin() as conn:
@@ -220,8 +251,8 @@ def test_pg_native_post_ack_fill_completion_and_stage2_no_double_sell(store):
         conn.execute(text("""
             INSERT INTO public.us_fills
             (client_order_key,symbol,side,env,trading_epoch_id,
-             portfolio_epoch_id,position_cycle_id,account_id,qty,meta)
-            VALUES (:key,'KO','SELL','practice',:epoch,:port,:cycle,:account,2,
+             portfolio_epoch_id,position_cycle_id,account_id,order_no,qty,meta)
+            VALUES (:key,'KO','SELL','practice',:epoch,:port,:cycle,:account,'00032121',2,
                     CAST(:meta AS jsonb))
         """), {
             "key":action["action_key"],"epoch":EPOCH,"port":PORT,
@@ -420,3 +451,49 @@ def test_pg_signed_trading_basis_triggers_and_cannot_reuse_net_hwm(store):
         )).mappings().one()
         assert state["accounting_method"] == TRADING_ACCOUNTING_METHOD
         assert state["high_water_pnl_usd"] == Decimal("100")
+
+
+@pytest.mark.parametrize("conflict", [
+    "foreign_order", "missing_order", "regression", "wrong_symbol",
+    "missing_order_account", "foreign_fill_day",
+])
+def test_pg_guard_fill_cannot_complete_wrong_or_regressed_native_order(store,conflict):
+    engine,now=store
+    with engine.begin() as conn:
+        _record(conn,pnl=100,qty=10,bid=100,now=now,snap="baseline",sold=0)
+        planned=_record(conn,pnl=75,qty=10,bid=95,now=now+timedelta(seconds=1),snap="trigger",sold=0)
+        key=planned["intents"][0]["action_key"]
+        conn.execute(text("""INSERT INTO public.us_orders
+            (client_order_key,side,env,trading_epoch_id,portfolio_epoch_id,position_cycle_id,
+             account_id,symbol,order_no,status,qty_filled,meta)
+            VALUES (:key,'SELL','practice',:epoch,:port,:cycle,:account,:sym,'32121','FILLED',2,
+                    CAST(:meta AS jsonb))"""),
+            dict(key=key,epoch=EPOCH,port=PORT,cycle=CYCLE,
+                 account=None if conflict=="missing_order_account" else ACCOUNT,
+                 sym="PG" if conflict=="wrong_symbol" else "KO",
+                 meta=json.dumps({"portfolio_guard_action_key":key})))
+        conn.execute(text("""INSERT INTO public.us_fills
+            (client_order_key,symbol,side,env,trading_epoch_id,portfolio_epoch_id,position_cycle_id,
+             account_id,order_no,trade_date,qty,meta)
+            VALUES (:key,'KO','SELL','practice',:epoch,:port,:cycle,:account,:no,
+                    current_date - :days_before,:qty,
+                    CAST(:meta AS jsonb))"""),
+            dict(key=key,epoch=EPOCH,port=PORT,cycle=CYCLE,account=ACCOUNT,
+                 no={"foreign_order":"55555","missing_order":None}.get(conflict,"00032121"),
+                 days_before=1 if conflict=="foreign_fill_day" else 0,
+                 qty=1 if conflict=="regression" else 2,
+                 meta=json.dumps({"fill_evidence_type":"KIS_ORDER_CUMULATIVE_ACTUAL","is_synthetic":False})))
+        if conflict=="regression":
+            conn.execute(text("UPDATE public.us_portfolio_guard_actions SET state='PARTIAL', cumulative_verified_fill_qty=2"))
+    if conflict in {"wrong_symbol", "missing_order_account"}:
+        with pytest.raises(PortfolioGuardUnavailable,match="SCOPE_MISMATCH"):
+            with engine.begin() as conn:
+                _record(conn,pnl=50,qty=8,bid=70,now=now+timedelta(seconds=2),snap="next",sold=2)
+    else:
+        with engine.begin() as conn:
+            result=_record(conn,pnl=50,qty=8,bid=70,now=now+timedelta(seconds=2),snap="next",sold=2)
+            assert result["state"]=="BLOCKED" and not result["intents"]
+    with engine.connect() as conn:
+        rows=conn.execute(text("SELECT state,cumulative_verified_fill_qty FROM public.us_portfolio_guard_actions")).all()
+        assert len(rows)==1 and rows[0][0]!="COMPLETE"
+        assert rows[0][1]==(2 if conflict=="regression" else 0)
