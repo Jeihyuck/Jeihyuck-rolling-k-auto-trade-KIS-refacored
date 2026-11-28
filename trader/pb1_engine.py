@@ -1627,31 +1627,51 @@ def _classify_kr_timing_zero_submit(submit_result, *, expected_count):
     return "OK_NO_TRADE", "KR_ENTRY_TIMING_POLICY_WAIT"
 
 
-def _kr_protective_zero_submit(submit_result, *, expected_count):
-    """No rapid re-entry unless each candidate has an explicit zero-order result."""
+def _kr_deferred_zero_submit_reason(submit_result, *, expected_count):
+    """Only explicit no-order outcomes can request a fresh serial tick."""
     results = submit_result.get("results") or []
     if (expected_count <= 0 or len(results) != expected_count
             or submit_result.get("skipped") != expected_count
             or any(submit_result.get(k) != 0 for k in
                    ("attempted", "api_submitted", "accepted", "filled", "rejected", "failed"))):
-        return False
-    deferred = [r for r in results if r.get("protective_deferred") is True]
-    if not deferred or any(r.get("terminal_event") != "FINAL_SKIP"
-            or r.get("skipped") != 1
-            or r.get("skipped_reason") != "KR_PROTECTIVE_REEVALUATION_REQUIRED"
-            for r in deferred):
-        return False
-    previous = [r for r in results if r.get("protective_deferred") is not True]
-    return not previous or _classify_kr_timing_zero_submit(
+        return None
+    previous = []
+    protective = entry_event = False
+    for result in results:
+        if result.get("protective_deferred") is True:
+            if (result.get("terminal_event") != "FINAL_SKIP" or result.get("skipped") != 1
+                    or result.get("skipped_reason") != "KR_PROTECTIVE_REEVALUATION_REQUIRED"):
+                return None
+            protective = True
+        elif result.get("entry_event_deferred") is True:
+            if (result.get("terminal_event") != "FINAL_SKIP" or result.get("skipped") != 1
+                    or result.get("skipped_reason") != "KR_ENTRY_EVENT_REEVALUATION_REQUIRED"):
+                return None
+            entry_event = True
+        else:
+            previous.append(result)
+    if not (protective or entry_event):
+        return None
+    if previous and _classify_kr_timing_zero_submit(
         {**submit_result, "results": previous, "skipped": len(previous)},
         expected_count=len(previous)
-    ) == ("OK_NO_TRADE", "KR_ENTRY_TIMING_POLICY_WAIT")
+    ) != ("OK_NO_TRADE", "KR_ENTRY_TIMING_POLICY_WAIT"):
+        return None
+    if protective:
+        return "KR_PROTECTIVE_REEVALUATION_REQUIRED"
+    # Active entry events require a real prior timing WAIT in this tick.
+    return "KR_ENTRY_EVENT_REEVALUATION_REQUIRED" if previous else None
+
+
+def _kr_protective_zero_submit(submit_result, *, expected_count):
+    return _kr_deferred_zero_submit_reason(submit_result, expected_count=expected_count) == "KR_PROTECTIVE_REEVALUATION_REQUIRED"
 
 
 def _submit_finalized_order_candidates(
     candidates: list["CandidateFeature"], *, submitter: Any,
     pre_submit_gate: Any | None = None,
     protective_checkpoint: Any | None = None,
+    entry_event_checkpoint: Any | None = None,
 ) -> dict[str, Any]:
     """Single production submission seam, injectable with a fake KIS submitter.
 
@@ -1660,12 +1680,26 @@ def _submit_finalized_order_candidates(
     counts = {"attempted": 0, "api_submitted": 0, "accepted": 0, "filled": 0,
               "rejected": 0, "skipped": 0, "failed": 0}
     results = []
+    active_entry_deferred = False
     for candidate in candidates:
         if protective_checkpoint is not None and protective_checkpoint():
             counts["skipped"] += 1
             results.append({"terminal_event": "FINAL_SKIP", "skipped": 1,
                             "skipped_reason": "KR_PROTECTIVE_REEVALUATION_REQUIRED",
                             "protective_deferred": True, "code": candidate.code})
+            continue
+        # A previous WAIT may become READY during this batch. Never re-use
+        # its old quantity or cross the broker boundary from this callback.
+        if (not active_entry_deferred and entry_event_checkpoint is not None
+                and results and counts["skipped"] == len(results)
+                and _classify_kr_timing_zero_submit({**counts, "results": results},
+                    expected_count=len(results)) == ("OK_NO_TRADE", "KR_ENTRY_TIMING_POLICY_WAIT")):
+            active_entry_deferred = bool(entry_event_checkpoint())
+        if active_entry_deferred:
+            counts["skipped"] += 1
+            results.append({"terminal_event": "FINAL_SKIP", "skipped": 1,
+                            "skipped_reason": "KR_ENTRY_EVENT_REEVALUATION_REQUIRED",
+                            "entry_event_deferred": True, "code": candidate.code})
             continue
         if pre_submit_gate is not None and not pre_submit_gate(candidate):
             counts["skipped"] += 1
@@ -19102,6 +19136,8 @@ class PB1Engine:
         # Cooperative protective preemption, only before the BUY boundary.
         # Existing order authority and reconciliation remain unchanged.
         self._kr_protective_yield_monitor = None
+        self._kr_active_entry_yield = None
+        self._kr_quote_wake_targets = {}
         if (
             self.env == "practice" and self.STRATEGY_NAME == "pb1_pullback_close"
             and self.phase in {"entry", "pm_entry"} and self.trading_day
@@ -19121,6 +19157,12 @@ class PB1Engine:
                 exit_summary=getattr(self, "_exit_summary_payload", None),
             )
             if _zero_sell:
+                _active_state = getattr(self, "_kr_active_entry_wake_state", None)
+                if (_active_state is not None
+                        and os.getenv("KR_PB1_QUOTE_WAKE_ENABLED", "1") == "1"
+                        and os.getenv("KR_PB1_ACTIVE_QUOTE_WAKE_ENABLED", "1") == "1"):
+                    from trader.kr.quote_wake import ActiveEntryYield
+                    self._kr_active_entry_yield = ActiveEntryYield(_active_state)
                 _hint_now = now_kst()
                 _hints = [hint for ev in getattr(self, "_exit_evaluations", []) or []
                           if (hint := make_protective_target(ev, _hint_now))]
@@ -22012,10 +22054,20 @@ class PB1Engine:
                                 raise RuntimeError(f"missing terminal submit event for code={cf.code} terminal_event={terminal_event or 'none'}")
                             return status
 
+                        def _entry_event_checkpoint():
+                            monitor = getattr(self, "_kr_active_entry_yield", None)
+                            if monitor is None:
+                                return None
+                            return monitor.check(
+                                getattr(self, "_kr_quote_wake_targets", {}).values(),
+                                now=now_kst, monotonic=time.monotonic,
+                            )
+
                         submit_result = _submit_finalized_order_candidates(
                             orderable_candidates, submitter=_submit_candidate,
                             pre_submit_gate=_pre_submit_gate,
                             protective_checkpoint=self._kr_protection_checkpoint,
+                            entry_event_checkpoint=_entry_event_checkpoint,
                         )
                         attempted_count = int(submit_result["attempted"])
                         api_submitted_count = int(submit_result["api_submitted"])
@@ -22151,10 +22203,11 @@ class PB1Engine:
                             "order_candidates=%s api_submitted=0 reason=%s",
                             len(orderable_candidates), final_notes,
                         )
-                    elif (not plan_skip_reasons
-                          and _kr_protective_zero_submit(submit_result, expected_count=len(orderable_candidates))):
-                        final_status, final_notes = "OK_NO_TRADE", "KR_PROTECTIVE_REEVALUATION_REQUIRED"
-                        logger.info("[KR][ORDER_ZERO_API][PROTECTIVE_DEFERRED] reason=%s", final_notes)
+                    elif (not plan_skip_reasons and
+                          (deferred_reason := _kr_deferred_zero_submit_reason(
+                              submit_result, expected_count=len(orderable_candidates))) is not None):
+                        final_status, final_notes = "OK_NO_TRADE", deferred_reason
+                        logger.info("[KR][ORDER_ZERO_API][SAFE_DEFERRED] reason=%s", final_notes)
                     elif (not plan_skip_reasons and
                           (timing_outcome := _classify_kr_timing_zero_submit(
                               submit_result, expected_count=len(orderable_candidates)
@@ -22184,7 +22237,8 @@ class PB1Engine:
                         raise RuntimeError(
                             f"[KR][ORDER_ZERO_API][FAIL] order_candidates={len(orderable_candidates)} api_submitted=0"
                         )
-                if entry_allowed and self.phase in {"entry", "pm_entry"} and allow_add_to_existing:
+                if (entry_allowed and self.phase in {"entry", "pm_entry"} and allow_add_to_existing
+                        and not any(r.get("entry_event_deferred") is True for r in submit_result.get("results", []))):
                     remaining_budget = max(0.0, float(tick_budget_krw) - planned_spent)
                     for pos in existing_positions:
                         if self._kr_protection_checkpoint():
