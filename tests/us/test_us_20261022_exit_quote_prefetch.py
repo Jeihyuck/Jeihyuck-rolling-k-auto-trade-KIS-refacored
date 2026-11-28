@@ -155,3 +155,29 @@ def test_isolated_reader_is_preferred_over_shared_unsafe_provider(monkeypatch):
 
     snapshots = prepare_exit_position_snapshots(_positions(), IsolatedProvider())
     assert [x["symbol"] for x in snapshots] == ["AAA", "BBB"]
+
+
+def test_native_ready_first_routes_fast_symbol_before_slow_quote(monkeypatch):
+    from threading import Event
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("WSL_RUN_MARKET", "US")
+    monkeypatch.setenv("US_ORDER_ARMED", "1")
+    monkeypatch.setenv("US_EXIT_QUOTE_PREFETCH_ENABLED", "1")
+    monkeypatch.setenv("US_EXIT_QUOTE_PREFETCH_WORKERS", "2")
+    monkeypatch.setenv("US_EXIT_QUOTE_PREFETCH_DEADLINE_SEC", "1")
+    monkeypatch.setenv("US_EXIT_READY_FIRST_ENABLED", "1")
+    released = Event()
+    observed = []
+    class Reader:
+        concurrent_price_reads_safe = True
+        def get_current_price(self, symbol, exchange):
+            if symbol == "AAA":
+                assert released.wait(0.8), "fast callback must run before slow read"
+            return {"last": "90"}
+    def callback(pos):
+        observed.append(pos["symbol"])
+        if pos["symbol"] == "BBB":
+            released.set()
+    result = prepare_exit_position_snapshots(_positions(), Reader(), on_snapshot_ready=callback)
+    assert observed == ["BBB", "AAA"]
+    assert [p["symbol"] for p in result] == ["AAA", "BBB"]

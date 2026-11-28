@@ -72,6 +72,17 @@ TICK_PHASE_MAP = {
     "entry_eval": "entry_engine_ms",
     "order_route": "order_route_ms",
     "post_route_reconcile": "post_route_reconcile_ms",
+    "position_reconcile": "position_reconcile_ms",
+    "order_reconcile": "order_reconcile_ms",
+    "market_state": "market_state_ms",
+    "infinite_eval": "tqqq_infinite_ms",
+    "balance_snapshot": "balance_snapshot_ms",
+    "price_fetch": "price_fetch_ms",
+    "prep_status": "prep_status_ms",
+    "watchlist_load": "watchlist_load_ms",
+    "risk_gate": "risk_gate_ms",
+    "active_claim_replay": "active_claim_replay_ms",
+    "ack_reconcile": "ack_reconcile_ms",
 }
 TICK_PHASES = tuple(TICK_PHASE_MAP)
 

@@ -90,3 +90,46 @@ def test_soft_stop_confirmed_triggers_partial_sell_after_required_ticks(monkeypa
     assert intent["side"] == "SELL"
     assert intent["exit_type"] == "soft_stop_loss"
     assert intent["qty"] <= 5
+
+
+def test_atomic_soft_stop_requires_durable_postgres(monkeypatch):
+    from trader.us.db import repos
+    import pytest
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
+    with pytest.raises(RuntimeError, match="US_SOFT_STOP_DURABLE_STATE_WRITE_FAILED"):
+        repos.update_us_soft_stop_risk_state_atomic(
+            symbol="GENERIC", trade_date="2026-06-29", pnl_pct=-.04,
+            current_price=96, now=datetime(2026,6,29,10,5,tzinfo=NY), soft_stop_pct=.03)
+
+
+def test_atomic_soft_stop_single_upsert_returns_committed_state(monkeypatch):
+    from trader.us.db import repos
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    queries = []
+    class Connection:
+        def execute(self, statement, params):
+            queries.append((str(statement), params))
+            return SimpleNamespace(mappings=lambda: SimpleNamespace(one=lambda: {
+                "soft_stop_breach_count":2, "state":{"lifecycle":{"lifecycle_id":"original"},
+                "soft_stop_execution":{"soft_stop_partial_done":True}},
+                "lowest_price_since_breach":95.0,
+            }))
+    class Engine:
+        dialect=SimpleNamespace(name="postgresql")
+        @contextmanager
+        def begin(self):
+            yield Connection()
+    monkeypatch.setattr(repos,"_get_engine_or_none",lambda:Engine())
+    monkeypatch.setattr(repos,"_ensure_us_position_risk_state_table",lambda conn:None)
+    monkeypatch.setattr(repos,"_active_us_epoch",lambda conn,required: "epoch")
+    result=repos.update_us_soft_stop_risk_state_atomic(
+        symbol="GENERIC",trade_date="2026-06-29",pnl_pct=-.04,current_price=96,
+        now=datetime(2026,6,29,10,5,tzinfo=NY),soft_stop_pct=.03)
+    assert len(queries)==1
+    assert "ON CONFLICT" in queries[0][0] and "RETURNING *" in queries[0][0]
+    assert "old.soft_stop_breach_count + 1" in queries[0][0]
+    assert queries[0][1]["breached"] is True
+    assert result["state"]["lifecycle"]["lifecycle_id"]=="original"
+    assert result["state"]["soft_stop_execution"]["soft_stop_partial_done"] is True
+    assert result["soft_stop_breach_count"]==2

@@ -278,15 +278,33 @@ def write_heartbeat_file(session: str, run_id: str, tick: int, phase: str, **ext
         logger.warning("[US_SESSION][LIVENESS_CHECK][WARN] heartbeat write failed: %s", exc)
 
 
-def sleep_with_heartbeat(session: str, run_id: str, tick: int, total_sec: int, heartbeat_sec: int = 30) -> None:
+def sleep_with_heartbeat(session: str, run_id: str, tick: int, total_sec: int, heartbeat_sec: int = 30, *, protective_poll=None):
     slept = 0
+    # The protective observer shares the normal slot's time budget: IPC and
+    # heartbeat overhead must not become extra sleep after the fixed deadline.
+    # Keep the ordinary no-observer scheduler unchanged.
+    watch_started = time_mod.monotonic() if protective_poll is not None else None
+    def elapsed():
+        return max(slept, time_mod.monotonic() - watch_started) if watch_started is not None else slept
     logger.info("[US_TICK_LOOP][SLEEP_START] session=%s tick=%d seconds=%d", session, tick, total_sec)
     write_heartbeat_file(session, run_id, tick, phase="SLEEP_START", slept=slept)
-    while slept < total_sec:
-        step = min(heartbeat_sec, total_sec - slept)
+    while elapsed() < total_sec:
+        step = min(5 if protective_poll is not None else heartbeat_sec, total_sec - elapsed())
+        if step <= 0:
+            break
         time_mod.sleep(step)
         slept += step
-        logger.info("[US_TICK_LOOP][SLEEP_HEARTBEAT] session=%s run_id=%s tick=%d slept=%d/%d", session, run_id, tick, slept, total_sec)
+        if protective_poll is not None and elapsed() < total_sec:
+            try:
+                wakeup=protective_poll()
+            except Exception:
+                logger.warning("[US_EXIT][IDLE_WATCH_UNAVAILABLE] action=continue_normal_schedule",exc_info=True)
+                protective_poll=None
+                wakeup=None
+            if wakeup is not None and elapsed() < total_sec:
+                write_heartbeat_file(session, run_id, tick, phase="PROTECTIVE_WAKEUP")
+                return wakeup
+        logger.info("[US_TICK_LOOP][SLEEP_HEARTBEAT] session=%s run_id=%s tick=%d slept=%d/%d", session, run_id, tick, elapsed(), total_sec)
         write_heartbeat_file(session, run_id, tick, phase="SLEEP_HEARTBEAT", slept=slept)
     logger.info("[US_TICK_LOOP][SLEEP_DONE] session=%s tick=%d slept=%d", session, tick, slept)
     write_heartbeat_file(session, run_id, tick, phase="SLEEP_DONE", slept=slept)
@@ -1467,11 +1485,11 @@ def run_trade_session(
                         sys.executable, "-m", "trader.us.entry_timing.opening_observer",
                         "--env", "practice", "--trade-date", trade_date,
                         "--scope", _obs_scope, "--parent-pid", str(os.getpid()),
-                        "--watchlist-file", str(_obs_file),
+                        "--watchlist-file", str(_obs_file), "--continuous",
                     ],
                     env=_obs_env, stdin=subprocess.DEVNULL,
                     stdout=_opening_observer_log_stream,
-                    stderr=_opening_observer_log_stream, close_fds=True,
+                    stderr=_opening_observer_log_stream, close_fds=True, start_new_session=True,
                 )
                 logger.info(
                     "[US_OPENING_OBSERVER][START] pid=%s session=%s symbols=%d mode=%s "
@@ -1489,6 +1507,14 @@ def run_trade_session(
         completed_market_context = None
         completed_market_context_age_ticks = 0
         tick_count = 0
+        _normal_tick_count = 0
+        _protective_wakeup = None
+        _protective_slot_deadline = None
+        _remaining_protective_watch = []
+        _hot_idle_wait=None
+        _hot_focus=None
+        _hot_not_before=0.0
+        _protective_tick_count = 0
         warn_count = 0
         consecutive_errors = 0
         consecutive_tick_timeouts = 0
@@ -2057,7 +2083,8 @@ def run_trade_session(
                 _prep_entry_blocked = not bool(prep_guard_result.get("entry_can_proceed", False))
                 if (session in {"am", "afternoon"}
                         and (_prep_cache_incomplete or _prep_entry_blocked)
-                        and tick_count % 2 == 0):
+                        and _protective_wakeup is None
+                        and _normal_tick_count % 2 == 0):
                     try:
                         from trader.us.db.repos import (
                             load_latest_us_prep_status,
@@ -2165,6 +2192,21 @@ def run_trade_session(
                             type(_refresh_exc).__name__,
                         )
 
+                _wakeup_for_tick = _protective_wakeup
+                _focus_for_tick=_hot_focus
+                _hot_focus=None
+                _protective_wakeup = None
+                _idle_watch = []
+                _entry_profit_followup=None
+                _active_protective_followup = None
+                _prior_protective_watch = _remaining_protective_watch
+                if _wakeup_for_tick is None:
+                    _normal_tick_count += 1
+                    _protective_slot_deadline = None
+                    _remaining_protective_watch = []
+                    _hot_idle_wait=None
+                else:
+                    _protective_tick_count += 1
                 tick_count += 1
                 tick_id = f"{session_run_id}:{tick_count}"
                 _write_active_session_state(
@@ -2183,6 +2225,22 @@ def run_trade_session(
                     "?",
                 )
 
+                # Separate parent-side wall time from the child phase timer.
+                # Every attempted tick has an identity even if its child
+                # never returns. Acceptance must not count such failures as
+                # fast successful ticks.
+                _acceptance_started = time_mod.monotonic()
+                _acceptance_scope = {
+                    "trade_date": str(trade_date), "session": session,
+                    "run_id": str(session_run_id), "tick_id": str(tick_id),
+                    "code_sha": _verified_code_sha or "",
+                    "account_digest": session_account_scope.get("account_digest"),
+                    "tick_kind": "protective_wakeup" if _wakeup_for_tick is not None else "normal",
+                    "native_practice": bool(env == "practice" and not offline
+                        and not force_now and not resolved_signal_only and kis_order_allowed),
+                }
+                logger.info("[US400_RUNTIME][ATTEMPT] payload=%s",
+                            json.dumps(_acceptance_scope, sort_keys=True))
                 try:
                     write_heartbeat_file(session, run_id, tick_count, phase="TICK_START", last_stage=last_stage)
                     order_activity_before = _count_trade_date_order_activity(trade_date)
@@ -2203,7 +2261,7 @@ def run_trade_session(
                             kis_order_allowed=kis_order_allowed,
                             session_entry_allowed=session_entry_allowed,
                             session_buy_orders_count=buy_count,
-                            tick_index=tick_count,
+                            tick_index=max(1,_normal_tick_count),
                             balance_reconcile_interval=int(os.getenv("US_BALANCE_RECONCILE_INTERVAL_TICKS", "3")),
                             prep_status_cache=prep_status_cache,
                             locked_watchlist_cache=locked_watchlist_cache,
@@ -2239,6 +2297,17 @@ def run_trade_session(
                             # shared by the watchdog, child and all KIS I/O.
                             tick_deadline_monotonic=time_mod.monotonic() + child_budget_sec,
                         )
+                    if _wakeup_for_tick is not None:
+                        from trader.us.runner.protective_entry_interrupt import split_wakeup
+                        _wake_identity,_wake_kind=split_wakeup(_wakeup_for_tick)
+                        if _wake_identity is None:
+                            raise ValueError("invalid_protective_wakeup_identity")
+                        tick_kwargs.update(protective_wakeup_identity=_wake_identity,
+                            protective_wakeup_kind=_wake_kind,
+                            entry_can_proceed=False,tqqq_policy_override_allowed=False,
+                            session_entry_allowed=False,entry_block_reason="PROTECTIVE_WAKEUP")
+                    if _focus_for_tick is not None and _wakeup_for_tick is None:
+                        tick_kwargs['hot_focus']=_focus_for_tick
                     if _stage4_exit_only_fallback:
                         # Block EVERY new BUY, including dedicated TQQQ policy
                         # overrides. Keep existing authorized SELL evaluation.
@@ -2268,11 +2337,27 @@ def run_trade_session(
                         tick_result = run_trade_tick(**tick_kwargs)
                     else:
                         from trader.us.runner.tick_process import run_tick_in_process, TickChildUnverifiedError
+                        _active_watch = None
+                        if (_wakeup_for_tick is None and _prior_protective_watch
+                                and env == "practice" and not force_now and max_ticks == 0
+                                and not resolved_signal_only and kis_order_allowed
+                                and _reconcile_mode == "WORKER" and not _unreaped_child_seen
+                                and bool(prep_guard_result.get("exit_can_proceed", True))
+                                and os.getenv("US_ENTRY_PROTECTIVE_INTERRUPT_ENABLED", "1") == "1"):
+                            from trader.us.runner.protective_entry_interrupt import (
+                                ActiveProtectiveWatch, make_idle_hard_stop_poll,
+                            )
+                            _active_poll = make_idle_hard_stop_poll(
+                                _prior_protective_watch, trade_date=trade_date, env=env,
+                            )
+                            if _active_poll is not None:
+                                _active_watch = ActiveProtectiveWatch(_active_poll)
                         try:
                             process_result = run_tick_in_process(
                                 run_trade_tick, kwargs=tick_kwargs, timeout_sec=tick_timeout_sec,
                                 terminate_grace_sec=float(os.getenv("US_TICK_TERMINATE_GRACE_SEC", "10")),
                                 fence_account_scope=session_account_scope,
+                                **({"observe_while_running": _active_watch} if _active_watch is not None else {}),
                             )
                         except TickChildUnverifiedError as exc:
                             _unreaped_child_seen = True
@@ -2289,8 +2374,31 @@ def run_trade_session(
                             final_reason = "tick_child_unreaped"
                             raise
                         tick_result = process_result.result
+                        if _active_watch is not None:
+                            _active_protective_followup = _active_watch.followup(
+                                tick_result, tick_result.get("_protective_idle_watch") or [],
+                            )
                         tick_result.setdefault("child_pid", process_result.child_pid)
                         tick_result.setdefault("total_tick_sec", process_result.duration_sec)
+                    _idle_watch = tick_result.pop("_protective_idle_watch", [])
+                    _returned_hot_wait=tick_result.pop("_hot_idle_wait",None)
+                    _entry_profit_followup=tick_result.pop("_entry_profit_followup",None)
+                    if _wakeup_for_tick is None:
+                        _remaining_protective_watch = _idle_watch
+                        _hot_idle_wait=_returned_hot_wait
+                    else:
+                        # A protective event takes precedence over old BUY advice.
+                        _hot_idle_wait=None
+                    if _wakeup_for_tick is not None:
+                        from trader.us.runner.protective_entry_interrupt import (
+                            remaining_idle_watch, remaining_profit_idle_watch,
+                        )
+                        _remaining_protective_watch = (
+                            remaining_idle_watch(_remaining_protective_watch,_wake_identity,tick_result)
+                            if _wake_kind=="stop" else
+                            remaining_profit_idle_watch(_remaining_protective_watch,_wake_identity,tick_result)
+                            if _wake_kind=="profit" else []
+                        )
                     # Never publish incomplete market data as reusable truth.
                     # Scheduled revalidation detects upstream corrections even
                     # if a provider does not publish an explicit new version.
@@ -2301,7 +2409,20 @@ def run_trade_session(
                             completed_market_context_age_ticks = 0
                     elif completed_market_context is None:
                         completed_market_context_age_ticks = 0
-                    completed_market_context_age_ticks += 1
+                    if _wakeup_for_tick is None:
+                        completed_market_context_age_ticks += 1
+                    # Read-only acceptance record, no additional DB/KIS I/O.
+                    # Preserve missing values as null rather than inventing a
+                    # zero workload or a completed phase.
+                    try:
+                        from trader.us.runner.runtime_acceptance_evidence import result_evidence
+                        logger.info("[US400_RUNTIME][RESULT] payload=%s", json.dumps(
+                            result_evidence(_acceptance_scope, tick_result,
+                                            wall_sec=time_mod.monotonic()-_acceptance_started),
+                            sort_keys=True, allow_nan=False))
+                    except Exception:
+                        # Missing evidence fails the read-only gate, never the trading tick.
+                        logger.warning("[US400_RUNTIME][EVIDENCE_UNAVAILABLE]", exc_info=True)
                     results.append(tick_result)
                     final_tick = tick_result
                     tick_completed += 1
@@ -2416,6 +2537,10 @@ def run_trade_session(
                         logger.warning("[US_SESSION][TICK_LOOP][WARN] tick=%d status=%s consecutive_errors=%d", tick_count, tick_status, consecutive_errors)
 
                 except Exception as timeout_exc:
+                    logger.info("[US400_RUNTIME][FAILURE] payload=%s", json.dumps({
+                        **_acceptance_scope, "error_type": type(timeout_exc).__name__,
+                        "wall_sec": max(0.0, time_mod.monotonic()-_acceptance_started),
+                    }, sort_keys=True, allow_nan=False))
                     from trader.us.runner.tick_process import TickProcessTimeout
                     if not isinstance(timeout_exc, TickProcessTimeout):
                         raise
@@ -2600,11 +2725,82 @@ def run_trade_session(
 
                 if not force_now:
                     from trader.us.runner.tick_process import fixed_rate_slot
-                    sleep_sec, skipped = fixed_rate_slot(session_anchor_monotonic, tick_count, interval_sec, time_mod.monotonic())
+                    if _wakeup_for_tick is not None and _protective_slot_deadline is not None:
+                        # An event child does not consume a normal slot. If it
+                        # overran that slot, resume normal work immediately.
+                        sleep_sec=max(0.0,_protective_slot_deadline-time_mod.monotonic())
+                        skipped=0
+                    else:
+                        sleep_sec, skipped = fixed_rate_slot(session_anchor_monotonic, _normal_tick_count, interval_sec, time_mod.monotonic())
                     skipped_slot_count += skipped
                     if skipped:
                         logger.warning("[US_TICK_LOOP][SLOTS_SKIPPED] count=%d total=%d", skipped, skipped_slot_count)
-                    sleep_with_heartbeat(session, run_id, tick_count, int(sleep_sec))
+                    if _active_protective_followup is not None:
+                        # Detection during a busy tick never starts another
+                        # writer. The reaped child has finished and the next
+                        # canonical SELL-only tick revalidates all authority.
+                        _protective_wakeup = _active_protective_followup
+                        _protective_slot_deadline = time_mod.monotonic() + sleep_sec
+                        _hot_idle_wait = None
+                        logger.info("[US_EXIT][ACTIVE_WATCH_FOLLOWUP] action=SERIAL_SELL_ONLY")
+                        continue
+                    if (_entry_profit_followup is not None and _wakeup_for_tick is None
+                            and sleep_sec>5 and not offline and max_ticks==0
+                            and not resolved_signal_only and kis_order_allowed and env=="practice"
+                            and _reconcile_mode=="WORKER" and not _unreaped_child_seen
+                            and bool(prep_guard_result.get("exit_can_proceed",True))
+                            and os.getenv("US_DISABLE_TICK_PROCESS_ISOLATION")!="1"):
+                        from trader.us.runner.protective_entry_interrupt import split_wakeup
+                        _follow_identity,_follow_kind=split_wakeup(_entry_profit_followup)
+                        if _follow_identity is not None and _follow_kind=="profit":
+                            # Previous child is already reaped. Existing
+                            # canonical SELL-only child revalidates all evidence.
+                            _protective_wakeup=_entry_profit_followup
+                            _protective_slot_deadline=time_mod.monotonic()+sleep_sec
+                            _hot_idle_wait=None
+                            logger.info("[US_EXIT][ENTRY_PROFIT_FOLLOWUP] action=SERIAL_SELL_ONLY")
+                            continue
+                    _idle_poll=None
+                    if (sleep_sec>5 and not offline and max_ticks==0
+                            and not resolved_signal_only and kis_order_allowed and env=="practice"
+                            and _reconcile_mode=="WORKER" and not _unreaped_child_seen
+                            and bool(prep_guard_result.get("exit_can_proceed",True))
+                            and os.getenv("US_DISABLE_TICK_PROCESS_ISOLATION")!="1"
+                            and os.getenv("US_ENTRY_PROTECTIVE_INTERRUPT_ENABLED","1")=="1"):
+                        from trader.us.runner.protective_entry_interrupt import make_idle_hard_stop_poll
+                        _idle_poll=make_idle_hard_stop_poll(_remaining_protective_watch,trade_date=trade_date,env=env)
+                    _hot_poll=None
+                    if (sleep_sec>5 and _hot_idle_wait and not offline and max_ticks==0
+                            and not resolved_signal_only and kis_order_allowed and env=="practice"
+                            and _reconcile_mode=="WORKER" and not _unreaped_child_seen
+                            and session_execution_mode=="NORMAL" and not timeout_entry_block
+                            and bool(prep_guard_result.get("entry_can_proceed",False))
+                            and bool(prep_guard_result.get("exit_can_proceed",True))
+                            and os.getenv("US_DISABLE_TICK_PROCESS_ISOLATION")!="1"
+                            and os.getenv("WSL_RUN_MARKET","").upper()=="US"
+                            and os.getenv("US_HOT_EVENT_RETRY_ENABLED","1")=="1"):
+                        from trader.us.entry_timing.hot_event_evaluator import make_hot_slot_poll,combine_idle_polls
+                        _hot_poll=make_hot_slot_poll(_hot_idle_wait,env=env,
+                            scope=str(os.getenv("US_ENTRY_WINDOW_SCOPE") or "").strip(),
+                            trade_date=trade_date,not_before_monotonic=_hot_not_before)
+                        _idle_poll=combine_idle_polls(_idle_poll,_hot_poll)
+                    if _idle_poll is not None:
+                        if _protective_slot_deadline is None:
+                            _protective_slot_deadline=time_mod.monotonic()+sleep_sec
+                        _protective_wakeup=sleep_with_heartbeat(session,run_id,tick_count,int(sleep_sec),protective_poll=_idle_poll)
+                        if isinstance(_protective_wakeup,dict) and _protective_wakeup.get("kind")=="hot_slot":
+                            # Consume the already scheduled normal slot, not an extra
+                            # BUY tick. No chain advance before its original boundary.
+                            _hot_not_before=_protective_slot_deadline
+                            _hot_focus=_protective_wakeup
+                            logger.info("[US_HOT_EVENT][NORMAL_SLOT_ADVANCED] pairs=%s action=CANONICAL_TICK",_protective_wakeup.get("pairs"))
+                            _protective_wakeup=None
+                            _hot_idle_wait=None
+                        if _protective_wakeup is None:
+                            _protective_slot_deadline=None
+                    else:
+                        _protective_slot_deadline=None
+                        sleep_with_heartbeat(session, run_id, tick_count, int(sleep_sec))
 
         except KeyboardInterrupt:
             final_status = "OPERATOR_CANCELLED_RECONCILE_PENDING" if results else "OPERATOR_CANCELLED"
@@ -2666,7 +2862,7 @@ def run_trade_session(
                 )
         
         expected_to_trade = not (force_now or max_ticks > 0 or offline or resolved_signal_only)
-        if expected_to_trade and tick_count < expected_min_ticks and final_reason not in {"market_skip", "max_ticks", "force_now_single_tick", "graceful_shutdown"}:
+        if expected_to_trade and _normal_tick_count < expected_min_ticks and final_reason not in {"market_skip", "max_ticks", "force_now_single_tick", "graceful_shutdown"}:
             if final_status == "FAILED":
                 surface_reason = "early_termination_min_ticks_not_met"
                 logger.error("[US_SESSION][EARLY_TERMINATION] root_cause=%s surface_reason=%s ticks=%d expected_min_ticks=%d", root_cause or final_reason, surface_reason, tick_count, expected_min_ticks)
@@ -3228,10 +3424,12 @@ def run_trade_session(
             "endpoint_breakdown": kis_temp_errors_by_api,
             # 추가 필드
             "expected_min_ticks": expected_min_ticks,
-            "liveness_status": "FAILED" if (session in {"am", "afternoon"} and actual_is_trading_day and tick_count == 0) else ("FAILED_EARLY_TERMINATION" if (expected_min_ticks and tick_count < expected_min_ticks and final_status == "FAILED") else "OK"),
+            "normal_tick_count": _normal_tick_count,
+            "protective_tick_count": _protective_tick_count,
+            "liveness_status": "FAILED" if (session in {"am", "afternoon"} and actual_is_trading_day and tick_count == 0) else ("FAILED_EARLY_TERMINATION" if (expected_min_ticks and _normal_tick_count < expected_min_ticks and final_status == "FAILED") else "OK"),
             "last_liveness_event": _last_liveness_event,
             "has_session_finally": True,
-            "probable_liveness_cause": ("FAILED_PREP_GUARD" if str(final_reason).startswith("prep_guard") else "NO_TICK_EXECUTED") if (session in {"am", "afternoon"} and actual_is_trading_day and tick_count == 0) else ((root_cause or final_reason) if (expected_min_ticks and tick_count < expected_min_ticks and final_status == "FAILED") else ""),
+            "probable_liveness_cause": ("FAILED_PREP_GUARD" if str(final_reason).startswith("prep_guard") else "NO_TICK_EXECUTED") if (session in {"am", "afternoon"} and actual_is_trading_day and tick_count == 0) else ((root_cause or final_reason) if (expected_min_ticks and _normal_tick_count < expected_min_ticks and final_status == "FAILED") else ""),
             "root_cause": root_cause,
             "surface_reason": surface_reason,
             "received_signal": _signal_name(_received_signal),
@@ -3332,23 +3530,12 @@ def run_trade_session(
     # ---------------------------------------------------------------------------
 
     finally:
-        # Market-data observer is isolated from the SELL execution authority.
+        # Day-scoped read-only observer owns a process lock and exits at
+        # exchange close / epoch change. Do not terminate at the AM/PM handoff.
         if _opening_observer_child is not None:
-            try:
-                if _opening_observer_child.poll() is None:
-                    _opening_observer_child.terminate()
-                _opening_observer_child.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                _opening_observer_child.kill()
-                _opening_observer_child.wait(timeout=2)
-            except Exception as _obs_stop_exc:
-                logger.warning(
-                    "[US_OPENING_OBSERVER][STOP_UNAVAILABLE] type=%s",
-                    type(_obs_stop_exc).__name__,
-                )
-            else:
-                logger.info("[US_OPENING_OBSERVER][STOPPED] pid=%s",
-                            _opening_observer_child.pid)
+            logger.info("[US_OPENING_OBSERVER][SESSION_HANDOFF] pid=%s status=%s",
+                        _opening_observer_child.pid,
+                        "RUNNING" if _opening_observer_child.poll() is None else "EXITED")
         if _opening_observer_log_stream is not None:
             _opening_observer_log_stream.close()
         os.environ.pop("US_ENTRY_WINDOW_SCOPE", None)

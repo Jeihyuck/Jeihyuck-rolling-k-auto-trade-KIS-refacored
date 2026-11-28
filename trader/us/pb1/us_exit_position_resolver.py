@@ -628,6 +628,8 @@ def _enrich_single_position(
             pos.get("pnl_rate"),
         )
 
+    # Never accept a prior caller's private resolver marker as fresh DB proof.
+    enriched.pop("_protective_verified_risk_state",None)
     # Persisted lifecycle timing and high-watermark are independent authorities.
     # Restore timing even when a historical row lacks a high-watermark value.
     lifecycle: dict = {}
@@ -642,6 +644,10 @@ def _enrich_single_position(
         latest = _latest_exact_history_candidate(candidates, identity, "trade_date")
         lifecycle = ((latest.get("state") or {}).get("lifecycle") or {}) if isinstance(latest.get("state"), dict) else {}
         if lifecycle and _lifecycle_matches_identity(latest, lifecycle, identity):
+            # Same-day verified read-only state for a protective wakeup. The
+            # regular snapshot writer remains the only confirmation counter.
+            if str(latest.get("trade_date") or "")==str(trade_date):
+                enriched["_protective_verified_risk_state"]=dict(latest)
             enriched["position_lifecycle_id"] = lifecycle.get("lifecycle_id") or enriched.get("position_lifecycle_id")
             enriched["opened_trade_date"] = lifecycle.get("opened_trade_date") or enriched.get("opened_trade_date")
             enriched["opened_at"] = lifecycle.get("opened_at") or enriched.get("opened_at")

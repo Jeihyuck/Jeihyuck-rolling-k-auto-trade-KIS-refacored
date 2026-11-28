@@ -626,6 +626,7 @@ def generate_entry_intents(
     diagnostics: dict[str, Any] | None = None,
     intent_acceptor: Any | None = None,
     cancel_event: Any | None = None,
+    publish_priority: bool = True,
 ) -> list[dict]:
     """진입 intent 목록 생성.
 
@@ -1018,12 +1019,15 @@ def generate_entry_intents(
         input_symbols_count, unique_symbols_count, skipped_duplicates, len(candidates)
     )
 
+    _hot_retry_generation = None
+    _hot_retry_waiting = set()
     # Publish the pre-1m scored candidates BEFORE evaluating the strict
     # minute gate. Otherwise the observer cannot collect the native evidence
     # required to turn a candidate READY. This is only collection priority;
     # it cannot create an intent or bypass risk/owner/timing gates.
     if (
-        os.getenv("KIS_ENV", "practice").lower() == "practice"
+        publish_priority
+        and os.getenv("KIS_ENV", "practice").lower() == "practice"
         and os.getenv("US_OPENING_OBSERVER_ENABLED", "0") == "1"
         and str(os.getenv("US_ENTRY_WINDOW_SCOPE") or "").strip()
     ):
@@ -1035,6 +1039,7 @@ def generate_entry_intents(
                 trade_date=_resolve_us_trade_date(now),
                 candidates=candidates,
             )
+            _hot_retry_generation = _priority_stats["generation"]
             logger.info(
                 "[US_ENTRY][PRIORITY_PUBLISH] source=PREMINUTE "
                 "hot=%d warm=%d candidates=%d generation=%s order_authorized=0",
@@ -1055,7 +1060,31 @@ def generate_entry_intents(
     # Candidate fill loop: a rejected candidate never consumes an accepted
     # slot.  Evaluate the complete deterministic pool until N intents are
     # accepted or the pool is exhausted.
-    for rank, (score, symbol, exchange, existing_price, entry_meta) in enumerate(candidates):
+    _ranked_candidates = enumerate(candidates)
+    if (_hot_retry_generation and has_precomputed_scores
+            and os.getenv("WSL_RUN_MARKET","").upper()=="US"
+            and os.getenv("US_ORDER_ARMED","0").strip().lower() in {"1","true","yes","on"}
+            and os.getenv("US_HOT_EVENT_RETRY_ENABLED","1")=="1"):
+        from trader.us.entry_timing.hot_event_evaluator import (
+            iter_candidates_with_hot_retries,read_hot_retry_hints,
+        )
+        import time as _hot_time
+        def _read_ready_hints(waiting):
+            if _entry_cancelled():
+                return set()
+            hints=read_hot_retry_hints(
+                env="practice",scope=str(os.getenv("US_ENTRY_WINDOW_SCOPE") or "").strip(),
+                trade_date=_resolve_us_trade_date(now),generation=_hot_retry_generation,
+                waiting=waiting,now_epoch=_hot_time.time(),
+            )
+            if hints:
+                logger.info("[US_HOT_EVENT][CANONICAL_REEVALUATE] symbols=%s action=RECHECK_ALL_BUY_GATES",
+                            ",".join(sorted(x[0] for x in hints)))
+            return hints
+        _ranked_candidates = iter_candidates_with_hot_retries(
+            candidates,waiting=_hot_retry_waiting,ready_reader=_read_ready_hints,
+        )
+    for rank, (score, symbol, exchange, existing_price, entry_meta) in _ranked_candidates:
         if _stop_if_cancelled("phase2_candidate_loop"):
             break
         if added_count >= max_new_entries:
@@ -1253,6 +1282,8 @@ def generate_entry_intents(
                         style=_family, trade_date=_resolve_us_trade_date(now),
                         now_et=_op_now, verified_bars=_observed_bars,
                         quote=_opportunity_quote, prep=entry_meta or {},
+                        feature_scope=(_scope, str(symbol).upper(), str(exchange).upper(), "US_STANDARD")
+                            if _scope else None,
                         min_rr=float(os.getenv("US_OPPORTUNITY_MIN_REFERENCE_RR", "1.5")),
                         max_stop_distance=float(os.getenv("US_OPPORTUNITY_MAX_STOP_DISTANCE", "0.025")),
                     )
@@ -1283,6 +1314,11 @@ def generate_entry_intents(
                         ((_price_opportunity.get("facts") or {}).get("opening") or {}).get("observed_1m"),
                     )
                     if _opportunity_mode == "ENFORCE" and _price_opportunity["state"] != "READY":
+                        if _hot_retry_generation and _price_opportunity["state"] in {"WAIT","WATCH"}:
+                            from trader.us.entry_timing.hot_event_evaluator import candidate_pair
+                            _retry_pair=candidate_pair((score,symbol,exchange,existing_price,entry_meta))
+                            if _retry_pair is not None and _retry_pair[0]!="TQQQ":
+                                _hot_retry_waiting.add(_retry_pair)
                         track_skip(symbol, "ENTRY_TIMING_WAIT", {
                             "state": _price_opportunity["state"],
                             "reason": _price_opportunity["reason"],
@@ -2194,6 +2230,17 @@ def generate_entry_intents(
 
     logger.info("[US_ENTRY][EVAL][DONE] entry_intents=%d", len(intents))
     if diagnostics is not None:
+        if (_hot_retry_generation and _hot_retry_waiting and not intents
+                and not _entry_cancelled()):
+            from trader.us.entry_timing.hot_event_evaluator import collection_manifest,_execution_hot_pairs
+            import time as _hot_wait_time
+            _manifest=collection_manifest(env="practice",scope=str(os.getenv("US_ENTRY_WINDOW_SCOPE") or "").strip(),
+                trade_date=_resolve_us_trade_date(now),now_epoch=_hot_wait_time.time())
+            if _manifest and _manifest["generation"]==_hot_retry_generation:
+                _waiting=sorted(_execution_hot_pairs(_manifest)&_hot_retry_waiting)
+                if _waiting:
+                    diagnostics["hot_wait"]={"generation":_hot_retry_generation,
+                                             "pairs":[list(p) for p in _waiting]}
         diagnostics.update({
             "attempted": len(seen_symbols),
             "accepted": len(intents),
