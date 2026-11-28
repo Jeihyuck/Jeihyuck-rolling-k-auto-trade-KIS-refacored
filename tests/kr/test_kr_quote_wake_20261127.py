@@ -271,3 +271,87 @@ def test_protective_batch_clean_deferral_and_no_false_zero_trade():
     assert _kr_protective_zero_submit(mixed, expected_count=2)
     mixed["results"][0]["timing_state"] = "UNKNOWN"
     assert not _kr_protective_zero_submit(mixed, expected_count=2)
+
+
+def test_active_quote_event_dedupes_across_fresh_ticks_and_idle():
+    state = w.QuoteWakeState()
+    t = target()
+    good = {"code":t["code"], "latest_bar_ts":t["latest_bar_ts"], "is_order_authorization":False}
+    monitor = w.ActiveEntryYield(state, probe=lambda *a:good)
+    assert monitor.check([t],now=lambda:NOW,monotonic=lambda:0) == good
+    assert not state.accept(t, good["latest_bar_ts"])
+    assert w.ActiveEntryYield(state,probe=lambda *a:good).check(
+        [t],now=lambda:NOW,monotonic=lambda:0) is None
+
+
+def test_active_quote_event_rejects_wrong_symbol_stale_and_authorization():
+    t = target()
+    good = {"code":t["code"], "latest_bar_ts":t["latest_bar_ts"], "is_order_authorization":False}
+    for result in ({**good,"code":"012750"}, {**good,"is_order_authorization":True},
+                   {**good,"latest_bar_ts":(NOW-timedelta(minutes=4)).isoformat()}):
+        state = w.QuoteWakeState()
+        assert w.ActiveEntryYield(state,probe=lambda *a:result).check(
+            [t],now=lambda:NOW,monotonic=lambda:0) is None
+        assert not state.seen
+    state = w.QuoteWakeState()
+    calls = iter([0., 2.])
+    assert w.ActiveEntryYield(state,probe=lambda *a:good).check(
+        [t],now=lambda:NOW,monotonic=lambda:next(calls)) is None
+    assert not state.seen
+
+
+def test_active_quote_event_defers_only_after_actual_timing_wait():
+    from types import SimpleNamespace
+    from trader.pb1_engine import _submit_finalized_order_candidates, _kr_deferred_zero_submit_reason
+    candidates = [SimpleNamespace(code=code) for code in ("111111","222222","333333")]
+    calls = []
+    def wait(candidate):
+        calls.append(candidate.code)
+        return {"terminal_event":"FINAL_SKIP","skipped":1,
+                "skipped_reason":"KR_ENTRY_TIMING_NOT_READY_OR_PRICE_TOO_HIGH",
+                "timing_state":"WAIT","timing_reason":"ADAPTIVE_V3_PRICE_OUTSIDE_INTERVAL"}
+    result = _submit_finalized_order_candidates(
+        candidates,submitter=wait,entry_event_checkpoint=lambda:True)
+    assert calls == ["111111"]
+    assert result["skipped"] == 3 and result["api_submitted"] == 0
+    assert _kr_deferred_zero_submit_reason(result,expected_count=3) == "KR_ENTRY_EVENT_REEVALUATION_REQUIRED"
+    # Unknown data may not be treated as a clean wake.
+    result["results"][0]["timing_state"] = "UNKNOWN"
+    assert _kr_deferred_zero_submit_reason(result,expected_count=3) is None
+    result["results"][0]["timing_state"] = "WAIT"
+    result["results"][2] = {"terminal_event":"FINAL_SKIP","skipped":1,
+        "skipped_reason":"KR_PROTECTIVE_REEVALUATION_REQUIRED","protective_deferred":True}
+    assert _kr_deferred_zero_submit_reason(result,expected_count=3) == "KR_PROTECTIVE_REEVALUATION_REQUIRED"
+
+
+def test_active_event_does_not_interrupt_after_any_submit_attempt():
+    from types import SimpleNamespace
+    from trader.pb1_engine import _submit_finalized_order_candidates, _kr_deferred_zero_submit_reason
+    candidates = [SimpleNamespace(code=code) for code in ("111111","222222")]
+    calls = []
+    def submit(candidate):
+        calls.append(candidate.code)
+        return {"terminal_event":"ORDER_SUBMIT_UNRESOLVED","submit_attempted":1,"api_submitted":1}
+    result = _submit_finalized_order_candidates(
+        candidates, submitter=submit,
+        entry_event_checkpoint=lambda: (_ for _ in ()).throw(AssertionError("must not probe after a submit")))
+    assert calls == ["111111","222222"]
+    assert _kr_deferred_zero_submit_reason(result,expected_count=2) is None
+
+
+def test_active_entry_resume_requires_clean_practice_tick(monkeypatch):
+    from trader.pb1_runner import _kr_active_entry_yield_resume
+    monkeypatch.setenv("KR_PB1_ACTIVE_QUOTE_WAKE_ENABLED","1")
+    monkeypatch.setenv("KR_PB1_QUOTE_WAKE_ENABLED","1")
+    monkeypatch.setenv("KR_PB1_FRESH_POLICY_WAIT_RESUME","1")
+    monkeypatch.setenv("PB1_PENDING_RECONCILE_ONLY","0")
+    metrics = {"tick_result_reason":"KR_ENTRY_EVENT_REEVALUATION_REQUIRED",
+               "kr_infinite_decision":"WAIT","api_submitted":0,"buy_orders":0,"sell_orders":0}
+    args = dict(env="practice",strategy="pb1_pullback_close",session_kind="am",
+                status="OK_NO_TRADE",metrics=metrics)
+    assert _kr_active_entry_yield_resume(**args)
+    assert not _kr_active_entry_yield_resume(**{**args,"env":"real"})
+    assert not _kr_active_entry_yield_resume(**{**args,"metrics":{**metrics,"api_submitted":1}})
+    assert not _kr_active_entry_yield_resume(**{**args,"metrics":{**metrics,"degraded":True}})
+    monkeypatch.setenv("KR_PB1_ACTIVE_QUOTE_WAKE_ENABLED","0")
+    assert not _kr_active_entry_yield_resume(**args)
