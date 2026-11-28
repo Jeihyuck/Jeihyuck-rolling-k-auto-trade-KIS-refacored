@@ -620,6 +620,7 @@ def test_runtime_portfolio_guard_legacy_ledger_to_canonical_intent(monkeypatch):
     ("100", "99.80"),
     ("0.01", None),  # previously stranded PLANNED after DB commit
     ("NaN", None),
+    ("Infinity", None),
     ("0", None),
     ("-1", None),
 ])
