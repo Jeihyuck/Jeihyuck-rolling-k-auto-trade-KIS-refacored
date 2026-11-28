@@ -384,7 +384,9 @@ def test_concurrent_protective_reader_latches_without_order_authority(monkeypatc
         assert monitor.check(now=NOW+timedelta(seconds=11), monotonic=0) is None
         assert monitor.check(now=NOW+timedelta(days=1), monotonic=0) is None
         time.sleep(.1)
-        assert len(calls) == 1
+        # Repeated read-only probes refresh the latch during a long I/O wait;
+        # a one-shot observation could expire before the owner resumes.
+        assert len(calls) >= 2
     finally:
         monitor.close()
     assert monitor.check(now=NOW,monotonic=0) is None
