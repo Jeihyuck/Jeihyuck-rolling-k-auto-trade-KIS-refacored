@@ -59,7 +59,15 @@ class QuoteWakeState:
         self.seen = OrderedDict()
 
     def accept(self, target, bar):
-        key = (target["account_scope"], target["code"], bar)
+        # A single completed minute must dedupe even if its ISO offset differs.
+        try:
+            stamp = datetime.fromisoformat(bar)
+            if stamp.tzinfo is None:
+                return False
+            canonical_bar = stamp.astimezone(KST).isoformat()
+        except (TypeError, ValueError, OverflowError):
+            return False
+        key = (target["account_scope"], target["code"], canonical_bar)
         if key in self.seen:
             return False
         self.seen[key] = None
@@ -172,6 +180,24 @@ def probe_protective_targets(targets, now, *, read_quote=_protective_quote):
     return None
 
 
+def _valid_entry_wake(target, result, before, after):
+    """Idle and active wakes share the same read-only, fresh-minute contract."""
+    try:
+        if (not isinstance(result, dict) or result.get("code") != target["code"]
+                or target.get("is_order_authorization") is not False
+                or result.get("is_order_authorization") is not False
+                or before.tzinfo is None or after.tzinfo is None
+                or not time(9,30) <= after.astimezone(KST).time() < time(15,5)
+                or before.astimezone(KST).date() != after.astimezone(KST).date()):
+            return False
+        bar = datetime.fromisoformat(result["latest_bar_ts"])
+        return (bar.tzinfo is not None
+                and bar.astimezone(KST).date() == after.astimezone(KST).date()
+                and 0 <= (after-bar).total_seconds() <= 180)
+    except (KeyError, TypeError, ValueError, OverflowError, AttributeError):
+        return False
+
+
 def wait_for_quote_wake(*, targets, state, seconds, session_end, now, monotonic, sleep,
                         probe=probe_wait_target, protective_targets=(),
                         protective_probe=probe_protective_targets):
@@ -187,7 +213,10 @@ def wait_for_quote_wake(*, targets, state, seconds, session_end, now, monotonic,
                 result = protective_probe(protective_targets, now())
                 if monotonic() >= deadline or now() >= session_end:
                     return None
-                if result:
+                if (isinstance(result, dict)
+                        and result.get("kind") == "PROTECTIVE_HARD_STOP_HINT"
+                        and result.get("is_order_authorization") is False
+                        and result.get("code") in {t["code"] for t in protective_targets[:10]}):
                     return result
             except Exception:
                 pass
@@ -196,12 +225,14 @@ def wait_for_quote_wake(*, targets, state, seconds, session_end, now, monotonic,
             if monotonic() >= deadline or now() >= session_end:
                 return None
             try:
-                result = probe(target, now())
+                before = now()
+                result = probe(target, before)
                 # Native proof evaluation can consume the remainder of the idle
                 # interval. Never accept or consume dedupe for a late wake.
-                if monotonic() >= deadline or now() >= session_end:
+                after = now()
+                if monotonic() >= deadline or after >= session_end:
                     return None
-                if (result and result.get("code") == target["code"]
+                if (_valid_entry_wake(target, result, before, after)
                         and state.accept(target, result["latest_bar_ts"])):
                     return result
             except Exception:
@@ -326,12 +357,7 @@ class ActiveEntryYield:
                 after = now()
                 if monotonic() - started > 1.0 or not time(9,30) <= after.astimezone(KST).time() < time(15,5):
                     return None
-                if (not isinstance(result, dict) or result.get("code") != target["code"]
-                        or result.get("is_order_authorization") is not False):
-                    continue
-                bar = datetime.fromisoformat(result["latest_bar_ts"])
-                if (bar.tzinfo is None or not 0 <= (after-bar).total_seconds() <= 180
-                        or after.astimezone(KST).date() != before.astimezone(KST).date()):
+                if not _valid_entry_wake(target, result, before, after):
                     continue
                 if self.state.accept(target, result["latest_bar_ts"]):
                     return result
