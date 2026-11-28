@@ -31,7 +31,63 @@ def _opening_features(bars: tuple[Bar, ...]) -> tuple:
     return peak, trough, support
 
 
-def analyze_opening(*, proof: dict, now: datetime, prep_style: str | None = None) -> dict:
+def _advance_opening_extrema(previous, rows, count):
+    """Exact append-only state; first occurrence wins ties as in max/min."""
+    if not isinstance(previous, list) or len(previous) != 3:
+        return None
+    peak, low, support = previous
+    if (type(peak) is not int or type(low) is not int
+            or not 0 <= peak < count or not 0 <= low < count
+            or (support is not None and
+                (type(support) is not int or not peak < support < count))
+            or (support is None and peak != count - 1)):
+        return None
+    for i in range(count, len(rows)):
+        if rows[i][1] > rows[peak][1]:
+            peak, support = i, None
+        elif support is None or rows[i][2] < rows[support][2]:
+            support = i
+        if rows[i][2] < rows[low][2]:
+            low = i
+    return [peak, low, support]
+
+
+def _compute_opening_extrema(rows):
+    return _advance_opening_extrema([0, 0, None], rows, 1)
+
+
+def _scoped_opening_features(opening, *, account_scope, code, trade_date, cache_base=None):
+    """Shared pure observation features, never a cached eligibility decision."""
+    if (os.getenv("KR_OPENING_FEATURE_SHARED_ENABLED", "1") != "1"
+            or not isinstance(account_scope, str) or not account_scope.startswith("practice:")
+            or not isinstance(code, str) or len(code) != 6
+            or not code.isascii() or not code.isdigit()):
+        return _opening_features(opening)
+    from pathlib import Path
+    from trader.marketdata.feature_reuse import shared_native_features
+    # Exact normalized native bar content, including fields not used by the
+    # extrema. No freshness, strategy decision or quote enters the store.
+    rows = [[b.stamp.isoformat(), b.high, b.low, b.close, b.volume] for b in opening]
+    root = cache_base if cache_base is not None else Path("/tmp") / f"kr-opening-features-{os.getuid()}"
+    indices = shared_native_features(
+        market="KR", scope=(account_scope, code, "PB1_OPENING_OBSERVATION"),
+        trade_date=trade_date, settings=("opening-extrema-v1",), rows=rows,
+        compute=_compute_opening_extrema, advance=_advance_opening_extrema, base=root,
+    )
+    # A malformed cache payload must not prevent native observation.
+    if (not isinstance(indices, list) or len(indices) != 3
+            or any(type(i) is not int or not 0 <= i < len(opening) for i in indices[:2])
+            or (indices[2] is not None and
+                (type(indices[2]) is not int or not indices[0] < indices[2] < len(opening)))
+            or (indices[2] is None and indices[0] != len(opening)-1)):
+        return _opening_features(opening)
+    peak, low, support = indices
+    return opening[peak], opening[low], opening[support] if support is not None else None
+
+
+def analyze_opening(*, proof: dict, now: datetime, prep_style: str | None = None,
+                    account_scope: str | None = None, code: str | None = None,
+                    cache_base=None) -> dict:
     """Caller supplies a checksum-validated native proof from load_opening_proof."""
     now = now.astimezone(KST)
     result = {"is_order_authorization": False, "state": "INSUFFICIENT_DATA",
@@ -54,7 +110,13 @@ def analyze_opening(*, proof: dict, now: datetime, prep_style: str | None = None
     opening = tuple(b for b in bars if time(9, 0) <= b.stamp.time() < time(9, 30))
     if not opening or not bars:
         return {**result, "reason": "NO_COMPLETED_OPENING_BAR"}
-    peak, low, opening_support = _opening_features(opening)
+    # The observer provides the account from its verified native read path.
+    # Direct or unbound callers retain the original process-local calculation.
+    cache_scope = account_scope if (proof.get("env") == "practice" and proof.get("code") == code) else None
+    peak, low, opening_support = _scoped_opening_features(
+        opening, account_scope=cache_scope, code=code,
+        trade_date=now.date().isoformat(), cache_base=cache_base,
+    )
     expected = max(0, min(30, int((now-now.replace(hour=9, minute=0, second=0, microsecond=0)).total_seconds()//60)))
     result.update(opening_count=len(opening), opening_expected=expected,
                   opening_missing=max(0, expected-len(opening)),
