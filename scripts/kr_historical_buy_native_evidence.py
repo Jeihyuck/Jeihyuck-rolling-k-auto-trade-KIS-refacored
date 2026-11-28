@@ -31,7 +31,7 @@ KST = ZoneInfo("Asia/Seoul")
 def exact_buy_evidence(payload, *, day, code, odno, qty):
     if (not isinstance(payload, dict) or payload.get("rt_cd") != "0"
             or payload.get("_sep29_complete") is not True
-            or payload.get("_diag_stub") or payload.get("_ccld_status")
+            or payload.get("_diag_stub") or payload.get("_stub") or payload.get("_ccld_status")
             or not isinstance(payload.get("output1"), list)
             or any(not isinstance(row, dict) for row in payload["output1"])):
         return {"state": "NATIVE_HISTORY_UNVERIFIED"}
@@ -44,6 +44,26 @@ def exact_buy_evidence(payload, *, day, code, odno, qty):
     row = matches[0]
     if not _broker_buy_cumulative_verified(row, code=code, order_number=odno,
                                            quantity=qty, trade_date=day):
+        # A full execution is not the only possible terminal broker outcome.
+        # Explicit, complete zero-fill cancellation/rejection economics are
+        # distinguishable from an ACK with zero fills and remaining shares.
+        # This is evidence only; never changes a claim or authorizes retry.
+        try:
+            keys = ("ord_qty", "tot_ccld_qty", "cncl_cfrm_qty", "rjct_qty", "rmn_qty")
+            raw = [str(row[k]) for k in keys]
+            if (str(row.get("sll_buy_dvsn_cd") or "") == "02"
+                    and all(v.isascii() and v.isdigit() for v in raw)):
+                ordered, filled, cancelled, rejected, remaining = map(int, raw)
+                notional = Decimal(str(row["tot_ccld_amt"]))
+                if (ordered == qty > 0 and filled == remaining == 0
+                        and cancelled + rejected == ordered and notional == 0):
+                    return {"state": "ORIGINAL_ZERO_FILL_TERMINAL_PROVEN",
+                            "qty": qty, "filled_qty": 0, "cancelled_qty": cancelled,
+                            "rejected_qty": rejected, "recovery_authorized": False,
+                            "native_row_sha256": hashlib.sha256(json.dumps(
+                                row, sort_keys=True, default=str).encode()).hexdigest()}
+        except (KeyError, ArithmeticError, TypeError, ValueError):
+            pass
         return {"state": "ORIGINAL_FULL_EXECUTION_NOT_PROVEN"}
     notional = Decimal(str(row["tot_ccld_amt"]))
     return {"state": "ORIGINAL_FULL_EXECUTION_PROVEN", "code": code, "odno": odno,
