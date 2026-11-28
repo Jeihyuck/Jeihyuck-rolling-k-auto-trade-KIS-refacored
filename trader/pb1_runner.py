@@ -4059,6 +4059,18 @@ def _kr_fresh_policy_wait_resume(*, env: str, strategy: str, session_kind: str,
     return not any((metrics.get("warning_counts") or {}).values())
 
 
+def _kr_active_entry_yield_resume(*, env, strategy, session_kind, status, metrics):
+    """Consume an active hint only after the same clean timing-WAIT proof."""
+    if (metrics.get("tick_result_reason") != "KR_ENTRY_EVENT_REEVALUATION_REQUIRED"
+            or os.getenv("KR_PB1_ACTIVE_QUOTE_WAKE_ENABLED", "1") != "1"
+            or os.getenv("KR_PB1_QUOTE_WAKE_ENABLED", "1") != "1"):
+        return False
+    return _kr_fresh_policy_wait_resume(
+        env=env, strategy=strategy, session_kind=session_kind, status=status,
+        metrics={**metrics, "tick_result_reason": "KR_ENTRY_TIMING_POLICY_WAIT"},
+    )
+
+
 def _kr_protective_yield_resume(*, env, strategy, session_kind, status, metrics):
     """Shorten idle only for a clean, completed cooperative pre-submit yield."""
     return bool(
@@ -5552,6 +5564,7 @@ def run_once(
     runtime_dir: Path | None = None,
     max_seconds: int = 0,
     runs_ledger_fail_open: bool = False,
+    quote_wake_state=None,
 ) -> tuple[list[Path], bool, dict[str, int], str, str]:
     if (os.getenv("MODE") or "").strip().lower() == "trade" and not (os.getenv("PB1_UNIVERSE_STRATEGY") or "").strip():
         os.environ["PB1_UNIVERSE_STRATEGY"] = "pb1_watchlist_final_scored"
@@ -8309,6 +8322,8 @@ def run_once(
                 logger.exception("[KR_INF][BLOCK] reason=isolated_exception_after_protective_exit error=%s", inf_exc)
 
         engine_runner._kr_after_protective_exit = _kr_after_protective_exit
+        if loop_mode and env_effective == "practice":
+            engine_runner._kr_active_entry_wake_state = quote_wake_state
 
         if close_cancel_only:
             result = engine_runner.run_close_cancel()
@@ -9230,6 +9245,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                             window=window,
                             max_seconds=max(1, int(shared_tick_budget_sec)),
                             runs_ledger_fail_open=runs_ledger_fail_open,
+                            quote_wake_state=quote_wake_state,
                         ),
                     )
                     _tick_result_status_for_latency = str(result_status or "UNKNOWN")
@@ -9387,6 +9403,17 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                         # its holdings, BUY authorization or SELL observations.
                         time_mod.sleep(min(1.0, sleep_for))
                         logger.info("[KR][PROTECTIVE_YIELD][FRESH_SERIAL_TICK] order_authorization=0")
+                        sticky_precheck_reason = None
+                        sticky_precheck_count = 0
+                        sticky_runtime_signature = None
+                        sticky_runtime_count = 0
+                        continue
+                    if _kr_active_entry_yield_resume(
+                        env=ctx.env, strategy=last_tick_metrics.get("strategy_owner", ""),
+                        session_kind=session_kind, status=result_status, metrics=last_tick_metrics,
+                    ):
+                        time_mod.sleep(min(1.0, sleep_for))
+                        logger.info("[KR][ACTIVE_QUOTE_WAKE][FRESH_SERIAL_TICK] order_authorization=0")
                         sticky_precheck_reason = None
                         sticky_precheck_count = 0
                         sticky_runtime_signature = None
