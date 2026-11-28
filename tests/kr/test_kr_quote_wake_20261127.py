@@ -355,3 +355,116 @@ def test_active_entry_resume_requires_clean_practice_tick(monkeypatch):
     assert not _kr_active_entry_yield_resume(**{**args,"metrics":{**metrics,"degraded":True}})
     monkeypatch.setenv("KR_PB1_ACTIVE_QUOTE_WAKE_ENABLED","0")
     assert not _kr_active_entry_yield_resume(**args)
+
+
+def test_concurrent_protective_reader_latches_without_order_authority(monkeypatch):
+    import threading
+    import time
+    seen = threading.Event()
+    calls = []
+    class FakeClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return NOW if tz is not None else NOW.replace(tzinfo=None)
+    monkeypatch.setattr(w, "datetime", FakeClock)
+    hint = {"kind":"PROTECTIVE_HARD_STOP_HINT","code":"251970",
+            "is_order_authorization":False}
+    def probe(targets, now):
+        calls.append(now)
+        seen.set()
+        return hint
+    monitor = w.ConcurrentProtectiveYield([{"code":"251970"}],
+                probe=probe, interval=.05, max_runtime_sec=.6).start()
+    try:
+        assert seen.wait(1)
+        got = monitor.check(now=NOW, monotonic=0)
+        assert got and got["code"] == "251970"
+        assert got["is_order_authorization"] is False
+        assert got["observed_at"] == NOW.isoformat()
+        assert monitor.check(now=NOW+timedelta(seconds=11), monotonic=0) is None
+        assert monitor.check(now=NOW+timedelta(days=1), monotonic=0) is None
+        time.sleep(.1)
+        assert len(calls) == 1
+    finally:
+        monitor.close()
+    assert monitor.check(now=NOW,monotonic=0) is None
+
+
+def test_concurrent_protective_poll_preempts_blocked_private_select(monkeypatch):
+    import threading
+    class FakeClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return NOW if tz is not None else NOW.replace(tzinfo=None)
+    monkeypatch.setattr(w, "datetime", FakeClock)
+    monkeypatch.setattr(w, "_PRICE_READ_SLOT", threading.BoundedSemaphore(1))
+    read_entered, release_read, read_done = (threading.Event() for _ in range(3))
+    observed = threading.Event()
+    hint = {"kind":"PROTECTIVE_HARD_STOP_HINT","code":"251970",
+            "is_order_authorization":False}
+    def probe(targets, now):
+        if not read_entered.wait(1):
+            return None
+        observed.set()
+        return hint
+    monitor = w.ConcurrentProtectiveYield([{"code":"251970"}],
+            probe=probe, interval=.05, max_runtime_sec=1).start()
+    def select():
+        read_entered.set()
+        try:
+            assert release_read.wait(2)
+            return {"data":"must_not_cache_after_hint"}
+        finally:
+            read_done.set()
+    try:
+        completed, payload = w.protective_daily_read(
+            select,
+            checkpoint=lambda: monitor.check(now=NOW,monotonic=0),
+            poll_sec=.01,
+        )
+        assert observed.is_set()
+        assert (completed, payload) == (False, None)
+        assert monitor.check(now=NOW,monotonic=0)["is_order_authorization"] is False
+    finally:
+        monitor.close()
+        release_read.set()
+        assert read_done.wait(2)
+
+
+def test_concurrent_protective_rejects_unknown_symbol_and_closing_race(monkeypatch):
+    import threading
+    class FakeClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return NOW if tz is not None else NOW.replace(tzinfo=None)
+    monkeypatch.setattr(w, "datetime", FakeClock)
+    for invalid in (
+        {"kind":"PROTECTIVE_HARD_STOP_HINT","code":"012750","is_order_authorization":False},
+        {"kind":"PROTECTIVE_HARD_STOP_HINT","code":"251970","is_order_authorization":True},
+        {"kind":"WRONG_KIND","code":"251970","is_order_authorization":False},
+    ):
+        ready = threading.Event()
+        def probe(targets, now):
+            ready.set()
+            return invalid
+        monitor = w.ConcurrentProtectiveYield([{"code":"251970"}],
+                    probe=probe, interval=.05, max_runtime_sec=.12).start()
+        try:
+            assert ready.wait(.6)
+            assert monitor.check(now=NOW,monotonic=0) is None
+        finally:
+            monitor.close()
+    started, release = threading.Event(), threading.Event()
+    def waiting(targets, now):
+        started.set()
+        assert release.wait(1)
+        return {"kind":"PROTECTIVE_HARD_STOP_HINT","code":"251970",
+                "is_order_authorization":False}
+    monitor = w.ConcurrentProtectiveYield([{"code":"251970"}],
+              probe=waiting, interval=.05, max_runtime_sec=.9).start()
+    assert started.wait(.5)
+    monitor.close()
+    release.set()
+    if monitor._thread is not None:
+        monitor._thread.join(timeout=1)
+    assert monitor.check(now=NOW,monotonic=0) is None
