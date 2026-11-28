@@ -161,3 +161,22 @@ def test_missing_ack_native_candidates_never_authorize_recovery():
         result = evidence(data)
         assert result["state"] == "MISSING_ORDER_ID_NATIVE_HISTORY_UNVERIFIED"
         assert result["recovery_authorized"] is False
+
+
+def test_historical_native_day_budget_prioritizes_active_uncertain_claims():
+    from datetime import date
+    from scripts.kr_historical_buy_native_evidence import _evidence_target_priority
+
+    def target(day, claim_id, exact_cycle):
+        return {"claim": {"trade_date": day, "action_key": claim_id},
+                "order": {"order_id": str(day), "position_cycle_id": "cycle"},
+                "positions": [{"position_cycle_id": "cycle"}] if exact_cycle else []}
+
+    audits = [target(date(2026, 9, d), None, False) for d in (1, 2, 3, 4)]
+    unresolved = [
+        target(date(2026, 10, 27), "old-claim", True),
+        target(date(2026, 11, 27), "new-claim", False),
+    ]
+    ranked = sorted(audits + unresolved, key=_evidence_target_priority)
+    assert {t["claim"]["action_key"] for t in ranked[:2]} == {"old-claim", "new-claim"}
+    assert ranked[2]["claim"]["action_key"] is None
