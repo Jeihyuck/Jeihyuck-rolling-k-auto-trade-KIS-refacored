@@ -89,8 +89,10 @@ def preflight_guard_native_execution_prices(native_valuations, exchange_resolver
     for native in native_valuations:
         symbol = str(native["symbol"]).upper()
         bid = _decimal(native["mark_bid_usd"])
+        if not symbol or symbol in prepared or not bid.is_finite() or bid <= 0:
+            raise PortfolioGuardUnavailable("PORT_GUARD_EXECUTABLE_PRICE_INVALID")
         limit = (bid * Decimal("0.998")).quantize(Decimal("0.01"), rounding=ROUND_FLOOR)
-        if not symbol or symbol in prepared or not bid.is_finite() or bid <= 0 or limit <= 0:
+        if not limit.is_finite() or limit <= 0:
             raise PortfolioGuardUnavailable("PORT_GUARD_EXECUTABLE_PRICE_INVALID")
         exchange = exchange_resolver(symbol)
         if not isinstance(exchange, str) or not exchange.strip():
