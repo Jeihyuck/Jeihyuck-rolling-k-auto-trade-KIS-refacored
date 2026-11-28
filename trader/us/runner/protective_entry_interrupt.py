@@ -507,9 +507,11 @@ def route_idle_hard_stop_once(intents, *, route):
 def remaining_idle_watch(watch, attempted_identity, result):
     """Only advisory hints survive; each new child independently reconciles."""
     if (not isinstance(result,dict) or result.get("protective_wakeup") is not True
-            or result.get("exit_route_reconcile_required") or result.get("manual_reconcile_required")
+            or result.get("exit_route_reconcile_required") is not False
+            or result.get("manual_reconcile_required")!=0
             or result.get("status") not in {"OK_NO_TRADE","OK_EXIT_ORDERS_SENT"}
             or result.get("entry_intents")!=0 or result.get("buy_orders")!=0
+            or holding_identity(attempted_identity) is None
             or holding_identity(attempted_identity)!=attempted_identity):
         return []
     if result["status"]=="OK_EXIT_ORDERS_SENT":
@@ -536,6 +538,7 @@ def remaining_profit_idle_watch(watch, attempted_identity, result):
             or result.get("exit_route_reconcile_required") is not False
             or result.get("manual_reconcile_required")!=0
             or result.get("entry_intents")!=0 or result.get("buy_orders")!=0
+            or holding_identity(attempted_identity) is None
             or holding_identity(attempted_identity)!=attempted_identity
             or not isinstance(result.get("orders"),list)):
         return []
@@ -598,10 +601,25 @@ def profit_wakeup_result(orders, intents, *, trade_date, session, position_count
     """Truthful terminal result for a multi-symbol SELL-only invocation."""
     from trader.us.runner.trade_tick_runner import _routed_order_truth_counts,_routed_sell_notional
     sent,ack,rejected,blocked=_routed_order_truth_counts(orders)
-    count=len({str(i.get("symbol") or "").upper() for i in intents if str(i.get("side") or "").upper()=="SELL"})
-    uncertain=(incomplete or any(str(o.get("status") or "").upper()!="ACK"
-               or o.get("requires_reconcile") or str((o.get("intent") or {}).get("side") or "").upper()!="SELL"
-               for o in orders) or count!=ack or sent!=ack)
+    # Counts alone cannot establish that the ACK belongs to the selected
+    # holding. Preserve scope even when a TP is repriced or its qty reduced
+    # by the canonical router; never match an unrelated SELL by count.
+    def scope(intent):
+        if not isinstance(intent,dict) or str(intent.get("side") or "").upper()!="SELL":
+            return None
+        symbol=str(intent.get("symbol") or "").strip().upper()
+        if not symbol:
+            return None
+        return (symbol, *(str(intent.get(k) or "").strip() for k in _IDENTITY_FIELDS[1:]))
+    expected=[scope(i) for i in intents]
+    actual=[scope(o.get("intent")) if isinstance(o,dict) else None for o in orders]
+    count=len({key[0] for key in expected if key is not None})
+    exact=(None not in expected and None not in actual
+           and len(expected)==count and Counter(expected)==Counter(actual))
+    uncertain=(incomplete or not exact or any(not isinstance(o,dict)
+               or str(o.get("status") or "").upper()!="ACK"
+               or o.get("requires_reconcile") for o in orders)
+               or count!=ack or sent!=ack)
     return dict(status="WARN_RECONCILE_PENDING" if uncertain else "OK_EXIT_ORDERS_SENT" if ack else "OK_NO_TRADE",
         reason="protective_profit_wakeup_unverified" if uncertain else "protective_profit_wakeup_routed" if ack else "protective_profit_wakeup_no_trade",
         protective_wakeup=True,protective_wakeup_kind="profit",orders=orders,orders_sent=sent,orders_ack=ack,
