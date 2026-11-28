@@ -3239,6 +3239,14 @@ class PB1Engine:
                 logger.warning("[POSITIONS][UPDATE][FAIL_SOFT] code=%s err=%r", update["code"], exc)
 
     def _finalize_run_result(self, *, status: str, notes: str | None) -> RunResult:
+        monitor = getattr(self, "_kr_protective_yield_monitor", None)
+        if monitor is not None:
+            close = getattr(monitor, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    logger.warning("[KR][PROTECTIVE_WATCH][CLOSE_FAILED] action=NO_ORDER")
         self._flush_exit_audit_updates()
         self._emit_tick_warning_summary()
         warning_counts = self._warning_counts_dict()
@@ -19167,7 +19175,15 @@ class PB1Engine:
                 _hints = [hint for ev in getattr(self, "_exit_evaluations", []) or []
                           if (hint := make_protective_target(ev, _hint_now))]
                 if _hints:
-                    self._kr_protective_yield_monitor = ProtectiveYield(_hints)
+                    if os.getenv("KR_PB1_CONCURRENT_PROTECTIVE_POLL_ENABLED", "0") == "1":
+                        from trader.kr.quote_wake import ConcurrentProtectiveYield
+                        self._kr_protective_yield_monitor = ConcurrentProtectiveYield(_hints).start()
+                        logger.info(
+                            "[KR][PROTECTIVE_WATCH][START] mode=READ_ONLY_CONCURRENT "
+                            "targets=%s interval_sec=5 order_authorization=0", len(_hints),
+                        )
+                    else:
+                        self._kr_protective_yield_monitor = ProtectiveYield(_hints)
 
         def _yield_to_kr_protection():
             hit = self._kr_protection_checkpoint()
