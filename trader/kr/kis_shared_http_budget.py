@@ -119,6 +119,9 @@ def acquire(*, environment: str, appkey: str, priority: bool,
                         # short-lived notification of imminent critical work.
                         state["priority_until"] = max(state["priority_until"], min(deadline, now+1.0))
                         _write(file, state)
+                        now = time.monotonic()
+                        if now >= deadline:
+                            return False, "DEADLINE", now-start
                     if observer and not priority and state["priority_until"] > now:
                         return False, "PRIORITY_TRAFFIC", time.monotonic()-start
                     earliest = max(state["next_at"], state["cooldown_until"])
@@ -134,7 +137,13 @@ def acquire(*, environment: str, appkey: str, priority: bool,
                             return False, "DEADLINE", now-start
                         state["next_at"] = now + 1.0 / rate
                         _write(file, state)
-                        return True, "GRANTED", time.monotonic()-start
+                        finished = time.monotonic()
+                        # A slow state flush must not authorize transport after
+                        # the caller's deadline. Keep the reserved slot rather
+                        # than roll back shared state or risk a quota bypass.
+                        if finished >= deadline:
+                            return False, "DEADLINE", finished-start
+                        return True, "GRANTED", finished-start
                     wait = min(0.05, earliest-now)
             # File closes/releases flock before wait or any HTTP.
             remaining = deadline-time.monotonic()
