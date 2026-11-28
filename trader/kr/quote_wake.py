@@ -262,6 +262,7 @@ def protective_daily_read(loader, *, checkpoint, poll_sec=.25):
     import queue
     import threading
 
+    interval = max(.01, min(.5, float(poll_sec)))
     if checkpoint():
         return False, None
     if not _PRICE_READ_SLOT.acquire(blocking=False):
@@ -271,18 +272,20 @@ def protective_daily_read(loader, *, checkpoint, poll_sec=.25):
 
     def read():
         try:
-            output.put((True, loader()))
+            result = (True, loader())
         except BaseException as exc:
-            output.put((False, exc))
+            result = (False, exc)
         finally:
             _PRICE_READ_SLOT.release()
+        # The SELECT and disposal have finished before any later caller
+        # can see this result. A detached result has no cache write path.
+        output.put(result)
 
     try:
         threading.Thread(target=read, name="kr-pb1-price-daily-read", daemon=True).start()
     except BaseException:
         _PRICE_READ_SLOT.release()
         raise
-    interval = max(.01, min(.5, float(poll_sec)))
     while True:
         if checkpoint():
             return False, None
