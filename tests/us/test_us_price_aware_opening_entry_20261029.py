@@ -505,3 +505,173 @@ def test_shared_opening_and_rolling_feature_adapter_preserves_live_decision(tmp_
     assert evaluate_price_opportunity(**kwargs,feature_scope=scope)["reason"]=="recent_minute_bars_stale"
     clear_feature_cache()
 
+
+def test_shared_v3_atr_matches_original_and_invalidates_bad_bar(tmp_path, monkeypatch):
+    from trader.marketdata.feature_reuse import clear_feature_cache
+    from trader.us.pb1.swing_runner_exit_v3 import (cached_chandelier_from_verified_bars,
+        chandelier_from_verified_completed_bars)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("WSL_RUN_MARKET","US")
+    monkeypatch.setenv("KIS_ENV","practice")
+    monkeypatch.setenv("US_SHARED_NATIVE_FEATURES_ENABLED","1")
+    start=datetime(2026,8,1)
+    rows=[{"trade_date":(start+timedelta(days=i)).date().isoformat(),"complete":True,
+           "source":"KIS_DAILY_VERIFIED","adjustment_basis":"RAW",
+           "high":101+i*.1,"low":99+i*.1,"close":100+i*.1} for i in range(60)]
+    kw=dict(decision_date=DAY,atr_period=14,lookback=22,multiplier=3.0,ratchet=True)
+    scope=("acct:epoch","ABC","NASDAQ","US_STANDARD","life","cycle","portfolio","contract")
+    clear_feature_cache()
+    original=chandelier_from_verified_completed_bars(rows,**kw)
+    assert original["valid"]
+    assert cached_chandelier_from_verified_bars(rows,scope=scope,**kw)==original
+    clear_feature_cache()
+    assert cached_chandelier_from_verified_bars(rows,scope=scope,**kw)==original
+    corrected=copy.deepcopy(rows)
+    corrected[-1]["high"]+=2
+    assert cached_chandelier_from_verified_bars(corrected,scope=scope,**kw)==chandelier_from_verified_completed_bars(corrected,**kw)
+    corrected[-1]["source"]="UNVERIFIED"
+    assert cached_chandelier_from_verified_bars(corrected,scope=scope,**kw)=={"valid":False,"reason":"BAR_SOURCE_UNVERIFIED"}
+    clear_feature_cache()
+
+
+@pytest.mark.parametrize("ratchet",[True,False])
+def test_incremental_v3_atr_append_parity_and_correction(tmp_path,monkeypatch,ratchet):
+    from trader.marketdata.feature_reuse import clear_feature_cache
+    from trader.us.pb1 import swing_runner_exit_v3 as v3
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("WSL_RUN_MARKET","US")
+    monkeypatch.setenv("KIS_ENV","practice")
+    monkeypatch.setenv("US_SHARED_NATIVE_FEATURES_ENABLED","1")
+    start=datetime(2026,8,1)
+    rows=[{"trade_date":(start+timedelta(days=i)).date().isoformat(),"complete":True,
+           "source":"KIS_DAILY_VERIFIED","adjustment_basis":"RAW",
+           "high":101+i*.1+(i%7)*.4,"low":99+i*.1-(i%5)*.3,"close":100+i*.1}
+          for i in range(60)]
+    kw=dict(decision_date=DAY,atr_period=14,lookback=22,multiplier=3.0,ratchet=ratchet)
+    scope=("acct:epoch","ABC","NASDAQ","US_STANDARD","life","cycle","portfolio","contract")
+    original=v3.chandelier_from_verified_completed_bars
+    expected=[original(rows[:n],**kw) for n in (40,41,48,60)]
+    clear_feature_cache()
+    assert v3.cached_chandelier_from_verified_bars(rows[:40],scope=scope,**kw)==expected[0]
+    def forbidden(*args,**kwargs):
+        raise AssertionError("verified append must not recompute the original prefix")
+    monkeypatch.setattr(v3,"chandelier_from_verified_completed_bars",forbidden)
+    for n,want in zip((41,48,60),expected[1:]):
+        clear_feature_cache()  # exercise durable shared prefix, not local LRU
+        assert v3.cached_chandelier_from_verified_bars(rows[:n],scope=scope,**kw)==want
+    monkeypatch.setattr(v3,"chandelier_from_verified_completed_bars",original)
+    corrected=copy.deepcopy(rows)
+    corrected[10]["high"]+=2
+    clear_feature_cache()
+    assert v3.cached_chandelier_from_verified_bars(corrected,scope=scope,**kw)==original(corrected,**kw)
+    for changed in (corrected[1:],corrected[:-2],corrected+[dict(corrected[-1])],
+                    corrected+[dict(corrected[-1],trade_date=DAY)]):
+        clear_feature_cache()
+        assert v3.cached_chandelier_from_verified_bars(changed,scope=scope,**kw)==original(changed,**kw)
+    clear_feature_cache()
+
+
+@pytest.mark.parametrize("change",["append","correction","gap","missing_amount","scope"])
+def test_incremental_opening_geometry_vwap_parity_and_invalidation(tmp_path,monkeypatch,change):
+    from trader.us.entry_timing import opportunity
+    from trader.marketdata.feature_reuse import clear_feature_cache
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("WSL_RUN_MARKET","US")
+    monkeypatch.setenv("KIS_ENV","practice")
+    monkeypatch.setenv("US_SHARED_NATIVE_FEATURES_ENABLED","1")
+    scope=("acct:epoch","ABC","NASDAQ","US_STANDARD")
+    rows=copy.deepcopy([r for r in sample_bars() if "T09:30:00" <= r["time_et"][10:19] < "T10:00:00"])
+    assert len(rows)==30
+    original=opportunity._opening_static_features
+    calls=[]
+    def counted(bars,day,n):
+        calls.append(len(bars))
+        return original(bars,day,n)
+    monkeypatch.setattr(opportunity,"_opening_static_features",counted)
+    clear_feature_cache()
+    try:
+        assert opportunity.opening_static_features(rows[:20],DAY,30,feature_scope=scope)==original(rows[:20],DAY,30)
+        clear_feature_cache()
+        if change=="correction": rows[0]["high"]+=1
+        if change=="gap": rows.pop(3)
+        if change=="missing_amount": rows[-1]["turnover"]=None
+        if change=="scope": scope=("other:epoch",*scope[1:])
+        assert opportunity.opening_static_features(rows,DAY,30,feature_scope=scope)==original(rows,DAY,30)
+        assert calls==([20] if change in {"append","missing_amount"} else [20,len(rows)])
+    finally:
+        clear_feature_cache()
+
+
+@pytest.mark.parametrize("change",["slide","min_removed","equal_mins","multi_slide","correction",
+                                   "gap","scope","truncation","operand_type"])
+def test_rolling_native_feature_slide_exact_parity(tmp_path,monkeypatch,change):
+    from trader.us.entry_timing import opportunity
+    from trader.marketdata.feature_reuse import clear_feature_cache
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("WSL_RUN_MARKET","US")
+    monkeypatch.setenv("KIS_ENV","practice")
+    monkeypatch.setenv("US_SHARED_NATIVE_FEATURES_ENABLED","1")
+    scope=("acct:epoch","ABC","NASDAQ","US_STANDARD")
+    rows=copy.deepcopy(sample_bars()[:20])
+    assert len(rows)==20
+    if change=="min_removed":
+        rows[0]["low"]=1.0
+    if change=="equal_mins":
+        rows[0]["low"]=rows[1]["low"]=1.0
+        rows[15]["volume"]=3701
+    original=opportunity._recent_static_features
+    calls=[]
+    def counted(bars):
+        calls.append(len(bars))
+        return original(bars)
+    monkeypatch.setattr(opportunity,"_recent_static_features",counted)
+    clear_feature_cache()
+    try:
+        assert opportunity.recent_static_features(rows[:15],DAY,feature_scope=scope)==original(rows[:15])
+        clear_feature_cache()
+        end=18 if change=="multi_slide" else 16
+        newer=copy.deepcopy(rows[:end])
+        if change=="correction": newer[8]["volume"]+=1
+        if change=="gap": newer.pop(8)
+        if change=="scope": scope=("other:epoch",*scope[1:])
+        if change=="truncation": newer=newer[-10:]
+        if change=="operand_type":
+            volume = newer[-2]["volume"]
+            newer[-2]["volume"] = int(volume) if type(volume) is float else float(volume)
+        assert opportunity.recent_static_features(newer,DAY,feature_scope=scope)==original(newer[-15:])
+        assert calls==([15] if change in {"slide","min_removed","equal_mins","multi_slide"}
+                       else [15,min(len(newer),15)])
+    finally:
+        clear_feature_cache()
+
+
+def test_shared_feature_payload_modes_are_isolated(tmp_path):
+    """Changing reuse mode must not return a cached state envelope as a feature."""
+    from itertools import permutations
+    from trader.marketdata.feature_reuse import shared_native_features
+
+    for order in permutations(("exact", "append", "window")):
+        calls = []
+        kwargs = dict(market="US",
+                      scope=("acct:epoch", "-".join(order), "NASDAQ", "US_STANDARD"),
+                      trade_date=DAY, settings=("SAME_FORMULA",),
+                      base=tmp_path, rows=[{"close": 100}])
+
+        def read(mode):
+            def compute(rows):
+                calls.append(mode)
+                return {"close": rows[-1]["close"]}
+
+            extra = {}
+            if mode == "append":
+                extra["advance"] = lambda *args: pytest.fail("not an append")
+            elif mode == "window":
+                extra["slide"] = lambda *args: pytest.fail("not a slide")
+            return shared_native_features(**kwargs, compute=compute, **extra)
+
+        for mode in order:
+            assert read(mode) == {"close": 100}
+        assert calls == list(order)
+        for mode in reversed(order):
+            assert read(mode) == {"close": 100}
+        assert calls == list(order)

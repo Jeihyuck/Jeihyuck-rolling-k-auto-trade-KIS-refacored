@@ -14,6 +14,12 @@ on:
       - ".github/workflows/us-portfolio-guard-acceptance.yml"
   workflow_dispatch:
 
+
+# Only superseded PR validation runs are cancellable; manual/push runs stay isolated.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   guard-native:
     name: PORT-01..15 signed policy native PG safety

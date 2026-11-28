@@ -106,6 +106,87 @@ def chandelier_from_verified_completed_bars(
     }
 
 
+def _advance_chandelier(previous, rows, prefix_count, *, decision_date,
+                        atr_period, lookback, multiplier, ratchet):
+    """Advance the identical Wilder/ratchet recurrence on verified append only.
+
+    The cache has already proved the exact complete prefix. Every appended
+    bar still undergoes the original source/date/OHLC/basis validation.
+    Invalid or unsupported state returns None for canonical full evaluation.
+    """
+    if not isinstance(previous, dict) or previous.get("valid") is not True:
+        return None
+    if (prefix_count < max(atr_period + 2, lookback + 1)
+            or prefix_count >= len(rows) or atr_period < 1 or lookback < 1):
+        return None
+    end = rows[prefix_count-1]
+    basis = previous.get("adjustment_basis")
+    last_date = date.fromisoformat(str(previous["as_of_date"]))
+    signal_date = date.fromisoformat(str(decision_date))
+    if (not basis or last_date >= signal_date
+            or str(end["trade_date"]) != str(last_date)):
+        return None
+    atr = _positive(previous.get("atr14"))
+    stop = float(previous["stop"])
+    prev_close = _positive(end.get("close"))
+    highs = [float(b["high"]) for b in rows[max(0,prefix_count-lookback+1):prefix_count]]
+    if atr is None or prev_close is None or not math.isfinite(stop):
+        return None
+    for row in rows[prefix_count:]:
+        if (not isinstance(row, dict) or row.get("complete") is not True
+                or row.get("source") not in {"KIS_DAILY_VERIFIED","INDEPENDENT_DAILY_VERIFIED"}
+                or row.get("adjustment_basis") != basis):
+            return None
+        at = date.fromisoformat(str(row["trade_date"]))
+        h, l, c = _positive(row.get("high")), _positive(row.get("low")), _positive(row.get("close"))
+        if at <= last_date or at >= signal_date or h is None or l is None or c is None or not l <= c <= h:
+            return None
+        tr = max(h-l, abs(h-prev_close), abs(l-prev_close))
+        atr = ((atr * (atr_period - 1)) + tr) / atr_period
+        if not math.isfinite(atr) or atr <= 0:
+            return None
+        highs.append(h)
+        highest = max(highs[-lookback:])
+        raw_stop = highest - multiplier * atr
+        previous_stop = stop
+        stop = max(stop,raw_stop) if ratchet else raw_stop
+        if not math.isfinite(stop):
+            return None
+        two_below = prev_close < previous_stop and c < stop
+        prev_close, last_date = c, at
+        highs = highs[-lookback:]
+    return {"valid": True, "source": rows[-1]["source"], "adjustment_basis": basis,
+            "as_of_date": str(last_date), "atr14": atr, "highest_high_22": highest,
+            "stop": stop, "previous_stop": previous_stop,
+            "two_completed_below_stop": two_below}
+
+
+def cached_chandelier_from_verified_bars(bars, *, decision_date, atr_period,
+                                           lookback, multiplier, ratchet, scope=None):
+    """Reuse only completed-bar math, never live HWM, quantities or stage truth."""
+    import os
+    from trader.marketdata.feature_reuse import cached_native_features, shared_native_features
+    kwargs = dict(decision_date=decision_date, atr_period=atr_period,
+                  lookback=lookback, multiplier=multiplier, ratchet=ratchet)
+    def compute(rows):
+        return chandelier_from_verified_completed_bars(rows, **kwargs)
+    if not scope or not all(scope):
+        return compute(bars)
+    settings = ("US_V3_CHANDELIER_WILDER_V2_APPEND", atr_period, lookback, multiplier, ratchet)
+    def shared_or_compute(rows):
+        if (os.getenv("WSL_RUN_MARKET", "").upper() == "US"
+                and os.getenv("KIS_ENV", "practice").lower() == "practice"
+                and os.getenv("US_SHARED_NATIVE_FEATURES_ENABLED", "1") == "1"):
+            return shared_native_features(
+                market="US", scope=scope, trade_date=decision_date,
+                settings=settings, rows=rows, compute=compute,
+                base="runtime/private/native-features",
+                advance=lambda prior, all_rows, n: _advance_chandelier(prior, all_rows, n, **kwargs))
+        return compute(rows)
+    return cached_native_features(market="US", scope=scope, trade_date=decision_date,
+                                  settings=settings, rows=bars, compute=shared_or_compute)
+
+
 def evaluate_v3_runner(
     *, entry_price: float, verified_high: float, current_price: float,
     holding_qty: int, orderable_qty: int, trend_state: str,
@@ -320,8 +401,15 @@ def evaluate_v3_from_position(*, position: dict, current_price: float,
     )
     atr_evidence = {"valid": False, "reason": "KIS_COMPLETED_CACHE_MISSING_OR_STALE"}
     if isinstance(daily, list) and daily:
-        atr_evidence = chandelier_from_verified_completed_bars(
-            daily, decision_date=decision_date,
+        import os
+        feature_scope = (
+            str(os.getenv("US_ENTRY_WINDOW_SCOPE") or ""),
+            str(position.get("symbol") or "").upper(),
+            str(position.get("exchange") or "").upper(),
+            "US_STANDARD", lid, cycle, portfolio, str(contract.get("sha256") or ""),
+        )
+        atr_evidence = cached_chandelier_from_verified_bars(
+            daily, decision_date=decision_date, scope=feature_scope,
             atr_period=int(contract["management"]["runner_exit"]["atr_period"]),
             lookback=int(contract["management"]["runner_exit"]["chandelier_lookback"]),
             multiplier=float(contract["management"]["runner_exit"]["chandelier_atr_mult"]),

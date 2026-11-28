@@ -107,21 +107,93 @@ def _opening_static_features(open_bars: list[dict], trade_date: str, min_opening
     return coverage, vwap
 
 
+def _strict_opening_append(row, trade_date, previous):
+    """Only canonical, strictly ordered, unique completed native minutes."""
+    if not isinstance(row, dict):
+        return False
+    stamp = row.get("time_et")
+    if not isinstance(stamp, str) or stamp[:10] != trade_date:
+        return False
+    try:
+        at = datetime.fromisoformat(stamp)
+        if (at.tzinfo is None or at.isoformat() != at.astimezone(NY).isoformat()
+                or at.second or at.microsecond or not "T09:30:00" <= stamp[10:19] < "T10:00:00"
+                or (previous and stamp <= previous)):
+            return False
+        for key in ("high", "low", "close", "volume"):
+            if type(row.get(key)) not in (int, float) or not math.isfinite(row[key]):
+                return False
+        turnover = row.get("turnover")
+        return turnover is None or (type(turnover) in (int,float) and math.isfinite(turnover))
+    except (ValueError,TypeError,OverflowError):
+        return False
+
+
+def _opening_append_state(prior, rows, prefix_count, trade_date, min_opening_bars):
+    # The shared cache verifies the hash of the entire old prefix before
+    # invoking this callback. Never advance corrections or missing history.
+    if not isinstance(prior, dict) or prior.get("strict") is not True or prior.get("count") != prefix_count:
+        return None
+    if not 0 < prefix_count < len(rows) <= 30:
+        return None
+    coverage = dict(prior["result"][0])
+    if coverage.get("observed_1m") != prefix_count or coverage.get("last_bar") != rows[prefix_count-1]["time_et"]:
+        return None
+    volumes, amounts, closes = (list(prior[k]) for k in ("volumes","amounts","closes"))
+    if any(len(v) != prefix_count for v in (volumes,amounts,closes)):
+        return None
+    for row in rows[prefix_count:]:
+        if not _strict_opening_append(row,trade_date,coverage["last_bar"]):
+            return None
+        coverage["last_bar"] = row["time_et"]
+        coverage["opening_high"] = max(coverage["opening_high"],row["high"])
+        coverage["opening_low"] = min(coverage["opening_low"],row["low"])
+        volumes.append(row["volume"])
+        amounts.append(row.get("turnover"))
+        closes.append(row["close"])
+    count=len(rows)
+    coverage.update(observed_1m=count,missing_1m=max(0,30-count))
+    vwap=None
+    if count >= min_opening_bars:
+        # Keep the original Python sum order on every runtime (including
+        # versions with compensated float sum); never substitute subtract/add.
+        volume=sum(volumes)
+        if all(a is not None for a in amounts) and volume>0:
+            vwap=sum(amounts)/volume
+            mid=sum(closes)/count
+            if not 0.75 <= vwap/mid <= 1.25:
+                vwap=None
+    return {"strict":True,"count":count,"result":[coverage,vwap],
+            "volumes":volumes,"amounts":amounts,"closes":closes}
+
+
 def opening_static_features(bars, trade_date, min_opening_bars, *, feature_scope=None):
     opening = [b for b in bars if "T09:30:00" <= b["time_et"][10:19] < "T10:00:00"]
     if not feature_scope:
         return _opening_static_features(opening, trade_date, min_opening_bars)
-    # Exact operands, formula version and account/owner scope are mandatory.
-    # Return the same tuple contract whether computed locally or shared.
+    def build(rows):
+        result=list(_opening_static_features(rows,trade_date,min_opening_bars))
+        previous=None
+        strict=0 < len(rows) <= 30
+        for row in rows:
+            if not _strict_opening_append(row,trade_date,previous):
+                strict=False
+                break
+            previous=row["time_et"]
+        return {"strict":strict,"count":len(rows),"result":result,
+                "volumes":[r["volume"] for r in rows] if strict else [],
+                "amounts":[r.get("turnover") for r in rows] if strict else [],
+                "closes":[r["close"] for r in rows] if strict else []}
     result = _reuse_us_static_features(
         scope=feature_scope, trade_date=trade_date,
-        settings=("US_OPENING_STATIC_V1", min_opening_bars), rows=opening,
-        compute=lambda rows: list(_opening_static_features(rows, trade_date, min_opening_bars)),
+        settings=("US_OPENING_STATIC_APPEND_V2", min_opening_bars), rows=opening,
+        compute=build,
+        advance=lambda prior,rows,n: _opening_append_state(prior,rows,n,trade_date,min_opening_bars),
     )
-    return tuple(result)
+    return tuple(result["result"])
 
 
-def _reuse_us_static_features(*, scope, trade_date, settings, rows, compute):
+def _reuse_us_static_features(*, scope, trade_date, settings, rows, compute, advance=None, slide=None):
     import os
     from trader.marketdata.feature_reuse import cached_native_features, shared_native_features
     def shared_or_compute(operands):
@@ -131,7 +203,7 @@ def _reuse_us_static_features(*, scope, trade_date, settings, rows, compute):
                 and len(scope) == 4 and scope[3] == "US_STANDARD"):
             return shared_native_features(
                 market="US", scope=scope, trade_date=trade_date,
-                settings=settings, rows=operands, compute=compute,
+                settings=settings, rows=operands, compute=compute, advance=advance, slide=slide,
                 base="runtime/private/native-features")
         return compute(operands)
     return cached_native_features(
@@ -139,16 +211,52 @@ def _reuse_us_static_features(*, scope, trade_date, settings, rows, compute):
         rows=rows, compute=shared_or_compute)
 
 
-def _recent_static_features(rows):
-    tail = rows[-4:]
+def _recent_tail_features(tail):
     return {
         "recent_volume": sum(b["volume"] for b in tail[-2:]),
         "prior_volume": sum(b["volume"] for b in tail[:2]),
         "rising_closes": tail[-1]["close"] > tail[-2]["close"] > tail[-3]["close"],
         "higher_lows": tail[-1]["low"] >= tail[-2]["low"] >= tail[-3]["low"],
-        "local_trough": min(b["low"] for b in rows),
         "stop": min(b["low"] for b in tail[-3:]),
     }
+
+
+def _recent_static_features(rows):
+    return {**_recent_tail_features(rows[-4:]), "local_trough": min(b["low"] for b in rows)}
+
+
+def _extend_rolling_lows(prior, incoming, first_stamp):
+    from collections import deque
+
+    lows = deque(pair for pair in prior if pair[0] >= first_stamp)
+    for row in incoming:
+        low = row["low"]
+        # Keep equal lows in arrival order, as Python's min does.
+        while lows and lows[-1][1] > low:
+            lows.pop()
+        lows.append([row["time_et"], low])
+    return list(lows)
+
+
+def _build_recent_static_state(rows):
+    return {"features": _recent_static_features(rows),
+            "lows": _extend_rolling_lows([], rows, rows[0]["time_et"])}
+
+
+def _slide_recent_static(prior, previous, rows, shift):
+    """Advance the exact rolling trough even when the previous trough expires."""
+    if not isinstance(prior,dict) or len(rows)!=15 or len(previous)!=15 or not 1<=shift<15:
+        return None
+    # Duplicate or out-of-order timestamps could produce ambiguous overlap.
+    stamps=[r["time_et"] for r in previous]
+    next_stamps=[r["time_et"] for r in rows]
+    if (not all(a<b for a,b in zip(stamps,stamps[1:]))
+            or not all(a<b for a,b in zip(next_stamps,next_stamps[1:]))
+            or next_stamps[-1]<=stamps[-1]):
+        return None
+    lows = _extend_rolling_lows(prior["lows"], rows[-shift:], next_stamps[0])
+    return {"features": {**_recent_tail_features(rows[-4:]), "local_trough": lows[0][1]},
+            "lows": lows}
 
 
 def recent_static_features(bars, trade_date, *, feature_scope=None):
@@ -157,10 +265,11 @@ def recent_static_features(bars, trade_date, *, feature_scope=None):
     rows = bars[-15:]
     if not feature_scope:
         return _recent_static_features(rows)
-    return _reuse_us_static_features(
+    state = _reuse_us_static_features(
         scope=feature_scope, trade_date=trade_date,
-        settings=("US_RECENT_STATIC_V1", 15, 4, 3),
-        rows=rows, compute=_recent_static_features)
+        settings=("US_RECENT_STATIC_WINDOW_V3", 15, 4, 3),
+        rows=rows, compute=_build_recent_static_state, slide=_slide_recent_static)
+    return state["features"]
 
 
 def _decision(state: str, reason: str, *, style: str, facts: dict,
