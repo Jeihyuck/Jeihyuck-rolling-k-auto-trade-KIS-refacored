@@ -3161,6 +3161,7 @@ def run_trade_tick(
         # The existing reconciliation/account/session gates above run anew.
         from trader.us.runner.protective_entry_interrupt import (
             holding_identity,make_hard_stop_poll,execute_hard_stop_interrupt,route_idle_hard_stop_once,
+            stop_wakeup_route_result,
         )
         from trader.us.stop_policy_revision import attach_approved_revisions
         from trader.us.pb1.us_exit_engine import generate_exit_intents
@@ -3174,8 +3175,12 @@ def run_trade_tick(
                 or str(_stage4_health.get("worker_state") or "")!="READY"
                 or str(_stage4_health.get("reconcile_status") or "") not in {"OK","WARN"}
                 or not tick_context.broker_submit_allowed()):
-            result.update(status="WARN_RECONCILE_PENDING",reason="protective_wakeup_authority_unverified")
+            result.update(status="WARN_RECONCILE_PENDING",reason="protective_wakeup_authority_unverified",
+                          exit_route_reconcile_required=True,manual_reconcile_required=1)
             return result
+        # These flags describe this child invocation, not global account debt.
+        # Every subsequent child independently checks the account and Stage4.
+        result.update(exit_route_reconcile_required=False,manual_reconcile_required=0)
         _symbol=protective_wakeup_identity["symbol"]
         _matching=[p for p in current_positions if str(p.get("symbol") or "").upper()==_symbol]
         if len(_matching)!=1 or holding_identity(_matching[0])!=protective_wakeup_identity:
@@ -3216,19 +3221,12 @@ def run_trade_tick(
                     current_position_symbols={str(p.get("symbol") or "").upper() for p in current_positions},
                     context=tick_context,kis_client=routing_kis_client)))
         if _routed is not None:
-            _orders=_routed.get("orders",[])
-            _sent,_ack,_rejected,_blocked=_routed_order_truth_counts(_orders)
-            _uncertain=any(str(o.get("status") or "").upper()!="ACK" or o.get("requires_reconcile")
-                           for o in _orders) or not _orders
-            result.update(status="WARN_RECONCILE_PENDING" if _uncertain else "OK_EXIT_ORDERS_SENT",
-                          reason="protective_wakeup_routed",orders=_orders,orders_sent=_sent,
-                          orders_ack=_ack,orders_rejected=_rejected,orders_blocked=_blocked,
-                          exit_intents=len(_selected),sell_decisions_detail=_routed.get("decisions",[]),
-                          sell_notional_routed=_routed_sell_notional(_orders),
-                          exit_route_reconcile_required=_uncertain,manual_reconcile_required=int(_uncertain),
-                          unresolved_ack_count=_ack,reconcile_liveness_status="PENDING_SETTLEMENT" if _ack and not _uncertain else "RECONCILE_REQUIRED")
+            result.update(stop_wakeup_route_result(
+                _routed.get("orders",[]),_selected,trade_date=trade_date,session=session,
+                position_count=position_count,decisions=_routed.get("decisions",[])))
         else:
-            result.update(status="WARN_RECONCILE_PENDING",reason="protective_wakeup_canonical_gate_wait")
+            result.update(status="WARN_RECONCILE_PENDING",reason="protective_wakeup_canonical_gate_wait",
+                          exit_route_reconcile_required=True,manual_reconcile_required=1)
         return result
 
     # ── EXIT safety pass: trend DB work must not delay hard/soft/trailing exits ─

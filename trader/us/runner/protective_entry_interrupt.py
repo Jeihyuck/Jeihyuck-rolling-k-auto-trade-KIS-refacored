@@ -630,6 +630,16 @@ def profit_wakeup_result(orders, intents, *, trade_date, session, position_count
         unresolved_ack_count=ack,reconcile_liveness_status="RECONCILE_REQUIRED" if uncertain else "PENDING_SETTLEMENT" if ack else "OK")
 
 
+
+def stop_wakeup_route_result(orders, intents, *, trade_date, session, position_count, decisions):
+    """Require the same exact acknowledgement scope as the profit lane."""
+    result=profit_wakeup_result(orders,intents,trade_date=trade_date,session=session,
+                                position_count=position_count,decisions=decisions,
+                                incomplete=len(intents)!=1 or len(orders)!=1)
+    result.update(protective_wakeup_kind="stop",reason="protective_wakeup_routed")
+    return result
+
+
 def make_entry_protective_poll(hard_poll, watch, *, trade_date, env, context):
     """Read-only profit signal during BUY evaluation; hard/soft have priority.
 
