@@ -56,6 +56,7 @@ def store(monkeypatch):
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS public.us_orders (
                 id bigserial primary key,
+                trade_date date NOT NULL DEFAULT current_date,
                 client_order_key text,
                 side text,
                 env text,
@@ -82,6 +83,7 @@ def store(monkeypatch):
             );
             CREATE TABLE IF NOT EXISTS public.us_fills (
                 id bigserial primary key,
+                trade_date date NOT NULL DEFAULT current_date,
                 symbol text,
                 side text,
                 env text,
@@ -423,7 +425,10 @@ def test_pg_signed_trading_basis_triggers_and_cannot_reuse_net_hwm(store):
         assert state["high_water_pnl_usd"] == Decimal("100")
 
 
-@pytest.mark.parametrize("conflict",["foreign_order","missing_order","regression","wrong_symbol"])
+@pytest.mark.parametrize("conflict", [
+    "foreign_order", "missing_order", "regression", "wrong_symbol",
+    "missing_order_account", "foreign_fill_day",
+])
 def test_pg_guard_fill_cannot_complete_wrong_or_regressed_native_order(store,conflict):
     engine,now=store
     with engine.begin() as conn:
@@ -435,21 +440,24 @@ def test_pg_guard_fill_cannot_complete_wrong_or_regressed_native_order(store,con
              account_id,symbol,order_no,status,qty_filled,meta)
             VALUES (:key,'SELL','practice',:epoch,:port,:cycle,:account,:sym,'32121','FILLED',2,
                     CAST(:meta AS jsonb))"""),
-            dict(key=key,epoch=EPOCH,port=PORT,cycle=CYCLE,account=ACCOUNT,
+            dict(key=key,epoch=EPOCH,port=PORT,cycle=CYCLE,
+                 account=None if conflict=="missing_order_account" else ACCOUNT,
                  sym="PG" if conflict=="wrong_symbol" else "KO",
                  meta=json.dumps({"portfolio_guard_action_key":key})))
         conn.execute(text("""INSERT INTO public.us_fills
             (client_order_key,symbol,side,env,trading_epoch_id,portfolio_epoch_id,position_cycle_id,
-             account_id,order_no,qty,meta)
-            VALUES (:key,'KO','SELL','practice',:epoch,:port,:cycle,:account,:no,:qty,
+             account_id,order_no,trade_date,qty,meta)
+            VALUES (:key,'KO','SELL','practice',:epoch,:port,:cycle,:account,:no,
+                    current_date - :days_before,:qty,
                     CAST(:meta AS jsonb))"""),
             dict(key=key,epoch=EPOCH,port=PORT,cycle=CYCLE,account=ACCOUNT,
                  no={"foreign_order":"55555","missing_order":None}.get(conflict,"00032121"),
+                 days_before=1 if conflict=="foreign_fill_day" else 0,
                  qty=1 if conflict=="regression" else 2,
                  meta=json.dumps({"fill_evidence_type":"KIS_ORDER_CUMULATIVE_ACTUAL","is_synthetic":False})))
         if conflict=="regression":
             conn.execute(text("UPDATE public.us_portfolio_guard_actions SET state='PARTIAL', cumulative_verified_fill_qty=2"))
-    if conflict=="wrong_symbol":
+    if conflict in {"wrong_symbol", "missing_order_account"}:
         with pytest.raises(PortfolioGuardUnavailable,match="SCOPE_MISMATCH"):
             with engine.begin() as conn:
                 _record(conn,pnl=50,qty=8,bid=70,now=now+timedelta(seconds=2),snap="next",sold=2)

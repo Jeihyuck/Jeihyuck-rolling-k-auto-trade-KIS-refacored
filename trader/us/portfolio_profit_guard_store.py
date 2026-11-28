@@ -92,7 +92,8 @@ def reconcile_guard_native_order_actions(
         SELECT a.action_key,a.symbol,a.position_cycle_id,a.target_qty,
                a.cumulative_verified_fill_qty,a.state,
                o.status AS order_status,o.qty_filled AS broker_qty_filled,
-               o.order_no,o.symbol AS order_symbol,o.meta AS order_meta,o.client_order_key,
+               o.order_no,o.trade_date AS order_trade_date,
+               o.symbol AS order_symbol,o.meta AS order_meta,o.client_order_key,
                o.trading_epoch_id,o.portfolio_epoch_id,
                o.position_cycle_id AS order_cycle,
                o.account_id AS order_account
@@ -124,7 +125,8 @@ def reconcile_guard_native_order_actions(
             continue
         meta = row.get("order_meta") if isinstance(row.get("order_meta"), dict) else {}
         if (
-            str(row.get("order_account") or "") not in ("", account_hash)
+            str(row.get("order_account") or "") != account_hash
+            or row.get("order_trade_date") is None
             or str(row.get("order_symbol") or "").upper() != row["symbol"]
             or str(row.get("order_cycle") or "") != row["position_cycle_id"]
             or str(row.get("trading_epoch_id") or "") != epoch
@@ -149,7 +151,7 @@ def reconcile_guard_native_order_actions(
         if not expected_no or expected_no == "0":
             return {"state": "BLOCKED", "reason": "GUARD_NATIVE_ORDER_NUMBER_UNVERIFIED"}
         actual = conn.execute(text("""
-            SELECT order_no,qty
+            SELECT order_no,trade_date,qty
             FROM public.us_fills
             WHERE symbol=:symbol AND side='SELL'
               AND account_id=:account
@@ -164,6 +166,7 @@ def reconcile_guard_native_order_actions(
                "account":account_hash,
                "key":row["action_key"]}).mappings().all()
         if any(normalize_us_order_no(fill["order_no"]) != expected_no
+               or fill["trade_date"] != row["order_trade_date"]
                or int(fill["qty"] or 0) <= 0 for fill in actual):
             return {"state":"BLOCKED","reason":"GUARD_NATIVE_FILL_ORDER_IDENTITY_CONFLICT"}
         native_filled = sum(int(fill["qty"]) for fill in actual)
