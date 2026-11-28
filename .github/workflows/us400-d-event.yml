@@ -4,8 +4,10 @@ on:
     branches: [dual-agent, fix/us-20261126-hot-only-tp90-integrated, 'fix/us-rebuild-*']
     paths:
       - 'trader/us/entry_timing/**'
+      - 'trader/us/market_state_overlay.py'
       - 'trader/us/pb1/us_entry_engine.py'
       - 'tests/us/test_us400_d_hot_event.py'
+      - 'tests/us/test_us_20261030_live_risk_ws_tp_prehttp.py'
       - '.github/workflows/us400-d-event.yml'
 permissions:
   contents: read
@@ -33,5 +35,5 @@ jobs:
           python-version: '3.11'
       - run: python -m pip install -r requirements.txt pytest
       - run: |
-          python -m pytest -q --junitxml=/tmp/us400-d.xml tests/us/test_us400_d_hot_event.py tests/us/test_us_20261120_minute_priority_conflict.py
+          python -m pytest -q --junitxml=/tmp/us400-d.xml tests/us/test_us400_d_hot_event.py tests/us/test_us_20261120_minute_priority_conflict.py tests/us/test_us_20261030_live_risk_ws_tp_prehttp.py::test_intraday_quote_can_expire_while_a_later_index_is_read
           python -c 'import xml.etree.ElementTree as E; c=list(E.parse("/tmp/us400-d.xml").iter("testcase")); assert len(c)>=21 and all(x.find("skipped") is None for x in c)'

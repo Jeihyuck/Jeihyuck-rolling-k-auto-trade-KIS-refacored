@@ -373,6 +373,7 @@ def read_us_live_intraday_returns(
                             recovered[sym] = close
                 except Exception as exc:
                     warnings.append(f"benchmark_close_recovery_failed:{sym}:{type(exc).__name__}")
+    raw_quotes = {}
     for sym in symbols:
         q: dict = {}
         if fetch_allowed:
@@ -393,7 +394,12 @@ def read_us_live_intraday_returns(
                         q = provider.get_current_price(sym, resolve_quote_exchange(sym))
             except Exception as exc:
                 warnings.append(f"live_intraday_quote_failed:{sym}:{type(exc).__name__}")
-        q = q if isinstance(q, dict) else {}
+        raw_quotes[sym] = q if isinstance(q, dict) else {}
+
+    # All three quotes must still be current when the overlay consumes them.
+    # A slow later symbol can expire an earlier quote during this batch.
+    evaluated_at = time.time()
+    for sym, q in raw_quotes.items():
         current = next((
             value for value in (
                 _num(q.get("last")), _num(q.get("current")),
@@ -409,9 +415,11 @@ def read_us_live_intraday_returns(
         received = _num(q.get("asof_epoch") if q.get("asof_epoch") is not None
                         else q.get("received_at"))
         source = str(q.get("source") or "").upper()
-        # Each native quote may complete after earlier sequential reads.
-        # Measure against its actual evaluation time, not the loop start.
-        age = (time.time() - received) if received is not None else None
+        age = (
+            evaluated_at - received
+            if received is not None and math.isfinite(received)
+            else None
+        )
         valid = bool(
             current is not None and previous is not None
             and math.isfinite(previous) and previous > 0
