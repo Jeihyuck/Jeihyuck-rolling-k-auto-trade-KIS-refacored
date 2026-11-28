@@ -182,3 +182,92 @@ def test_protective_yield_resume_is_clean_pb1_only(monkeypatch):
     assert not _kr_protective_yield_resume(**{**args,"status":"BLOCKED_RECONCILE"})
     monkeypatch.setenv("PB1_PENDING_RECONCILE_ONLY","1")
     assert not _kr_protective_yield_resume(**args)
+
+
+def test_protective_daily_read_discards_outstanding_select_without_second_worker(monkeypatch):
+    import threading
+    slot = threading.BoundedSemaphore(1)
+    monkeypatch.setattr(w, "_PRICE_READ_SLOT", slot)
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+    calls = []
+    def loader():
+        calls.append("read")
+        started.set()
+        try:
+            assert release.wait(3)
+            return {"stale": "discard"}
+        finally:
+            finished.set()
+    try:
+        assert w.protective_daily_read(loader, checkpoint=started.is_set, poll_sec=.01) == (False, None)
+        assert started.is_set()
+        assert w.protective_daily_read(lambda: calls.append("second"), checkpoint=lambda: False) == (False, None)
+        assert calls == ["read"]
+    finally:
+        release.set()
+        assert finished.wait(3)
+    assert slot.acquire(timeout=3)
+    slot.release()
+    assert w.protective_daily_read(lambda: {"fresh": 1}, checkpoint=lambda: False) == (True, {"fresh": 1})
+
+
+def test_protective_daily_read_error_and_preexisting_hint(monkeypatch):
+    import threading
+    import pytest
+    monkeypatch.setattr(w, "_PRICE_READ_SLOT", threading.BoundedSemaphore(1))
+    def explode():
+        raise ValueError("native read failed")
+    assert w.protective_daily_read(explode, checkpoint=lambda: True) == (False, None)
+    with pytest.raises(ValueError, match="native read failed"):
+        w.protective_daily_read(explode, checkpoint=lambda: False)
+    assert w.protective_daily_read(lambda: 3, checkpoint=lambda: False) == (True, 3)
+
+
+def test_protective_batch_never_relabels_submitted_or_uncertain_order():
+    from types import SimpleNamespace
+    from trader.pb1_engine import _submit_finalized_order_candidates, _kr_protective_zero_submit
+    candidates = [SimpleNamespace(code=code) for code in ("111111", "222222", "333333")]
+    called = []
+    def submitter(candidate):
+        called.append(candidate.code)
+        return {"terminal_event": "ORDER_SUBMIT_UNRESOLVED", "submit_attempted": 1,
+                "api_submitted": 1, "failed": 1}
+    result = _submit_finalized_order_candidates(
+        candidates, submitter=submitter, protective_checkpoint=lambda: bool(called))
+    assert called == ["111111"]
+    assert result["attempted"] == result["api_submitted"] == result["failed"] == 1
+    assert result["skipped"] == 2
+    assert result["results"][0]["terminal_event"] == "ORDER_SUBMIT_UNRESOLVED"
+    assert not _kr_protective_zero_submit(result, expected_count=3)
+
+
+def test_protective_batch_clean_deferral_and_no_false_zero_trade():
+    from types import SimpleNamespace
+    from trader.pb1_engine import _submit_finalized_order_candidates, _kr_protective_zero_submit
+    candidates = [SimpleNamespace(code=code) for code in ("111111", "222222")]
+    def forbidden(candidate):
+        raise AssertionError("deferred BUY must not reach submission")
+    result = _submit_finalized_order_candidates(
+        candidates, submitter=forbidden, protective_checkpoint=lambda: True)
+    assert result["skipped"] == 2
+    assert _kr_protective_zero_submit(result, expected_count=2)
+    for changed in (
+        {**result, "attempted": 1},
+        {**result, "failed": 1},
+        {**result, "results": result["results"][:1]},
+        {**result, "results": [{**result["results"][0], "terminal_event": "ORDER_SUBMIT_UNRESOLVED"},
+                                result["results"][1]]},
+    ):
+        assert not _kr_protective_zero_submit(changed, expected_count=2)
+    called = []
+    def timing_wait(candidate):
+        called.append(candidate.code)
+        return {"terminal_event":"FINAL_SKIP", "skipped":1,
+                "skipped_reason":"KR_ENTRY_TIMING_NOT_READY_OR_PRICE_TOO_HIGH",
+                "timing_state":"WAIT", "timing_reason":"ADAPTIVE_V3_PRICE_OUTSIDE_INTERVAL"}
+    mixed = _submit_finalized_order_candidates(
+        candidates, submitter=timing_wait, protective_checkpoint=lambda: bool(called))
+    assert called == ["111111"]
+    assert _kr_protective_zero_submit(mixed, expected_count=2)
+    mixed["results"][0]["timing_state"] = "UNKNOWN"
+    assert not _kr_protective_zero_submit(mixed, expected_count=2)
