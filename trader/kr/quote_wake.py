@@ -378,12 +378,14 @@ class ConcurrentProtectiveYield:
     """
 
     def __init__(self, targets, *, probe=probe_protective_targets,
-                 interval=5.0, max_runtime_sec=90.0):
+                 interval=5.0, max_runtime_sec=180.0):
         import threading
         self.targets = tuple(targets[:10])
         self.probe = probe
         self.interval = max(0.05, min(10.0, float(interval)))
-        self.max_runtime_sec = max(0.1, min(90.0, float(max_runtime_sec)))
+        # Cover the measured long entry ticks, but never outlive the
+        # original 180-second owner-stop hint validity.
+        self.max_runtime_sec = max(0.1, min(180.0, float(max_runtime_sec)))
         self._stop = threading.Event()
         self._ready = threading.Event()
         self._thread = None
@@ -408,6 +410,11 @@ class ConcurrentProtectiveYield:
                 return
             try:
                 signal = self.probe(self.targets, observed)
+                finished = datetime.now(KST)
+                if (clock.monotonic() - started >= self.max_runtime_sec
+                        or finished.date() != observed.date()
+                        or not time(9, 0) <= finished.time() <= time(15, 5)):
+                    return
                 if (isinstance(signal, dict)
                         and signal.get("kind") == "PROTECTIVE_HARD_STOP_HINT"
                         and signal.get("is_order_authorization") is False
@@ -437,6 +444,7 @@ class ConcurrentProtectiveYield:
             observed = datetime.fromisoformat(self.hit["observed_at"])
             if (now.tzinfo is None or observed.tzinfo is None
                     or now.astimezone(KST).date() != observed.astimezone(KST).date()
+                    or not time(9, 0) <= now.astimezone(KST).time() <= time(15, 5)
                     or not 0 <= (now - observed).total_seconds() <= 10):
                 return None
             return self.hit
