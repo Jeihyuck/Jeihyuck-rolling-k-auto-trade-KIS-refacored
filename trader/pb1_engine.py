@@ -20186,6 +20186,9 @@ class PB1Engine:
                     notes=f"minervini_only_complete_{minervini_pass_count}_candidates",
                 )
             
+            _yield_result = _yield_to_kr_protection()
+            if _yield_result is not None:
+                return _yield_result
             with self._stage_timer("entry.minervini_report"):
                 minervini_report_path = run_minervini_report(
                     scan_members,
@@ -20217,6 +20220,9 @@ class PB1Engine:
             if isinstance(self._budget_plan_meta, dict) and self._budget_plan_meta.get("effective_target"):
                 new_position_limit = min(new_position_limit, int(self._budget_plan_meta["effective_target"]))
             held_codes = {p.get("code") for p in existing_positions if p.get("code")}
+            _yield_result = _yield_to_kr_protection()
+            if _yield_result is not None:
+                return _yield_result
             with self._stage_timer("entry.open_orders_lookup"):
                 open_orders = self._safe_get_open_orders()
             open_buy_codes = {
@@ -20236,6 +20242,9 @@ class PB1Engine:
                     len(ignored_prebroker_open),
                     sorted({str(row.get("code") or "") for row in ignored_prebroker_open}),
                 )
+            _yield_result = _yield_to_kr_protection()
+            if _yield_result is not None:
+                return _yield_result
             try:
                 with self._stage_timer("entry.today_buy_orders_lookup"):
                     today_orders = self._safe_list_today_orders(side="BUY")
@@ -20294,6 +20303,9 @@ class PB1Engine:
                 existing_prior = blocking_prior_by_code.get(code_key)
                 if existing_prior is None or str((row or {}).get("created_at") or "") > str(existing_prior.get("created_at") or ""):
                     blocking_prior_by_code[code_key] = dict(row)
+            _yield_result = _yield_to_kr_protection()
+            if _yield_result is not None:
+                return _yield_result
             today_buy_fill_rows: list[dict[str, Any]] = []
             if ok_after_risk_codes:
                 with self._stage_timer("entry.today_buy_fills_bulk_lookup"):
@@ -20324,6 +20336,9 @@ class PB1Engine:
             bulk_prior_intents_enabled = hasattr(
                 self.orders_repo, "list_orders_by_client_order_keys"
             )
+            _yield_result = _yield_to_kr_protection()
+            if _yield_result is not None:
+                return _yield_result
             if bulk_prior_intents_enabled and prior_intent_keys:
                 with self._stage_timer("entry.prior_intents_bulk_lookup"):
                     prior_intent_rows = self.orders_repo.list_orders_by_client_order_keys(
@@ -20350,6 +20365,9 @@ class PB1Engine:
             logger.info("[PB1][STAGE][START] stage=buyable_gate")
             with self._stage_timer("entry.buyable_gate"):
                 for cf in ok_after_risk:
+                    _yield_result = _yield_to_kr_protection()
+                    if _yield_result is not None:
+                        return _yield_result
                     self.current_code = cf.code
                     code_key = str(cf.code or "").zfill(6)
                     close_price = float(cf.features.get("close") or 0.0)
@@ -20720,6 +20738,9 @@ class PB1Engine:
                             )
                             continue
                         raise
+                    _yield_result = _yield_to_kr_protection()
+                    if _yield_result is not None:
+                        return _yield_result
                     last_price = float(cf.features.get("last_price") or order_price or close_price or 0.0)
                     last_volume = float(cf.features.get("last_volume") or 0.0)
                     trigger_ok, trigger_info = entry_trigger(
@@ -21282,6 +21303,9 @@ class PB1Engine:
                 if atr_max_ratio > 1.0:
                     atr_max_ratio = atr_max_ratio / 100.0
                 for code in emergency_ranked_codes:
+                    _yield_result = _yield_to_kr_protection()
+                    if _yield_result is not None:
+                        return _yield_result
                     if code in held_codes or code in open_buy_codes or code in today_buy_codes:
                         continue
                     emergency_cf = next((c for c in candidates if c.code == code), None)
@@ -21345,6 +21369,9 @@ class PB1Engine:
                 order_stage_counter["setup_not_ok"] += 1
             orderable_candidates = valid_orderable
 
+            _yield_result = _yield_to_kr_protection()
+            if _yield_result is not None:
+                return _yield_result
             candidate_width_result = self._apply_candidate_width_backfill_and_concentration_guard(
                 orderable_candidates=orderable_candidates,
                 candidates=candidates if 'candidates' in locals() else [],
