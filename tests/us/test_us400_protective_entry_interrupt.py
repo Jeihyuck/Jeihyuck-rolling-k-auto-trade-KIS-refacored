@@ -678,3 +678,55 @@ def test_process_supervisor_observes_busy_child_without_cancelling(tmp_path, obs
     assert calls and set(calls) == {os.getpid()}
     assert outcome.child_pid != os.getpid()
     assert outcome.result == {"seen": True, "cancelled": False}
+
+
+@pytest.mark.parametrize("latest", ["same", "recovered", "different", "collector_failure"])
+def test_active_protective_long_tick_rechecks_fresh_trigger_before_serial_followup(latest):
+    from trader.us.runner.protective_entry_interrupt import ActiveProtectiveWatch
+
+    identity = {k: v for k, v in _scoped_sell("ABC").items() if k != "side"}
+    other = {**identity, "position_lifecycle_id": "new-cycle",
+             "position_cycle_id": "new-cycle"}
+    clock = [0.0]
+    calls = []
+
+    def poll():
+        calls.append(clock[0])
+        if len(calls) == 1:
+            return identity
+        if latest == "same":
+            return dict(identity)
+        if latest == "different":
+            return other
+        if latest == "collector_failure":
+            raise ConnectionError("offline collector")
+        return None
+
+    watch = ActiveProtectiveWatch(poll, clock=lambda: clock[0])
+    watch()
+    clock[0] = 120.0  # normal Tick took two minutes; no new order writer
+    result = dict(runtime_integrity_status="OK", sell_liveness_status="OK",
+                  exit_can_proceed=True, exit_route_reconcile_required=False,
+                  manual_reconcile_required=0)
+    followup = watch.followup(result, [{"identity": identity}])
+    assert followup == (identity if latest == "same" else None)
+    assert calls == [0.0, 120.0]
+
+
+def test_active_protective_long_tick_never_rechecks_when_order_fence_uncertain():
+    from trader.us.runner.protective_entry_interrupt import ActiveProtectiveWatch
+
+    identity = {k: v for k, v in _scoped_sell("ABC").items() if k != "side"}
+    clock = [0.0]
+    calls = []
+    def poll():
+        calls.append(clock[0])
+        return identity
+    watch = ActiveProtectiveWatch(poll, clock=lambda: clock[0])
+    watch()
+    clock[0] = 120.0
+    result = dict(runtime_integrity_status="OK", sell_liveness_status="OK",
+                  exit_can_proceed=True, exit_route_reconcile_required=True,
+                  manual_reconcile_required=0)
+    assert watch.followup(result, [{"identity": identity}]) is None
+    assert calls == [0.0]
