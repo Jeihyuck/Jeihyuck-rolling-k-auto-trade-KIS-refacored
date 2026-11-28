@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import sqlite3
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -59,6 +60,27 @@ def open_store(path: Path) -> sqlite3.Connection:
     );
     CREATE INDEX IF NOT EXISTS ix_us_minute_unresolved
     ON bar_conflicts(trade_date,symbol,owner,minute_et,status);
+    CREATE TABLE IF NOT EXISTS bar_repair_candidate (
+        trade_date TEXT NOT NULL, symbol TEXT NOT NULL, owner TEXT NOT NULL,
+        minute_et TEXT NOT NULL, candidate_json TEXT NOT NULL,
+        first_epoch REAL NOT NULL, last_epoch REAL NOT NULL,
+        response_ids_json TEXT NOT NULL,
+        PRIMARY KEY (trade_date,symbol,owner,minute_et)
+    );
+    CREATE TABLE IF NOT EXISTS bar_conflict_resolution_history (
+        trade_date TEXT NOT NULL, symbol TEXT NOT NULL, owner TEXT NOT NULL,
+        minute_et TEXT NOT NULL, resolved_epoch REAL NOT NULL,
+        original_row_json TEXT, accepted_row_json TEXT NOT NULL,
+        response_ids_json TEXT NOT NULL,
+        PRIMARY KEY (trade_date,symbol,owner,minute_et,resolved_epoch)
+    );
+    CREATE TABLE IF NOT EXISTS hot_retry_events (
+        trade_date TEXT NOT NULL, symbol TEXT NOT NULL, exchange TEXT NOT NULL,
+        manifest_generation TEXT NOT NULL, event_id TEXT NOT NULL,
+        observed_epoch REAL NOT NULL, quote_received_epoch REAL NOT NULL,
+        state TEXT NOT NULL,
+        PRIMARY KEY (trade_date,symbol,exchange)
+    );
     CREATE TABLE IF NOT EXISTS quote_samples (
         trade_date TEXT NOT NULL, symbol TEXT NOT NULL, owner TEXT NOT NULL,
         received_epoch REAL NOT NULL, last REAL NOT NULL, source TEXT NOT NULL,
@@ -76,8 +98,51 @@ def open_store(path: Path) -> sqlite3.Connection:
     return db
 
 
+def _observe_conflict_candidate(db, *, key, payload, prior_payload,
+                                observation_id, observed_epoch, timestamp):
+    """Resolve only three separately received, spaced native HTTP observations.
+
+    Replaying the same rows or local quote data can never increment proof.
+    A different candidate resets the sequence. Original conflict and
+    correction history remain durable.
+    """
+    prev = db.execute(
+        "SELECT candidate_json,first_epoch,last_epoch,response_ids_json FROM bar_repair_candidate "
+        "WHERE trade_date=? AND symbol=? AND owner=? AND minute_et=?", key).fetchone()
+    if prev and prev[0] != payload:
+        db.execute("DELETE FROM bar_repair_candidate WHERE trade_date=? AND symbol=? AND owner=? AND minute_et=?", key)
+        prev = None
+    if not observation_id or observed_epoch is None or not math.isfinite(observed_epoch):
+        return False
+    first, last, ids = (prev[1], prev[2], json.loads(prev[3])) if prev else (observed_epoch, observed_epoch, [])
+    if observation_id in ids or (ids and observed_epoch-last < 60.0):
+        return False
+    ids.append(observation_id)
+    last = observed_epoch
+    db.execute("INSERT INTO bar_repair_candidate VALUES(?,?,?,?,?,?,?,?) "
+               "ON CONFLICT(trade_date,symbol,owner,minute_et) DO UPDATE SET "
+               "candidate_json=excluded.candidate_json,first_epoch=excluded.first_epoch,"
+               "last_epoch=excluded.last_epoch,response_ids_json=excluded.response_ids_json",
+               (*key, payload, first, last, json.dumps(ids)))
+    if len(ids) < 3 or last-first < 120.0:
+        return False
+    db.execute("INSERT INTO bar_conflict_resolution_history VALUES(?,?,?,?,?,?,?,?)",
+               (*key, last, prior_payload, payload, json.dumps(ids)))
+    db.execute("INSERT INTO verified_bars VALUES(?,?,?,?,?,?,?) "
+               "ON CONFLICT(trade_date,symbol,owner,minute_et,source) DO UPDATE SET "
+               "row_json=excluded.row_json,observed_utc=excluded.observed_utc",
+               (*key, "KIS_OVERSEAS_1M", payload, timestamp))
+    db.execute("UPDATE bar_conflicts SET status='RESOLVED' WHERE trade_date=? AND symbol=? "
+               "AND owner=? AND minute_et=? AND source='KIS_OVERSEAS_1M' AND status='UNRESOLVED'", key)
+    db.execute("DELETE FROM bar_repair_candidate WHERE trade_date=? AND symbol=? AND owner=? AND minute_et=?", key)
+    LOG.info("[US_OPENING_OBSERVER][CONFLICT_RESOLVED] symbol=%s minute=%s independent_reads=%d span_sec=%.1f",
+             key[1], key[3], len(ids), last-first)
+    return True
+
+
 def persist_bars(db: sqlite3.Connection, *, trade_date: str, symbol: str,
-                 owner: str, native_rows: list[dict], now_et: datetime) -> int:
+                 owner: str, native_rows: list[dict], now_et: datetime,
+                 observation_id: str | None = None, observed_epoch: float | None = None) -> int:
     """Idempotent native-bar persistence; no partial current minute."""
     if owner != "US_STANDARD" or symbol.upper() == "TQQQ":
         return 0
@@ -121,6 +186,13 @@ def persist_bars(db: sqlite3.Connection, *, trade_date: str, symbol: str,
                         original, new_payload, timestamp,
                     ),
                 )
+            # A formerly resolved variant may recur; reopen quarantine
+            # without erasing the earlier resolution history.
+            db.execute("UPDATE bar_conflicts SET status='UNRESOLVED' WHERE trade_date=? AND symbol=? "
+                       "AND owner=? AND minute_et=? AND source='KIS_OVERSEAS_1M'",
+                       (trade_date, symbol.upper(), owner, minute))
+            db.execute("DELETE FROM bar_repair_candidate WHERE trade_date=? AND symbol=? AND owner=? AND minute_et=?",
+                       (trade_date, symbol.upper(), owner, minute))
             LOG.warning(
                 "[US_OPENING_OBSERVER][SAME_BATCH_NATIVE_BAR_CONFLICT] "
                 "symbol=%s minute=%s variants=%d action=QUARANTINE_NO_REWRITE",
@@ -138,9 +210,8 @@ def persist_bars(db: sqlite3.Connection, *, trade_date: str, symbol: str,
                 (trade_date, symbol.upper(), owner, row["time_et"]),
             ).fetchone()
             payload = json.dumps(row, sort_keys=True, separators=(",", ":"), allow_nan=False)
-            if prior:
-                if prior[0] == payload:
-                    continue
+            key = (trade_date, symbol.upper(), owner, row["time_et"])
+            if prior and prior[0] != payload:
                 # Completed native minutes may be corrected or conflict. A
                 # second observation is *not* automatically authoritative.
                 # Preserve both payloads, quarantine only this minute, and
@@ -155,11 +226,24 @@ def persist_bars(db: sqlite3.Connection, *, trade_date: str, symbol: str,
                      hashlib.sha256(payload.encode("utf-8")).hexdigest(),
                      prior[0], payload, timestamp),
                 )
+                db.execute("UPDATE bar_conflicts SET status='UNRESOLVED' WHERE trade_date=? AND symbol=? "
+                           "AND owner=? AND minute_et=? AND source='KIS_OVERSEAS_1M' AND incoming_sha256=?",
+                           (*key, hashlib.sha256(payload.encode("utf-8")).hexdigest()))
                 LOG.warning(
                     "[US_OPENING_OBSERVER][COMPLETED_BAR_CONFLICT] "
                     "symbol=%s minute=%s action=QUARANTINE_NO_REWRITE",
                     symbol.upper(), row["time_et"],
                 )
+            unresolved = db.execute(
+                "SELECT 1 FROM bar_conflicts WHERE trade_date=? AND symbol=? AND owner=? "
+                "AND minute_et=? AND source='KIS_OVERSEAS_1M' AND status='UNRESOLVED' LIMIT 1", key
+            ).fetchone()
+            if unresolved:
+                changed += int(_observe_conflict_candidate(
+                    db, key=key, payload=payload, prior_payload=prior[0] if prior else None,
+                    observation_id=observation_id, observed_epoch=observed_epoch, timestamp=timestamp))
+                continue
+            if prior:
                 continue
             db.execute(
                 "INSERT INTO verified_bars VALUES(?,?,?,?,?,?,?)",
@@ -310,7 +394,7 @@ def priority_manifest_path(*, env: str, scope: str, trade_date: str,
 def publish_preminute_candidates(
     *, env: str, scope: str, trade_date: str, candidates: list[tuple],
     now_epoch: float | None = None, hot_limit: int = 4, warm_limit: int = 8,
-    base: str | Path = "runtime/private",
+    base: str | Path = "runtime/private", prep_contract: dict | None = None,
 ) -> dict:
     """Publish a non-authorizing, pre-1m shortlist without KIS network I/O.
 
@@ -348,11 +432,81 @@ def publish_preminute_candidates(
         seen.add(sym)
         ranked.append({"symbol": sym, "exchange": exchange, "score": score_value,
                        "position_state": str(meta.get("position_state") or "")})
+    # Event evaluation only uses strategy-owned preminute metadata.
+    # Never infer an entry family from PREP rank or publish an order intent.
+    from trader.us.pb1.us_explain import normalize_us_entry_style
+    event_inputs = {}
+    if prep_contract is None:
+        for candidate in candidates:
+            if not isinstance(candidate, (tuple, list)) or len(candidate) < 5:
+                continue
+            sym = str(candidate[1] or "").strip().upper()
+            meta = candidate[4] if isinstance(candidate[4], dict) else {}
+            if (sym not in seen or sym in event_inputs
+                    or str(meta.get("strategy_owner") or "US_STANDARD").upper() != "US_STANDARD"
+                    or str(meta.get("position_state") or "") != "NOT_HELD"):
+                continue
+            family = normalize_us_entry_style(meta.get("entry_style_selected") or meta.get("entry_style"))
+            if family not in {"ENTRY_PULLBACK","ENTRY_MOMENTUM","ENTRY_BREAKOUT"}:
+                continue
+            fields = {}
+            for key in ("breakout_pivot_price","pivot_price","timing_target_reference"):
+                try:
+                    value = float(meta.get(key))
+                    if math.isfinite(value) and value > 0:
+                        fields[key] = value
+                except (ValueError, TypeError, OverflowError):
+                    pass
+            event_inputs[sym] = {"family":family,"prep":fields}
     # First prioritize new candidates; retained/add BUY candidates are still
     # eligible for WARM collection and are not treated as global excludes.
     ranked.sort(key=lambda row: row["position_state"] == "HELD")
-    hot = ranked[:max(0, min(30, int(hot_limit)))]
-    warm = ranked[len(hot):len(hot) + max(0, min(30, int(warm_limit)))]
+    hot_cap = max(0, min(4, int(hot_limit)))
+    desired_hot = ranked[:hot_cap]
+    hot = list(desired_hot)
+    # Collection-only hysteresis: an eligible, unheld incumbent at rank
+    # HOT+1 or HOT+2 survives a single new challenger publication. A challenger
+    # ranked HOT on two consecutive fresh manifests takes its slot. A removed,
+    # held, stale or scope-invalid incumbent has no retention privilege.
+    if prep_contract is None and hot_cap and len(ranked) > hot_cap:
+        pairs = [(row["symbol"], row["exchange"]) for row in ranked]
+        previous, previous_state = load_preminute_priority(
+            env=env, scope=scope, trade_date=trade_date, pairs=pairs,
+            now_epoch=epoch, base=base)
+        if previous_state == "VALID":
+            previous_path = priority_manifest_path(
+                env=env, scope=scope, trade_date=trade_date, base=base)
+            try:
+                prior = json.loads(previous_path.read_text(encoding="utf-8"))
+                prior_desired = prior.get("desired_hot")
+                # The extra read must match the previously validated HOT list
+                # and exact scope, time, and ranked membership.
+                if (isinstance(prior_desired, list) and len(prior_desired) <= 4
+                        and prior.get("hot") == [{"symbol": a, "exchange": b} for a,b in previous["HOT"]]
+                        and prior.get("schema") == "US_PREMINUTE_PRIORITY_V1"
+                        and prior.get("owner") == "US_STANDARD"
+                        and prior.get("env") == env and prior.get("trade_date") == trade_date
+                        and prior.get("is_order_authorization") is False
+                        and prior.get("scope_sha256") == hashlib.sha256((env+":"+scope).encode()).hexdigest()
+                        and float(prior["created_epoch"]) < epoch <= float(prior["expires_epoch"])
+                        <= float(prior["created_epoch"]) + 180.00001):
+                    prior_raw = {(row["symbol"],row["exchange"]) for row in prior_desired}
+                    if prior_raw <= set(pairs):
+                        desired_pairs = {(row["symbol"],row["exchange"]) for row in desired_hot}
+                        challengers = [row for row in reversed(desired_hot)
+                            if (row["symbol"],row["exchange"]) not in prior_raw
+                            and (row["symbol"],row["exchange"]) not in previous["HOT"]]
+                        incumbents = [row for row in ranked[hot_cap:hot_cap+2]
+                            if row["position_state"] == "NOT_HELD"
+                            and (row["symbol"],row["exchange"]) in previous["HOT"]
+                            and (row["symbol"],row["exchange"]) not in desired_pairs]
+                        for incumbent, challenger in zip(incumbents, challengers):
+                            hot[hot.index(challenger)] = incumbent
+            except (OSError, ValueError, TypeError, KeyError, AttributeError):
+                pass
+    hot_keys = {(row["symbol"],row["exchange"]) for row in hot}
+    remaining = [row for row in ranked if (row["symbol"],row["exchange"]) not in hot_keys]
+    warm = remaining[:max(0, min(8, int(warm_limit)))]
     payload = {
         "schema": "US_PREMINUTE_PRIORITY_V1", "env": env,
         "owner": "US_STANDARD", "trade_date": trade_date,
@@ -361,9 +515,52 @@ def publish_preminute_candidates(
         "generation": str(os.getpid()) + ":" + str(epoch),
         "hot": [{"symbol": x["symbol"], "exchange": x["exchange"]} for x in hot],
         "warm": [{"symbol": x["symbol"], "exchange": x["exchange"]} for x in warm],
+        "cold": [{"symbol": x["symbol"], "exchange": x["exchange"]} for x in remaining[len(warm):]],
+        "desired_hot": [{"symbol": x["symbol"], "exchange": x["exchange"]} for x in desired_hot],
         "is_order_authorization": False,
+        "hot_event_inputs": {r["symbol"]: event_inputs[r["symbol"]] for r in ranked
+                             if r["symbol"] in event_inputs},
     }
     path = priority_manifest_path(env=env, scope=scope, trade_date=trade_date, base=base)
+    if prep_contract is None:
+        # A new canonical tick may publish exactly the same execution shortlist.
+        # Retain the previous event namespace only while its manifest is fresh
+        # and every strategy-owned input and ordered lane is unchanged. The
+        # event reader still requires a fresh (<=5s) native quote and the full
+        # canonical WAIT/READY, risk and order gates. Never revive an expired
+        # generation, or carry an event across candidate/strategy changes.
+        try:
+            if path.stat().st_size <= 65536:
+                prior_event = json.loads(path.read_text(encoding="utf-8"))
+                identity_keys = ("schema", "env", "owner", "trade_date",
+                    "scope_sha256", "is_order_authorization", "hot", "warm",
+                    "cold", "desired_hot", "hot_event_inputs")
+                prior_created = float(prior_event["created_epoch"])
+                prior_expires = float(prior_event["expires_epoch"])
+                prior_generation = prior_event["generation"]
+                if (isinstance(prior_generation, str) and prior_generation
+                        and all(k in prior_event and prior_event[k] == payload[k] for k in identity_keys)
+                        and prior_event["is_order_authorization"] is False
+                        and math.isfinite(prior_created) and math.isfinite(prior_expires)
+                        and prior_created < epoch <= prior_expires <= prior_created + 180.00001):
+                    payload["generation"] = prior_generation
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
+            pass
+    if prep_contract is not None:
+        from datetime import date
+        from trader.us.market_calendar import is_us_trading_day, regular_close_time_for_date
+        day = date.fromisoformat(trade_date)
+        close = datetime.combine(day, regular_close_time_for_date(day), tzinfo=NY).timestamp()
+        if not is_us_trading_day(day) or epoch >= close:
+            raise ValueError("PREP_COLLECTION_OUTSIDE_SESSION")
+        payload.update(schema="US_PREP_COLLECTION_PRIORITY_V2", market="US",
+                       kind="COLLECTION_PRIORITY", expires_epoch=close,
+                       final30_digest=prep_contract["final30_hash"],
+                       prep_contract_hash=_prep_collection_contract_hash(prep_contract),
+                       source_code_sha=prep_contract["run_revision"],
+                       selection_reason="PREP_FINAL30_EXISTING_RANK",
+                       position_and_quantity_state="PROVISIONAL_UNVERIFIED")
+        path = path.with_suffix(".prep.json")
     temp_name = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -384,15 +581,44 @@ def publish_preminute_candidates(
     return {"hot": len(hot), "warm": len(warm), "generation": payload["generation"]}
 
 
+def _prep_collection_contract_hash(contract: dict) -> str:
+    return hashlib.sha256(json.dumps(contract, sort_keys=True, separators=(",", ":"),
+                                     allow_nan=False).encode()).hexdigest()
+
+
+def publish_prep_collection_priority(*, env, scope, trade_date, rows, contract,
+                                     now_epoch=None, base="runtime/private"):
+    """Existing PREP rank, never a new scoring or order decision."""
+    from trader.us.prep_contract import _compute_final30_hash
+    if (not isinstance(contract, dict) or contract.get("market") != "US"
+            or contract.get("env") != env or contract.get("trade_date") != trade_date
+            or contract.get("contract_ok") is not True
+            or not contract.get("run_revision") or contract["run_revision"] == "unknown"
+            or contract.get("final30_hash") != _compute_final30_hash({"final30_scored": rows})):
+        raise ValueError("PREP_COLLECTION_CONTRACT_INVALID")
+    candidates = []
+    for row in sorted(rows, key=lambda x: int(x.get("rank_final30") or 999)):
+        meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+        candidates.append((row.get("score_final") or row.get("final_score") or row.get("score"),
+                           row.get("symbol"), row.get("exchange"), None,
+                           {**meta, "strategy_owner": row.get("strategy_owner") or meta.get("strategy_owner") or "US_STANDARD",
+                            "position_state": "PROVISIONAL_UNKNOWN"}))
+    return publish_preminute_candidates(env=env, scope=scope, trade_date=trade_date,
+               candidates=candidates, now_epoch=now_epoch, base=base, prep_contract=contract)
+
+
 def load_preminute_priority(
     *, env: str, scope: str, trade_date: str,
     pairs: list[tuple[str, str]], now_epoch: float | None = None,
-    base: str | Path = "runtime/private",
+    base: str | Path = "runtime/private", prep_only: bool = False,
+    verified_prep_contract: dict | None = None,
 ) -> tuple[dict[str, list[tuple[str, str]]], str]:
     """Return validated HOT/WARM/COLD, or explicit MISSING/STALE/INVALID."""
     available = {sym: exch for sym, exch in pairs}
-    fallback = {"HOT": [], "WARM": [], "COLD": list(pairs)}
+    fallback = {"HOT": [], "WARM": [], "COLD": []}
     path = priority_manifest_path(env=env, scope=scope, trade_date=trade_date, base=base)
+    if prep_only:
+        path = path.with_suffix(".prep.json")
     try:
         if not path.is_file():
             return fallback, "MISSING"
@@ -401,7 +627,7 @@ def load_preminute_priority(
         payload = json.loads(path.read_text(encoding="utf-8"))
         epoch = time.time() if now_epoch is None else float(now_epoch)
         if (not isinstance(payload, dict)
-                or payload.get("schema") != "US_PREMINUTE_PRIORITY_V1"
+                or payload.get("schema") != ("US_PREP_COLLECTION_PRIORITY_V2" if prep_only else "US_PREMINUTE_PRIORITY_V1")
                 or payload.get("owner") != "US_STANDARD"
                 or payload.get("env") != env
                 or payload.get("trade_date") != trade_date
@@ -413,13 +639,29 @@ def load_preminute_priority(
         expires = float(payload["expires_epoch"])
         if not all(map(math.isfinite, (created, expires, epoch))):
             return fallback, "INVALID"
-        if created > epoch + 5 or expires > created + 180.0 + 1e-5:
+        if created > epoch + 5:
+            return fallback, "INVALID"
+        if prep_only:
+            from datetime import date
+            from trader.us.market_calendar import regular_close_time_for_date, is_us_trading_day
+            day = date.fromisoformat(trade_date)
+            close = datetime.combine(day, regular_close_time_for_date(day), tzinfo=NY).timestamp()
+            c = verified_prep_contract or {}
+            if (not is_us_trading_day(day) or expires != close
+                    or payload.get("market") != "US" or payload.get("kind") != "COLLECTION_PRIORITY"
+                    or c.get("contract_ok") is not True or c.get("env") != env
+                    or c.get("trade_date") != trade_date or c.get("market") != "US"
+                    or payload.get("final30_digest") != c.get("final30_hash")
+                    or payload.get("source_code_sha") != c.get("run_revision")
+                    or payload.get("prep_contract_hash") != _prep_collection_contract_hash(c)):
+                return fallback, "INVALID"
+        elif expires > created + 180.0 + 1e-5:
             return fallback, "INVALID"
         if expires < epoch:
             return fallback, "STALE"
         lanes: dict[str, list[tuple[str, str]]] = {"HOT": [], "WARM": [], "COLD": []}
         selected = set()
-        for lane, cap in (("HOT", 4), ("WARM", 8)):
+        for lane, cap in (("HOT", 4), ("WARM", 8), ("COLD", 30)):
             rows = payload.get(lane.lower())
             if not isinstance(rows, list) or len(rows) > cap:
                 return fallback, "INVALID"
@@ -432,46 +674,322 @@ def load_preminute_priority(
                     return fallback, "INVALID"
                 selected.add(sym)
                 lanes[lane].append((sym, exch))
-        lanes["COLD"] = [p for p in pairs if p[0] not in selected]
-        return lanes, "VALID"
+        return lanes, "PREP_VALID" if prep_only else "VALID"
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
         return fallback, "INVALID"
+
+
+def merge_collection_priorities(execution, prep):
+    """Collection-only rank: eligible execution symbols first, then PREP.
+    
+    An empty execution shortlist is not a prohibition on observing verified
+    PREP candidates. Both manifests were scope-checked before this merge.
+    Never return a broker permission or admit a symbol outside those lists.
+    """
+    ranked = list(dict.fromkeys(
+        execution["HOT"] + execution["WARM"] +
+        prep["HOT"] + prep["WARM"] + execution["COLD"] + prep["COLD"]
+    ))[:30]
+    return {"HOT": ranked[:4], "WARM": ranked[4:12], "COLD": ranked[12:]}
+
+
+def collection_priorities(*, env, scope, trade_date, pairs, now_epoch=None,
+                          base="runtime/private", allow_prep_rebind=False):
+    """Keep PREP observation independent from execution eligibility.
+
+    A full-day observer may rebind to a newly verified same-day PREP
+    contract after recovery replaces Final30. Rebind only after checking the
+    account/epoch-scoped collection manifest; never trust a loose watchlist.
+    """
+    kw = dict(env=env, scope=scope, trade_date=trade_date, pairs=pairs,
+              now_epoch=now_epoch, base=base)
+    lanes, state = load_preminute_priority(**kw)
+    try:
+        from trader.us.path_contract import us_prep_contract_path, us_final30_scored_path
+        from trader.us.prep_contract import _compute_final30_hash
+        contract = json.loads(us_prep_contract_path(trade_date).read_text(encoding="utf-8"))
+        payload = json.loads(us_final30_scored_path(trade_date).read_text(encoding="utf-8"))
+        rows = payload.get("final30_scored") or []
+        verified_pairs = standard_entry_pairs(rows)
+        changed = set(verified_pairs) != set(pairs)
+        if (payload.get("trade_date") != trade_date or payload.get("env") != env
+                or contract.get("final30_hash") != _compute_final30_hash({"final30_scored": rows})):
+            if allow_prep_rebind:
+                # A partial PREP replacement is not authority to keep polling
+                # the old universe, even if its execution manifest is still fresh.
+                return {"HOT": [], "WARM": [], "COLD": []}, "PREP_REBIND_UNVERIFIED"
+            return lanes, state
+        if changed and not allow_prep_rebind:
+            return lanes, state
+        verified_kw = {**kw, "pairs":verified_pairs}
+        fallback, prep_state = load_preminute_priority(**verified_kw, prep_only=True,
+                                                        verified_prep_contract=contract)
+        if prep_state == "PREP_VALID":
+            if changed:
+                # Revalidate the execution list against the NEW universe;
+                # old removed symbols cannot survive as collection targets.
+                lanes, state = load_preminute_priority(**verified_kw)
+            if state == "VALID":
+                return merge_collection_priorities(lanes, fallback), "VALID"
+            return fallback, prep_state
+        if changed or allow_prep_rebind:
+            return {"HOT": [], "WARM": [], "COLD": []}, "PREP_REBIND_UNVERIFIED"
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        if allow_prep_rebind:
+            return {"HOT": [], "WARM": [], "COLD": []}, "PREP_REBIND_UNVERIFIED"
+    return lanes, state
 
 
 def next_priority_pair(
     lanes: dict[str, list[tuple[str, str]]],
     *, slot: int, offsets: dict[str, int],
+    promoted_hot: set[tuple[str, str]] | None = None,
+    last_hot_attempt: dict[tuple[str, str], float] | None = None,
+    now_mono: float | None = None,
+    poll_interval_sec: float = 10.0,
 ) -> tuple[tuple[str, str], str] | None:
-    """Fixed 4:1:1 request budget, with non-starving low-priority discovery."""
+    """V2 4:1:1; prioritize HOT attempt deadlines without adding requests.
+
+    Attempt time is scheduling evidence, not proof of a fresh completed bar.
+    An overdue established symbol wins over repeated promotions. The next
+    ordinary HOT slot still honors unattempted promotions and rotation.
+    """
+    if any(len(lanes.get(tier) or []) > cap for tier, cap in (("HOT", 4), ("WARM", 8), ("COLD", 30))):
+        return None
     schedule = ("HOT", "HOT", "HOT", "HOT", "WARM", "COLD")
     preferred = schedule[slot % len(schedule)]
-    for tier in (preferred, "HOT", "WARM", "COLD"):
-        lane = lanes.get(tier) or []
-        if lane:
-            pos = offsets.get(tier, 0)
-            offsets[tier] = pos + 1
-            return lane[pos % len(lane)], tier
-    return None
+    tier = preferred if lanes.get(preferred) else "HOT"
+    lane = lanes.get(tier) or []
+    if not lane:
+        return None
+    pos = offsets.get(tier, 0)
+    offsets[tier] = pos + 1
+    if tier == "HOT":
+        rotated = [lane[(pos + i) % len(lane)] for i in range(len(lane))]
+        if last_hot_attempt is not None and now_mono is not None:
+            # Reserve one normal poll interval before the 60s attempt
+            # target. This is admission priority, not a latency guarantee.
+            cutoff = now_mono - max(0.0, 60.0 - max(0.0, poll_interval_sec))
+            due = [pair for pair in rotated if pair in last_hot_attempt
+                   and last_hot_attempt[pair] <= cutoff]
+            if due:
+                return min(due, key=lambda pair: last_hot_attempt[pair]), tier
+            unseen = [pair for pair in rotated if pair not in last_hot_attempt]
+            if unseen:
+                return next((pair for pair in unseen if pair in (promoted_hot or set())), unseen[0]), tier
+        if promoted_hot:
+            for candidate in rotated:
+                if candidate in promoted_hot:
+                    return candidate, tier
+    return lane[pos % len(lane)], tier
+
+
+def _minute_repair_targets(db, *, trade_date, symbol, requested_at):
+    """Separate missing completed bars from quarantined native conflicts."""
+    from datetime import timedelta
+    present = {b["time_et"] for b in load_bars(db, trade_date=trade_date, symbol=symbol)}
+    conflicts = {row[0] for row in db.execute(
+        "SELECT DISTINCT minute_et FROM bar_conflicts WHERE trade_date=? AND symbol=? "
+        "AND owner='US_STANDARD' AND status='UNRESOLVED'", (trade_date, symbol.upper()))}
+    opening = requested_at.replace(hour=9, minute=30, second=0, microsecond=0)
+    elapsed = min(30, max(0, int((requested_at-opening).total_seconds() // 60)))
+    expected = {(opening + timedelta(minutes=i)).isoformat() for i in range(elapsed)}
+    latest_boundary = requested_at.replace(second=0, microsecond=0)
+    expected.update(at.isoformat() for i in range(1,5)
+                    if (at := latest_boundary - timedelta(minutes=i)) >= opening)
+    return expected - present - conflicts, conflicts
+
+
+def collect_hot_minutes(client, db, *, symbol, exchange, trade_date,
+                        repair_due: bool, still_hot, max_pages: int = 4, clock=None) -> dict:
+    """Latest first, then bounded native historical pages only for a HOT symbol."""
+    cursor = ""
+    seen = set()
+    requests = changed = 0
+    missing = conflicts = None
+    clock = clock or time.monotonic
+    deadline = clock() + 8.0
+    while requests < max(1, min(4, int(max_pages))) and clock() < deadline:
+        if not still_hot() or clock() >= deadline:
+            break
+        page = client.get_us_intraday_1m_page(
+            symbol, exchange, before_key=cursor, deadline_monotonic=deadline,
+        )
+        requests += 1
+        requested_at = page["requested_at"].astimezone(NY)
+        if requested_at.date().isoformat() != trade_date:
+            break
+        changed += persist_bars(db, trade_date=trade_date, symbol=symbol,
+                                owner="US_STANDARD", native_rows=page["rows"],
+                                now_et=requested_at, observation_id=page["observation_id"],
+                                observed_epoch=page["observed_epoch"])
+        if repair_due:
+            missing, conflicts = _minute_repair_targets(
+                db, trade_date=trade_date, symbol=symbol, requested_at=requested_at)
+        if not repair_due or clock() >= deadline:
+            break
+        targets = missing | conflicts
+        next_key = str(page.get("next_key") or "")
+        # KEYB is derived from the actual preceding response, never a
+        # fabricated anchor. Only continue if unresolved evidence is older.
+        if (not targets or not next_key or next_key in seen
+                or next_key[:8] != trade_date.replace("-", "")
+                or (cursor and next_key >= cursor)
+                or min(datetime.fromisoformat(t).strftime("%Y%m%d%H%M%S") for t in targets) > next_key):
+            break
+        seen.add(next_key)
+        cursor = next_key
+        LOG.info("[US_OPENING_OBSERVER][HISTORICAL_REPAIR] symbol=%s cursor=%s targets=%d",
+                 symbol, cursor, len(targets))
+    return {"requests": requests, "changed": changed,
+            "missing_targets": len(missing) if missing is not None else None,
+            "conflict_targets": len(conflicts) if conflicts is not None else None}
+
+
+def repair_retry_delay(result):
+    """A successful GET is not proof of repaired coverage.
+
+    Retry missing bars on the next ordinary eligible HOT slot, but never
+    accelerate conflict observation beyond its existing 60s spacing.
+    """
+    missing = result.get("missing_targets")
+    conflicts = result.get("conflict_targets")
+    if result.get("requests",0) <= 0 or missing is None or conflicts is None:
+        return None
+    if missing:
+        return 0.0
+    if conflicts:
+        return 60.0
+    return 120.0
+
+
+def start_prep_observer(*, env: str, scope: str, trade_date: str, rows: list[dict],
+                        now_et=None, base="runtime/private", log_base="runtime/logs"):
+    """Launch the existing singleton READ-ONLY observer after verified PREP.
+
+    No new broker client/order authority; the child owns its existing lock.
+    AM/PM keep their existing recovery launch in case the child died.
+    """
+    from datetime import date
+    from trader.us.market_calendar import is_us_trading_day, regular_close_time_for_date
+    import subprocess
+    import tempfile
+    now_et = now_et or datetime.now(NY)
+    day = date.fromisoformat(trade_date)
+    if (env != "practice" or now_et.tzinfo is None
+            or now_et.astimezone(NY).date() != day or not is_us_trading_day(day)
+            or now_et.astimezone(NY).time() >= regular_close_time_for_date(day)):
+        return None
+    pairs = standard_entry_pairs(rows)
+    if not pairs:
+        return None
+    key = hashlib.sha256((env + ":" + scope).encode()).hexdigest()[:20]
+    root = Path(base)
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    watchlist = root / ("us-opening-watchlist-" + key + "-" + trade_date + ".json")
+    temp_name = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=root,
+                                         delete=False) as handle:
+            temp_name = handle.name
+            json.dump([{"symbol": sym, "exchange": exch} for sym,exch in pairs], handle)
+        os.replace(temp_name, watchlist)
+    finally:
+        if temp_name:
+            Path(temp_name).unlink(missing_ok=True)
+    log_dir = Path(log_base)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    path = log_dir / ("us-opening-observer-" + trade_date + "-" + key + ".log")
+    flags = os.O_CREAT | os.O_APPEND | os.O_WRONLY | os.O_NOFOLLOW
+    with os.fdopen(os.open(path, flags, 0o600), "a", encoding="utf-8") as stream:
+        return subprocess.Popen(
+            [sys.executable, "-m", "trader.us.entry_timing.opening_observer",
+             "--env", env, "--scope", scope, "--trade-date", trade_date,
+             "--parent-pid", str(os.getpid()), "--watchlist-file", str(watchlist),
+             "--continuous"],
+            env={**os.environ, "KIS_ENV":"practice", "DRY_RUN":"1",
+                 "ALLOW_REAL_ORDER":"0", "US_KIS_ORDER_ALLOWED":"0",
+                 "TRADING_REGION":"US", "US_ORDER_ARMED":"0",
+                 "LIVE_TRADING_ENABLED":"0", "US_LIVE_TRADING_ENABLED":"0"},
+            stdin=subprocess.DEVNULL, stdout=stream, stderr=stream,
+            close_fds=True, start_new_session=True,
+        )
+
+
+def _run_hot_quote_observer(*, stop, session_valid, env, scope, trade_date,
+                            pairs, continuous, quote_reader, path, collection_rank=None):
+    """Watch collector quotes even while the native minute reader is blocked."""
+    from trader.us.entry_timing.hot_event_evaluator import poll_hot_events, refresh_collection_rank
+    from trader.marketdata.us_ws_collector import get_quotes_many
+    from trader.us.market_calendar import regular_close_time_for_date
+
+    seen = {}
+    next_rank_refresh=0.0
+    db = sqlite3.connect(path, timeout=0.1)
+    try:
+        while not stop.is_set():
+            now = datetime.now(NY)
+            if now.date().isoformat() != trade_date or now.time() >= regular_close_time_for_date(now.date()):
+                break
+            if session_valid() and (now.hour, now.minute) >= (10, 0):
+                try:
+                    lanes, state = collection_priorities(
+                        env=env, scope=scope, trade_date=trade_date, pairs=pairs,
+                        now_epoch=now.timestamp(), allow_prep_rebind=continuous)
+                    if state in {"VALID", "PREP_VALID"}:
+                        poll_hot_events(db, env=env, scope=scope, trade_date=trade_date,
+                                        hot_pairs=lanes["HOT"], now_et=now, quote_reader=quote_reader,
+                                        seen=seen, live_clock=lambda: datetime.now(NY))
+                        if collection_rank is not None and time.monotonic()>=next_rank_refresh:
+                            next_rank_refresh=time.monotonic()+2.0
+                            swap=refresh_collection_rank(db,rank=collection_rank,lanes=lanes,env=env,
+                                scope=scope,trade_date=trade_date,now_et=now,
+                                quote_many=lambda items:get_quotes_many(items,env=env,max_age_sec=5,timeout_sec=.2),
+                                live_clock=lambda:datetime.now(NY))
+                            if swap:
+                                LOG.info("[US_OPENING_OBSERVER][DYNAMIC_COLLECTION_HOT] demote=%s promote=%s action=NO_ORDER",*swap)
+                    else:
+                        seen.clear()
+                except Exception as exc:
+                    db.rollback()
+                    LOG.warning("[US_HOT_EVENT][UNAVAILABLE] error=%s action=NO_ORDER", type(exc).__name__)
+            else:
+                seen.clear()
+            stop.wait(1.0)
+    finally:
+        db.close()
 
 
 def run_observer(*, env: str, trade_date: str, scope: str,
                  parent_pid: int, watchlist: list[dict],
                  min_interval_sec: float = 10.0,
-                 max_runtime_sec: float = 180.0 * 60.0) -> int:
-    if env != "practice" or parent_pid < 2:
+                 max_runtime_sec: float = 180.0 * 60.0,
+                 continuous: bool = False) -> int:
+    if env != "practice" or (not continuous and parent_pid < 2):
         return 2
     # The child cannot submit, cancel, or route orders. Existing KIS client
     # maintains its own practice-only guard; process permission also denies it.
     os.environ.update({
         "KIS_ENV": "practice", "DRY_RUN": "1", "ALLOW_REAL_ORDER": "0",
         "US_KIS_ORDER_ALLOWED": "0", "TRADING_REGION": "US",
+        "US_ORDER_ARMED": "0", "LIVE_TRADING_ENABLED": "0",
+        "US_LIVE_TRADING_ENABLED": "0",
+        "US_OPENING_OBSERVER_READ_ONLY": "1",
+        "US_SHARED_KIS_LIMITER_ENABLED": "1",
     })
+    from trader.us.market_calendar import is_us_trading_day, regular_close_time_for_date
+    from datetime import date
+    day = date.fromisoformat(trade_date)
+    if not is_us_trading_day(day):
+        LOG.info("[US_OPENING_OBSERVER][HOLIDAY] date=%s action=NO_COLLECTION", trade_date)
+        return 0
+    close_time = regular_close_time_for_date(day)
     pairs = standard_entry_pairs(watchlist)
     if not pairs:
         LOG.warning("[US_OPENING_OBSERVER][NO_WATCHLIST] action=NO_ORDER")
         return 2
     from trader.us.execution.kis_us_client import KisUSClient
-    from trader.marketdata.us_ws_collector import get_quote, subscribe_many
+    from trader.marketdata.us_ws_collector import get_quote, subscribe_many, ensure_started
     db = open_store(store_path(env=env, account_scope=scope, trade_date=trade_date))
     client = KisUSClient(env="practice", offline=False)
     ws_on = os.getenv("US_WS_COLLECTOR_ENABLED", "0") == "1"
@@ -479,31 +997,90 @@ def run_observer(*, env: str, trade_date: str, scope: str,
     interval = max(6.0, float(min_interval_sec))
     start = time.monotonic()
     next_poll = 0.0
+    event_stop = threading.Event()
+    event_worker = None
+    from trader.us.entry_timing.hot_event_evaluator import CollectionRankState, collection_manifest
+    collection_rank=CollectionRankState()
+    def dynamic_lanes(lanes):
+        epoch=time.time()
+        manifest=collection_manifest(env=env,scope=scope,trade_date=trade_date,now_epoch=epoch)
+        return collection_rank.apply(lanes,manifest["generation"],epoch) if manifest else lanes
     pointer = 0
     priority_offsets = {"HOT": 0, "WARM": 0, "COLD": 0}
     last_priority_state = None
+    next_repair_by_symbol = {}
+    previous_hot = set()
+    promoted_hot = set()
+    last_hot_attempt = {}
+    next_epoch_check = 0.0
+    epoch_verified = not continuous
     fetch_enabled = os.getenv("US_OPENING_OBSERVER_BAR_FETCH_ENABLED", "1") == "1"
     try:
-        while os.getppid() == parent_pid and time.monotonic() - start <= max_runtime_sec:
+        while (continuous or os.getppid() == parent_pid) and time.monotonic() - start <= max_runtime_sec:
             now_et = datetime.now(NY)
-            if now_et.date().isoformat() != trade_date or now_et.hour >= 16:
+            if now_et.date().isoformat() != trade_date or now_et.time() >= close_time:
                 break
-            if (now_et.hour, now_et.minute) < (9, 30):
+            if continuous and time.monotonic() >= next_epoch_check:
+                epoch_verified = False
+                next_epoch_check = time.monotonic() + 60.0
+                try:
+                    from trader.db.trading_epoch import active_trading_epoch_id
+                    active = active_trading_epoch_id(env="practice", required=True)
+                    epoch_verified = bool(active and scope.rsplit(":", 1)[-1] == str(active))
+                    if not epoch_verified:
+                        LOG.warning("[US_OPENING_OBSERVER][EPOCH_CHANGED] action=STOP_COLLECTION")
+                        break
+                except Exception as exc:
+                    epoch_verified = False
+                    LOG.warning("[US_OPENING_OBSERVER][EPOCH_UNVERIFIED] type=%s action=PAUSE_COLLECTION", type(exc).__name__)
+            if not epoch_verified:
                 time.sleep(2.0)
                 continue
+            if (now_et.hour, now_et.minute) < (9, 25):
+                time.sleep(2.0)
+                continue
+            if ws_on and event_worker is None:
+                # Dedicated collector IPC and local SQLite connection. The
+                # main thread retains the native minute client and its quota.
+                def session_valid():
+                    if continuous:
+                        return epoch_verified and time.monotonic() < next_epoch_check
+                    return os.getppid() == parent_pid
+                event_worker = threading.Thread(
+                    name="us-hot-quote-observer", daemon=True, target=_run_hot_quote_observer,
+                    kwargs=dict(stop=event_stop, session_valid=session_valid, env=env, scope=scope,
+                                trade_date=trade_date, pairs=pairs, continuous=continuous,
+                                quote_reader=lambda sym, exch: get_quote(
+                                    sym, exch, env=env, max_age_sec=5, timeout_sec=.11),
+                                path=store_path(env=env, account_scope=scope, trade_date=trade_date),
+                                collection_rank=collection_rank))
+                event_worker.start()
             if time.monotonic() < next_poll:
                 time.sleep(min(1.0, next_poll - time.monotonic()))
                 continue
             # Collector starts asynchronously; subscription warmup must
             # retry after readiness/reconnect, not fire once and disappear.
-            if ws_on and time.monotonic() >= next_subscription_refresh:
-                for _i in range(0, len(pairs), 16):
-                    subscribe_many(pairs[_i:_i + 16], env=env, timeout_sec=0.3)
-                next_subscription_refresh = time.monotonic() + 30.0
-            lanes, priority_state = load_preminute_priority(
+            lanes, priority_state = collection_priorities(
                 env=env, scope=scope, trade_date=trade_date,
-                pairs=pairs, now_epoch=time.time(),
+                pairs=pairs, now_epoch=time.time(), allow_prep_rebind=continuous,
             )
+            lanes=dynamic_lanes(lanes)
+            if ws_on and time.monotonic() >= next_subscription_refresh:
+                try:
+                    ensure_started(env=env, offline=False)
+                except Exception as exc:
+                    LOG.warning("[US_OPENING_OBSERVER][COLLECTOR_START_WARN] type=%s", type(exc).__name__)
+                from trader.us.symbols import resolve_quote_exchange
+                benchmark_pairs = [(sym, resolve_quote_exchange(sym)) for sym in ("SPY","QQQ","SMH")]
+                # Benchmark subscriptions are independent of the entry shortlist.
+                # Do not bulk-prewarm COLD ahead of held/exit-owner quotes.
+                targets = list(dict.fromkeys(benchmark_pairs + lanes["HOT"] + lanes["WARM"]))
+                for _i in range(0, len(targets), 16):
+                    subscribe_many(targets[_i:_i + 16], env=env, timeout_sec=0.3)
+                next_subscription_refresh = time.monotonic() + 30.0
+            if (now_et.hour, now_et.minute) < (9, 30):
+                time.sleep(2.0)
+                continue
             if pointer == 0 or priority_state != last_priority_state:
                 LOG.info(
                     "[US_OPENING_OBSERVER][PRIORITY_SCOPE] state=%s hot=%d warm=%d cold=%d "
@@ -512,7 +1089,17 @@ def run_observer(*, env: str, trade_date: str, scope: str,
                     len(lanes["COLD"]),
                 )
             last_priority_state = priority_state
-            picked = next_priority_pair(lanes, slot=pointer, offsets=priority_offsets)
+            current_hot = set(lanes["HOT"])
+            promoted_hot.intersection_update(current_hot)
+            promoted_hot.update(current_hot - previous_hot)
+            previous_hot = current_hot
+            # A demoted or removed symbol must not inherit a previous HOT
+            # attempt deadline when it later earns a new HOT admission.
+            last_hot_attempt = {pair: at for pair, at in last_hot_attempt.items()
+                                if pair in current_hot}
+            picked = next_priority_pair(lanes, slot=pointer, offsets=priority_offsets,
+                                        promoted_hot=promoted_hot, last_hot_attempt=last_hot_attempt,
+                                        now_mono=time.monotonic(), poll_interval_sec=interval)
             pointer += 1
             if picked is None:
                 LOG.warning("[US_OPENING_OBSERVER][NO_COLLECTION_TARGET] action=NO_ORDER")
@@ -520,6 +1107,7 @@ def run_observer(*, env: str, trade_date: str, scope: str,
                 continue
             (symbol, exchange), tier = picked
             next_poll = time.monotonic() + interval
+            quote = None
             try:
                 quote = get_quote(symbol, exchange, env=env, timeout_sec=0.13)
                 if quote:
@@ -531,17 +1119,58 @@ def run_observer(*, env: str, trade_date: str, scope: str,
             if not fetch_enabled:
                 continue
             try:
-                native = client.get_us_intraday_1m_bars(symbol, exchange, count=120)
-                rows = persist_bars(db, trade_date=trade_date, symbol=symbol,
-                                    owner="US_STANDARD", native_rows=native,
-                                    now_et=datetime.now(NY))
-                LOG.info("[US_OPENING_OBSERVER][BAR_UPDATE] symbol=%s new_rows=%d "
-                         "source=KIS_OVERSEAS_1M action=NO_ORDER", symbol, rows)
+                def _still_hot():
+                    current, state = collection_priorities(env=env, scope=scope,
+                        trade_date=trade_date, pairs=pairs, now_epoch=time.time(),
+                        allow_prep_rebind=continuous)
+                    current=dynamic_lanes(current)
+                    live = datetime.now(NY)
+                    return (epoch_verified and live.date().isoformat() == trade_date
+                            and live.time() < close_time and state in {"VALID", "PREP_VALID"}
+                            and (symbol, exchange) in current[tier])
+                promoted = tier == "HOT" and (symbol, exchange) in promoted_hot
+                repair_due = tier == "HOT" and (promoted or time.monotonic() >= next_repair_by_symbol.get(symbol, 0.0))
+                # A failed/deferred native read must not consume the repair
+                # cooldown. A newly promoted HOT symbol gets its first backfill
+                # on a HOT slot without increasing the WARM/COLD request quota.
+                if tier == "HOT" and _still_hot():
+                    # Track attempted admission even if the native call fails;
+                    # do not mistake it for a verified bar or retry endlessly.
+                    attempted_at = time.monotonic()
+                    previous_attempt = last_hot_attempt.get((symbol, exchange))
+                    last_hot_attempt[(symbol, exchange)] = attempted_at
+                    LOG.info("[US_OPENING_OBSERVER][HOT_ATTEMPT_INTERVAL] symbol=%s interval_sec=%s target_sec=60",
+                             symbol, "UNKNOWN" if previous_attempt is None else round(attempted_at-previous_attempt, 3))
+                result = collect_hot_minutes(client, db, symbol=symbol, exchange=exchange,
+                    trade_date=trade_date, repair_due=repair_due, still_hot=_still_hot, max_pages=4 if tier == "HOT" else 1)
+                delay = repair_retry_delay(result) if repair_due else None
+                if delay is not None:
+                    next_repair_by_symbol[symbol] = time.monotonic() + delay
+                    promoted_hot.discard((symbol, exchange))
+                    LOG.info("[US_OPENING_OBSERVER][REPAIR_OUTCOME] symbol=%s missing=%s conflicts=%s retry_after_sec=%s",
+                             symbol,result["missing_targets"],result["conflict_targets"],delay)
+                elif promoted:
+                    LOG.info("[US_OPENING_OBSERVER][PROMOTION_REPAIR_DEFERRED] symbol=%s", symbol)
+                LOG.info("[US_OPENING_OBSERVER][BAR_UPDATE] symbol=%s new_rows=%d requests=%d "
+                         "source=KIS_OVERSEAS_1M action=NO_ORDER", symbol, result["changed"], result["requests"])
+                from trader.marketdata.opening_range_intelligence import analyze_opening_range
+                summary = analyze_opening_range(
+                    market="US", trade_date=trade_date, now=datetime.now(NY),
+                    bars=load_bars(db, trade_date=trade_date, symbol=symbol),
+                    # Market-specific structural target must be provided by
+                    # the actual strategy adapter before a ceiling is emitted.
+                    quote=quote or {},
+                )
+                LOG.info("[US_OPENING_OBSERVER][OPENING_INTELLIGENCE] symbol=%s tier=%s %s",
+                         symbol, tier, json.dumps(summary, sort_keys=True, allow_nan=False))
             except Exception as exc:
                 # Missing bars must remain WAIT. Never block an unrelated SELL.
                 LOG.warning("[US_OPENING_OBSERVER][BAR_UNAVAILABLE] symbol=%s error=%s",
                             symbol, type(exc).__name__)
     finally:
+        event_stop.set()
+        if event_worker is not None:
+            event_worker.join(timeout=2.0)
         db.close()
     return 0
 
@@ -553,17 +1182,34 @@ def main() -> int:
     parser.add_argument("--scope", required=True)
     parser.add_argument("--parent-pid", type=int, required=True)
     parser.add_argument("--watchlist-file", type=Path, required=True)
+    parser.add_argument("--continuous", action="store_true")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
     with args.watchlist_file.open(encoding="utf-8") as fh:
         rows = json.load(fh)
     if not isinstance(rows, list):
         return 2
-    return run_observer(
-        env=args.env, trade_date=args.trade_date, scope=args.scope,
-        parent_pid=args.parent_pid, watchlist=rows,
-        min_interval_sec=float(os.getenv("US_OPENING_OBSERVER_INTERVAL_SEC", "10")),
-    )
+    kwargs = dict(env=args.env, trade_date=args.trade_date, scope=args.scope,
+                  parent_pid=args.parent_pid, watchlist=rows,
+                  min_interval_sec=float(os.getenv("US_OPENING_OBSERVER_INTERVAL_SEC", "10")))
+    if not args.continuous:
+        return run_observer(**kwargs)
+    # Linux/WSL process-held advisory lock, not a PID file. A second AM/PM
+    # launcher exits without opening the DB or calling the broker. Never
+    # unlink the lock file (which could allow separate locked inodes).
+    import fcntl
+    lock = store_path(env=args.env, account_scope=args.scope,
+                      trade_date=args.trade_date).with_suffix(".observer.lock")
+    fd = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            LOG.info("[US_OPENING_OBSERVER][ALREADY_RUNNING] action=NO_COLLECTION")
+            return 0
+        return run_observer(**kwargs, continuous=True, max_runtime_sec=8*3600)
+    finally:
+        os.close(fd)
 
 
 if __name__ == "__main__":

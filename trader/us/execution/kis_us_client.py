@@ -33,6 +33,17 @@ def _endpoint_label(method: str, path: str) -> str:
     return f"{method.upper()}_{tail}"
 
 
+def _urgent_kis_request(method: str, path: str, headers: dict) -> bool:
+    """Exact registry identity; never infer SELL from the shared order URL."""
+    tr_id = str(headers.get("tr_id") or "").upper()
+    for name in ("us_sell_order", "us_order_cancel", "us_fills_today"):
+        tr = get_tr_info(name)
+        if (tr["method"] == method and tr["path"] == path.split("?")[0]
+                and tr["tr_id"] == tr_id):
+            return True
+    return False
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None:
@@ -323,7 +334,7 @@ class KisUSClient:
     # Market Data
     # ------------------------------------------------------------------
 
-    def get_us_price(self, symbol: str, exchange: str) -> dict:
+    def get_us_price(self, symbol: str, exchange: str, *, max_quote_age_sec: float | None = None) -> dict:
         """해외주식 현재가 조회."""
         self._assert_not_offline("get_us_price")
         tr = get_tr_info("us_price")
@@ -335,9 +346,11 @@ class KisUSClient:
         }
         cache_key = ("price", symbol.upper(), self._resolve_quote_excd(exchange))
         ttl = float(os.getenv("US_KIS_PRICE_CACHE_TTL_SEC", "20") or 20)
+        if max_quote_age_sec is not None:
+            ttl = min(ttl, max(0.0, float(max_quote_age_sec)))
         now_ts = time.time()
         cached = self._response_cache.get(cache_key)
-        if cached and now_ts - cached[0] <= ttl:
+        if cached and 0 <= now_ts - cached[0] <= ttl:
             age_sec = max(0.0, now_ts - float(cached[0]))
             logger.debug("[US_KIS][CACHE_HIT] endpoint=GET_price symbol=%s ttl=%.1f", symbol, ttl)
             cached_payload = dict(cached[1]) if isinstance(cached[1], dict) else cached[1]
@@ -412,6 +425,79 @@ class KisUSClient:
         logger.info("[US_ENTRY][MINUTE_BARS] symbol=%s rows=%d source=KIS_OVERSEAS_1M",
                     params["SYMB"], len(rows))
         return rows
+
+    def get_us_intraday_1m_page(self, symbol: str, exchange: str, *,
+                                before_key: str = "", count: int = 120,
+                                deadline_monotonic: float | None = None) -> dict:
+        """Bounded authenticated native minute read, with continuation evidence.
+
+        KIS official overseas-stock 030 specifies PINC=1/NEXT=1 and KEYB
+        equal to one minute before the preceding page's last minute.
+        https://github.com/koreainvestment/open-trading-api/tree/main/examples_llm/overseas_stock/inquire_time_itemchartprice
+        Never synthesize missing trades; only the observer's scoped store
+        determines whether an actual returned row is admissible.
+        """
+        from datetime import datetime, timedelta, timezone
+        from uuid import uuid4
+        self._assert_not_offline("get_us_intraday_1m_page")
+        symbol = str(symbol or "").strip().upper()
+        if not symbol:
+            raise ValueError("missing_intraday_symbol")
+        cursor = str(before_key or "")
+        if cursor:
+            if len(cursor) != 14 or not cursor.isdigit():
+                raise ValueError("invalid_native_minute_cursor")
+            datetime.strptime(cursor, "%Y%m%d%H%M%S")
+        params = {
+            "AUTH": "", "EXCD": self._resolve_quote_excd(exchange), "SYMB": symbol,
+            "NMIN": "1", "PINC": "1" if cursor else "0", "NEXT": "1" if cursor else "",
+            "NREC": str(max(1, min(120, int(count)))), "FILL": "", "KEYB": cursor,
+        }
+        previous_deadline = getattr(self, "_stage_deadline", None)
+        if deadline_monotonic is not None:
+            self._stage_deadline = (
+                min(previous_deadline, deadline_monotonic) if previous_deadline is not None
+                else deadline_monotonic
+            )
+        try:
+            if deadline_monotonic is not None:
+                self._request_budget()
+            headers = self._build_headers("HHDFS76950200")
+            if cursor:
+                headers["tr_cont"] = "N"
+            requested_at = datetime.now(timezone.utc)
+            response = self._get("/uapi/overseas-price/v1/quotations/inquire-time-itemchartprice",
+                                 headers=headers, params=params, max_attempts_override=1)
+        finally:
+            if deadline_monotonic is not None:
+                self._stage_deadline = previous_deadline
+        observed_at = datetime.now(timezone.utc)
+        if not isinstance(response, dict) or str(response.get("rt_cd")) != "0":
+            raise KisUSClientError("KIS_US_1M_BAR_RESPONSE_UNVERIFIED")
+        rows = response.get("output2")
+        if not isinstance(rows, list):
+            raise KisUSClientError("KIS_US_1M_BAR_ROWS_MISSING")
+        stamps = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            stamp = str(row.get("xymd") or "").replace("-", "") + str(row.get("xhms") or "").replace(":", "").zfill(6)
+            try:
+                if len(stamp) == 14 and stamp.isdigit():
+                    stamps.append(datetime.strptime(stamp, "%Y%m%d%H%M%S"))
+            except ValueError:
+                continue
+        response_meta = response.get("_response_meta") or {}
+        cont = str(response_meta.get("tr_cont") or "").upper() if isinstance(response_meta, dict) else ""
+        next_key = ""
+        if stamps and cont in {"M", "F"}:
+            next_key = (min(stamps) - timedelta(minutes=1)).strftime("%Y%m%d%H%M%S")
+            if cursor and next_key >= cursor:
+                next_key = ""
+        logger.info("[US_ENTRY][MINUTE_PAGE] symbol=%s rows=%d cursor=%s next=%s tr_cont=%s",
+                    symbol, len(rows), cursor or "LATEST", next_key or "END", cont or "UNKNOWN")
+        return {"rows": rows, "next_key": next_key, "requested_at": requested_at,
+                "observed_epoch": observed_at.timestamp(), "observation_id": str(uuid4())}
 
     def get_us_daily_price(self, symbol: str, exchange: str, count: int = 120, as_of_date: str | None = None) -> list[dict]:
         """해외주식 기간별 시세 (일봉)."""
@@ -1456,7 +1542,7 @@ class KisUSClient:
         else:
             return (0.7, 0.7)  # trading 기본
 
-    def _apply_rate_limit(self, path: str) -> None:
+    def _apply_rate_limit(self, path: str, *, urgent: bool = False) -> None:
         """API 호출 전 rate limiting 적용."""
         endpoint_key = path.split("?")[0]  # query string 제거
         last_time = self._last_request_time.get(endpoint_key, 0.0)
@@ -1486,6 +1572,11 @@ class KisUSClient:
                         float(os.getenv("US_SHARED_KIS_HTTP_MIN_INTERVAL_SEC", "0.35")),
                     ),
                     sleep_with_budget=self._sleep_with_budget,
+                    urgent=urgent,
+                    **({"defer_if_busy": True} if (
+                        os.getenv("US_OPENING_OBSERVER_READ_ONLY") == "1"
+                        and path.split("?")[0] == "/uapi/overseas-price/v1/quotations/inquire-time-itemchartprice"
+                    ) else {}),
                 )
             except Exception as exc:
                 raise KisUSTemporaryError(
@@ -1541,7 +1632,11 @@ class KisUSClient:
         
         for attempt in range(1, max_attempts + 1):
             try:
-                self._apply_rate_limit(path)
+                if (os.getenv("US_SHARED_KIS_LIMITER_ENABLED", "0") == "1"
+                        and _urgent_kis_request("GET", path, headers)):
+                    self._apply_rate_limit(path, urgent=True)
+                else:
+                    self._apply_rate_limit(path)
                 
                 url = self._base_url + path
                 record_kis_http_call("GET", path)
@@ -1648,7 +1743,11 @@ class KisUSClient:
         for attempt in range(1, max_attempts + 1):
             http_attempted = False
             try:
-                self._apply_rate_limit(path)
+                if (os.getenv("US_SHARED_KIS_LIMITER_ENABLED", "0") == "1"
+                        and _urgent_kis_request("POST", path, headers)):
+                    self._apply_rate_limit(path, urgent=True)
+                else:
+                    self._apply_rate_limit(path)
                 
                 url = self._base_url + path
                 timeout = self._request_budget()
@@ -1662,6 +1761,19 @@ class KisUSClient:
                     # the same Tick deadline; a timeout measured *before*
                     # those checks must not authorize a late native POST.
                     timeout = self._request_budget()
+                # A regular-session tick can reach this point after the exchange
+                # closes while waiting on quota, the writer or reservation I/O.
+                # Cancellations and reconciliation have separate session rules.
+                context = getattr(self, "_tick_context", None)
+                if (path == get_tr_info("us_buy_order")["path"]
+                        and getattr(context, "session", None) in {"am", "afternoon"}):
+                    from trader.us import market_calendar
+                    now = market_calendar.now_ny()
+                    if (context.trade_date != now.date().isoformat()
+                            or market_calendar.us_calendar_load_error()
+                            or now.year not in market_calendar.us_calendar_supported_years()
+                            or not market_calendar.is_us_regular_market_open(now)):
+                        raise KisUSPreSubmitError("US_REGULAR_SESSION_CLOSED_BEFORE_HTTP")
                 # A pre-HTTP callback may fence the attempt; a logged POST
                 # must not be fabricated when requests.post was never reached.
                 record_kis_http_call("POST", path)

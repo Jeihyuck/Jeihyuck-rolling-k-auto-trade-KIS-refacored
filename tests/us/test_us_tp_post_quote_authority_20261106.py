@@ -244,3 +244,41 @@ def test_native_post_rechecks_tick_budget_after_callback(monkeypatch):
                      headers={}, body={"symbol": "HCA"})
     assert budgets == ["CHECK", "CHECK"]
     assert would_post == []
+
+
+@pytest.mark.parametrize(("day", "before", "after", "expected_posts"), [
+    ("2026-11-27", "12:59:59", "13:00:00", 0),
+    ("2026-11-27", "12:59:58", "12:59:59", 1),
+    ("2026-11-26", "10:00:00", "10:00:01", 0),
+    ("2026-11-25", "15:59:59", "16:00:00", 0),
+    ("2026-07-06", "09:30:00", "09:30:01", 1),
+])
+def test_native_order_uses_actual_exchange_clock_after_authority(
+        monkeypatch, day, before, after, expected_posts):
+    from datetime import datetime
+    from types import SimpleNamespace
+    import requests
+    from trader.us import market_calendar
+    from trader.us.execution import kis_us_client as transport
+
+    def instant(value):
+        return datetime.fromisoformat(day + "T" + value).replace(tzinfo=market_calendar.NY_TZ)
+
+    wall = [instant(before)]
+    monkeypatch.setattr(market_calendar, "now_ny", lambda: wall[0])
+    client = _stub_native_transport()
+    client.bind_tick_context(SimpleNamespace(session="afternoon", trade_date=day))
+    client.set_before_order_http(lambda: wall.__setitem__(0, instant(after)))
+    posted = []
+    def post(*args, **kwargs):
+        posted.append(wall[0])
+        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"rt_cd": "0"})
+    monkeypatch.setattr(requests, "post", post)
+    monkeypatch.setattr(transport, "record_kis_http_call", lambda *_: None)
+    path = transport.get_tr_info("us_sell_order")["path"]
+    if expected_posts:
+        client._post(path, headers={}, body={})
+    else:
+        with pytest.raises(KisUSPreSubmitError, match="US_REGULAR_SESSION_CLOSED_BEFORE_HTTP"):
+            client._post(path, headers={}, body={})
+    assert len(posted) == expected_posts
