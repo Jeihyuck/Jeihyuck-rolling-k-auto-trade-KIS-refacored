@@ -174,3 +174,34 @@ def test_admission_deadline_rechecked_after_file_open_or_state_read(monkeypatch,
         assert path.read_text() == ""  # no stale priority or HTTP reservation
     finally:
         path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("priority", [False, True])
+def test_admission_never_grants_after_slow_state_flush(monkeypatch, priority):
+    monkeypatch.setenv("KR_SHARED_HTTP_RPS_PRACTICE", "2")
+    key = "test-" + uuid.uuid4().hex
+    path = budget._path("practice", key)
+    clock = [100.0]
+    original_write = budget._write
+    def delayed_write(file, state):
+        original_write(file, state)
+        clock[0] += 0.2
+    monkeypatch.setattr(budget, "_write", delayed_write)
+    monkeypatch.setattr(budget.time, "monotonic", lambda: clock[0])
+    try:
+        granted, reason, waited = budget.acquire(
+            environment="practice", appkey=key, priority=priority,
+            observer=False, max_wait_sec=.1,
+        )
+        assert not granted and reason == "DEADLINE"
+        assert waited >= .1
+        # No rollback of the persisted lease/slot; conservative quota usage.
+        import json
+        state = json.loads(path.read_text())
+        if priority:
+            assert state["priority_until"] > 100
+            assert state["next_at"] == 0
+        else:
+            assert state["next_at"] > 100
+    finally:
+        path.unlink(missing_ok=True)
