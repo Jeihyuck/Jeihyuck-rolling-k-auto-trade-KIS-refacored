@@ -445,7 +445,8 @@ def test_tp_boundary_budget_retains_every_unexamined_candidate(pg_engine, monkey
 
 @pytest.mark.skipif(not os.getenv("PBCORE_TEST_POSTGRES_URL"), reason="requires disposable PostgreSQL")
 @pytest.mark.parametrize("contradiction", ["raw_order", "fill", "event_account", "event_symbol",
-                                           "event_side", "event_stage", "intent_account"])
+                                           "event_side", "event_stage", "intent_account",
+                                           "event_env", "event_meta_env", "intent_env"])
 def test_postgres_preclaim_certificate_rejects_contradictory_durable_fields(pg_engine, monkeypatch, contradiction):
     from sqlalchemy import text
     from trader.us.db import repos
@@ -466,6 +467,9 @@ def test_postgres_preclaim_certificate_rejects_contradictory_durable_fields(pg_e
         "event_side": "UPDATE us_order_events SET side='BUY'",
         "event_stage": "UPDATE us_order_events SET profit_capture_stage='tp1'",
         "intent_account": "UPDATE us_order_intents SET account_id='residual-account', meta='{\"broker_account_hash\":\"foreign-account\"}'::jsonb",
+        "event_env": "UPDATE us_order_events SET payload=jsonb_set(payload, '{env}', to_jsonb('real'::text))",
+        "event_meta_env": "UPDATE us_order_events SET payload=jsonb_set(payload, '{meta,trading_env}', to_jsonb('real'::text))",
+        "intent_env": "UPDATE us_order_intents SET meta=jsonb_set(meta, '{trading_env}', to_jsonb('real'::text))",
     }
     with pg_engine.begin() as conn:
         conn.execute(text(updates[contradiction] + " WHERE client_order_key=:key"), {"key": key})
@@ -483,6 +487,8 @@ def test_postgres_preclaim_certificate_rejects_contradictory_durable_fields(pg_e
     ("intent","account_id"), ("meta","account_id"),
     ("intent","trading_epoch_id"), ("meta","trading_epoch_id"),
     ("intent","strategy_owner"), ("meta","strategy_owner"),
+    ("intent","env"), ("meta","env"),
+    ("intent","trading_env"), ("meta","trading_env"),
 ])
 def test_preclaim_abort_cannot_retag_foreign_declared_scope(monkeypatch, location, field):
     from trader.us.db import repos

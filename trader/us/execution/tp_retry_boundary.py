@@ -14,9 +14,18 @@ logger = logging.getLogger(__name__)
 CERTIFICATE = "ROUTER_ABORTED_BEFORE_CLAIM"
 
 
+def _matches_declared_environment(data: dict, env: str) -> bool:
+    return all(
+        data.get(field) is None or str(data[field]).strip().lower() in {"", env}
+        for field in ("env", "trading_env")
+    )
+
+
 def record_router_abort(intent: dict, *, checkpoint: str) -> bool:
     """Called only on two returns preceding intent/claim/native submission."""
     meta = intent.get("meta") or {}
+    if not isinstance(meta, dict):
+        return False
     symbol = str(intent.get("symbol") or "").upper()
     stage = str(meta.get("profit_capture_stage") or "").lower()
     owner = str(intent.get("strategy_owner") or meta.get("strategy_owner") or "US_STANDARD")
@@ -42,6 +51,8 @@ def record_router_abort(intent: dict, *, checkpoint: str) -> bool:
         # account/epoch/owner. In particular, the original-scope rejection
         # path must not replace contradictory identity with current values.
         for source in (intent, meta):
+            if not _matches_declared_environment(source, scope["env"]):
+                return False
             for field, expected in (
                 ("broker_account_hash", scope["account_id"]),
                 ("account_id", scope["account_id"]),
@@ -99,6 +110,11 @@ def _release_certificate_row(conn, row: dict, scope: dict) -> bool:
         payload = e.get("payload") or {}
         if not isinstance(payload, dict):
             return False
+        event_meta = payload.get("meta") or {}
+        if (not isinstance(event_meta, dict)
+                or not _matches_declared_environment(payload, scope["env"])
+                or not _matches_declared_environment(event_meta, scope["env"])):
+            return False
         account_columns = (e.get("account_id"), payload.get("broker_account_hash"))
         if (e.get("event_type") != CERTIFICATE or not e.get("submit_attempt_id")
                 or not any(account_columns)
@@ -112,7 +128,7 @@ def _release_certificate_row(conn, row: dict, scope: dict) -> bool:
                 or payload.get("symbol") != params["sym"] or payload.get("side") != "SELL"
                 or payload.get("profit_capture_stage") != params["stage"]
                 or payload.get("strategy_owner") != "US_STANDARD"
-                or (payload.get("meta") or {}).get("router_abort_checkpoint")
+                or event_meta.get("router_abort_checkpoint")
                     not in {"semantic_lookup_failed", "original_scope_rejected"}):
             return False
     # Check all epochs/accounts for this globally unique client key. Unknown
@@ -128,7 +144,7 @@ def _release_certificate_row(conn, row: dict, scope: dict) -> bool:
     """), params).mappings().one_or_none()
     if intent_row:
         im = intent_row.get("meta") or {}
-        if not isinstance(im, dict):
+        if not isinstance(im, dict) or not _matches_declared_environment(im, scope["env"]):
             return False
         declared_accounts = (intent_row.get("account_id"), im.get("broker_account_hash"))
         declared_cycle = str(im.get("position_lifecycle_id") or "")
