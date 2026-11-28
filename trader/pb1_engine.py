@@ -1627,15 +1627,46 @@ def _classify_kr_timing_zero_submit(submit_result, *, expected_count):
     return "OK_NO_TRADE", "KR_ENTRY_TIMING_POLICY_WAIT"
 
 
+def _kr_protective_zero_submit(submit_result, *, expected_count):
+    """No rapid re-entry unless each candidate has an explicit zero-order result."""
+    results = submit_result.get("results") or []
+    if (expected_count <= 0 or len(results) != expected_count
+            or submit_result.get("skipped") != expected_count
+            or any(submit_result.get(k) != 0 for k in
+                   ("attempted", "api_submitted", "accepted", "filled", "rejected", "failed"))):
+        return False
+    deferred = [r for r in results if r.get("protective_deferred") is True]
+    if not deferred or any(r.get("terminal_event") != "FINAL_SKIP"
+            or r.get("skipped") != 1
+            or r.get("skipped_reason") != "KR_PROTECTIVE_REEVALUATION_REQUIRED"
+            for r in deferred):
+        return False
+    previous = [r for r in results if r.get("protective_deferred") is not True]
+    return not previous or _classify_kr_timing_zero_submit(
+        {**submit_result, "results": previous, "skipped": len(previous)},
+        expected_count=len(previous)
+    ) == ("OK_NO_TRADE", "KR_ENTRY_TIMING_POLICY_WAIT")
+
+
 def _submit_finalized_order_candidates(
     candidates: list["CandidateFeature"], *, submitter: Any,
     pre_submit_gate: Any | None = None,
+    protective_checkpoint: Any | None = None,
 ) -> dict[str, Any]:
-    """Single production submission seam, injectable with a fake KIS submitter."""
+    """Single production submission seam, injectable with a fake KIS submitter.
+
+    Protection defers only candidates whose submission has not begun.
+    """
     counts = {"attempted": 0, "api_submitted": 0, "accepted": 0, "filled": 0,
               "rejected": 0, "skipped": 0, "failed": 0}
     results = []
     for candidate in candidates:
+        if protective_checkpoint is not None and protective_checkpoint():
+            counts["skipped"] += 1
+            results.append({"terminal_event": "FINAL_SKIP", "skipped": 1,
+                            "skipped_reason": "KR_PROTECTIVE_REEVALUATION_REQUIRED",
+                            "protective_deferred": True, "code": candidate.code})
+            continue
         if pre_submit_gate is not None and not pre_submit_gate(candidate):
             counts["skipped"] += 1
             continue
@@ -21984,6 +22015,7 @@ class PB1Engine:
                         submit_result = _submit_finalized_order_candidates(
                             orderable_candidates, submitter=_submit_candidate,
                             pre_submit_gate=_pre_submit_gate,
+                            protective_checkpoint=self._kr_protection_checkpoint,
                         )
                         attempted_count = int(submit_result["attempted"])
                         api_submitted_count = int(submit_result["api_submitted"])
@@ -22119,6 +22151,10 @@ class PB1Engine:
                             "order_candidates=%s api_submitted=0 reason=%s",
                             len(orderable_candidates), final_notes,
                         )
+                    elif (not plan_skip_reasons
+                          and _kr_protective_zero_submit(submit_result, expected_count=len(orderable_candidates))):
+                        final_status, final_notes = "OK_NO_TRADE", "KR_PROTECTIVE_REEVALUATION_REQUIRED"
+                        logger.info("[KR][ORDER_ZERO_API][PROTECTIVE_DEFERRED] reason=%s", final_notes)
                     elif (not plan_skip_reasons and
                           (timing_outcome := _classify_kr_timing_zero_submit(
                               submit_result, expected_count=len(orderable_candidates)
@@ -22151,6 +22187,8 @@ class PB1Engine:
                 if entry_allowed and self.phase in {"entry", "pm_entry"} and allow_add_to_existing:
                     remaining_budget = max(0.0, float(tick_budget_krw) - planned_spent)
                     for pos in existing_positions:
+                        if self._kr_protection_checkpoint():
+                            break  # only defer new ADD orders, not existing settlement
                         code = pos.get("code")
                         if not code or remaining_budget <= 0:
                             continue
@@ -22212,6 +22250,8 @@ class PB1Engine:
                             continue
                         if order_value > available_cash_krw:
                             continue
+                        if self._kr_protection_checkpoint():
+                            break
                         self._place_add_on(pos, qty=qty_add, price=float(mark))
                         planned_spent += order_value
                         remaining_budget = max(0.0, float(tick_budget_krw) - planned_spent)
