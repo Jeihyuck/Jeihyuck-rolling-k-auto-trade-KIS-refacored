@@ -128,7 +128,7 @@ def collection_manifest(*,env,scope,trade_date,now_epoch,base="runtime/private")
 
 
 def refresh_collection_rank(db, *, rank, lanes, env, scope, trade_date, now_et,
-                            quote_many, base="runtime/private", live_clock=None):
+                            quote_many, base="runtime/private", live_clock=None, monotonic_clock=None):
     """One bounded collector IPC batch, pure strategy evaluation, no order output."""
     from trader.us.entry_timing.opening_observer import load_bars
     from trader.us.entry_timing.opportunity import evaluate_price_opportunity,effective_mode
@@ -148,15 +148,18 @@ def refresh_collection_rank(db, *, rank, lanes, env, scope, trade_date, now_et,
            if pair in allowed and pair[0]!="TQQQ" and isinstance(p["hot_event_inputs"].get(pair[0]),dict)]
     if not pairs or len(pairs)>12:
         return None
-    deadline=time.monotonic()+.8
+    monotonic_clock = monotonic_clock or time.monotonic
+    deadline=monotonic_clock()+.8
     quotes=quote_many(pairs) or {}
+    if monotonic_clock()>=deadline:
+        return None
     observations={}
     price_wait={"spread_exceeds_limit","live_price_far_from_completed_bar",
                 "breakout_chase_too_large","reversal_not_confirmed","breakout_not_confirmed",
                 "stop_geometry_invalid","stop_reference_too_far",
                 "unfavorable_reference_reward_risk","entry_ceiling_below_ask"}
     for symbol,exchange in pairs:
-        if time.monotonic()>=deadline:
+        if monotonic_clock()>=deadline:
             break
         at=live_clock() if live_clock else now
         try:
@@ -168,13 +171,20 @@ def refresh_collection_rank(db, *, rank, lanes, env, scope, trade_date, now_et,
                     or not 0<=at.timestamp()-received<=5 or not 0<bid<=ask or last<=0):
                 continue
             c=p["hot_event_inputs"][symbol]
+            bars=load_bars(db,trade_date=trade_date,symbol=symbol,owner="US_STANDARD")
+            # A slow native-bar read must not start an evaluation after the budget.
+            if monotonic_clock()>=deadline:
+                break
             decision=evaluate_price_opportunity(
                 style=c["family"],trade_date=trade_date,now_et=at,
-                verified_bars=load_bars(db,trade_date=trade_date,symbol=symbol,owner="US_STANDARD"),
+                verified_bars=bars,
                 quote={"source":q["source"],"last":last,"bid":bid,"ask":ask,"age_sec":at.timestamp()-received},
                 prep=c["prep"],feature_scope=(scope,symbol,exchange,"US_STANDARD"),
                 min_rr=float(os.getenv("US_OPPORTUNITY_MIN_REFERENCE_RR","1.5")),
                 max_stop_distance=float(os.getenv("US_OPPORTUNITY_MAX_STOP_DISTANCE","0.025")))
+            # Keep already completed observations, never use a late result to promote.
+            if monotonic_clock()>=deadline:
+                break
             state="READY" if decision["state"]=="READY" else "PRICE_WAIT" if decision.get("reason") in price_wait else None
             if state:
                 observations[(symbol,exchange)]={"state":state,"received":received,

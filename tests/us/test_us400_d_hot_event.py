@@ -1,3 +1,4 @@
+import pytest
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from trader.us.entry_timing import opening_observer as observer
@@ -395,3 +396,66 @@ def test_independent_collection_refresh_uses_canonical_native_evidence_without_w
         assert rank.apply(lanes,manifest["generation"],epoch+7)==lanes
     finally:
         db.close()
+
+
+@pytest.mark.parametrize("delay_stage", ["none", "quote", "bars", "evaluate"])
+def test_dynamic_rank_does_not_promote_using_out_of_budget_evidence(tmp_path, monkeypatch, delay_stage):
+    from datetime import timedelta
+    from trader.us.entry_timing import opportunity
+    from trader.us.entry_timing.hot_event_evaluator import CollectionRankState, refresh_collection_rank
+
+    now = datetime(2026, 11, 25, 10, 10, tzinfo=ZoneInfo("America/New_York"))
+    scope = dict(env="practice", scope="scope:epoch", trade_date=now.date().isoformat(), base=tmp_path)
+    pairs = [(s, "NYSE") for s in ("AAA", "BBB", "CCC", "DDD", "EEE")]
+    manifest = observer.publish_preminute_candidates(**scope, now_epoch=now.timestamp()-1,
+        candidates=[(20-i, s, e, None, {"position_state":"NOT_HELD", "entry_style":"ENTRY_PULLBACK",
+                                      "pivot_price":100+i}) for i,(s,e) in enumerate(pairs)])
+    lanes, status = observer.load_preminute_priority(**scope, pairs=pairs, now_epoch=now.timestamp())
+    assert status == "VALID"
+    rank = CollectionRankState()
+    clock = [now, 0.0, "none"]
+    evaluated = []
+    monkeypatch.setattr(opportunity, "effective_mode", lambda: "ENFORCE")
+
+    def quotes(items):
+        if clock[2] == "quote":
+            clock[1] = 0.81
+        return {p: {"bid":99.9, "ask":100, "last":100, "received_at":clock[0].timestamp()-1,
+                    "collector_generation":"g", "source":"KIS_WEBSOCKET_COLLECTOR"} for p in items}
+
+    def bars(db, **kw):
+        if clock[2] == "bars" and kw["symbol"] == "EEE":
+            clock[1] = 0.81
+        return []
+
+    def evaluate(**kw):
+        pivot = kw["prep"]["pivot_price"]
+        evaluated.append(pivot)
+        if clock[2] == "evaluate" and pivot == 104:
+            clock[1] = 0.81
+        return {"state":"READY" if pivot == 104 else "WAIT",
+                "reason":"test" if pivot == 104 else "reversal_not_confirmed"}
+
+    monkeypatch.setattr(observer, "load_bars", bars)
+    monkeypatch.setattr(opportunity, "evaluate_price_opportunity", evaluate)
+
+    def refresh():
+        return refresh_collection_rank(None, **scope, rank=rank, lanes=lanes, now_et=clock[0],
+            quote_many=quotes, live_clock=lambda:clock[0], monotonic_clock=lambda:clock[1])
+
+    assert refresh() is None  # first fresh receipt is not sufficient
+    evaluated.clear()
+    clock[:] = [now+timedelta(seconds=2), 0.0, delay_stage]
+    chosen = refresh()
+    if delay_stage == "none":
+        assert chosen == (pairs[3], pairs[4])
+        assert rank.apply(lanes, manifest["generation"], clock[0].timestamp())["HOT"][-1] == pairs[4]
+    else:
+        assert chosen is None
+        assert rank.apply(lanes, manifest["generation"], clock[0].timestamp()) == lanes
+        if delay_stage == "quote":
+            assert evaluated == []
+        elif delay_stage == "bars":
+            assert 104 not in evaluated
+        else:
+            assert 104 in evaluated
