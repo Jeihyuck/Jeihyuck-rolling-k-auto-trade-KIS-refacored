@@ -211,25 +211,40 @@ def _reuse_us_static_features(*, scope, trade_date, settings, rows, compute, adv
         rows=rows, compute=shared_or_compute)
 
 
-def _recent_static_features(rows):
-    tail = rows[-4:]
+def _recent_tail_features(tail):
     return {
         "recent_volume": sum(b["volume"] for b in tail[-2:]),
         "prior_volume": sum(b["volume"] for b in tail[:2]),
         "rising_closes": tail[-1]["close"] > tail[-2]["close"] > tail[-3]["close"],
         "higher_lows": tail[-1]["low"] >= tail[-2]["low"] >= tail[-3]["low"],
-        "local_trough": min(b["low"] for b in rows),
         "stop": min(b["low"] for b in tail[-3:]),
     }
 
 
-def _slide_recent_static(prior, previous, rows, shift):
-    """Reuse rolling extrema only when the original minimum survives.
+def _recent_static_features(rows):
+    return {**_recent_tail_features(rows[-4:]), "local_trough": min(b["low"] for b in rows)}
 
-    The shared cache already checked exact overlap. Preserve tail volume
-    addition and comparisons exactly, and recompute when the minimum leaves.
-    No live quote, decision, or risk state is part of this cache.
-    """
+
+def _extend_rolling_lows(prior, incoming, first_stamp):
+    from collections import deque
+
+    lows = deque(pair for pair in prior if pair[0] >= first_stamp)
+    for row in incoming:
+        low = row["low"]
+        # Keep equal lows in arrival order, as Python's min does.
+        while lows and lows[-1][1] > low:
+            lows.pop()
+        lows.append([row["time_et"], low])
+    return list(lows)
+
+
+def _build_recent_static_state(rows):
+    return {"features": _recent_static_features(rows),
+            "lows": _extend_rolling_lows([], rows, rows[0]["time_et"])}
+
+
+def _slide_recent_static(prior, previous, rows, shift):
+    """Advance the exact rolling trough even when the previous trough expires."""
     if not isinstance(prior,dict) or len(rows)!=15 or len(previous)!=15 or not 1<=shift<15:
         return None
     # Duplicate or out-of-order timestamps could produce ambiguous overlap.
@@ -239,17 +254,9 @@ def _slide_recent_static(prior, previous, rows, shift):
             or not all(a<b for a,b in zip(next_stamps,next_stamps[1:]))
             or next_stamps[-1]<=stamps[-1]):
         return None
-    old_min=prior["local_trough"]
-    if any(r["low"]==old_min for r in previous[:shift]):
-        trough=min(r["low"] for r in rows)
-    else:
-        trough=min(old_min,min(r["low"] for r in rows[-shift:]))
-    tail=rows[-4:]
-    return {"recent_volume":sum(b["volume"] for b in tail[-2:]),
-            "prior_volume":sum(b["volume"] for b in tail[:2]),
-            "rising_closes":tail[-1]["close"]>tail[-2]["close"]>tail[-3]["close"],
-            "higher_lows":tail[-1]["low"]>=tail[-2]["low"]>=tail[-3]["low"],
-            "local_trough":trough,"stop":min(b["low"] for b in tail[-3:])}
+    lows = _extend_rolling_lows(prior["lows"], rows[-shift:], next_stamps[0])
+    return {"features": {**_recent_tail_features(rows[-4:]), "local_trough": lows[0][1]},
+            "lows": lows}
 
 
 def recent_static_features(bars, trade_date, *, feature_scope=None):
@@ -258,10 +265,11 @@ def recent_static_features(bars, trade_date, *, feature_scope=None):
     rows = bars[-15:]
     if not feature_scope:
         return _recent_static_features(rows)
-    return _reuse_us_static_features(
+    state = _reuse_us_static_features(
         scope=feature_scope, trade_date=trade_date,
-        settings=("US_RECENT_STATIC_WINDOW_V2", 15, 4, 3),
-        rows=rows, compute=_recent_static_features, slide=_slide_recent_static)
+        settings=("US_RECENT_STATIC_WINDOW_V3", 15, 4, 3),
+        rows=rows, compute=_build_recent_static_state, slide=_slide_recent_static)
+    return state["features"]
 
 
 def _decision(state: str, reason: str, *, style: str, facts: dict,

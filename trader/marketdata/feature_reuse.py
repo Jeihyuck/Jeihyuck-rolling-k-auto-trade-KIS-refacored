@@ -134,8 +134,10 @@ def shared_native_features(*, market, scope, trade_date, settings, rows, compute
                                 # Exact suffix/prefix equality, including all
                                 # provenance and numerical operands. Corrections
                                 # inside the overlap never reuse old state.
+                                previous_keys = [encode(item) for item in previous]
+                                next_keys = [encode(item) for item in rows]
                                 for shift in range(1,len(rows)):
-                                    if encode(previous[shift:])==encode(rows[:-shift]):
+                                    if previous_keys[shift:] == next_keys[:-shift]:
                                         prior_window=(decoded["value"],previous,shift)
                                         break
                     elif advance is None:

@@ -592,3 +592,89 @@ def test_idle_stop_route_result_requires_exact_single_ack(case):
     assert result["status"]==("OK_EXIT_ORDERS_SENT" if case=="exact" else "WARN_RECONCILE_PENDING")
     assert result["exit_route_reconcile_required"] is (case!="exact")
     assert result["entry_can_proceed"] is False
+
+
+def test_active_protective_watch_polls_on_cadence_and_prefers_stop():
+    from trader.us.runner.protective_entry_interrupt import ActiveProtectiveWatch
+
+    identity = {k: v for k, v in _scoped_sell("ABC").items() if k != "side"}
+    clock = [0.0]
+    calls = []
+    signals = iter([{"kind": "profit", "identity": identity}, identity,
+                    {"kind": "profit", "identity": identity}])
+
+    def poll():
+        calls.append(clock[0])
+        return next(signals)
+
+    watch = ActiveProtectiveWatch(poll, clock=lambda: clock[0])
+    for now in (0, 1, 4.99, 5, 8, 10):
+        clock[0] = now
+        watch()
+    assert calls == [0, 5, 10]
+    result = dict(runtime_integrity_status="OK", sell_liveness_status="OK",
+                  exit_can_proceed=True, exit_route_reconcile_required=False,
+                  manual_reconcile_required=0)
+    assert watch.followup(result, [{"identity": identity}]) == identity
+    clock[0] = 15.01
+    assert watch.followup(result, [{"identity": identity}]) is None
+
+
+@pytest.mark.parametrize("case", ["unreconciled", "degraded", "manual", "routed", "reopened", "exit_blocked"])
+def test_active_protective_followup_requires_current_unrouted_holding(case):
+    from trader.us.runner.protective_entry_interrupt import ActiveProtectiveWatch
+
+    identity = {k: v for k, v in _scoped_sell("ABC").items() if k != "side"}
+    watch = ActiveProtectiveWatch(lambda: identity, clock=lambda: 0.0)
+    watch()
+    result = dict(runtime_integrity_status="OK", sell_liveness_status="OK",
+                  exit_can_proceed=True, exit_route_reconcile_required=False,
+                  manual_reconcile_required=0)
+    current = [{"identity": identity}]
+    if case == "unreconciled":
+        result.pop("exit_route_reconcile_required")
+    elif case == "degraded":
+        result["sell_liveness_status"] = "LIVENESS_DEGRADED"
+    elif case == "manual":
+        result["manual_reconcile_required"] = 1
+    elif case == "routed":
+        current = []
+    elif case == "exit_blocked":
+        result["exit_can_proceed"] = False
+    else:
+        current = [{"identity": {**identity, "position_cycle_id": "new",
+                                 "position_lifecycle_id": "new"}}]
+    assert watch.followup(result, current) is None
+
+
+def _tick_waits_for_readonly_observer(marker, tick_cancellation_event=None):
+    from pathlib import Path
+    import time
+
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and not Path(marker).exists():
+        time.sleep(0.01)
+    return {"seen": Path(marker).exists(), "cancelled": tick_cancellation_event.is_set()}
+
+
+@pytest.mark.parametrize("observer_error", [False, True])
+def test_process_supervisor_observes_busy_child_without_cancelling(tmp_path, observer_error):
+    import os
+    from trader.us.runner.tick_process import run_tick_in_process
+
+    marker = tmp_path / "readonly-observed"
+    calls = []
+
+    def observe():
+        calls.append(os.getpid())
+        marker.touch()
+        if observer_error:
+            raise OSError("collector unavailable")
+
+    outcome = run_tick_in_process(
+        _tick_waits_for_readonly_observer, kwargs={"marker": str(marker)}, timeout_sec=4,
+        observe_while_running=observe,
+    )
+    assert calls and set(calls) == {os.getpid()}
+    assert outcome.child_pid != os.getpid()
+    assert outcome.result == {"seen": True, "cancelled": False}
