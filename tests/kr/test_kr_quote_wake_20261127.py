@@ -51,7 +51,7 @@ def test_serial_idle_wake_and_dedupe():
     def now(): return NOW+timedelta(seconds=elapsed[0])
     def probe(t,n):
         if elapsed[0]>=2:
-            return {"code":t["code"],"latest_bar_ts":t["latest_bar_ts"]}
+            return {"code":t["code"],"latest_bar_ts":t["latest_bar_ts"],"is_order_authorization":False}
     args=dict(targets=[target()],state=state,seconds=10,session_end=NOW+timedelta(minutes=1),
               now=now,monotonic=lambda:elapsed[0],sleep=sleep,probe=probe)
     assert w.wait_for_quote_wake(**args)["code"]=="251970"
@@ -66,7 +66,7 @@ def test_late_probe_does_not_wake_or_consume_dedupe():
         state = w.QuoteWakeState()
         def probe(t, n):
             elapsed[0] += 3
-            return {"code": t["code"], "latest_bar_ts": t["latest_bar_ts"]}
+            return {"code": t["code"], "latest_bar_ts": t["latest_bar_ts"], "is_order_authorization": False}
         assert w.wait_for_quote_wake(
             targets=[target()], state=state, seconds=deadline,
             session_end=NOW+timedelta(seconds=session_seconds),
@@ -85,7 +85,7 @@ def test_wrong_symbol_probe_does_not_consume_dedupe():
         session_end=NOW+timedelta(minutes=1),
         now=lambda: NOW+timedelta(seconds=elapsed[0]),
         monotonic=lambda: elapsed[0], sleep=sleep,
-        probe=lambda t, n: {"code": "012750", "latest_bar_ts": t["latest_bar_ts"]},
+        probe=lambda t, n: {"code": "012750", "latest_bar_ts": t["latest_bar_ts"], "is_order_authorization": False},
     ) is None
     assert not state.seen
 
@@ -542,3 +542,56 @@ def test_protective_checkpoint_precedes_expensive_entry_stages():
                         assert is_yield_guard(node.body, 2)
                         found.add("emergency_per_candidate")
     assert found == stages | {"buyable_per_candidate", "emergency_per_candidate"}
+
+
+def test_idle_wake_rejects_stale_authorized_and_future_bar_hints():
+    t = target()
+    good = {"code": t["code"], "latest_bar_ts": t["latest_bar_ts"],
+            "is_order_authorization": False}
+    for invalid in (
+        {**good, "is_order_authorization": True},
+        {**good, "is_order_authorization": None},
+        {**good, "latest_bar_ts": (NOW - timedelta(minutes=4)).isoformat()},
+        {**good, "latest_bar_ts": (NOW + timedelta(minutes=1)).isoformat()},
+        {**good, "latest_bar_ts": NOW.replace(tzinfo=None).isoformat()},
+    ):
+        elapsed = [0.0]
+        state = w.QuoteWakeState()
+        result = w.wait_for_quote_wake(
+            targets=[t], state=state, seconds=2,
+            session_end=NOW+timedelta(minutes=1),
+            now=lambda: NOW+timedelta(seconds=elapsed[0]),
+            monotonic=lambda: elapsed[0],
+            sleep=lambda n: elapsed.__setitem__(0, elapsed[0]+n),
+            probe=lambda *a: invalid,
+        )
+        assert result is None
+        assert not state.seen
+
+
+def test_wake_dedupes_same_completed_minute_across_utc_and_kst():
+    from datetime import timezone
+    state = w.QuoteWakeState()
+    t = target()
+    assert state.accept(t, t["latest_bar_ts"])
+    same_bar_utc = datetime.fromisoformat(t["latest_bar_ts"]).astimezone(timezone.utc).isoformat()
+    assert not state.accept(t, same_bar_utc)
+    assert not state.accept(t, "invalid")
+
+
+def test_idle_protective_wake_rejects_wrong_symbol_or_order_authorization():
+    good = {"code": "251970", "kind": "PROTECTIVE_HARD_STOP_HINT",
+            "is_order_authorization": False}
+    for invalid in ({**good, "code": "012750"},
+                    {**good, "is_order_authorization": True},
+                    {**good, "kind": "WRONG_KIND"}):
+        elapsed = [0.0]
+        state = w.QuoteWakeState()
+        assert w.wait_for_quote_wake(
+            targets=[], protective_targets=[good], state=state, seconds=2,
+            session_end=NOW+timedelta(minutes=1), now=lambda: NOW,
+            monotonic=lambda: elapsed[0],
+            sleep=lambda n: elapsed.__setitem__(0, elapsed[0]+n),
+            protective_probe=lambda *a: invalid,
+        ) is None
+        assert not state.seen
