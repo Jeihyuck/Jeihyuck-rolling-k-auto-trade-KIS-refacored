@@ -267,7 +267,7 @@ def test_hot_historical_repair_stops_on_demotion_and_preserves_opening(tmp_path)
     requested = datetime(2026, 10, 28, 12, 0, tzinfo=NY)
     calls = []
     class Fake:
-        def get_us_intraday_1m_page(self, symbol, exchange, *, before_key):
+        def get_us_intraday_1m_page(self, symbol, exchange, *, before_key, deadline_monotonic):
             calls.append(before_key)
             rows = ([{**sample_rows()[-1], "xhms": "115900"}]
                     if not before_key else sample_rows()[:30])
@@ -286,3 +286,63 @@ def test_hot_historical_repair_stops_on_demotion_and_preserves_opening(tmp_path)
         assert len(load_bars(db, trade_date=date, symbol="ELV")) == 31
     finally:
         db.close()
+
+
+def test_hot_page_admission_rechecks_deadline_after_scope_lookup(tmp_path):
+    from trader.us.entry_timing.opening_observer import collect_hot_minutes
+    from types import SimpleNamespace
+
+    day = "2026-10-28"
+    requested = datetime(2026, 10, 28, 12, 0, tzinfo=NY)
+    db = open_store(store_path(env="practice", account_scope="scope", trade_date=day, base=tmp_path))
+    clock = [100.0]
+    calls = []
+
+    def still_hot():
+        if calls:
+            clock[0] = 109.0
+        return True
+
+    def native_page(symbol, exchange, *, before_key, deadline_monotonic):
+        calls.append((before_key, deadline_monotonic))
+        return {"rows": [], "next_key": "20261028115800",
+                "requested_at": requested, "observation_id": "latest",
+                "observed_epoch": requested.timestamp()}
+
+    try:
+        result = collect_hot_minutes(SimpleNamespace(get_us_intraday_1m_page=native_page),
+                                     db, symbol="ELV", exchange="NASDAQ", trade_date=day,
+                                     repair_due=True, still_hot=still_hot, clock=lambda: clock[0])
+        assert calls == [("", 108.0)]
+        assert result["requests"] == 1
+        assert result["missing_targets"] > 0
+    finally:
+        db.close()
+
+
+def test_native_minute_page_inherits_shorter_stage_deadline_and_restores_it(monkeypatch):
+    from trader.us.execution.kis_us_client import KisUSClient, KisUSTemporaryError
+    from trader.us.execution import kis_us_client
+
+    client = object.__new__(KisUSClient)
+    client._tick_context = None
+    client._stage_deadline = 200.0
+    client._assert_not_offline = lambda name: None
+    client._resolve_quote_excd = lambda exchange: "NAS"
+    clock = [100.0]
+    monkeypatch.setattr(kis_us_client.time, "monotonic", lambda: clock[0])
+    budgets = []
+
+    def headers(_tr_id):
+        budgets.append(client._request_budget())
+        return {}
+
+    client._build_headers = headers
+    client._get = lambda *args, **kwargs: {"rt_cd": "0", "output2": []}
+    client.get_us_intraday_1m_page("ELV", "NASDAQ", deadline_monotonic=104.0)
+    assert budgets == [pytest.approx(3.95)]
+    assert client._stage_deadline == 200.0
+    with pytest.raises(KisUSTemporaryError):
+        client.get_us_intraday_1m_page("ELV", "NASDAQ", deadline_monotonic=99.0)
+    assert budgets == [pytest.approx(3.95)]
+    assert client._stage_deadline == 200.0

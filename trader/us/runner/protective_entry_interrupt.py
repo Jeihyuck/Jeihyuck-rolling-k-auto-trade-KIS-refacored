@@ -8,8 +8,11 @@ evidence leaves the ordinary exit path in charge.
 from collections import Counter
 from copy import deepcopy
 from datetime import datetime, timezone
+import logging
 import math
 import time
+
+logger = logging.getLogger(__name__)
 
 
 class ProtectiveEntryInterrupted(Exception):
@@ -452,6 +455,55 @@ def make_idle_hard_stop_poll(watch, *, trade_date, env):
                 continue
         return profit_wakeup
     return poll
+
+
+class ActiveProtectiveWatch:
+    """Read-only detection during a live child, with serial revalidation afterwards."""
+
+    def __init__(self, poll, *, clock=time.monotonic):
+        self._poll = poll
+        self._clock = clock
+        self._next_poll = clock()
+        self._last_poll = None
+        self._wakeup = None
+        self._observed_at = None
+
+    def __call__(self):
+        now = self._clock()
+        if now < self._next_poll:
+            return
+        self._next_poll = now + 5.0
+        interval = None if self._last_poll is None else now - self._last_poll
+        self._last_poll = now
+        wakeup = self._poll()
+        identity, kind = split_wakeup(wakeup)
+        logger.info("[US_EXIT][ACTIVE_WATCH_POLL] interval_sec=%s elapsed_ms=%.1f result=%s",
+                    "UNKNOWN" if interval is None else round(interval, 3),
+                    (self._clock() - now) * 1000,
+                    kind if identity is not None else "no_signal")
+        _, previous_kind = split_wakeup(self._wakeup)
+        if identity is not None and (kind == "stop" or previous_kind != "stop"):
+            self._wakeup = wakeup
+            self._observed_at = self._clock()
+
+    def followup(self, result, current_watch):
+        # Only the reaped normal child can provide current watch identities.
+        # A routed symbol is excluded from that export by the canonical tick.
+        identity, _ = split_wakeup(self._wakeup)
+        if (
+            identity is None
+            or self._observed_at is None
+            or not 0 <= self._clock() - self._observed_at <= 10.0
+            or result.get("runtime_integrity_status") not in {"OK", "POLICY_ENTRY_BLOCKED"}
+            or result.get("sell_liveness_status") != "OK"
+            or result.get("exit_can_proceed") is not True
+            or result.get("exit_route_reconcile_required") is not False
+            or result.get("manual_reconcile_required") != 0
+            or not any(isinstance(row, dict) and row.get("identity") == identity
+                       for row in current_watch)
+        ):
+            return None
+        return self._wakeup
 
 
 def execute_hard_stop_interrupt(snapshot, *, trade_date, context, evaluate,

@@ -801,17 +801,20 @@ def _minute_repair_targets(db, *, trade_date, symbol, requested_at):
 
 
 def collect_hot_minutes(client, db, *, symbol, exchange, trade_date,
-                        repair_due: bool, still_hot, max_pages: int = 4) -> dict:
+                        repair_due: bool, still_hot, max_pages: int = 4, clock=None) -> dict:
     """Latest first, then bounded native historical pages only for a HOT symbol."""
-    if not still_hot():
-        return {"requests": 0, "changed": 0, "missing_targets": None, "conflict_targets": None}
     cursor = ""
     seen = set()
     requests = changed = 0
     missing = conflicts = None
-    started = time.monotonic()
-    while requests < max(1, min(4, int(max_pages))) and still_hot():
-        page = client.get_us_intraday_1m_page(symbol, exchange, before_key=cursor)
+    clock = clock or time.monotonic
+    deadline = clock() + 8.0
+    while requests < max(1, min(4, int(max_pages))) and clock() < deadline:
+        if not still_hot() or clock() >= deadline:
+            break
+        page = client.get_us_intraday_1m_page(
+            symbol, exchange, before_key=cursor, deadline_monotonic=deadline,
+        )
         requests += 1
         requested_at = page["requested_at"].astimezone(NY)
         if requested_at.date().isoformat() != trade_date:
@@ -823,7 +826,7 @@ def collect_hot_minutes(client, db, *, symbol, exchange, trade_date,
         if repair_due:
             missing, conflicts = _minute_repair_targets(
                 db, trade_date=trade_date, symbol=symbol, requested_at=requested_at)
-        if not repair_due or time.monotonic() - started > 8.0:
+        if not repair_due or clock() >= deadline:
             break
         targets = missing | conflicts
         next_key = str(page.get("next_key") or "")

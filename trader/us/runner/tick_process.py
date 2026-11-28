@@ -60,7 +60,8 @@ class TickProcessResult:
 
 def run_tick_in_process(target: Callable, *, kwargs: dict, timeout_sec: float,
                         terminate_grace_sec: float = 10.0, mp_context=None,
-                        fence_account_scope: dict | None = None) -> TickProcessResult:
+                        fence_account_scope: dict | None = None,
+                        observe_while_running: Callable[[], None] | None = None) -> TickProcessResult:
     """Run an isolated tick; never infer broker non-submission from worker death."""
     ctx = mp_context or mp.get_context("fork" if "fork" in mp.get_all_start_methods() else "spawn")
     receiver, sender = ctx.Pipe(duplex=False)
@@ -107,6 +108,15 @@ def run_tick_in_process(target: Callable, *, kwargs: dict, timeout_sec: float,
                             "broker_submission_truth": "UNVERIFIED",
                         })
                 break
+            # The parent can read bounded collector IPC while the sole
+            # order-capable child is busy. Keep the watchdog's cleanup
+            # budget intact and do not let observer errors stop the child.
+            if observe_while_running is not None and deadline - time.monotonic() > 1.0:
+                try:
+                    observe_while_running()
+                except Exception as exc:
+                    logger.warning("[US_TICK_PROCESS][OBSERVER_UNAVAILABLE] error_type=%s",
+                                   type(exc).__name__)
         if payload is not None:
             process.join(max(0.0, deadline - time.monotonic()))
         if process.is_alive():
