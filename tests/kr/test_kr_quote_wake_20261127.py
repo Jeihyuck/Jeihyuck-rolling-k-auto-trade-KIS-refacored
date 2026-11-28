@@ -525,6 +525,9 @@ def test_protective_checkpoint_precedes_expensive_entry_stages():
                                 and expr.func.attr == "_stage_timer" and expr.args
                                 and isinstance(expr.args[0], ast.Constant)
                                 and expr.args[0].value in stages):
+                            if (expr.args[0].value == "entry.today_buy_orders_lookup"
+                                    and not isinstance(node, ast.Try)):
+                                continue  # already checked at the enclosing try
                             assert is_yield_guard(body, index), expr.args[0].value
                             found.add(expr.args[0].value)
                 if isinstance(node, ast.For) and isinstance(node.iter, ast.Name):
