@@ -551,3 +551,26 @@ def test_idle_stop_cannot_continue_without_explicit_reconciliation_proof(case):
     elif case=="manual_debt":
         result["manual_reconcile_required"]=1
     assert remaining_idle_watch(watch,attempted,result)==[]
+
+
+@pytest.mark.parametrize("case", ["exact", "wrong_identity", "duplicate", "missing_ack", "empty"])
+def test_idle_stop_route_result_requires_exact_single_ack(case):
+    from trader.us.runner.protective_entry_interrupt import stop_wakeup_route_result
+    intent=dict(symbol="ABC",side="SELL",strategy_owner="US_STANDARD",position_lifecycle_id="l",
+                position_cycle_id="l",portfolio_epoch_id="p",trading_epoch_id="e",broker_account_hash="a")
+    intents=[intent]
+    orders=[dict(status="ACK",intent=dict(intent))]
+    if case=="wrong_identity":
+        orders[0]["intent"]["broker_account_hash"]="foreign"
+    elif case=="duplicate":
+        orders.append(dict(orders[0]))
+    elif case=="missing_ack":
+        orders=[]
+    elif case=="empty":
+        intents,orders=[],[]
+    result=stop_wakeup_route_result(orders,intents,trade_date="2026-11-25",session="am",
+                                   position_count=1,decisions=[])
+    assert result["protective_wakeup_kind"]=="stop"
+    assert result["status"]==("OK_EXIT_ORDERS_SENT" if case=="exact" else "WARN_RECONCILE_PENDING")
+    assert result["exit_route_reconcile_required"] is (case!="exact")
+    assert result["entry_can_proceed"] is False
