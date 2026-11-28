@@ -472,17 +472,78 @@ def _journal_has_unrecovered_buy_ack(trade_date: str) -> bool:
         # commit before every POST.  Keep exit evaluation/reconciliation alive;
         # any real submit is fail-closed at that final boundary.
         return False
-    grouped: dict[str, list[dict]] = {}
+    # A recovery event must carry the same economic BUY identity. JSON
+    # metadata cannot override typed durable columns or another attempt.
+    from trader.us.utils.order_no import normalize_us_order_no
+
+    def sources(event):
+        durable=event.get("_durable_order_event_identity")
+        meta=event.get("meta")
+        return [event, durable if isinstance(durable,dict) else {},
+                meta if isinstance(meta,dict) else {}]
+
+    def one(rows, names, *, upper=False, order_no=False):
+        values=set()
+        for row in rows:
+            for key in names:
+                value=row.get(key)
+                if value is None or str(value).strip()=="":
+                    continue
+                value=str(value).strip()
+                if order_no:
+                    value=normalize_us_order_no(value)
+                if upper:
+                    value=value.upper()
+                if value:
+                    values.add(value)
+        if len(values)>1:
+            raise ValueError("conflicting_buy_ack_identity")
+        return next(iter(values),"")
+    
+    def kind(event):
+        durable=event.get("_durable_order_event_identity") or {}
+        # A contradictory payload cannot hide a typed BUY ACK.
+        return (str(durable.get("event_type") or event.get("event_type") or ""),
+                str(durable.get("side") or event.get("side") or "").upper())
+
+    def identity(event):
+        rows=sources(event)
+        try:
+            # These two must not conflict with SQL identity; event_type is
+            # compared only within one event, never between ACK and recovery.
+            one(rows[:2],("event_type",))
+            if one(rows[:2],("side",),upper=True)!="BUY":
+                return None
+            key=one(rows,("client_order_key",))
+            number=one(rows[:2],("canonical_broker_order_no","raw_broker_order_no","broker_order_no"),order_no=True)
+            if not key or not number or number=="0":
+                return None
+            return (key,number,one(rows,("submit_attempt_id",)),
+                    one(rows,("account_id","broker_account_hash")),
+                    one(rows,("trading_epoch_id",)),one(rows,("portfolio_epoch_id",)),
+                    one(rows,("position_cycle_id",)),one(rows,("position_lifecycle_id",)),
+                    one(rows,("strategy_owner",),upper=True),
+                    one(rows,("symbol",),upper=True),one(rows[:2],("trade_date",)),
+                    one(rows[:2],("requested_qty","qty")),
+                    one(rows,("entry_exit_contract_sha256",)),
+                    one(rows,("source_entry_contract_sha256",)))
+        except (ValueError,TypeError):
+            return None
+
+    recovered_types={"DB_ACK_PERSISTED","JOURNAL_REPLAY_DB_ACK_RESTORED"}
+    recovered=set()
     for event in events:
-        key = str(event.get("client_order_key") or "").strip()
-        if key:
-            grouped.setdefault(key, []).append(event)
-    recovered_types = {"DB_ACK_PERSISTED", "JOURNAL_REPLAY_DB_ACK_RESTORED"}
-    for order_events in grouped.values():
-        types = {str(event.get("event_type") or "") for event in order_events}
-        side = str(order_events[-1].get("side") or "").upper()
-        if side == "BUY" and "BROKER_ACK_RECEIVED" in types and not (types & recovered_types):
-            return True
+        typ,side=kind(event)
+        if side=="BUY" and typ in recovered_types:
+            scope=identity(event)
+            if scope is not None:
+                recovered.add(scope)
+    for event in events:
+        typ,side=kind(event)
+        if side=="BUY" and typ in {"BROKER_ACK_RECEIVED","BROKER_ACK_RECOVERED"}:
+            scope=identity(event)
+            if scope is None or scope not in recovered:
+                return True
     return False
 
 
@@ -567,6 +628,42 @@ def _suppress_pending_sell_exit_intents(
     except Exception:
         return [] if strict else exit_intents
     statuses = {"SUBMITTED", "ACK", "PENDING", "PARTIALLY_FILLED", "RECONCILE_PENDING", "ACK_DB_FAILED"}
+    # Native practice submits use one scoped durable snapshot rather than
+    # one transaction per SELL intent. No cache across batches or ticks.
+    # A failed DB read is UNKNOWN, not evidence of no pending order.
+    batch_pending = None
+    native_batch = (
+        str(env).lower() == "practice"
+        and os.getenv("KIS_ENV", "").strip().lower() == "practice"
+        and os.getenv("WSL_RUN_MARKET", "").upper() == "US"
+        and os.getenv("US_ORDER_ARMED", "0").strip().lower() in {"1", "true", "yes", "on"}
+        and os.getenv("US_PENDING_SELL_BATCH_ENABLED", "1") == "1"
+    )
+    if native_batch:
+        requested = sorted({str(i.get("symbol") or "").strip().upper()
+                            for i in exit_intents
+                            if str(i.get("side") or "").upper() == "SELL"
+                            and str(i.get("symbol") or "").strip()
+                            and _standard_lifecycle(i) not in historical_fenced})
+        if requested:
+            from trader.us.db.repos import load_pending_order_symbols_for_side
+            started = time.monotonic()
+            try:
+                batch_pending = load_pending_order_symbols_for_side(
+                    symbols=requested, side="SELL", trade_date=trade_date,
+                    include_statuses=statuses,
+                )
+                logger.info("[US_EXIT][PENDING_SELL_BATCH] symbols=%d pending=%d elapsed_ms=%.2f",
+                            len(requested), len(batch_pending), (time.monotonic()-started)*1000)
+            except Exception as exc:
+                # A fresh account/epoch DB check is mandatory for native
+                # execution. Do not substitute the permissive old bool helper.
+                # Keep non-SELL intents; no orders/claims are changed here.
+                logger.error("[US_EXIT][PENDING_SELL_BATCH_UNVERIFIED] symbols=%d error=%s",
+                             len(requested), type(exc).__name__)
+                return [i for i in exit_intents if str(i.get("side") or "").upper() != "SELL"]
+        else:
+            batch_pending = set()
     kept: list[dict] = []
     for intent in exit_intents:
         if str(intent.get("side") or "").upper() != "SELL":
@@ -582,7 +679,8 @@ def _suppress_pending_sell_exit_intents(
             )
             continue
         try:
-            pending = bool(symbol) and has_pending_order_for_symbol_side(symbol=symbol, side="SELL", trade_date=trade_date, include_statuses=statuses)
+            pending = (symbol in batch_pending if batch_pending is not None
+                       else bool(symbol) and has_pending_order_for_symbol_side(symbol=symbol, side="SELL", trade_date=trade_date, include_statuses=statuses))
         except Exception as exc:
             logger.warning("[US_EXIT][INTENT_SUPPRESS_CHECK_WARN] symbol=%s err=%s", symbol, exc)
             if strict:
@@ -1600,6 +1698,49 @@ def _routed_sell_notional(orders: list[dict]) -> float:
     return _routed_order_notional(sell_orders)
 
 
+def _refresh_selected_native_tp(candidate: dict, revalidate) -> dict | None:
+    """Candidate is advisory only; re-run selected TP before any claim/POST.
+
+    Do not fall back to the old decision, copy its evidence or raise quantity.
+    A changed stage/owner/cycle/contract is a new candidate, not this order.
+    """
+    meta = candidate.get("meta") or {}
+    if not callable(revalidate) or not (
+        meta.get("tp_pending_deferred_to_claim") is True
+        or meta.get("legacy_nine_tp_pending_deferred") is True
+    ):
+        return candidate
+    fresh = revalidate(candidate)
+    if not isinstance(fresh, dict):
+        return None
+    fm = fresh.get("meta") or {}
+    if not candidate.get("position_lifecycle_id"):
+        return None
+    for field in ("symbol", "side", "strategy_owner", "position_lifecycle_id",
+                  "position_cycle_id", "broker_account_hash", "trading_epoch_id",
+                  "portfolio_epoch_id"):
+        if candidate.get(field) != fresh.get(field):
+            return None
+    for field in ("profit_capture_stage", "source_entry_contract_sha256",
+                  "tp_threshold_fraction", "tp_pending_deferred_to_claim",
+                  "legacy_nine_tp_pending_deferred"):
+        if meta.get(field) != fm.get(field):
+            return None
+    if not (0 < int(fresh.get("qty") or 0) <= int(candidate.get("qty") or 0)):
+        return None
+    # Only arbitration annotations survive; the new decision's economics,
+    # evidence, key and Attempt remain its own. No old proof is re-signed.
+    for field in ("merged_exit_intent", "absorbed_exit_reasons",
+                  "selected_exit_reason", "selected_exit_family",
+                  "original_intent_count", "merge_policy_version"):
+        if field in candidate:
+            fresh[field] = candidate[field]
+            fm[field] = candidate[field]
+    fresh["final_qty"] = fm["final_qty"] = int(fresh["qty"])
+    fm["exit_family"] = "TAKE_PROFIT"
+    return fresh
+
+
 def route_exit_orders_immediately(
     exit_intents: list[dict],
     *,
@@ -1611,6 +1752,7 @@ def route_exit_orders_immediately(
     current_position_symbols: set[str],
     context=None,
     kis_client=None,
+    tp_revalidate=None,
 ) -> dict:
     """Route SELL intents before any entry watchlist/evaluation work.
 
@@ -1648,6 +1790,24 @@ def route_exit_orders_immediately(
     decisions: list[dict] = []
     for intent in sell_intents:
         try:
+            _candidate = intent
+            _fresh = _refresh_selected_native_tp(intent, tp_revalidate)
+            if _fresh is None:
+                logger.info("[US_PROFIT_CAPTURE][JIT_REVALIDATION_WAIT] symbol=%s action=NO_CLAIM_NO_POST", intent.get("symbol"))
+                decisions.append({"symbol": str(intent.get("symbol") or "").upper(),
+                                  "side": "SELL", "qty": 0, "action": "SKIPPED",
+                                  "reason": intent.get("reason"),
+                                  "skip_reason": "TP_JIT_REVALIDATION_WAIT"})
+                continue
+            intent = _fresh
+            if intent is not _candidate:
+                _symbol = str(intent.get("symbol") or "").upper()
+                for _attr in ("_sell_selected_ready_by_symbol", "_sell_selected_trace_id_by_symbol"):
+                    _mapping = getattr(context, _attr, None)
+                    if isinstance(_mapping, dict):
+                        _mapping.pop(_symbol, None)
+                logger.info("[US_PROFIT_CAPTURE][JIT_READY] symbol=%s stage=%s action=ROUTE_NOW",
+                            _symbol, (intent.get("meta") or {}).get("profit_capture_stage"))
             _individual_route_start = time.monotonic()
             logger.info(
                 "[US_EXIT][ROUTER_ENTER] symbol=%s qty=%s reason=%s",
@@ -3575,6 +3735,47 @@ def run_trade_tick(
         logger.warning("[US_EXIT][5W1H][UNAVAILABLE] error=%s action=SELL_CONTINUES",
                        type(_audit_module_exc).__name__)
 
+    # Only the actual arbitration winner is re-evaluated at its turn.
+    # The earlier profit-capture list is advisory and native stage claims
+    # are deferred. Offline/forced-clock paths retain replay semantics.
+    _tp_jit_callback = None
+    if real_order_mode and not offline and not force_now and env == "practice":
+        def _tp_jit_callback(candidate):
+            from trader.us.market_state_overlay import build_profit_capture_intents
+            from trader.us.execution.tp_signal_quote_refresh import refresh_tp_source_quotes
+            from trader.us.decision_evidence_5w1h import attach_standard_sell_evidence
+            symbol = str(candidate.get("symbol") or "").upper()
+            matching = [p for p in current_positions
+                        if str(p.get("symbol") or "").upper() == symbol]
+            if len(matching) != 1 or not tick_context.broker_submit_allowed():
+                return None
+            def _refresh_one(p):
+                return refresh_tp_source_quotes(
+                    [p], provider, budget_sec=min(3.0, tick_context.remaining_sec()),
+                    max_reads=1,
+                )[0]
+            fresh = build_profit_capture_intents(
+                matching, market_state_overlay, set(), now=now, trade_date=trade_date,
+                defer_pending_until_claim=True, decision_clock=lambda: datetime.now(timezone.utc),
+                quote_refresh=_refresh_one,
+            )
+            if len(fresh) != 1:
+                return None
+            fresh_meta = fresh[0].get("meta") or {}
+            if not fresh_meta.get("decision_quote_source_at"):
+                return None
+            fresh = _suppress_pending_sell_exit_intents(fresh, trade_date, env=env, strict=True)
+            if len(fresh) != 1:
+                return None
+            try:
+                attach_standard_sell_evidence(
+                    fresh[0], matching[0], decision_at=fresh_meta["last_profit_capture_at"],
+                    code_sha=str(os.getenv("US_PINNED_CODE_SHA") or os.getenv("GITHUB_SHA") or "UNKNOWN"),
+                )
+            except Exception as exc:
+                logger.warning("[US_EXIT][JIT_5W1H_UNAVAILABLE] symbol=%s type=%s", symbol, type(exc).__name__)
+            return fresh[0]
+
     exit_route_result = route_exit_orders_immediately(
         _late_exit_intents,
         buy_daily_notional=0.0,  # SELL-only risk path; BUY value loaded after routing.
@@ -3585,6 +3786,7 @@ def run_trade_tick(
         current_position_symbols=current_position_symbols,
         context=tick_context,
         kis_client=routing_kis_client,
+        tp_revalidate=_tp_jit_callback,
     )
 
     if _early_pilot_results:
@@ -5356,6 +5558,16 @@ def run_trade_tick(
         latency_metrics["measured_phase_evidence"] = _observed
         logger.info("[US_TICK][PHASE_EVIDENCE_JSON] payload=%s",
                     json.dumps(_observed, sort_keys=True, allow_nan=False))
+        # Separate measured wall-clock spans from nested HTTP/DB counters.
+        # Missing stages remain absent, not zero-duration successes.
+        _p0_phases = {k: float(tick_context.metrics[k])
+                      for k in _ACCOUNTED_TOP_LEVEL_STAGES
+                      if k in tick_context.metrics
+                      and isinstance(tick_context.metrics[k], (int, float))
+                      and 0 <= tick_context.metrics[k] < float("inf")}
+        logger.info("[MARKET_DATA_P0][TICK_PHASES] market=US session=%s trade_date=%s tick=%s total_ms=%.3f phases=%s",
+                    session, trade_date, tick_index, tick_total_ms,
+                    json.dumps(_p0_phases, sort_keys=True, separators=(",", ":")))
     except Exception as _phase_exc:
         logger.warning("[US_TICK][PHASE_EVIDENCE_UNAVAILABLE] error_type=%s",
                        type(_phase_exc).__name__)

@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from trader.us.execution import reconcile
 from trader.us.runner.trade_tick_runner import (
     _journal_has_unrecovered_buy_ack,
@@ -220,3 +222,75 @@ def test_close_balance_absent_unaccepted_sell_remains_unresolved(monkeypatch):
     result = reconcile.classify_ack_orders_with_final_balance(provider=object(), trade_date="2026-07-21", orders=orders)
     assert result["pending_order_count"] == 1
     assert result["orders"][0]["final_status"] == "ack_unresolved_error"
+
+
+@pytest.mark.parametrize("variant,blocked", [
+    ("exact", False), ("other_attempt", True), ("other_order", True),
+    ("other_account", True), ("other_epoch", True), ("sell_recovery", True),
+    ("missing_order", True), ("conflicting_order_columns", True),
+    ("second_ack", True), ("legacy_exact", False),
+    ("other_symbol", True), ("other_owner", True), ("other_cycle", True),
+    ("other_portfolio", True), ("other_contract", True), ("meta_conflict", True),
+    ("recovered_ack_without_db", True), ("durable_payload_conflict", True),
+])
+def test_buy_ack_fence_requires_exact_attempt_and_broker_identity(monkeypatch, variant, blocked):
+    from trader.us.execution import order_journal
+    ack = dict(event_type="BROKER_ACK_RECEIVED", client_order_key="buy-key",
+               submit_attempt_id="attempt-2", side="BUY", broker_order_no="000123",
+               account_id="account", trading_epoch_id="epoch", symbol="AMGN",
+               strategy_owner="US_STANDARD", position_cycle_id="cycle",
+               portfolio_epoch_id="portfolio", entry_exit_contract_sha256="signed")
+    restored = dict(ack, event_type="JOURNAL_REPLAY_DB_ACK_RESTORED", broker_order_no="123")
+    events = [ack, restored]
+    if variant == "other_attempt": restored["submit_attempt_id"] = "attempt-1"
+    if variant == "other_order": restored["broker_order_no"] = "456"
+    if variant == "other_account": restored["account_id"] = "other"
+    if variant == "other_epoch": restored["trading_epoch_id"] = "other"
+    if variant == "sell_recovery": restored["side"] = "SELL"
+    if variant == "missing_order": restored["broker_order_no"] = ""
+    if variant == "conflicting_order_columns": restored["raw_broker_order_no"] = "456"
+    if variant == "other_symbol": restored["symbol"]="KO"
+    if variant == "other_owner": restored["strategy_owner"]="TQQQ_INFINITE"
+    if variant == "other_cycle": restored["position_cycle_id"]="foreign"
+    if variant == "other_portfolio": restored["portfolio_epoch_id"]="foreign"
+    if variant == "other_contract": restored["entry_exit_contract_sha256"]="foreign"
+    if variant == "meta_conflict": restored["meta"]={"position_cycle_id":"foreign"}
+    if variant == "recovered_ack_without_db":
+        events=[dict(ack,event_type="BROKER_ACK_RECOVERED")]
+    if variant == "durable_payload_conflict":
+        restored["_durable_order_event_identity"]={"symbol":"KO"}
+    if variant == "second_ack":
+        events.append(dict(ack, submit_attempt_id="attempt-3", broker_order_no="456"))
+    if variant == "legacy_exact":
+        for event in events:
+            event.pop("submit_attempt_id")
+    monkeypatch.setattr(order_journal, "load_order_events", lambda _td: events)
+    assert _journal_has_unrecovered_buy_ack("2026-11-27") is blocked
+
+
+from tests.us.test_us_postgres_integration_real import pg_engine
+
+
+def test_pg_buy_ack_payload_cannot_replace_durable_symbol_or_attempt(pg_engine,monkeypatch):
+    from uuid import uuid4
+    from sqlalchemy import text
+    from trader.us.db import repos
+    day="2026-11-27"
+    epoch="buy-ack-proof-epoch"
+    monkeypatch.setattr(repos,"_active_us_epoch",lambda *_a,**_kw:epoch)
+    key="buy-ack-proof-key"
+    with pg_engine.begin() as conn:
+        for typ,sym,attempt in (("BROKER_ACK_RECEIVED","AMGN","attempt-2"),
+                                 ("DB_ACK_PERSISTED","KO","attempt-1")):
+            payload=dict(event_type=typ,trade_date=day,client_order_key=key,
+                         symbol="AMGN",side="BUY",submit_attempt_id="attempt-2",
+                         requested_qty=2,broker_order_no="000123",trading_epoch_id=epoch)
+            conn.execute(text("""INSERT INTO us_order_events
+                (event_id,trade_date,event_type,event_timestamp,trading_epoch_id,
+                 client_order_key,submit_attempt_id,symbol,side,requested_qty,
+                 raw_broker_order_no,canonical_broker_order_no,payload,idempotency_key)
+                VALUES (CAST(:id AS uuid),:day,:typ,now(),:epoch,:key,:attempt,:sym,
+                        'BUY',2,'000123','123',CAST(:payload AS jsonb),:id)
+                """),dict(id=str(uuid4()),day=day,typ=typ,epoch=epoch,key=key,
+                           attempt=attempt,sym=sym,payload=json.dumps(payload)))
+    assert _journal_has_unrecovered_buy_ack(day) is True

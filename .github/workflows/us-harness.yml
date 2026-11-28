@@ -2,7 +2,7 @@ name: US Harness (Offline QA)
 
 on:
   pull_request:
-    branches: [dual-agent, stabilize/01-execution-state-contract-20261004, stabilize/02-us-broker-recovery-20261004, stabilize/03-kr-broker-recovery-20261004, stabilize/04-lifecycle-contract-recovery-20261004]
+    branches: [dual-agent, fix/us-20261126-hot-only-tp90-integrated, stabilize/01-execution-state-contract-20261004, stabilize/02-us-broker-recovery-20261004, stabilize/03-kr-broker-recovery-20261004, stabilize/04-lifecycle-contract-recovery-20261004]
     paths:
       - "trader/us/**"
       - "tests/us/**"
@@ -13,6 +13,12 @@ on:
       - "config/us_*.yaml"
       - ".github/workflows/us-harness.yml"
   workflow_dispatch:
+
+
+# Only superseded PR validation runs are cancellable; manual/push runs stay isolated.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   harness:
@@ -86,6 +92,18 @@ jobs:
             tests/us/test_us_postgres_integration_real.py::test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions \
             tests/us/test_us353_tp_partial_retry_proof.py \
             tests/us/test_tp_pre_http_retry_proof_20261105.py
+
+      - name: Integrated original BUY to overnight SELL, exact reservation and restart acceptance
+        shell: bash
+        run: |
+          test -n "$PBCORE_TEST_POSTGRES_URL"
+          python -m pytest -q --junitxml=/tmp/us400-integrated-sst.xml \
+            tests/us/test_us_postgres_integration_real.py::test_pg_eight_families_actual_buy_route_to_overnight_protective_sell \
+            tests/us/test_us_postgres_integration_real.py::test_pg_original_signed_buy_contract_survives_raw_snapshot_upsert \
+            tests/us/test_us_postgres_integration_real.py::test_claim_reservation_outbox_triplet_rolls_back_as_one \
+            tests/us/test_us_postgres_integration_real.py::test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions \
+            tests/us/test_us_sst_architecture_20261124.py
+          python -c 'import xml.etree.ElementTree as E; c=list(E.parse("/tmp/us400-integrated-sst.xml").iter("testcase")); assert len(c)>=17 and all(x.find("skipped") is None for x in c)'
 
       - name: Run PostgreSQL broker recovery acceptance
         shell: bash
