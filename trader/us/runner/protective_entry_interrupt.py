@@ -600,6 +600,8 @@ def preserve_confirmed_soft_state(position,trade_date):
 def profit_wakeup_result(orders, intents, *, trade_date, session, position_count, decisions, incomplete=False):
     """Truthful terminal result for a multi-symbol SELL-only invocation."""
     from trader.us.runner.trade_tick_runner import _routed_order_truth_counts,_routed_sell_notional
+    from trader.us.utils.order_no import normalize_us_order_no
+
     sent,ack,rejected,blocked=_routed_order_truth_counts(orders)
     # Counts alone cannot establish that the ACK belongs to the selected
     # holding. Preserve scope even when a TP is repriced or its qty reduced
@@ -608,17 +610,23 @@ def profit_wakeup_result(orders, intents, *, trade_date, session, position_count
         if not isinstance(intent,dict) or str(intent.get("side") or "").upper()!="SELL":
             return None
         symbol=str(intent.get("symbol") or "").strip().upper()
-        if not symbol:
-            return None
-        return (symbol, *(str(intent.get(k) or "").strip() for k in _IDENTITY_FIELDS[1:]))
+        identity = (symbol, *(str(intent.get(k) or "").strip() for k in _IDENTITY_FIELDS[1:]))
+        return identity if all(identity) else None
+
+    def persisted_ack(order):
+        return (isinstance(order, dict)
+                and str(order.get("status") or "").upper() == "ACK"
+                and order.get("kis_ack") is True
+                and order.get("ack_db_saved") is True
+                and order.get("requires_reconcile") is False
+                and normalize_us_order_no(order.get("order_no")) not in {"", "0"})
+
     expected=[scope(i) for i in intents]
     actual=[scope(o.get("intent")) if isinstance(o,dict) else None for o in orders]
     count=len({key[0] for key in expected if key is not None})
     exact=(None not in expected and None not in actual
            and len(expected)==count and Counter(expected)==Counter(actual))
-    uncertain=(incomplete or not exact or any(not isinstance(o,dict)
-               or str(o.get("status") or "").upper()!="ACK"
-               or o.get("requires_reconcile") for o in orders)
+    uncertain=(incomplete or not exact or not all(persisted_ack(o) for o in orders)
                or count!=ack or sent!=ack)
     return dict(status="WARN_RECONCILE_PENDING" if uncertain else "OK_EXIT_ORDERS_SENT" if ack else "OK_NO_TRADE",
         reason="protective_profit_wakeup_unverified" if uncertain else "protective_profit_wakeup_routed" if ack else "protective_profit_wakeup_no_trade",

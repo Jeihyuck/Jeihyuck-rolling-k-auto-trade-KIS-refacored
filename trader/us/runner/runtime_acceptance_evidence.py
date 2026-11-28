@@ -42,8 +42,16 @@ def result_evidence(scope,result,*,wall_sec):
         out["protective_wakeup"]=result.get("protective_wakeup") is True
         out["protective_wakeup_kind"]=result.get("protective_wakeup_kind","stop")
         out["reason"]=str(result.get("reason") or "UNKNOWN")
-        out["exit_route_reconcile_required"]=bool(result.get("exit_route_reconcile_required"))
-        out["manual_reconcile_required"]=bool(result.get("manual_reconcile_required"))
+        route_reconcile = result.get("exit_route_reconcile_required")
+        manual_reconcile = result.get("manual_reconcile_required")
+        out["exit_route_reconcile_required"] = (
+            route_reconcile if type(route_reconcile) is bool else None
+        )
+        out["manual_reconcile_required"] = (
+            bool(manual_reconcile)
+            if type(manual_reconcile) in (bool, int) and manual_reconcile in (0, 1)
+            else None
+        )
         for key in ("entry_intents","exit_intents","buy_orders","orders_sent","orders_ack"):
             v=result.get(key)
             out[key]=v if type(v) is int and v>=0 else None
@@ -104,8 +112,8 @@ def summarize_runtime(lines,*,expected_sha):
                     and row.get("entry_can_proceed") is False and row.get("exit_can_proceed") is True
                     and row.get("entry_intents")==row.get("buy_orders")==0
                     and row.get("classification")=="success"
-                    and not row.get("exit_route_reconcile_required")
-                    and not row.get("manual_reconcile_required"))
+                    and row.get("exit_route_reconcile_required") is False
+                    and row.get("manual_reconcile_required") is False)
             if common and (
                 (row.get("status")=="OK_NO_TRADE" and row.get("orders_sent")==row.get("orders_ack")==row.get("exit_intents")==0
                  and row.get("reason") in {"protective_wakeup_no_fresh_signal","protective_wakeup_holding_changed"})
@@ -188,6 +196,7 @@ def compare_runtime(baseline,candidate,*,min_samples=20):
         blockers.append("BASELINE_CANDIDATE_SHA_IDENTICAL")
     if baseline["account_digest"] != candidate["account_digest"]:
         blockers.append("BASELINE_CANDIDATE_ACCOUNT_MISMATCH")
+    optimization_blockers = []
     for session in ("am","afternoon"):
         b,c=baseline["sessions"][session],candidate["sessions"][session]
         if b["normal"]<min_samples or c["normal"]<min_samples:
@@ -203,7 +212,14 @@ def compare_runtime(baseline,candidate,*,min_samples=20):
             blockers.append(session+":NONCOMPARABLE_POLICY_WORKLOAD")
         if c["mean_sec"] is None or c["mean_sec"]>60:
             blockers.append(session+":MEAN_TICK_OVER_60_OR_UNKNOWN")
+        if c["mean_sec"] is None or c["mean_sec"] > 30:
+            optimization_blockers.append(session + ":MEAN_TICK_OVER_30_OR_UNKNOWN")
     return {"status":"PASS_LOG_TIMING_ONLY" if not blockers else "NOT_PROVEN",
             "blockers":sorted(set(blockers)),"baseline":baseline,"candidate":candidate,
+            "optimization_status": (
+                "PASS_LOG_TIMING_ONLY" if not blockers and not optimization_blockers
+                else "NOT_PROVEN"
+            ),
+            "optimization_blockers": sorted(set(blockers + optimization_blockers)),
             "native_kis_ack_fill_verified":False,"operational_go":False,
             "order_authorization":False,"integrated_implementation_complete":False}

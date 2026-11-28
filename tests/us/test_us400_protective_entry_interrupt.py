@@ -282,11 +282,22 @@ def test_profit_wakeup_does_not_create_soft_confirmations(monkeypatch):
     assert not p["soft_stop_partial_done"] and "_legacy_prior_soft_stop_execution_candidate" not in p
 
 
+def _scoped_sell(symbol):
+    return dict(symbol=symbol, side="SELL", strategy_owner="US_STANDARD",
+                position_lifecycle_id=symbol, position_cycle_id=symbol,
+                portfolio_epoch_id="p", trading_epoch_id="e", broker_account_hash="a")
+
+
+def _persisted_sell_ack(intent, order_no="100"):
+    return dict(status="ACK", intent=dict(intent), order_no=order_no, kis_ack=True,
+                ack_db_saved=True, requires_reconcile=False)
+
+
 @pytest.mark.parametrize("case",["empty","two_ack","unknown","non_sell","missing_route"])
 def test_profit_wakeup_reports_all_outcomes_without_buy(case):
     from trader.us.runner.protective_entry_interrupt import profit_wakeup_result
-    intents=[dict(symbol=s,side="SELL") for s in ("ABC","DEF")] if case!="empty" else []
-    orders=[dict(status="ACK",intent=i) for i in intents]
+    intents=[_scoped_sell(s) for s in ("ABC","DEF")] if case!="empty" else []
+    orders=[_persisted_sell_ack(i, str(n)) for n,i in enumerate(intents, 1)]
     if case=="unknown": orders[-1]["status"]="BROKER_SUBMIT_RESULT_UNKNOWN"
     if case=="non_sell": orders[-1]["intent"]={"symbol":"DEF","side":"BUY"}
     if case=="missing_route": orders.pop()
@@ -501,14 +512,12 @@ def test_bounded_trend_daily_read_preserves_value_and_loader_error():
 
 
 @pytest.mark.parametrize("case", ["exact", "wrong_symbol", "duplicate_ack", "wrong_account",
-                                  "wrong_owner", "wrong_lifecycle", "missing_scope", "malformed"])
+                                  "wrong_owner", "wrong_lifecycle", "missing_scope", "malformed",
+                                  "missing_scope_on_both_sides", "unpersisted_ack"])
 def test_profit_wakeup_requires_one_to_one_sell_ack_scope(case):
     from trader.us.runner.protective_entry_interrupt import profit_wakeup_result
-    def intent(s):
-        return dict(symbol=s,side="SELL",strategy_owner="US_STANDARD",position_lifecycle_id=s,
-                    position_cycle_id=s,portfolio_epoch_id="p",trading_epoch_id="e",broker_account_hash="a")
-    intents=[intent("ABC"),intent("DEF")]
-    orders=[dict(status="ACK",intent=dict(i)) for i in intents]
+    intents=[_scoped_sell("ABC"),_scoped_sell("DEF")]
+    orders=[_persisted_sell_ack(i, str(n)) for n,i in enumerate(intents, 1)]
     if case=="wrong_symbol":
         orders[-1]["intent"]["symbol"]="GHI"
     elif case=="duplicate_ack":
@@ -521,6 +530,11 @@ def test_profit_wakeup_requires_one_to_one_sell_ack_scope(case):
         orders[-1]["intent"]["position_lifecycle_id"]="old"
     elif case=="missing_scope":
         orders[-1]["intent"].pop("trading_epoch_id")
+    elif case=="missing_scope_on_both_sides":
+        intents[-1].pop("trading_epoch_id")
+        orders[-1]["intent"].pop("trading_epoch_id")
+    elif case=="unpersisted_ack":
+        orders[-1]["ack_db_saved"] = False
     elif case=="malformed":
         orders[-1]=None
     result=profit_wakeup_result(orders,intents,trade_date="2026-11-25",session="am",
@@ -553,13 +567,13 @@ def test_idle_stop_cannot_continue_without_explicit_reconciliation_proof(case):
     assert remaining_idle_watch(watch,attempted,result)==[]
 
 
-@pytest.mark.parametrize("case", ["exact", "wrong_identity", "duplicate", "missing_ack", "empty"])
+@pytest.mark.parametrize("case", ["exact", "wrong_identity", "duplicate", "missing_ack", "empty",
+                                  "missing_broker_number", "missing_reconcile_proof"])
 def test_idle_stop_route_result_requires_exact_single_ack(case):
     from trader.us.runner.protective_entry_interrupt import stop_wakeup_route_result
-    intent=dict(symbol="ABC",side="SELL",strategy_owner="US_STANDARD",position_lifecycle_id="l",
-                position_cycle_id="l",portfolio_epoch_id="p",trading_epoch_id="e",broker_account_hash="a")
+    intent=_scoped_sell("ABC")
     intents=[intent]
-    orders=[dict(status="ACK",intent=dict(intent))]
+    orders=[_persisted_sell_ack(intent)]
     if case=="wrong_identity":
         orders[0]["intent"]["broker_account_hash"]="foreign"
     elif case=="duplicate":
@@ -568,6 +582,10 @@ def test_idle_stop_route_result_requires_exact_single_ack(case):
         orders=[]
     elif case=="empty":
         intents,orders=[],[]
+    elif case=="missing_broker_number":
+        orders[0]["order_no"] = "000000"
+    elif case=="missing_reconcile_proof":
+        orders[0].pop("requires_reconcile")
     result=stop_wakeup_route_result(orders,intents,trade_date="2026-11-25",session="am",
                                    position_count=1,decisions=[])
     assert result["protective_wakeup_kind"]=="stop"

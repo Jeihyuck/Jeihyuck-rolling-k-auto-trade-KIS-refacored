@@ -53,7 +53,10 @@ def test_comparison_requires_matching_account_and_order_workload(overrides, bloc
     assert blocker in report["blockers"]
 
 
-@pytest.mark.parametrize("case",["clean","ack","unknown","missing","failure","kind_conflict","buy","wrong_account"])
+@pytest.mark.parametrize("case", [
+    "clean", "ack", "unknown", "missing", "failure", "kind_conflict", "buy", "wrong_account",
+    "missing_exit_proof", "missing_manual_proof", "manual_debt",
+])
 def test_protective_wakeup_is_separate_and_cannot_pad_or_hide_normal_work(case):
     before=list(rows("a"*40))
     after=list(rows("b"*40))
@@ -66,7 +69,10 @@ def test_protective_wakeup_is_separate_and_cannot_pad_or_hide_normal_work(case):
               protective_wakeup=True,entry_can_proceed=False,exit_can_proceed=True,
               entry_intents=0,buy_orders=1 if case=="buy" else 0,
               exit_intents=1 if case=="ack" else 0,orders_sent=1 if case=="ack" else 0,
-              orders_ack=1 if case=="ack" else 0,exit_route_reconcile_required=case=="unknown")
+              orders_ack=1 if case=="ack" else 0,exit_route_reconcile_required=case=="unknown",
+              manual_reconcile_required=int(case=="manual_debt"))
+    if case=="missing_exit_proof": data.pop("exit_route_reconcile_required")
+    if case=="missing_manual_proof": data.pop("manual_reconcile_required")
     if case=="kind_conflict": scope=dict(scope,tick_kind="normal")
     if case=="wrong_account": scope=dict(scope,account_digest="e"*64)
     if case=="failure": after.append("[US400_RUNTIME][FAILURE] payload="+json.dumps(scope))
@@ -78,6 +84,21 @@ def test_protective_wakeup_is_separate_and_cannot_pad_or_hide_normal_work(case):
     assert am["attempted"]==am["normal"]==20
     assert am["total_attempted"]==21 and am["protective_wakeup_attempted"]==1
     assert report["operational_go"] is False
+
+
+@pytest.mark.parametrize(("seconds", "optimized"), [(30, True), (30.001, False), (60, False)])
+def test_30_second_target_requires_full_comparable_normal_work(seconds, optimized):
+    baseline = summarize_runtime(rows("a"*40, seconds=150), expected_sha="a"*40)
+    candidate = summarize_runtime(rows("b"*40, seconds=seconds), expected_sha="b"*40)
+    report = compare_runtime(baseline, candidate)
+    assert report["status"] == "PASS_LOG_TIMING_ONLY"
+    assert (report["optimization_status"] == "PASS_LOG_TIMING_ONLY") is optimized
+    assert ("am:MEAN_TICK_OVER_30_OR_UNKNOWN" in report["optimization_blockers"]) is not optimized
+
+    mismatched = summarize_runtime(rows("b"*40, seconds=seconds, positions=1), expected_sha="b"*40)
+    report = compare_runtime(baseline, mismatched)
+    assert report["optimization_status"] == "NOT_PROVEN"
+    assert "am:NONCOMPARABLE_WORKLOAD" in report["optimization_blockers"]
 
 
 @pytest.mark.parametrize("case", ["same", "missing", "different_workload"])
