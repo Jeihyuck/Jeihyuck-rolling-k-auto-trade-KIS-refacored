@@ -107,3 +107,43 @@ def test_cold_promotion_keeps_partition_and_execution_manifest(monkeypatch):
     monkeypatch.setenv("KR_COLD_DISCOVERY_ENABLED","0")
     p.observe("3",facts)
     assert p.apply(seed,now)["warm"] == ["2"]
+
+
+def test_scoped_opening_incremental_matches_original_and_rechecks_freshness(tmp_path, caplog, monkeypatch):
+    import logging
+    from trader.kr.opening_intelligence import _opening_features
+    monkeypatch.setenv("KR_OPENING_FEATURE_SHARED_ENABLED", "1")
+    now = datetime(2026, 11, 27, 9, 5, tzinfo=KST)
+    start = now.replace(minute=0)
+    rows = [{"date":"20261127", "time":(start+timedelta(minutes=i)).strftime("%H%M%S"),
+             "open":cl, "high":hi, "low":lo, "close":cl, "volume":100}
+            for i,(hi,lo,cl) in enumerate([(10000,9900,9950),(9800,9700,9750),
+                                          (9770,9700,9750),(9780,9710,9760),
+                                          (9790,9720,9770),(10100,9700,9800)])]
+    proof = {"source":"KIS_FHKST03010200","trade_date":"2026-11-27",
+             "env":"practice","code":"005930","sha256":"fixture","as_of":now.isoformat(),
+             "bars":rows[:5]}
+    args = {"account_scope":"practice:fixture","code":"005930","cache_base":tmp_path/"private"}
+    with caplog.at_level(logging.DEBUG, logger="trader.marketdata.feature_reuse"):
+        first = analyze_opening(proof=proof, now=now, prep_style="MOMENTUM", **args)
+        assert first == analyze_opening(proof=proof, now=now, prep_style="MOMENTUM")
+        _opening_features.cache_clear()  # no process-local hit can explain shared reuse
+        assert first == analyze_opening(proof=proof, now=now, prep_style="MOMENTUM", **args)
+        assert "[NATIVE_FEATURES][SHARED_HIT]" in caplog.text
+        caplog.clear()
+        later = now+timedelta(minutes=1)
+        extended = {**proof,"bars":rows,"as_of":later.isoformat()}
+        second = analyze_opening(proof=extended, now=later, prep_style="MOMENTUM", **args)
+        assert second == analyze_opening(proof=extended, now=later, prep_style="MOMENTUM")
+        assert second["opening_high"] == 10100
+        assert "[NATIVE_FEATURES][APPEND_REUSE]" in caplog.text
+        caplog.clear()
+        corrected = {**extended,"bars":[{**rows[0],"high":10200},*rows[1:]]}
+        third = analyze_opening(proof=corrected, now=later, prep_style="MOMENTUM", **args)
+        assert third == analyze_opening(proof=corrected, now=later, prep_style="MOMENTUM")
+        assert third["opening_high"] == 10200
+        assert "[NATIVE_FEATURES][APPEND_REUSE]" not in caplog.text
+        assert analyze_opening(proof=corrected,now=later+timedelta(minutes=4),**args)["state"] == "EXPIRED"
+        assert analyze_opening(proof={**corrected,"source_conflicts":["x"]},now=later,**args)["state"] == "INVALIDATED"
+        monkeypatch.setenv("KR_OPENING_FEATURE_SHARED_ENABLED","0")
+        assert third == analyze_opening(proof=corrected,now=later,prep_style="MOMENTUM",**args)
