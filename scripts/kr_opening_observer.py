@@ -614,7 +614,8 @@ def run_once(*, kis, codes: list[str], observed_at: datetime,
                 try:
                     intelligence = analyze_opening(
                         proof=persisted, now=proof_now,
-                        prep_style=(observation_styles or {}).get(code))
+                        prep_style=(observation_styles or {}).get(code),
+                        account_scope=scope, code=code)
                     logger.info("[KR][OPENING_OBSERVER][INTELLIGENCE] code=%s elapsed_ms=%.3f facts=%s",
                                 code, (time.monotonic()-intelligence_started)*1000,
                                 json.dumps(intelligence, ensure_ascii=False, sort_keys=True))
