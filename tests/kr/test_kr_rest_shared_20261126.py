@@ -123,3 +123,25 @@ def test_nonblocking_native_cache_read_preserves_receipt_and_expiry(monkeypatch)
     finally:
         _cleanup(key)
         _cleanup(key + "-other")
+
+
+def test_shared_native_fetch_error_releases_lease_without_poisoning_cache(caplog):
+    import logging
+    key = "fixture-" + uuid.uuid4().hex
+
+    def failed():
+        raise RuntimeError("fixture upstream failure")
+
+    try:
+        with caplog.at_level(logging.INFO, logger="trader.marketdata.rest_singleflight"):
+            with pytest.raises(RuntimeError, match="fixture upstream failure"):
+                shared.read_or_fetch(appkey=key, code="003490", fetch=failed)
+            assert shared.read_cached(appkey=key, code="003490") is None
+            assert shared.read_or_fetch(appkey=key, code="003490", fetch=_quote)[0] == "FETCH"
+            assert shared.read_or_fetch(appkey=key, code="003490", fetch=failed)[0] == "HIT"
+        assert "status=FETCH_ERROR" in caplog.text
+        assert "status=FETCH" in caplog.text
+        assert "status=HIT" in caplog.text
+        assert key not in caplog.text
+    finally:
+        _cleanup(key)
