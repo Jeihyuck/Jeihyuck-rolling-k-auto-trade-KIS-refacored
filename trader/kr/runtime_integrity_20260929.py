@@ -424,6 +424,40 @@ def _no_durable_fill_or_position(conn: Any, schema: Any, order: dict[str, Any]) 
     return True
 
 
+def _has_active_execution_claim(conn: Any, schema: Any, order: dict[str, Any]) -> bool:
+    """Legacy negative observations cannot settle a durable execution claim.
+
+    Match the exact local order key in its environment, never symbol or
+    quantity. A conflicting epoch is also a fence: orders have a unique
+    (env, client_order_key), so an active claim with that same key but a
+    different generation is an identity conflict, not proof of absence.
+    No foreign claim is mutated. A query error aborts the transaction.
+    """
+    key = str(order.get("client_order_key") or "").strip()
+    if not key:
+        return False
+    claims, attempts = schema.execution_claims, schema.execution_attempts
+    filters = [
+        attempts.c.client_order_key == key,
+        claims.c.env == order.get("env"),
+        claims.c.market == "KR",
+        claims.c.strategy_owner == "PB1",
+        claims.c.action_state.in_(("IN_FLIGHT", "UNCERTAIN", "PARTIALLY_SATISFIED")),
+    ]
+    linked = claims.join(attempts, sa.and_(
+        claims.c.action_key == attempts.c.action_key,
+        claims.c.active_attempt_id == attempts.c.attempt_id,
+    ))
+    row = conn.execute(sa.select(claims.c.action_key, claims.c.trading_epoch_id)
+                       .select_from(linked).where(sa.and_(*filters)).limit(1)).first()
+    if row is None:
+        return False
+    if not order.get("trading_epoch_id") or str(row.trading_epoch_id) != str(order["trading_epoch_id"]):
+        logger.warning("[KR_P0][NEGATIVE_TRUTH][CLAIM_SCOPE_CONFLICT] code=%s "
+                       "action=RETAIN_ORDER_AND_CLAIM", order.get("code"))
+    return True
+
+
 def _terminalize_unresolved_orders(
     *,
     engine: Any,
@@ -473,7 +507,12 @@ def _terminalize_unresolved_orders(
             if created is None:
                 continue
             response = _json_dict(order.get("response_json"))
+            claim_fenced = _has_active_execution_claim(conn, schema, order)
             if created.date() < today:
+                if claim_fenced:
+                    logger.warning("[KR_P0][NEGATIVE_TRUTH][CLAIM_RETAINED] code=%s "
+                                   "reason=ORIGINAL_ORDER_TERMINAL_PROOF_REQUIRED", code)
+                    continue
                 if not _no_durable_fill_or_position(conn, schema, order):
                     continue
                 response.update(
@@ -523,7 +562,14 @@ def _terminalize_unresolved_orders(
             response["negative_broker_truth"] = proof
             observed.append(code)
             values: dict[str, Any] = {"response_json": response, "updated_at": sa.func.now()}
-            if count >= required_proofs:
+            if count >= required_proofs and claim_fenced:
+                # Two absent snapshots plus holdings parity are useful audit
+                # evidence, not an explicit broker rejection/cancellation.
+                # Keep both the order and its active claim unresolved.
+                response["negative_truth_claim_fenced"] = True
+                logger.warning("[KR_P0][NEGATIVE_TRUTH][CLAIM_RETAINED] code=%s "
+                               "reason=ORIGINAL_ORDER_TERMINAL_PROOF_REQUIRED", code)
+            if count >= required_proofs and not claim_fenced:
                 response.update(
                     {
                         "manual_resolution": "BROKER_TRUTH_NO_ORDER_OBSERVED",
@@ -542,7 +588,7 @@ def _terminalize_unresolved_orders(
                 )
                 .values(**values)
             )
-            if int(result.rowcount or 0) == 1 and count >= required_proofs:
+            if int(result.rowcount or 0) == 1 and count >= required_proofs and not claim_fenced:
                 terminalized.append(code)
     return {"terminalized": terminalized, "negative_observed": observed}
 
@@ -859,6 +905,15 @@ def _build_reconcile_convergence_guard(original: Callable[..., Any]) -> Callable
     def guarded(*args: Any, **kwargs: Any):
         result = original(*args, **kwargs)
         if not isinstance(result, dict):
+            return result
+        # The canonical CURRENT_ONLY path already reconciles today's native
+        # orders/fills and validates the active account, claims and balance.
+        # Do not re-enter legacy cross-day recovery or replace its scoped
+        # activity verdict with an all-dates count. This wrapper cannot turn
+        # a failed current proof into a permit (return the result unchanged).
+        if (kwargs.get("historical_recovery") is False
+                or result.get("historical_recovery_executed") is False):
+            logger.info("[KR_P0][LEGACY_CONVERGENCE][SKIP] reason=CURRENT_ORDERS_ONLY")
             return result
         engine = kwargs.get("engine")
         kis = kwargs.get("kis")

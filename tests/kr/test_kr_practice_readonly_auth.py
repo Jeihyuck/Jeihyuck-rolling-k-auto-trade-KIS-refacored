@@ -132,3 +132,73 @@ def test_requests_session_integration_captures_transport_failure(monkeypatch):
                      json={"appsecret":"fake-test-secret"}, timeout=1)
     assert calls == ["POST"]
     assert guard.transport_failures == [{"scope":"OAUTH","state":"READ_TIMEOUT"}]
+
+
+def test_missing_ack_native_candidates_never_authorize_recovery():
+    from datetime import date
+    from scripts.kr_historical_buy_native_evidence import missing_order_id_evidence
+    day = date(2026,11,27)
+    row = {"pdno":"012750","odno":"0000000123","ord_dt":"20261127",
+           "sll_buy_dvsn_cd":"02","ord_qty":"19","ord_unpr":"101500",
+           "rmn_qty":"0"}
+    payload = {"rt_cd":"0","_sep29_complete":True,"output1":[row]}
+    def evidence(data):
+        return missing_order_id_evidence(data,day=day,code="012750",
+                                         qty=19,limit_price=101500)
+    result = evidence(payload)
+    assert result["state"] == "MISSING_ORDER_ID_MATCH_REVIEW_REQUIRED"
+    assert result["candidate_order_numbers"] == ["0000000123"]
+    assert result["recovery_authorized"] is False
+    result = evidence({**payload,"output1":[row,{**row,"odno":"0000000124"}]})
+    assert result["candidate_count"] == 2
+    assert result["recovery_authorized"] is False
+    result = evidence({**payload,"output1":[]})
+    assert result["state"] == "MISSING_ORDER_ID_NO_MATCH_NOT_ABSENCE_PROOF"
+    assert result["recovery_authorized"] is False
+    for data in ({**payload,"_sep29_complete":False},
+                 {**payload,"output1":[row,row]},
+                 {**payload,"output1":[{**row,"ord_qty":"bad"}]}):
+        result = evidence(data)
+        assert result["state"] == "MISSING_ORDER_ID_NATIVE_HISTORY_UNVERIFIED"
+        assert result["recovery_authorized"] is False
+
+
+def test_historical_native_day_budget_prioritizes_active_uncertain_claims():
+    from datetime import date
+    from scripts.kr_historical_buy_native_evidence import _evidence_target_priority
+
+    def target(day, claim_id, exact_cycle):
+        return {"claim": {"trade_date": day, "action_key": claim_id},
+                "order": {"order_id": str(day), "position_cycle_id": "cycle"},
+                "positions": [{"position_cycle_id": "cycle"}] if exact_cycle else []}
+
+    audits = [target(date(2026, 9, d), None, False) for d in (1, 2, 3, 4)]
+    unresolved = [
+        target(date(2026, 10, 27), "old-claim", True),
+        target(date(2026, 11, 27), "new-claim", False),
+    ]
+    ranked = sorted(audits + unresolved, key=_evidence_target_priority)
+    assert {t["claim"]["action_key"] for t in ranked[:2]} == {"old-claim", "new-claim"}
+    assert ranked[2]["claim"]["action_key"] is None
+
+
+@pytest.mark.parametrize("cancelled,rejected", [(174, 0), (0, 174)])
+def test_exact_original_zero_fill_terminal_evidence_does_not_authorize_retry(cancelled, rejected):
+    from datetime import date
+    from scripts.kr_historical_buy_native_evidence import exact_buy_evidence
+    day = date(2026, 10, 27)
+    row = {"pdno": "293490", "odno": "0000011280", "ord_dt": "20261027",
+           "sll_buy_dvsn_cd": "02", "ord_qty": "174", "tot_ccld_qty": "0",
+           "tot_ccld_amt": "0", "avg_prvs": "0", "rmn_qty": "0",
+           "cncl_cfrm_qty": str(cancelled), "rjct_qty": str(rejected)}
+    payload = {"rt_cd": "0", "_sep29_complete": True, "output1": [row]}
+    def proof(data):
+        return exact_buy_evidence(data, day=day, code="293490", odno="0000011280", qty=174)
+    result = proof(payload)
+    assert result["state"] == "ORIGINAL_ZERO_FILL_TERMINAL_PROVEN"
+    assert result["recovery_authorized"] is False
+    for changes in ({"rmn_qty": "174"}, {"sll_buy_dvsn_cd": "01"},
+                    {"tot_ccld_amt": "100"}, {"cncl_cfrm_qty": "175"},
+                    {"rjct_qty": "bad"}, {"ord_qty": "173"}):
+        assert proof({**payload, "output1": [{**row, **changes}]})["state"] != result["state"]
+    assert proof({**payload, "_stub": True})["state"] == "NATIVE_HISTORY_UNVERIFIED"

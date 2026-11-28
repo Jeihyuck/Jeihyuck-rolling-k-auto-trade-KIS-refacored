@@ -639,3 +639,126 @@ def test_cross_day_policy_recovery_refuses_symbol_only_ambiguity(monkeypatch):
     )
     assert result["recovered"] == []
     assert result["review_required"] == ["028050"]
+
+
+@pytest.mark.parametrize("prior_day", [False, True])
+@pytest.mark.parametrize("claim_epoch_matches", [True, False])
+def test_durable_pb1_uncertain_claim_never_terminalized_by_negative_observation(
+    monkeypatch, prior_day, claim_epoch_matches,
+):
+    engine = _db()
+    schema = schema_for_engine(engine)
+    now = datetime(2026, 11, 27, 10, 30, tzinfo=fix._KST)
+    order_id, cycle_id, epoch_id = str(uuid4()), str(uuid4()), str(uuid4())
+    key = "claimed-negative-buy"
+    action_key = "a" * 64
+    trading_epoch = str(uuid4())
+    claim_epoch = trading_epoch if claim_epoch_matches else str(uuid4())
+    with engine.begin() as conn:
+        _portfolio_epoch(conn, schema, epoch_id)
+        conn.execute(schema.orders.insert().values(
+            order_id=order_id, position_cycle_id=cycle_id, portfolio_epoch_id=epoch_id,
+            trading_epoch_id=trading_epoch,
+            env="practice", strategy=STRATEGY, sid=1, mode=1, code="012750",
+            market="KOSPI", side="BUY", ord_type="LIMIT", qty=19, stage="ENTRY",
+            client_order_key=key, status="UNRESOLVED_ACK",
+            request_json={"pre_order_holding_qty": 0},
+            response_json={"rt_cd": "UNRESOLVED_ACK"},
+            created_at=now-timedelta(days=int(prior_day), minutes=3)))
+        conn.execute(schema.execution_claims.insert().values(
+            action_key=action_key, env="practice", account_id="fixture", market="KR",
+            trading_epoch_id=claim_epoch, strategy_owner="PB1", lifecycle_id="entry:012750",
+            action="BUY_ENTRY:PB1-AM", target_qty=19, cumulative_filled_qty=0,
+            remaining_target_qty=19, active_attempt_id="attempt",
+            action_state="UNCERTAIN", trade_date=(now-timedelta(days=int(prior_day))).date()))
+        conn.execute(schema.execution_attempts.insert().values(
+            attempt_id="attempt", action_key=action_key, attempt_no=1,
+            requested_qty=19, client_order_key=key, attempt_state="UNRESOLVED",
+            authoritative=False))
+    monkeypatch.setattr(fix, "_active_epoch", lambda *_a, **_kw: trading_epoch)
+    kis = SimpleNamespace(_kr_20260929_daily_ccld_snapshot={
+        "captured_mono": fix.time.monotonic(), "start_date": now.strftime("%Y%m%d"),
+        "end_date": now.strftime("%Y%m%d"), "codes": [], "authoritative_complete": True})
+    for _ in range(2):
+        result = fix._terminalize_unresolved_orders(engine=engine, kis=kis,
+            env="practice", strategy=STRATEGY, holdings_rows=[], now=now)
+        assert result["terminalized"] == []
+        kis._kr_20260929_daily_ccld_snapshot["captured_mono"] -= .001
+    with engine.connect() as conn:
+        order = conn.execute(sa.select(schema.orders).where(
+            schema.orders.c.order_id == order_id)).mappings().one()
+        assert order["status"] == "UNRESOLVED_ACK"
+        assert order["trading_epoch_id"] == trading_epoch
+        claim = conn.execute(sa.select(schema.execution_claims)).mappings().one()
+        assert claim["trading_epoch_id"] == claim_epoch
+        assert claim["action_state"] == "UNCERTAIN"
+        assert claim["active_attempt_id"] == "attempt"
+        if not prior_day:
+            response = fix._json_dict(order["response_json"])
+            assert response["negative_truth_claim_fenced"] is True
+            assert response.get("auto_terminalized") is not True
+
+
+@pytest.mark.parametrize("current_proven", [True, False])
+def test_current_only_convergence_wrapper_preserves_canonical_proof(monkeypatch, current_proven):
+    from trader.kr.historical_recovery_journal import (
+        RecoveryLane, current_tick_reconcile_proves_buy_safe,
+    )
+    # A dated historical claim remains unresolved but cannot trigger the
+    # legacy all-dates query on this tick. A current proof failure still blocks.
+    result = {
+        "ok": current_proven, "degraded": None if current_proven else "CURRENT_UNVERIFIED",
+        "historical_recovery_executed": False,
+        "current_only_fresh_broker_proven": current_proven,
+        "frozen_contract_invariant_violations": 0,
+        "unresolved_broker_activity": not current_proven,
+        "guard_reason": None,
+        "_final_holdings_rows": [],
+        "execution_claim_health": {
+            "available": True, "unresolved_execution_actions": 2,
+            "unresolved_source_date_prior": 2,
+            "unresolved_source_date_current": 0,
+            "unresolved_source_date_other_or_unknown": 0,
+        },
+    }
+    def forbidden(**kwargs):
+        pytest.fail("CURRENT_ONLY must not enter legacy historical recovery or global open count")
+    for name in ("_recover_cross_day_contract_from_holdings",
+                 "_terminalize_unresolved_orders", "_count_open_activity"):
+        monkeypatch.setattr(fix, name, forbidden)
+    wrapped = fix._build_reconcile_convergence_guard(lambda **kwargs: result)
+    actual = wrapped(engine=object(), kis=object(), env="practice",
+                     strategy=STRATEGY, historical_recovery=False)
+    assert actual is result
+    assert current_tick_reconcile_proves_buy_safe(
+        lane=RecoveryLane("CURRENT_ONLY"), result=actual,
+        durable_record_ok=True,
+    ) is current_proven
+    assert not current_tick_reconcile_proves_buy_safe(
+        lane=RecoveryLane("CURRENT_ONLY"), result=actual,
+        durable_record_ok=False,
+    )
+
+
+def test_full_recovery_keeps_legacy_convergence_maintenance(monkeypatch):
+    calls = []
+    def recovery(**kwargs):
+        calls.append("cross_day")
+        return {"recovered": [], "review_required": []}
+    def converge(**kwargs):
+        calls.append("negative_truth")
+        return {"terminalized": []}
+    def count(**kwargs):
+        calls.append("open_count")
+        return 1
+    monkeypatch.setattr(fix, "_recover_cross_day_contract_from_holdings", recovery)
+    monkeypatch.setattr(fix, "_terminalize_unresolved_orders", converge)
+    monkeypatch.setattr(fix, "_count_open_activity", count)
+    result = {"ok": False, "historical_recovery_executed": True,
+              "_final_holdings_rows": [], "unresolved_broker_activity": True}
+    wrapped = fix._build_reconcile_convergence_guard(lambda **kwargs: result)
+    actual = wrapped(engine=object(), kis=object(), env="practice",
+                     strategy=STRATEGY, historical_recovery=True)
+    assert calls == ["cross_day", "negative_truth", "open_count"]
+    assert actual["unresolved_broker_activity"] is True
+    assert actual["ok"] is False

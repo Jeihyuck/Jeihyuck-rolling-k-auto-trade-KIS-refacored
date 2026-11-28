@@ -7,7 +7,6 @@ Critical callers may choose existing fallback after a bounded join.
 """
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import logging
@@ -18,6 +17,7 @@ import tempfile
 import time
 
 from trader.kr.executable_quote import verified_price
+from trader.marketdata.rest_singleflight import read_or_fetch_scoped
 
 log = logging.getLogger(__name__)
 _MAX_BYTES = 65536
@@ -56,6 +56,8 @@ def _open_private(path, flags):
 def _valid(row, code, now):
     return (isinstance(row, dict)
             and row.get("source") == "KIS_REST_INQUIRE_PRICE"
+            and row.get("native_market_division") == "J"
+            and row.get("native_requested_code") == code
             and verified_price(row, code, now=now, max_age_sec=5.0))
 
 
@@ -70,7 +72,8 @@ def _read(path, code):
         if not _valid(data, code, now):
             return None
         # Receipt identity is immutable; only its derived age changes.
-        return {**data, "age_sec": now - float(data["received_at"])}
+        return {**data, "age_sec": now - float(data["received_at"]),
+                "shared_transport": "KR_REST_FILE_CACHE"}
     except (OSError, ValueError, TypeError, OverflowError):
         return None
 
@@ -101,6 +104,15 @@ def _publish(path, row, code):
                 log.warning("[KR_REST_SHARED][CLEANUP_FAIL] code=%s", code)
 
 
+def read_cached(*, appkey, code):
+    """Nonblocking read of the same immutable native snapshot; no fetch or lock."""
+    try:
+        _, cache_path = _paths(appkey, code)
+        return _read(cache_path, code)
+    except (OSError, ValueError, TypeError):
+        return None
+
+
 def read_or_fetch(*, appkey, code, fetch, max_join_sec=0.15, defer_on_busy=False):
     """Return (status, quote) with at most one leader per symbol.
 
@@ -109,32 +121,12 @@ def read_or_fetch(*, appkey, code, fetch, max_join_sec=0.15, defer_on_busy=False
     The per-symbol lock is separate from the HTTP quota gate and is never
     used by write endpoints. OS releases it if the leader dies.
     """
-    try:
-        lock_path, cache_path = _paths(appkey, code)
-        fd = _open_private(lock_path, os.O_RDWR | os.O_CREAT)
-    except (OSError, ValueError, TypeError):
-        return "UNAVAILABLE", {}
-    try:
-        deadline = time.monotonic() + max(0.0, min(float(max_join_sec), 0.25))
-        while True:
-            cached = _read(cache_path, code)
-            if cached is not None:
-                return "HIT", cached
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                remaining = deadline - time.monotonic()
-                if defer_on_busy or remaining <= 0:
-                    return "BUSY", {}
-                time.sleep(min(0.02, remaining))
-                continue
-            # Re-read after acquiring the lease. Another process may have
-            # published between the first read and acquiring its lock.
-            cached = _read(cache_path, code)
-            if cached is not None:
-                return "HIT", cached
-            row = fetch()
-            _publish(cache_path, row, code)
-            return "FETCH", row
-    finally:
-        os.close(fd)
+    return read_or_fetch_scoped(
+        paths=lambda: _paths(appkey, code),
+        open_private=_open_private,
+        read=lambda path: _read(path, code),
+        publish=lambda path, row: _publish(path, row, code),
+        fetch=fetch,
+        max_join_sec=max_join_sec,
+        defer_on_busy=defer_on_busy,
+    )

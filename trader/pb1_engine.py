@@ -1627,15 +1627,80 @@ def _classify_kr_timing_zero_submit(submit_result, *, expected_count):
     return "OK_NO_TRADE", "KR_ENTRY_TIMING_POLICY_WAIT"
 
 
+def _kr_deferred_zero_submit_reason(submit_result, *, expected_count):
+    """Only explicit no-order outcomes can request a fresh serial tick."""
+    results = submit_result.get("results") or []
+    if (expected_count <= 0 or len(results) != expected_count
+            or submit_result.get("skipped") != expected_count
+            or any(submit_result.get(k) != 0 for k in
+                   ("attempted", "api_submitted", "accepted", "filled", "rejected", "failed"))):
+        return None
+    previous = []
+    protective = entry_event = False
+    for result in results:
+        if result.get("protective_deferred") is True:
+            if (result.get("terminal_event") != "FINAL_SKIP" or result.get("skipped") != 1
+                    or result.get("skipped_reason") != "KR_PROTECTIVE_REEVALUATION_REQUIRED"):
+                return None
+            protective = True
+        elif result.get("entry_event_deferred") is True:
+            if (result.get("terminal_event") != "FINAL_SKIP" or result.get("skipped") != 1
+                    or result.get("skipped_reason") != "KR_ENTRY_EVENT_REEVALUATION_REQUIRED"):
+                return None
+            entry_event = True
+        else:
+            previous.append(result)
+    if not (protective or entry_event):
+        return None
+    if previous and _classify_kr_timing_zero_submit(
+        {**submit_result, "results": previous, "skipped": len(previous)},
+        expected_count=len(previous)
+    ) != ("OK_NO_TRADE", "KR_ENTRY_TIMING_POLICY_WAIT"):
+        return None
+    if protective:
+        return "KR_PROTECTIVE_REEVALUATION_REQUIRED"
+    # Active entry events require a real prior timing WAIT in this tick.
+    return "KR_ENTRY_EVENT_REEVALUATION_REQUIRED" if previous else None
+
+
+def _kr_protective_zero_submit(submit_result, *, expected_count):
+    return _kr_deferred_zero_submit_reason(submit_result, expected_count=expected_count) == "KR_PROTECTIVE_REEVALUATION_REQUIRED"
+
+
 def _submit_finalized_order_candidates(
     candidates: list["CandidateFeature"], *, submitter: Any,
     pre_submit_gate: Any | None = None,
+    protective_checkpoint: Any | None = None,
+    entry_event_checkpoint: Any | None = None,
 ) -> dict[str, Any]:
-    """Single production submission seam, injectable with a fake KIS submitter."""
+    """Single production submission seam, injectable with a fake KIS submitter.
+
+    Protection defers only candidates whose submission has not begun.
+    """
     counts = {"attempted": 0, "api_submitted": 0, "accepted": 0, "filled": 0,
               "rejected": 0, "skipped": 0, "failed": 0}
     results = []
+    active_entry_deferred = False
     for candidate in candidates:
+        if protective_checkpoint is not None and protective_checkpoint():
+            counts["skipped"] += 1
+            results.append({"terminal_event": "FINAL_SKIP", "skipped": 1,
+                            "skipped_reason": "KR_PROTECTIVE_REEVALUATION_REQUIRED",
+                            "protective_deferred": True, "code": candidate.code})
+            continue
+        # A previous WAIT may become READY during this batch. Never re-use
+        # its old quantity or cross the broker boundary from this callback.
+        if (not active_entry_deferred and entry_event_checkpoint is not None
+                and results and counts["skipped"] == len(results)
+                and _classify_kr_timing_zero_submit({**counts, "results": results},
+                    expected_count=len(results)) == ("OK_NO_TRADE", "KR_ENTRY_TIMING_POLICY_WAIT")):
+            active_entry_deferred = bool(entry_event_checkpoint())
+        if active_entry_deferred:
+            counts["skipped"] += 1
+            results.append({"terminal_event": "FINAL_SKIP", "skipped": 1,
+                            "skipped_reason": "KR_ENTRY_EVENT_REEVALUATION_REQUIRED",
+                            "entry_event_deferred": True, "code": candidate.code})
+            continue
         if pre_submit_gate is not None and not pre_submit_gate(candidate):
             counts["skipped"] += 1
             continue
@@ -3174,6 +3239,14 @@ class PB1Engine:
                 logger.warning("[POSITIONS][UPDATE][FAIL_SOFT] code=%s err=%r", update["code"], exc)
 
     def _finalize_run_result(self, *, status: str, notes: str | None) -> RunResult:
+        monitor = getattr(self, "_kr_protective_yield_monitor", None)
+        if monitor is not None:
+            close = getattr(monitor, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    logger.warning("[KR][PROTECTIVE_WATCH][CLOSE_FAILED] action=NO_ORDER")
         self._flush_exit_audit_updates()
         self._emit_tick_warning_summary()
         warning_counts = self._warning_counts_dict()
@@ -5995,6 +6068,26 @@ class PB1Engine:
                 _timing = {**_timing, "live_quote_validation": _quote_check}
                 if _quote_check["state"] != "READY":
                     _timing.update(state=_quote_check["state"], reason=_quote_check["reason"])
+            # Only an actual owner-approved pre-submit timing WAIT can seed
+            # a wake hint. The observer never creates execution authority.
+            if os.getenv("KR_PB1_QUOTE_WAKE_ENABLED", "1") == "1":
+                try:
+                    from trader.kr.quote_wake import make_wait_target
+                    _wake_target = make_wait_target(
+                        code=str(cf.code).zfill(6), style=_timing_style,
+                        setup_ok=bool((cf.features or {}).get("setup_ok", cf.setup_ok)),
+                        trigger_ok=bool((cf.features or {}).get("breakout_trigger_ok")
+                                        or (cf.features or {}).get("trigger_ok")),
+                        pivot=(cf.features or {}).get("pivot"), timing=_timing,
+                        now=_timing_now, account_scope=get_account_key(env=self.env),
+                    )
+                    if _wake_target:
+                        _targets = getattr(self, "_kr_quote_wake_targets", {})
+                        if len(_targets) < 3 or _wake_target["code"] in _targets:
+                            _targets[_wake_target["code"]] = _wake_target
+                            self._kr_quote_wake_targets = _targets
+                except Exception:
+                    logger.warning("[KR][QUOTE_WAKE][HINT_UNAVAILABLE] code=%s action=KEEP_NORMAL_TIMING_GATE", cf.code)
             logger.info(
                 "[KR][ENTRY][DECISION_LATENCY] code=%s style=%s decision_at=%s latest_bar_ts=%s eval_elapsed_ms=%.1f state=%s reason=%s",
                 cf.code, _timing_style, now_kst().isoformat(), _timing.get("latest_bar_ts"),
@@ -6017,6 +6110,8 @@ class PB1Engine:
                     # These observations do NOT relax or authorize BUY.
                     "entry_policy": _timing.get("entry_policy", "LEGACY_V1"),
                     "adaptive_revision": _timing.get("adaptive_revision"),
+                    "entry_engine_revision": _timing.get("entry_engine_revision"),
+                    "signal_variant": _timing.get("signal_variant"),
                     "rebound_pattern": _timing.get("rebound_pattern"),
                     "diagnostic_entry_ceiling": _timing.get("diagnostic_entry_ceiling"),
                     "reference_source": _timing.get("reference_source"),
@@ -13435,7 +13530,11 @@ class PB1Engine:
 
         max_price = self._to_float(pos.get("max_price")) or 0.0
         new_max = max(max_price, float(mark or 0.0))
-        update_fields: dict[str, Any] = {"max_price": new_max}
+        from trader.kr.exit_feature_reuse import high_water_update_fields
+        update_fields = high_water_update_fields(
+            persisted_max=pos.get("max_price"), computed_max=new_max,
+            enabled=(self.env == "practice" and os.getenv("KR_EXIT_HWM_NOOP_WRITE_ELISION", "1") == "1"),
+        )
         if stop_price is not None and pos.get("stop_price") is None:
             update_fields["stop_price"] = stop_price
         if update_fields:
@@ -13975,6 +14074,14 @@ class PB1Engine:
             ordered_reasons = [final_reason]
 
         _paper_stop36_signal = False
+        # Stop observations must survive a later TP/runner HOLD replacement.
+        # Only observation/counter fields originate here; fill completion
+        # remains solely with broker-confirmed claim settlement.
+        _paper_stop36_observation: dict[str, Any] = {}
+        conds["paper_stop36"] = {
+            "eligible": False, "reason": "PAPER_SWING_ROUTE_NOT_APPLIED",
+            "is_order_authorization": False,
+        }
         _router_qty: int | None = None
         _router_full_exit = False
         _router_sell_pct = None
@@ -14048,7 +14155,7 @@ class PB1Engine:
                 and position_book == "SWING_BOOK"
                 and code != "122630"
             ):
-                from trader.kr.paper_stop36_policy import evaluate_kr_pb1_paper_stop36
+                from trader.kr.paper_stop36_policy import evaluate_kr_pb1_paper_stop36, paper_stop36_evidence
                 paper_decision = evaluate_kr_pb1_paper_stop36(
                     pos, mark=float(mark or 0.0), env=self.env,
                     strategy_owner=self.STRATEGY_NAME,
@@ -14062,7 +14169,21 @@ class PB1Engine:
                     int(paper_decision.soft_confirmed),
                     paper_decision.soft_breach_count, paper_decision.sell_qty,
                 )
+                conds["paper_stop36"] = paper_stop36_evidence(
+                    paper_decision, entry_price=float(avg), mark=float(mark or 0.0),
+                )
                 if paper_decision.eligible:
+                    _paper_stop36_observation = dict(paper_decision.update_meta)
+                    # Keep legacy diagnostic threshold for forensic comparison.
+                    # The separate paper route remains the actual authority.
+                    conds["legacy_stop_loss_pct"] = dict(conds["stop_loss_pct"])
+                    conds["stop_loss_pct"] = {
+                        **conds["stop_loss_pct"],
+                        "threshold": max(conds["stop_loss_pct"]["threshold"],
+                                         conds["paper_stop36"]["effective_hard_threshold"]),
+                        "hit": bool(stop_hit or paper_decision.hard_touched),
+                        "source": "LEGACY_OR_PAPER_SWING_HARD",
+                    }
                     horizon_result = dict(horizon_result or {
                         "exit_ok": False, "reason": "NO_SWING_EXIT",
                         "qty": 0, "sell_pct": None,
@@ -14110,33 +14231,46 @@ class PB1Engine:
                 and not _policy_adoption_active
                 and code != "122630"
             ):
-                from trader.kr.us_profit_execution_router import evaluate_active_kr_tp
-                _kr_candidate = evaluate_active_kr_tp(
-                    position=pos, engine=self.orders_repo.engine,
-                    kis=self.kis, env=self.env, code=code,
-                    balance_snapshot=self._authoritative_balance,
-                    # An analytical dry-run/DIAG is read-only. Explicit
-                    # historical policy amendment must not mutate account
-                    # positions until the real KIS practice SELL lane is
-                    # armed; all other existing V1 policies remain frozen.
-                    allow_amendment=bool(
-                        self.intended_live and not self.dry_run
-                        and not self.force_block_live
-                        and self.trading_day and self.strategy_mode != "DIAG"
-                    ),
+                from trader.kr.us_profit_execution_router import evaluate_active_kr_tp, frozen_kr_profit_contract
+                _safety_exit = bool(
+                    stop_hit or trail_hit or ma20_break or ma50_break
+                    or risk_off_hit or time_stop_hit
+                    or str(final_reason or "").upper() in {
+                        "EXIT_HARD_STOP", "EXIT_TRAIL", "EXIT_MA20_BREAK",
+                        "EXIT_MA50_BREAK", "EXIT_FORCE_EOD",
+                        "KR_PB1_SOFT_STOP_3PCT",
+                    }
+                    or _paper_stop36_signal
                 )
+                _frozen_profit = frozen_kr_profit_contract(pos)
+                if ((stop_hit or _paper_stop36_signal) and _safety_exit
+                        and isinstance(_frozen_profit, dict)
+                        and _frozen_profit.get("activation_mode") == "ACTIVE_PRACTICE"
+                        and os.getenv("KR_PROTECTIVE_STOP_SKIP_UNUSED_TP", "1") == "1"):
+                    # The original routing gives protection precedence even
+                    # when TP evidence is BLOCK. A frozen ACTIVE policy must
+                    # still suppress legacy profit overlays, but it cannot
+                    # authorize any TP order in this branch. No amendment.
+                    _kr_candidate = {"action": "DEFERRED_FOR_PROTECTIVE_STOP"}
+                    logger.info("[KR_LATENCY][UNUSED_TP_DEFERRED] code=%s reason=PROTECTIVE_STOP_PRIORITY",
+                                display_code)
+                else:
+                    _kr_candidate = evaluate_active_kr_tp(
+                        position=pos, engine=self.orders_repo.engine,
+                        kis=self.kis, env=self.env, code=code,
+                        balance_snapshot=self._authoritative_balance,
+                        # An analytical dry-run/DIAG is read-only. Explicit
+                        # historical policy amendment must not mutate account
+                        # positions until the real KIS practice SELL lane is
+                        # armed; all other existing V1 policies remain frozen.
+                        allow_amendment=bool(
+                            self.intended_live and not self.dry_run
+                            and not self.force_block_live
+                            and self.trading_day and self.strategy_mode != "DIAG"
+                        ),
+                    )
                 if _kr_candidate is not None:
                     _kr_us_tp_contract_active = True
-                    _safety_exit = bool(
-                        stop_hit or trail_hit or ma20_break or ma50_break
-                        or risk_off_hit or time_stop_hit
-                        or str(final_reason or "").upper() in {
-                            "EXIT_HARD_STOP", "EXIT_TRAIL", "EXIT_MA20_BREAK",
-                            "EXIT_MA50_BREAK", "EXIT_FORCE_EOD",
-                            "KR_PB1_SOFT_STOP_3PCT",
-                        }
-                        or _paper_stop36_signal
-                    )
                     if _safety_exit:
                         logger.info(
                             "[KR_PROFIT_PARITY][SAFETY_PRIORITY] code=%s reason=%s",
@@ -14199,7 +14333,10 @@ class PB1Engine:
                     _router_sell_pct,
                     qty,
                 )
-                _meta_update = dict(horizon_result.get("update_meta") or {})
+                _meta_update = {
+                    **dict(horizon_result.get("update_meta") or {}),
+                    **_paper_stop36_observation,
+                }
                 exit_execution_meta_update = dict(_meta_update)
                 for completion_flag in (
                     "tp1_done", "tp2_done", "core_tp1_done",
@@ -14441,6 +14578,13 @@ class PB1Engine:
         soft_blocked, holding_minutes, min_hold_minutes = same_day_soft_exit_block(
             now_kst=self._now_kst, bought_at=entry_ts, exit_reason=eval_reason,
         )
+        if conds.get("paper_stop36", {}).get("eligible"):
+            conds["paper_stop36"].update({
+                "same_day_soft_guard_blocked": bool(soft_blocked),
+                "holding_minutes": holding_minutes if soft_blocked else None,
+                "min_hold_minutes": min_hold_minutes,
+                "routed_reason": eval_reason,
+            })
         if soft_blocked:
             exit_eval = replace(exit_eval, exit_ok=False)
             exit_eval_payload.update({
@@ -15627,7 +15771,16 @@ class PB1Engine:
             features: dict[str, Any] = {}
             if not df.empty:
                 try:
-                    features = compute_features(df)
+                    if self.env == "practice" and os.getenv("KR_EXIT_FEATURE_REUSE_ENABLED", "1") == "1":
+                        from trader.kr.exit_feature_reuse import cached_exit_features
+                        features, reused = cached_exit_features(
+                            df=df, code=str(pos["code"]), trade_date=str(self._today),
+                            compute=compute_features,
+                        )
+                        logger.info("[KR_LATENCY][EXIT_FEATURES] code=%s reused=%s rows=%s",
+                                    display_code, int(reused), len(df))
+                    else:
+                        features = compute_features(df)
                 except ValueError:
                     features = {}
             features["_exit_ohlcv_source"] = str((meta or {}).get("source") or "none")
@@ -16008,8 +16161,26 @@ class PB1Engine:
                         hit, time.monotonic()-t_start)
             return
         try:
-            engine = make_engine()
-            bulk_map = load_price_daily_bulk(engine, pending_codes, start_date, end_date)
+            # A private engine belongs to this optional SELECT only; an
+            # abandoned read cannot dispose the order/account engine.
+            def _load_private_daily():
+                engine = make_engine()
+                try:
+                    return load_price_daily_bulk(engine, pending_codes, start_date, end_date)
+                finally:
+                    engine.dispose()
+
+            if (getattr(self, "_kr_protective_yield_monitor", None) is not None
+                    and os.getenv("KR_PB1_PROTECTIVE_DAILY_READ_ENABLED", "1") == "1"):
+                from trader.kr.quote_wake import protective_daily_read
+                completed, bulk_map = protective_daily_read(
+                    _load_private_daily, checkpoint=self._kr_protection_checkpoint,
+                )
+                if not completed:
+                    logger.info("[KR][PB1][OHLCV][BATCH_PRELOAD][DEFERRED] action=NO_CACHE_WRITE")
+                    return
+            else:
+                bulk_map = _load_private_daily()
         except Exception as exc:
             logger.warning("[KR][PB1][OHLCV][BATCH_PRELOAD][ERROR] err=%s", exc)
             return
@@ -16497,6 +16668,35 @@ class PB1Engine:
         daily_cache.set(key, dict(result), 1800)
         return result
 
+    def _kr_needs_short_ohlcv_fill(self, merged_features, precomputed_data_ok):
+        # Shared by the original fill branch and selective batch preload.
+        return not precomputed_data_ok or any(
+            self._value_missing(merged_features.get(key))
+            for key in ("ma20_slope", "vol_contraction", "volu_contraction",
+                        "high20", "tr_range_pct", "trend_strength", "ma10", "value20")
+        )
+
+    def _kr_select_short_ohlcv_preload(self, codes):
+        """Only prefetch daily frames actually needed by the existing entry path.
+
+        No candidate filtering, selection or authorization changes. If a
+        malformed row cannot be classified, retain the original prefetch.
+        """
+        needed = []
+        for raw in codes:
+            code = str(raw or "").zfill(6)
+            try:
+                mapped, _, _, _, data_ok = self._map_precomputed_candidate_row(code)
+                if self._kr_needs_short_ohlcv_fill(mapped, data_ok):
+                    needed.append(code)
+            except Exception:
+                needed.append(code)
+        return needed
+
+    def _kr_protection_checkpoint(self):
+        monitor = getattr(self, "_kr_protective_yield_monitor", None)
+        return monitor.check(now=now_kst(), monotonic=time.monotonic()) if monitor else None
+
     def _compute_candidates_from_codes(self, codes: list[str]) -> list[CandidateFeature]:
         # ── [KR][PB1] scope guard + batch OHLCV preload ─────────────────────
         # 한국장 PB1 trade 모드일 때 final30 코드 전체를 단일 DB 커넥션으로
@@ -16515,7 +16715,15 @@ class PB1Engine:
                 _final30_source,
                 _session,
             )
-            self._kr_pb1_batch_preload_ohlcv(list(codes or []), days=60)
+            preload_codes = list(codes or [])
+            if (str(getattr(self, "env", "")).lower() == "practice"
+                    and os.getenv("KR_SELECTIVE_DAILY_PRELOAD_ENABLED", "1") == "1"):
+                preload_codes = self._kr_select_short_ohlcv_preload(preload_codes)
+            logger.info("[KR_LATENCY][ENTRY_DAILY_PRELOAD] requested=%s needed=%s",
+                        len(codes or []), len(preload_codes))
+            self._kr_pb1_batch_preload_ohlcv(preload_codes, days=60)
+            if self._kr_protection_checkpoint():
+                return []  # caller finalizes before BUY, not a missing-data verdict
 
         code_market = {
             str(m.get("code") or "").zfill(6): (m.get("market") or "")
@@ -16530,6 +16738,8 @@ class PB1Engine:
             "VCP": {"scanned": 0, "ok": 0, "reasons": []},
         }
         for raw_code in codes or []:
+            if self._kr_protection_checkpoint():
+                break  # caller discards partial shortlist; no BUY submitted
             code = str(raw_code or "").zfill(6)
             if not code:
                 continue
@@ -16579,10 +16789,8 @@ class PB1Engine:
 
                 df = pd.DataFrame()
                 meta: dict[str, Any] = {}
-                need_short_ohlcv_fill = not precomputed_data_ok or any(
-                    self._value_missing(merged_features.get(key))
-                    for key in ("ma20_slope", "vol_contraction", "volu_contraction", "high20", "tr_range_pct", "trend_strength", "ma10", "value20")
-                )
+                need_short_ohlcv_fill = self._kr_needs_short_ohlcv_fill(
+                    merged_features, precomputed_data_ok)
                 if need_short_ohlcv_fill:
                     df, meta = self._fetch_daily(code, days=60)
                     if df is None or df.empty:
@@ -18792,6 +19000,52 @@ class PB1Engine:
             logger.info("[PB1][EXIT] entry_skipped=1")
             self._log_tick_price_cache_summary()
             return self._finalize_run_result(status=final_status, notes=final_notes or "exit_phase")
+        # An authoritative historical/post-exit reconciliation fence cannot
+        # be cleared by scanning entry candidates. Do not delay the next
+        # protective pass by doing an entire Final30 scan which cannot submit.
+        # Keep diagnostic, non-trading, other-owner and real-account paths
+        # unchanged. The runner still performs its normal final settlement.
+        _reconcile_fence = (
+            "KR_POST_EXIT_BROKER_RECONCILE_UNVERIFIED"
+            if not getattr(self, "_kr_post_exit_reconcile_ok", True)
+            else str(entry_reason or "")
+        )
+        if (
+            self.env == "practice" and self.STRATEGY_NAME == "pb1_pullback_close"
+            and self.phase in {"entry", "pm_entry"}
+            and self.trading_day and self.intended_live and not self.dry_run
+            and not self.force_block_live and not engine_compute_only
+            and not compute_only_full_run and not diag_compute_only
+            and not diag_full_exec and not minervini_only
+            and not entry_allowed and not order_allowed
+            and _reconcile_fence in {
+                "historical_recovery_unverified",
+                "KR_POST_EXIT_BROKER_RECONCILE_UNVERIFIED",
+            }
+            and os.getenv("KR_SKIP_FENCED_ENTRY_SCAN", "1") == "1"
+        ):
+            entry_reason = _reconcile_fence
+            self.order_allowed = False
+            self.entry_block_reason = _reconcile_fence
+            logger.warning(
+                "[KR][ENTRY][RECONCILE_FENCE_FAST_RETURN] reason=%s "
+                "exit_pass_ok=%s scanner_skipped=1 final30_compute_skipped=1",
+                _reconcile_fence, int(exit_pass_ok),
+            )
+            _blocked = Counter({_reconcile_fence: 1})
+            _emit_entry_summary([], [], _blocked)
+            _emit_entry_decision("SKIP", reason=_reconcile_fence,
+                                 ok_setups=0, blocked_by=_blocked)
+            _set_run_summary_payload(
+                scanned=0, setup_ok=0, relax_ok=0, score_ok=0,
+                risk_ok=0, sized_ok=0, buyable_ok=0,
+                order_candidates=0, submitted=0, api_submitted=0,
+                blocked_reasons_counter=_blocked, no_trade_reason=_reconcile_fence,
+            )
+            self._log_tick_price_cache_summary()
+            return self._finalize_run_result(status="BLOCKED_RECONCILE",
+                                             notes=_reconcile_fence)
+
         logger.info("[PB1][POST_CAPITAL][OPEN_ORDERS_LOOKUP]")
         open_orders = self._safe_get_open_orders()
         if open_orders:
@@ -18887,9 +19141,81 @@ class PB1Engine:
             self._log_tick_price_cache_summary()
             return self._finalize_run_result(status="OK_NO_TRADE", notes="PORTFOLIO_FULL")
 
+        # Cooperative protective preemption, only before the BUY boundary.
+        # Existing order authority and reconciliation remain unchanged.
+        self._kr_protective_yield_monitor = None
+        self._kr_active_entry_yield = None
+        self._kr_quote_wake_targets = {}
+        if (
+            self.env == "practice" and self.STRATEGY_NAME == "pb1_pullback_close"
+            and self.phase in {"entry", "pm_entry"} and self.trading_day
+            and self.intended_live and not self.dry_run and not self.force_block_live
+            and not engine_compute_only and not compute_only_full_run
+            and not diag_compute_only and not diag_full_exec and not minervini_only
+            and entry_allowed and order_allowed
+            and exit_pass_ok and getattr(self, "_kr_post_exit_reconcile_ok", True)
+            and getattr(self, "_kr_infinite_submit_attempted", None) is False
+            and os.getenv("KR_PB1_PROTECTIVE_WAKE_ENABLED", "1") == "1"
+            and os.getenv("PB1_PENDING_RECONCILE_ONLY", "0") != "1"
+        ):
+            from trader.kr.reconcile_lanes_257 import exit_pass_proves_zero_sell
+            from trader.kr.quote_wake import ProtectiveYield, make_protective_target
+            _zero_sell, _ = exit_pass_proves_zero_sell(
+                exit_pass_ok=exit_pass_ok,
+                exit_summary=getattr(self, "_exit_summary_payload", None),
+            )
+            if _zero_sell:
+                _active_state = getattr(self, "_kr_active_entry_wake_state", None)
+                if (_active_state is not None
+                        and os.getenv("KR_PB1_QUOTE_WAKE_ENABLED", "1") == "1"
+                        and os.getenv("KR_PB1_ACTIVE_QUOTE_WAKE_ENABLED", "1") == "1"):
+                    from trader.kr.quote_wake import ActiveEntryYield
+                    self._kr_active_entry_yield = ActiveEntryYield(_active_state)
+                _hint_now = now_kst()
+                _hints = [hint for ev in getattr(self, "_exit_evaluations", []) or []
+                          if (hint := make_protective_target(ev, _hint_now))]
+                if _hints:
+                    if os.getenv("KR_PB1_CONCURRENT_PROTECTIVE_POLL_ENABLED", "0") == "1":
+                        from trader.kr.quote_wake import ConcurrentProtectiveYield
+                        self._kr_protective_yield_monitor = ConcurrentProtectiveYield(_hints).start()
+                        logger.info(
+                            "[KR][PROTECTIVE_WATCH][START] mode=READ_ONLY_CONCURRENT "
+                            "targets=%s interval_sec=5 order_authorization=0", len(_hints),
+                        )
+                    else:
+                        self._kr_protective_yield_monitor = ProtectiveYield(_hints)
+
+        def _yield_to_kr_protection():
+            hit = self._kr_protection_checkpoint()
+            if not hit:
+                return None
+            reason = "KR_PROTECTIVE_REEVALUATION_REQUIRED"
+            logger.warning(
+                "[KR][PROTECTIVE_YIELD] code=%s action=END_ENTRY_BEFORE_SUBMIT "
+                "order_authorization=0", hit["code"],
+            )
+            blocked = Counter({reason: 1})
+            _emit_entry_summary([], [], blocked)
+            _emit_entry_decision("SKIP", reason=reason, ok_setups=0, blocked_by=blocked)
+            _set_run_summary_payload(
+                scanned=0, setup_ok=0, relax_ok=0, score_ok=0, risk_ok=0,
+                sized_ok=0, buyable_ok=0, order_candidates=0, submitted=0,
+                api_submitted=0, blocked_reasons_counter=blocked,
+                no_trade_reason=reason,
+            )
+            self._log_tick_price_cache_summary()
+            return self._finalize_run_result(status="OK_NO_TRADE", notes=reason)
+
+        _yield_result = _yield_to_kr_protection()
+        if _yield_result is not None:
+            return _yield_result
+
         _deferred_entry_scan = getattr(self, "_kr_deferred_entry_scan", None)
         if callable(_deferred_entry_scan) and self.phase == "entry":
             _deferred_entry_scan()
+        _yield_result = _yield_to_kr_protection()
+        if _yield_result is not None:
+            return _yield_result
 
         entry_pass_ok = True
         entry_pass_buys = 0
@@ -19144,6 +19470,9 @@ class PB1Engine:
                 t_pb1_start = time.monotonic()
                 scan_input_codes = [str(m.get("code") or "").zfill(6) for m in scan_members if m.get("code")]
                 candidates = self._compute_candidates_from_codes(scan_input_codes)
+                _yield_result = _yield_to_kr_protection()
+                if _yield_result is not None:
+                    return _yield_result
                 self._reject_summary_candidates = list(candidates or [])
                 dt_pb1_filter = time.monotonic() - t_pb1_start
                 dt_minervini = 0.0
@@ -19857,6 +20186,9 @@ class PB1Engine:
                     notes=f"minervini_only_complete_{minervini_pass_count}_candidates",
                 )
             
+            _yield_result = _yield_to_kr_protection()
+            if _yield_result is not None:
+                return _yield_result
             with self._stage_timer("entry.minervini_report"):
                 minervini_report_path = run_minervini_report(
                     scan_members,
@@ -19888,6 +20220,9 @@ class PB1Engine:
             if isinstance(self._budget_plan_meta, dict) and self._budget_plan_meta.get("effective_target"):
                 new_position_limit = min(new_position_limit, int(self._budget_plan_meta["effective_target"]))
             held_codes = {p.get("code") for p in existing_positions if p.get("code")}
+            _yield_result = _yield_to_kr_protection()
+            if _yield_result is not None:
+                return _yield_result
             with self._stage_timer("entry.open_orders_lookup"):
                 open_orders = self._safe_get_open_orders()
             open_buy_codes = {
@@ -19907,6 +20242,9 @@ class PB1Engine:
                     len(ignored_prebroker_open),
                     sorted({str(row.get("code") or "") for row in ignored_prebroker_open}),
                 )
+            _yield_result = _yield_to_kr_protection()
+            if _yield_result is not None:
+                return _yield_result
             try:
                 with self._stage_timer("entry.today_buy_orders_lookup"):
                     today_orders = self._safe_list_today_orders(side="BUY")
@@ -19965,6 +20303,9 @@ class PB1Engine:
                 existing_prior = blocking_prior_by_code.get(code_key)
                 if existing_prior is None or str((row or {}).get("created_at") or "") > str(existing_prior.get("created_at") or ""):
                     blocking_prior_by_code[code_key] = dict(row)
+            _yield_result = _yield_to_kr_protection()
+            if _yield_result is not None:
+                return _yield_result
             today_buy_fill_rows: list[dict[str, Any]] = []
             if ok_after_risk_codes:
                 with self._stage_timer("entry.today_buy_fills_bulk_lookup"):
@@ -19995,6 +20336,9 @@ class PB1Engine:
             bulk_prior_intents_enabled = hasattr(
                 self.orders_repo, "list_orders_by_client_order_keys"
             )
+            _yield_result = _yield_to_kr_protection()
+            if _yield_result is not None:
+                return _yield_result
             if bulk_prior_intents_enabled and prior_intent_keys:
                 with self._stage_timer("entry.prior_intents_bulk_lookup"):
                     prior_intent_rows = self.orders_repo.list_orders_by_client_order_keys(
@@ -20021,6 +20365,9 @@ class PB1Engine:
             logger.info("[PB1][STAGE][START] stage=buyable_gate")
             with self._stage_timer("entry.buyable_gate"):
                 for cf in ok_after_risk:
+                    _yield_result = _yield_to_kr_protection()
+                    if _yield_result is not None:
+                        return _yield_result
                     self.current_code = cf.code
                     code_key = str(cf.code or "").zfill(6)
                     close_price = float(cf.features.get("close") or 0.0)
@@ -20391,6 +20738,9 @@ class PB1Engine:
                             )
                             continue
                         raise
+                    _yield_result = _yield_to_kr_protection()
+                    if _yield_result is not None:
+                        return _yield_result
                     last_price = float(cf.features.get("last_price") or order_price or close_price or 0.0)
                     last_volume = float(cf.features.get("last_volume") or 0.0)
                     trigger_ok, trigger_info = entry_trigger(
@@ -20953,6 +21303,9 @@ class PB1Engine:
                 if atr_max_ratio > 1.0:
                     atr_max_ratio = atr_max_ratio / 100.0
                 for code in emergency_ranked_codes:
+                    _yield_result = _yield_to_kr_protection()
+                    if _yield_result is not None:
+                        return _yield_result
                     if code in held_codes or code in open_buy_codes or code in today_buy_codes:
                         continue
                     emergency_cf = next((c for c in candidates if c.code == code), None)
@@ -21016,6 +21369,9 @@ class PB1Engine:
                 order_stage_counter["setup_not_ok"] += 1
             orderable_candidates = valid_orderable
 
+            _yield_result = _yield_to_kr_protection()
+            if _yield_result is not None:
+                return _yield_result
             candidate_width_result = self._apply_candidate_width_backfill_and_concentration_guard(
                 orderable_candidates=orderable_candidates,
                 candidates=candidates if 'candidates' in locals() else [],
@@ -21424,6 +21780,9 @@ class PB1Engine:
                     order_ready=cf.code in orderable_code_set,
                     reasons=[str(reason) for reason in (cf.reasons or [cf.features.get("final_entry_reason_code") or "ENTRY_CONDITION_NOT_MET"]) if str(reason)],
                 )
+            _yield_result = _yield_to_kr_protection()
+            if _yield_result is not None:
+                return _yield_result
             self._log_fail_reason_breakdown(candidates, note="post_filter")
             _emit_entry_summary(setup_ok_codes, orderable_candidates, drop_reason_counter)
             if not candidates or ok_count == 0:
@@ -21738,9 +22097,20 @@ class PB1Engine:
                                 raise RuntimeError(f"missing terminal submit event for code={cf.code} terminal_event={terminal_event or 'none'}")
                             return status
 
+                        def _entry_event_checkpoint():
+                            monitor = getattr(self, "_kr_active_entry_yield", None)
+                            if monitor is None:
+                                return None
+                            return monitor.check(
+                                getattr(self, "_kr_quote_wake_targets", {}).values(),
+                                now=now_kst, monotonic=time.monotonic,
+                            )
+
                         submit_result = _submit_finalized_order_candidates(
                             orderable_candidates, submitter=_submit_candidate,
                             pre_submit_gate=_pre_submit_gate,
+                            protective_checkpoint=self._kr_protection_checkpoint,
+                            entry_event_checkpoint=_entry_event_checkpoint,
                         )
                         attempted_count = int(submit_result["attempted"])
                         api_submitted_count = int(submit_result["api_submitted"])
@@ -21877,6 +22247,11 @@ class PB1Engine:
                             len(orderable_candidates), final_notes,
                         )
                     elif (not plan_skip_reasons and
+                          (deferred_reason := _kr_deferred_zero_submit_reason(
+                              submit_result, expected_count=len(orderable_candidates))) is not None):
+                        final_status, final_notes = "OK_NO_TRADE", deferred_reason
+                        logger.info("[KR][ORDER_ZERO_API][SAFE_DEFERRED] reason=%s", final_notes)
+                    elif (not plan_skip_reasons and
                           (timing_outcome := _classify_kr_timing_zero_submit(
                               submit_result, expected_count=len(orderable_candidates)
                           )) is not None):
@@ -21905,9 +22280,12 @@ class PB1Engine:
                         raise RuntimeError(
                             f"[KR][ORDER_ZERO_API][FAIL] order_candidates={len(orderable_candidates)} api_submitted=0"
                         )
-                if entry_allowed and self.phase in {"entry", "pm_entry"} and allow_add_to_existing:
+                if (entry_allowed and self.phase in {"entry", "pm_entry"} and allow_add_to_existing
+                        and not any(r.get("entry_event_deferred") is True for r in submit_result.get("results", []))):
                     remaining_budget = max(0.0, float(tick_budget_krw) - planned_spent)
                     for pos in existing_positions:
+                        if self._kr_protection_checkpoint():
+                            break  # only defer new ADD orders, not existing settlement
                         code = pos.get("code")
                         if not code or remaining_budget <= 0:
                             continue
@@ -21969,6 +22347,8 @@ class PB1Engine:
                             continue
                         if order_value > available_cash_krw:
                             continue
+                        if self._kr_protection_checkpoint():
+                            break
                         self._place_add_on(pos, qty=qty_add, price=float(mark))
                         planned_spent += order_value
                         remaining_budget = max(0.0, float(tick_budget_krw) - planned_spent)

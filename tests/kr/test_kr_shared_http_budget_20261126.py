@@ -119,3 +119,89 @@ def test_practice_shell_defaults_inherit_existing_cap_and_observer_profile(monke
                                     KR_SHARED_HTTP_BUDGET_ENABLED="1").stdout
     finally:
         budget._path("practice", key).unlink(missing_ok=True)
+
+
+def test_ordinary_market_read_honors_critical_lease_without_bypass(monkeypatch):
+    monkeypatch.setenv("KR_SHARED_HTTP_RPS_PRACTICE","10")
+    key = "test-" + uuid.uuid4().hex
+    try:
+        assert budget.acquire(environment="practice",appkey=key,priority=True,
+                              observer=False,max_wait_sec=1.0)[0]
+        # The normal 0.1-second aggregate gap is shorter than this lease.
+        # A competing non-observer market-data request must not take it.
+        granted, reason, _ = budget.acquire(environment="practice",appkey=key,
+                    priority=False,observer=False,max_wait_sec=.20)
+        assert not granted and reason == "DEADLINE"
+        assert budget.acquire(environment="practice",appkey=key,priority=True,
+                              observer=False,max_wait_sec=1.0)[0]
+        assert budget.acquire(environment="practice",appkey=key,priority=False,
+                              observer=False,max_wait_sec=1.5)[0]
+    finally:
+        budget._path("practice",key).unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("delay_stage", ["open", "read"])
+def test_admission_deadline_rechecked_after_file_open_or_state_read(monkeypatch, delay_stage):
+    from contextlib import contextmanager
+    monkeypatch.setenv("KR_SHARED_HTTP_RPS_PRACTICE", "2")
+    key = "test-" + uuid.uuid4().hex
+    path = budget._path("practice", key)
+    clock = [100.0]
+    original_open, original_read = budget._locked_file, budget._read
+
+    @contextmanager
+    def delayed_open(path):
+        with original_open(path) as file:
+            if delay_stage == "open":
+                clock[0] += 0.2
+            yield file
+
+    def delayed_read(file, now, rate):
+        state = original_read(file, now, rate)
+        if delay_stage == "read":
+            clock[0] += 0.2
+        return state
+
+    monkeypatch.setattr(budget, "_locked_file", delayed_open)
+    monkeypatch.setattr(budget, "_read", delayed_read)
+    monkeypatch.setattr(budget.time, "monotonic", lambda: clock[0])
+    try:
+        granted, reason, _ = budget.acquire(
+            environment="practice", appkey=key, priority=True,
+            observer=False, max_wait_sec=0.1,
+        )
+        assert not granted and reason == "DEADLINE"
+        assert path.read_text() == ""  # no stale priority or HTTP reservation
+    finally:
+        path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("priority", [False, True])
+def test_admission_never_grants_after_slow_state_flush(monkeypatch, priority):
+    monkeypatch.setenv("KR_SHARED_HTTP_RPS_PRACTICE", "2")
+    key = "test-" + uuid.uuid4().hex
+    path = budget._path("practice", key)
+    clock = [100.0]
+    original_write = budget._write
+    def delayed_write(file, state):
+        original_write(file, state)
+        clock[0] += 0.2
+    monkeypatch.setattr(budget, "_write", delayed_write)
+    monkeypatch.setattr(budget.time, "monotonic", lambda: clock[0])
+    try:
+        granted, reason, waited = budget.acquire(
+            environment="practice", appkey=key, priority=priority,
+            observer=False, max_wait_sec=.1,
+        )
+        assert not granted and reason == "DEADLINE"
+        assert waited >= .1
+        # No rollback of the persisted lease/slot; conservative quota usage.
+        import json
+        state = json.loads(path.read_text())
+        if priority:
+            assert state["priority_until"] > 100
+            assert state["next_at"] == 0
+        else:
+            assert state["next_at"] > 100
+    finally:
+        path.unlink(missing_ok=True)

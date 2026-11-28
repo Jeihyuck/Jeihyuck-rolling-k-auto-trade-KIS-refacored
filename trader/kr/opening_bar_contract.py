@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, time as dtime
 from decimal import Decimal
+from functools import lru_cache
 from pathlib import Path
 from zoneinfo import ZoneInfo
 import hashlib
@@ -46,6 +47,12 @@ def _source_time(raw: dict, date_str: str) -> datetime | None:
     hhmmss = str(raw.get("time") or "").strip().zfill(6)
     if len(hhmmss) != 6 or not hhmmss.isdigit():
         return None
+    return _parse_native_minute(date_str, hhmmss)
+
+
+@lru_cache(maxsize=4096)
+def _parse_native_minute(date_str: str, hhmmss: str) -> datetime | None:
+    """Reuse immutable parsed timestamps, never cache proof freshness or authority."""
     try:
         return datetime.strptime(f"{date_str}T{hhmmss}", "%Y-%m-%dT%H%M%S").replace(tzinfo=KST)
     except ValueError:

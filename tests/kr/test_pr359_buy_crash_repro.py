@@ -187,12 +187,12 @@ def _json_dict(value):
     return {}
 
 
+@pytest.mark.parametrize("isolated_engine", ["postgres"], indirect=True)
 def test_concurrent_signed_buy_reconciliation_rejects_stale_watermark_and_applies_once(
     monkeypatch, isolated_engine,
 ):
     engine = isolated_engine
-    if engine.dialect.name != "postgresql":
-        pytest.skip("row-level FOR UPDATE concurrency is PostgreSQL-only")
+    assert engine.dialect.name == "postgresql", "requires actual PostgreSQL row locks"
     code, odno, key = "251970", "0000041002", "pr359-signed-buy-concurrent"
     order_id, cycle = _signed_buy_order(engine, code=code, odno=odno, key=key)
     row = _buy_row(code, odno)

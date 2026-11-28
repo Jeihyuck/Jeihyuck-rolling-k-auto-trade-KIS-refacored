@@ -104,19 +104,46 @@ def acquire(*, environment: str, appkey: str, priority: bool,
                 except BlockingIOError:
                     pass
                 else:
+                    # File opening and scheduler preemption may consume the
+                    # caller's entire budget. Recheck under the actual lease
+                    # before reading or reserving an HTTP attempt.
+                    now = time.monotonic()
+                    if now >= deadline:
+                        return False, "DEADLINE", now-start
                     state = _read(file, now, rate)
+                    now = time.monotonic()
+                    if now >= deadline:
+                        return False, "DEADLINE", now-start
                     if priority:
                         # Never reserve a long queue; allow only one
                         # short-lived notification of imminent critical work.
                         state["priority_until"] = max(state["priority_until"], min(deadline, now+1.0))
                         _write(file, state)
+                        now = time.monotonic()
+                        if now >= deadline:
+                            return False, "DEADLINE", now-start
                     if observer and not priority and state["priority_until"] > now:
                         return False, "PRIORITY_TRAFFIC", time.monotonic()-start
                     earliest = max(state["next_at"], state["cooldown_until"])
+                    # Ordinary entry/scanner quote and OHLCV requests are
+                    # also contenders, not just the observer. Honor the same
+                    # short critical lease without bypassing the aggregate
+                    # gap/cooldown or holding the file lock while waiting.
+                    if not priority:
+                        earliest = max(earliest, state["priority_until"])
                     if earliest <= now:
+                        now = time.monotonic()
+                        if now >= deadline:
+                            return False, "DEADLINE", now-start
                         state["next_at"] = now + 1.0 / rate
                         _write(file, state)
-                        return True, "GRANTED", time.monotonic()-start
+                        finished = time.monotonic()
+                        # A slow state flush must not authorize transport after
+                        # the caller's deadline. Keep the reserved slot rather
+                        # than roll back shared state or risk a quota bypass.
+                        if finished >= deadline:
+                            return False, "DEADLINE", finished-start
+                        return True, "GRANTED", finished-start
                     wait = min(0.05, earliest-now)
             # File closes/releases flock before wait or any HTTP.
             remaining = deadline-time.monotonic()

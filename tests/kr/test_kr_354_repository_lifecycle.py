@@ -32,7 +32,13 @@ def isolated_lifecycle_engine(request):
         return
     url = os.getenv("PBCORE_TEST_POSTGRES_URL")
     if not url:
+        if os.getenv("GITHUB_ACTIONS") == "true":
+            pytest.fail("Required isolated PostgreSQL CI service not configured")
         pytest.skip("disposable PostgreSQL test database not configured")
+    target = sa.engine.make_url(url)
+    if (target.host not in {"localhost", "127.0.0.1", "::1"}
+            or target.database != "kr_ci" or target.get_backend_name() != "postgresql"):
+        pytest.fail("Refuse non-local or non-disposable PostgreSQL test database")
     # Unique CI-only schema. Never use the operational database URL.
     schema_name = "kr401_" + uuid4().hex
     admin = sa.create_engine(url)

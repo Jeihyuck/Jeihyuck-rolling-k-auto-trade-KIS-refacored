@@ -71,7 +71,8 @@ def _prep_snapshot(date: str, filename: str | None = None) -> dict | None:
     if not present:
         return None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload_bytes = path.read_bytes()
+        payload = json.loads(payload_bytes)
         contracts = [json.loads(p.read_text(encoding="utf-8")) for p in present]
         for contract in contracts:
             if (not isinstance(contract, dict)
@@ -109,7 +110,7 @@ def _prep_snapshot(date: str, filename: str | None = None) -> dict | None:
                     return None
         contract_hash = str(contracts[0].get("contract_hash") or "")
         return {"codes": codes, "contract_hash": contract_hash,
-                "final30_digest": sha256(path.read_bytes()).hexdigest()}
+                "rows": rows, "final30_digest": sha256(payload_bytes).hexdigest()}
     except (ValueError, TypeError, OSError, KeyError):
         return None
 
@@ -279,7 +280,8 @@ def collection_priorities(*, date: str, account_scope: str,
             raise ValueError("STALE_OR_UNTRUSTED_MANIFEST")
         return {"state": "PB1_ACTIVE", "hot": list(raw["hot"]),
                 "warm": list(raw["warm"]), "cold": list(raw["cold"]),
-                "code_sha": observed_sha}
+                "code_sha": observed_sha, "final30_digest": prep["final30_digest"],
+                "observation_styles": _observation_styles(prep["rows"])}
     except (FileNotFoundError, ValueError, TypeError, KeyError, OSError, AttributeError) as exc:
         # Not an authorization failure: preserve Final30, but the observer
         # must disclose why HOT/WARM is empty rather than idle silently.
@@ -289,6 +291,141 @@ def collection_priorities(*, date: str, account_scope: str,
                   else "INVALID_MANIFEST_" + type(exc).__name__.upper())
         return {"state": "PREP_FALLBACK", "reason": reason,
                 "hot": [], "warm": [], "cold": prep["codes"]}
+
+
+# Observation-only PREP manifest: intentionally separate from execution shortlist.
+PREP_COLLECTION_VERSION = "kr_pb1_prep_collection_v1"
+
+
+def _collection_scope_ok(scope: str) -> bool:
+    parts = str(scope or "").split(":")
+    return (len(parts) == 3 and parts[0] == "practice"
+            and all(p.isascii() and p.isdigit() for p in parts[1:]))
+
+
+def prep_collection_path(date: str, account_scope: str) -> Path:
+    return manifest_path(date, account_scope).with_suffix(".collection.json")
+
+
+def _observation_styles(rows: list[dict]) -> dict[str, str]:
+    return {_code(row.get("code")): str(row.get("entry_style_selected") or "")
+            for row in rows if isinstance(row, dict) and _code(row.get("code"))}
+
+
+def _prep_collection_rank(rows: list[dict]) -> list[str]:
+    """Observation only; compare existing scores within strategy, never authorize BUY."""
+    import math
+    families = {}
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        code = _code(row.get("code"))
+        style = str(row.get("entry_style_selected") or "").upper().removeprefix("ENTRY_")
+        family = next((f for f in ("PULLBACK", "MOMENTUM", "BREAKOUT", "MINERVINI", "VCP")
+                       if style == f or style.startswith(f + "_")), "")
+        if not code or code == "122630" or not family:
+            continue
+        try:
+            rank = int(row.get("rank_final30") or i + 1)
+            score = float(row.get(family.lower() + "_score"))
+            if not 1 <= rank <= 30 or not math.isfinite(score) or score <= 0:
+                continue
+        except (ValueError, TypeError, OverflowError):
+            continue
+        families.setdefault(family, []).append((rank, -score, code))
+    for values in families.values():
+        values.sort(key=lambda item: (item[1], item[0], item[2]))
+    lanes = sorted(families.values(), key=lambda values: min(x[0] for x in values))
+    result = []
+    while any(lanes):
+        for lane in lanes:
+            if lane:
+                result.append(lane.pop(0)[2])
+    return _unique(result)
+
+
+def publish_prep_collection(*, date: str, account_scope: str,
+                            now: datetime | None = None) -> dict:
+    now = (now or datetime.now(KST)).astimezone(KST)
+    prep = _prep_snapshot(date)
+    sha = _current_sha()
+    if (not _collection_scope_ok(account_scope) or prep is None
+            or not prep["contract_hash"] or len(sha) != 40
+            or now.date().isoformat() != date):
+        return {"state": "INVALID_PREP_COLLECTION_SCOPE"}
+    ranked = _prep_collection_rank(prep["rows"])
+    body = _snapshot(date=date, account_scope=account_scope, prep=prep,
+                     hot=ranked[:HOT_TARGET], warm=ranked[HOT_TARGET:HOT_TARGET+WARM_TARGET],
+                     source="PREP_COLLECTION_ONLY", stage="PREP", now=now, code_sha=sha)
+    body.pop("sha256")
+    body["version"] = PREP_COLLECTION_VERSION
+    body["expires_at_kst"] = now.replace(hour=15, minute=6, second=0, microsecond=0).isoformat()
+    body["selection_reason"] = "FINAL30_WITHIN_STYLE_SCORE_ROUND_ROBIN"
+    body["sha256"] = sha256(_canonical(body)).hexdigest()
+    path = prep_collection_path(date, account_scope)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix="prep-collection-", delete=False) as out:
+            tmp = out.name
+            json.dump(body, out, ensure_ascii=False, sort_keys=True)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, path)
+    finally:
+        if tmp and os.path.exists(tmp):
+            os.unlink(tmp)
+    return {"state": "PREP_COLLECTION_PUBLISHED", "hot": body["hot"], "warm": body["warm"]}
+
+
+def load_prep_collection(*, date: str, account_scope: str,
+                         now: datetime, final30_file: str | None = None) -> dict | None:
+    if not _collection_scope_ok(account_scope):
+        return None
+    prep = _prep_snapshot(date, filename=final30_file)
+    if prep is None or not prep["contract_hash"] or now.astimezone(KST).date().isoformat() != date:
+        return None
+    try:
+        raw = json.loads(prep_collection_path(date, account_scope).read_text(encoding="utf-8"))
+        digest = raw.pop("sha256")
+        hot, warm, cold = (raw[k] for k in ("hot", "warm", "cold"))
+        groups = hot + warm + cold
+        sha = _current_sha()
+        if (raw.get("version") != PREP_COLLECTION_VERSION
+                or raw.get("source") != "PREP_COLLECTION_ONLY"
+                or raw.get("stage") != "PREP" or raw.get("owner") != "PB1"
+                or raw.get("env") != "practice" or raw.get("trade_date") != date
+                or raw.get("account_scope_hash") != _scope_digest(account_scope)
+                or raw.get("is_order_authorization") is not False
+                or raw.get("final30_digest") != prep["final30_digest"]
+                or raw.get("prep_contract_hash") != prep["contract_hash"]
+                or not sha or raw.get("code_sha") != sha
+                or digest != sha256(_canonical(raw)).hexdigest()
+                or not datetime.fromisoformat(raw["created_at_kst"]) <= now < datetime.fromisoformat(raw["expires_at_kst"])
+                or len(hot) > HOT_TARGET or len(warm) > WARM_TARGET
+                or "122630" in hot + warm or len(groups) != 30
+                or len(set(groups)) != 30 or set(groups) != set(prep["codes"])):
+            return None
+        return {"state": "PREP_COLLECTION_ACTIVE", "hot": hot, "warm": warm, "cold": cold,
+                "code_sha": sha, "final30_digest": prep["final30_digest"],
+                "observation_styles": _observation_styles(prep["rows"]),
+                "is_order_authorization": False}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+
+
+def observer_collection_priorities(*, date: str, account_scope: str, now: datetime,
+                                   final30_file: str | None = None) -> dict:
+    execution = collection_priorities(date=date, account_scope=account_scope, now=now,
+                                      final30_file=final30_file)
+    if (os.getenv("KR_PREP_COLLECTION_PRIORITY_ENABLED", "1") != "1"
+            or execution["state"] == "INVALID_PREP"
+            or (execution["state"] == "PB1_ACTIVE" and (execution["hot"] or execution["warm"]))):
+        return execution
+    seed = load_prep_collection(date=date, account_scope=account_scope, now=now,
+                                final30_file=final30_file)
+    return seed if seed is not None else execution
 
 
 class CandidateSchedule:
@@ -353,7 +490,6 @@ class CandidateSchedule:
                 age = float("inf") if last is None or promoted else (now - last).total_seconds()
                 if age >= self.periods[category]:
                     items.append((age, code))
-                self.last_tier[code] = category
             items.sort(key=lambda x: (-x[0], x[1]))
             due[category] = items
 
@@ -384,4 +520,5 @@ class CandidateSchedule:
         chosen.extend(code for _, _, code in remaining[:self.max_batch - len(chosen)])
         for code in chosen:
             self.last_attempt[code] = now
+            self.last_tier[code] = next(t for t in ("hot", "warm", "cold") if code in _unique(snapshot.get(t) or []))
         return chosen

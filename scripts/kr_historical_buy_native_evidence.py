@@ -31,7 +31,7 @@ KST = ZoneInfo("Asia/Seoul")
 def exact_buy_evidence(payload, *, day, code, odno, qty):
     if (not isinstance(payload, dict) or payload.get("rt_cd") != "0"
             or payload.get("_sep29_complete") is not True
-            or payload.get("_diag_stub") or payload.get("_ccld_status")
+            or payload.get("_diag_stub") or payload.get("_stub") or payload.get("_ccld_status")
             or not isinstance(payload.get("output1"), list)
             or any(not isinstance(row, dict) for row in payload["output1"])):
         return {"state": "NATIVE_HISTORY_UNVERIFIED"}
@@ -44,6 +44,26 @@ def exact_buy_evidence(payload, *, day, code, odno, qty):
     row = matches[0]
     if not _broker_buy_cumulative_verified(row, code=code, order_number=odno,
                                            quantity=qty, trade_date=day):
+        # A full execution is not the only possible terminal broker outcome.
+        # Explicit, complete zero-fill cancellation/rejection economics are
+        # distinguishable from an ACK with zero fills and remaining shares.
+        # This is evidence only; never changes a claim or authorizes retry.
+        try:
+            keys = ("ord_qty", "tot_ccld_qty", "cncl_cfrm_qty", "rjct_qty", "rmn_qty")
+            raw = [str(row[k]) for k in keys]
+            if (str(row.get("sll_buy_dvsn_cd") or "") == "02"
+                    and all(v.isascii() and v.isdigit() for v in raw)):
+                ordered, filled, cancelled, rejected, remaining = map(int, raw)
+                notional = Decimal(str(row["tot_ccld_amt"]))
+                if (ordered == qty > 0 and filled == remaining == 0
+                        and cancelled + rejected == ordered and notional == 0):
+                    return {"state": "ORIGINAL_ZERO_FILL_TERMINAL_PROVEN",
+                            "qty": qty, "filled_qty": 0, "cancelled_qty": cancelled,
+                            "rejected_qty": rejected, "recovery_authorized": False,
+                            "native_row_sha256": hashlib.sha256(json.dumps(
+                                row, sort_keys=True, default=str).encode()).hexdigest()}
+        except (KeyError, ArithmeticError, TypeError, ValueError):
+            pass
         return {"state": "ORIGINAL_FULL_EXECUTION_NOT_PROVEN"}
     notional = Decimal(str(row["tot_ccld_amt"]))
     return {"state": "ORIGINAL_FULL_EXECUTION_PROVEN", "code": code, "odno": odno,
@@ -95,6 +115,39 @@ def current_day_unfilled_evidence(payload, *, day, codes):
             for code, (count, qty) in totals.items()}
 
 
+def missing_order_id_evidence(payload, *, day, code, qty, limit_price):
+    """Candidate list for human review, NEVER order identity or absence proof.
+
+    Even one matching native row cannot establish that this particular local
+    attempt produced it. Missing matches also cannot prove non-submission.
+    """
+    unknown = {"state": "MISSING_ORDER_ID_NATIVE_HISTORY_UNVERIFIED",
+               "candidate_order_numbers": [], "recovery_authorized": False}
+    check = current_day_unfilled_evidence(payload, day=day, codes={code})
+    if check[code]["state"] == "CURRENT_DAY_UNFILLED_UNVERIFIED":
+        return unknown
+    try:
+        price = Decimal(str(limit_price))
+        if not price.is_finite() or price <= 0 or int(qty) <= 0:
+            return unknown
+        candidates = []
+        for row in payload["output1"]:
+            if row["pdno"] != code or row["sll_buy_dvsn_cd"] != "02":
+                continue
+            requested = Decimal(str(row.get("ord_qty")))
+            native_price = Decimal(str(row.get("ord_unpr")))
+            if not requested.is_finite() or not native_price.is_finite():
+                return unknown
+            if requested == qty and native_price == price:
+                candidates.append(str(row["odno"]))
+        return {"state": "MISSING_ORDER_ID_MATCH_REVIEW_REQUIRED" if candidates
+                         else "MISSING_ORDER_ID_NO_MATCH_NOT_ABSENCE_PROOF",
+                "candidate_order_numbers": sorted(candidates),
+                "candidate_count": len(candidates), "recovery_authorized": False}
+    except (ArithmeticError, ValueError, TypeError, KeyError):
+        return unknown
+
+
 def fresh_original_balance_quantities(kis):
     """Fail closed on a normalized empty/stub, stale or incomplete raw balance.
 
@@ -132,6 +185,19 @@ def fresh_original_balance_quantities(kis):
         return False, {}
 
 
+def _evidence_target_priority(target):
+    """Active execution uncertainty must precede optional historical audits.
+
+    The read-only collector has a three-day native-query budget. Never let
+    an older imported-position audit consume all days ahead of live claims.
+    """
+    claim, order = target["claim"], target["order"]
+    exact_cycle = any(str(p.get("position_cycle_id")) == str(order.get("position_cycle_id"))
+                      for p in target["positions"])
+    return (claim.get("action_key") is None, exact_cycle,
+            str(claim["trade_date"]), str(order["order_id"]))
+
+
 def collect(*, engine, kis, now, code=None, trade_date=None):
     if getattr(kis, "env", None) != "practice":
         raise RuntimeError("PRACTICE_BROKER_REQUIRED")
@@ -153,7 +219,8 @@ def collect(*, engine, kis, now, code=None, trade_date=None):
             claims.c.env == "practice", claims.c.market == "KR",
             claims.c.strategy_owner == "PB1", claims.c.account_id == account_hash,
             claims.c.trading_epoch_id == scope.trading_epoch_id,
-            claims.c.action.like("BUY_ENTRY:%"), claims.c.trade_date < today,
+            claims.c.action.like("BUY_ENTRY:%"),
+            claims.c.trade_date <= today if trade_date == today else claims.c.trade_date < today,
             claims.c.action_state == "UNCERTAIN", claims.c.active_attempt_id.is_not(None),
         )
         if code:
@@ -183,8 +250,9 @@ def collect(*, engine, kis, now, code=None, trade_date=None):
                         strategy="pb1_pullback_close", scope=scope)):
                 continue
             odno = str(order.get("kis_odno") or "")
-            if len(odno) != 10 or not odno.isascii() or not odno.isdigit():
-                continue
+            # Missing broker ID is precisely the lost-ACK case. Do not
+            # silently omit it; only exact verified local ownership enters
+            # the read-only candidate report, not an automatic recovery.
             db_qty = conn.execute(sa.select(sa.func.coalesce(sa.func.sum(fills.c.qty), 0)).where(
                 fills.c.order_id == order["order_id"], fills.c.env == scope.env,
                 fills.c.trading_epoch_id == scope.trading_epoch_id, fills.c.side == "BUY",
@@ -292,10 +360,7 @@ def collect(*, engine, kis, now, code=None, trade_date=None):
                             "order": order, "db_fill_qty": sum(int(f.get("qty") or 0) for f in native),
                             "positions": positions})
             seen.add(identity)
-    targets.sort(key=lambda t: (
-        any(str(p.get("position_cycle_id")) == str(t["order"].get("position_cycle_id"))
-            for p in t["positions"]),
-        str(t["claim"]["trade_date"]), str(t["order"]["order_id"])))
+    targets.sort(key=_evidence_target_priority)
     proofs = []
     daily = {}
     failures = {}
@@ -305,27 +370,33 @@ def collect(*, engine, kis, now, code=None, trade_date=None):
         if isinstance(day, str):
             day = date.fromisoformat(day)
         symbol = str(order["code"])
-        odno = str(order["kis_odno"])
+        odno = str(order.get("kis_odno") or "")
+        identity = {"code": symbol, "odno": odno, "trade_date": day.isoformat(),
+                    "claim_action_key": claim["action_key"], "source_order_id": str(order["order_id"]),
+                    "source_cycle": str(order["position_cycle_id"]),
+                    "db_fill_qty": target["db_fill_qty"], "positions": target["positions"]}
         try:
             if day in failures:
                 raise RuntimeError("ORIGINAL_DAY_QUERY_ALREADY_FAILED")
             if day not in daily:
                 if len(daily) + len(failures) >= 3:
-                    proofs.append({"code": symbol, "odno": odno, "source_order_id": str(order["order_id"]), "state": "DEFERRED_DAY_BUDGET"})
+                    proofs.append({**identity, "state": "DEFERRED_DAY_BUDGET"})
                     continue
                 try:
                     daily[day] = _daily_ccld_all_pages_for_date(kis, day)
                 except Exception as exc:
                     failures[day] = type(exc).__name__
                     raise
-            proof = exact_buy_evidence(daily[day], day=day, code=symbol, odno=odno,
-                                       qty=int(order["qty"]))
+            if len(odno) == 10 and odno.isascii() and odno.isdigit():
+                proof = exact_buy_evidence(daily[day], day=day, code=symbol, odno=odno,
+                                           qty=int(order["qty"]))
+            else:
+                proof = missing_order_id_evidence(
+                    daily[day], day=day, code=symbol, qty=int(order["qty"]),
+                    limit_price=order.get("limit_price"))
         except Exception as exc:
             proof = {"state": "NATIVE_QUERY_FAILED", "error_type": type(exc).__name__}
-        proofs.append({**proof, "code": symbol, "odno": odno,
-                       "claim_action_key": claim["action_key"], "source_order_id": str(order["order_id"]),
-                       "source_cycle": str(order["position_cycle_id"]),
-                       "db_fill_qty": target["db_fill_qty"], "positions": target["positions"]})
+        proofs.append({**proof, **identity})
     balance_ok, quantities = fresh_original_balance_quantities(kis)
     # Query today's all-page broker orders separately from the historical
     # three-day budget. An API failure must not be represented as zero orders.
@@ -333,7 +404,7 @@ def collect(*, engine, kis, now, code=None, trade_date=None):
     current_orders = None
     if codes:
         try:
-            current_orders = _daily_ccld_all_pages_for_date(kis, today)
+            current_orders = daily[today] if today in daily else _daily_ccld_all_pages_for_date(kis, today)
         except Exception:
             pass
     unfilled = current_day_unfilled_evidence(current_orders, day=today, codes=codes)
@@ -342,7 +413,9 @@ def collect(*, engine, kis, now, code=None, trade_date=None):
         proof["fresh_balance_proven"] = balance_ok
         proof["current_holding_qty"] = quantities.get(proof["code"], 0) if balance_ok else None
         proof["recovery_authorized"] = False
-        proof["reason"] = "EXACT_CYCLE_AND_CURRENT_UNFILLED_REVIEW_REQUIRED_NO_WRITE"
+        proof["reason"] = ("MISSING_BROKER_ID_REQUIRES_ORIGINAL_ACK_OR_INDEPENDENT_IDENTITY_NO_WRITE"
+                           if not proof.get("odno") else
+                           "EXACT_CYCLE_AND_CURRENT_UNFILLED_REVIEW_REQUIRED_NO_WRITE")
     return {"version": "KR_HISTORICAL_BUY_NATIVE_EVIDENCE_V4", "env": scope.env,
             "trading_epoch_id": scope.trading_epoch_id, "cases": proofs,
             "days_queried": len(daily) + len(failures), "orders_submitted": 0, "db_rows_modified": 0}

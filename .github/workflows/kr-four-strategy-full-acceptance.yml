@@ -66,7 +66,8 @@ jobs:
           bash scripts/check_kr_legacy_regime.sh
       - name: Full KR four-style regression suite
         run: |
-          python -m pytest -q tests/kr
+          python -m pytest -q -rs --junitxml="$RUNNER_TEMP/kr-four-full.xml" tests/kr
+          python scripts/kr_assert_no_skips.py "$RUNNER_TEMP/kr-four-full.xml"
       - name: Historical watchlist to locked BUY and sell contracts
         run: |
           python -m pytest -q \
