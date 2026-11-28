@@ -5,6 +5,7 @@ on:
     paths:
       - 'trader/us/portfolio_profit_guard_store.py'
       - 'tests/us/test_us_20261123_portfolio_guard_pg_lifecycle.py'
+      - 'tests/us/test_us_20261123_portfolio_profit_guard_policy_math.py'
       - '.github/workflows/us400-e-portfolio.yml'
 permissions:
   contents: read
@@ -46,5 +47,5 @@ jobs:
           python-version: '3.11'
       - run: python -m pip install -r requirements.txt psycopg2-binary pytest
       - run: |
-          python -m pytest -q --junitxml=/tmp/us400-e.xml tests/us/test_us_20261123_portfolio_guard_pg_lifecycle.py
+          python -m pytest -q --junitxml=/tmp/us400-e.xml tests/us/test_us_20261123_portfolio_guard_pg_lifecycle.py tests/us/test_us_20261123_portfolio_profit_guard_policy_math.py
           python -c 'import xml.etree.ElementTree as E; c=list(E.parse("/tmp/us400-e.xml").iter("testcase")); assert len(c)>=8 and all(x.find("skipped") is None for x in c)'
