@@ -507,7 +507,11 @@ def test_entry_disabled_order_candidates_initialize_submit_result_before_policy_
     """Regression for 2026-09-23 AM UnboundLocalError on submit_result."""
     source = Path("trader/pb1_engine.py").read_text(encoding="utf-8")
     anchor = source.index('with self._stage_timer("entry.order_submit")')
-    section = source[anchor:source.index('if entry_allowed and self.phase in {"entry", "pm_entry"}', anchor)]
+    # Bound the section by the ADD budget calculation, not the spelling of
+    # its multi-line guard. The original initialization/blocked-path/policy
+    # read ordering must still hold after entry-event deferral was added.
+    add_budget = "remaining_budget = max(0.0, float(tick_budget_krw) - planned_spent)"
+    section = source[anchor:source.index(add_budget, anchor)]
     init = 'submit_result = {'
     blocked = "if not entry_allowed:"
     policy_read = 'for result in (submit_result.get("results") or [])'
