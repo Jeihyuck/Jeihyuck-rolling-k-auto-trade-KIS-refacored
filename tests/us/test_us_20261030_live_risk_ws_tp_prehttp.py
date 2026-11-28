@@ -1367,7 +1367,8 @@ def test_intraday_quote_age_is_measured_after_each_delayed_read(monkeypatch):
     assert [result["quotes"][sym]["age_sec"] for sym in ("SPY", "QQQ", "SMH")] == [4, 2, 0]
 
 
-def test_intraday_quote_can_expire_while_a_later_index_is_read(monkeypatch):
+@pytest.mark.parametrize("source_offset", [0, 2], ids=["expires", "future-on-receipt"])
+def test_intraday_quote_can_expire_while_a_later_index_is_read(monkeypatch, source_offset):
     clock = [1000.0]
     monkeypatch.setattr(overlay.time, "time", lambda: clock[0])
 
@@ -1375,7 +1376,8 @@ def test_intraday_quote_can_expire_while_a_later_index_is_read(monkeypatch):
         def get_current_price(self, symbol, exchange):
             if symbol == "SMH":
                 clock[0] += 6
-            return _live_quote(99, clock[0])
+                return _live_quote(99, clock[0])
+            return _live_quote(99, clock[0] + source_offset)
 
     warnings = []
     result = overlay.read_us_live_intraday_returns(
@@ -1385,7 +1387,7 @@ def test_intraday_quote_can_expire_while_a_later_index_is_read(monkeypatch):
     assert result["returns"]["spy"] is None
     assert result["returns"]["qqq"] is None
     assert result["returns"]["smh"] == pytest.approx(-0.01)
-    assert result["quotes"]["SPY"]["age_sec"] == 6
+    assert result["quotes"]["SPY"]["age_sec"] == 6 - source_offset
     assert "live_intraday_quote_unverified:SPY" in warnings
 
 

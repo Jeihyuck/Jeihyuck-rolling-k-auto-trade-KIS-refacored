@@ -394,12 +394,12 @@ def read_us_live_intraday_returns(
                         q = provider.get_current_price(sym, resolve_quote_exchange(sym))
             except Exception as exc:
                 warnings.append(f"live_intraday_quote_failed:{sym}:{type(exc).__name__}")
-        raw_quotes[sym] = q if isinstance(q, dict) else {}
+        raw_quotes[sym] = (q if isinstance(q, dict) else {}, time.time())
 
     # All three quotes must still be current when the overlay consumes them.
     # A slow later symbol can expire an earlier quote during this batch.
     evaluated_at = time.time()
-    for sym, q in raw_quotes.items():
+    for sym, (q, observed_at) in raw_quotes.items():
         current = next((
             value for value in (
                 _num(q.get("last")), _num(q.get("current")),
@@ -424,6 +424,7 @@ def read_us_live_intraday_returns(
             current is not None and previous is not None
             and math.isfinite(previous) and previous > 0
             and age is not None and -1.0 <= age <= max_age_sec
+            and received <= observed_at + 1.0
             and not q.get("stale") and not q.get("suspect") and not q.get("_stale_date")
             and str(q.get("quality") or "").upper() not in {
                 "STALE", "SUSPECT", "DEGRADED", "OFFLINE",
