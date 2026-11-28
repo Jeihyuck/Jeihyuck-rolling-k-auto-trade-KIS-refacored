@@ -489,11 +489,11 @@ class ActiveProtectiveWatch:
     def followup(self, result, current_watch):
         # Only the reaped normal child can provide current watch identities.
         # A routed symbol is excluded from that export by the canonical tick.
-        identity, _ = split_wakeup(self._wakeup)
+        identity, kind = split_wakeup(self._wakeup)
         if (
             identity is None
             or self._observed_at is None
-            or not 0 <= self._clock() - self._observed_at <= 10.0
+            or self._clock() < self._observed_at
             or result.get("runtime_integrity_status") not in {"OK", "POLICY_ENTRY_BLOCKED"}
             or result.get("sell_liveness_status") != "OK"
             or result.get("exit_can_proceed") is not True
@@ -503,6 +503,25 @@ class ActiveProtectiveWatch:
                        for row in current_watch)
         ):
             return None
+        if self._clock() - self._observed_at > 10.0:
+            # A busy Tick can run far longer than the observation TTL.
+            # Never resurrect an old stop/profit signal: ask the same bounded,
+            # read-only collector for a NEW fresh trigger after the writer has
+            # exited. The next canonical child still checks the original
+            # owner, position, risk/TP and all order fences before any HTTP.
+            try:
+                current_signal = self._poll()
+            except Exception as exc:
+                logger.warning("[US_EXIT][ACTIVE_WATCH_RECHECK_UNAVAILABLE] error_type=%s",
+                               type(exc).__name__)
+                return None
+            fresh_identity, fresh_kind = split_wakeup(current_signal)
+            if fresh_identity != identity or fresh_kind != kind:
+                logger.info("[US_EXIT][ACTIVE_WATCH_STALE_DISCARDED] kind=%s", kind)
+                return None
+            self._wakeup = current_signal
+            self._observed_at = self._clock()
+            logger.info("[US_EXIT][ACTIVE_WATCH_RECONFIRMED] kind=%s", kind)
         return self._wakeup
 
 
