@@ -614,3 +614,38 @@ def test_runtime_portfolio_guard_legacy_ledger_to_canonical_intent(monkeypatch):
     original["qty"] = 4
     assert store.build_authorized_portfolio_guard_intents(**kwargs) == []
     assert len(captured) == 1
+
+
+@pytest.mark.parametrize("bid,expect", [
+    ("100", "99.80"),
+    ("0.01", None),  # previously stranded PLANNED after DB commit
+    ("NaN", None),
+    ("0", None),
+    ("-1", None),
+])
+def test_native_guard_price_is_preflighted_before_durable_reservation(bid, expect):
+    from trader.us.portfolio_profit_guard_store import (
+        preflight_guard_native_execution_prices, PortfolioGuardUnavailable,
+    )
+    native = [{"symbol": "KO", "mark_bid_usd": bid}]
+    if expect is None:
+        with pytest.raises((ValueError, PortfolioGuardUnavailable)):
+            preflight_guard_native_execution_prices(native, lambda sym: "NYSE")
+    else:
+        result = preflight_guard_native_execution_prices(native, lambda sym: "NYSE")
+        assert result["KO"] == ("NYSE", Decimal("100"), Decimal(expect))
+
+
+def test_native_guard_preflight_fails_closed_on_exchange_or_duplicate_symbol():
+    from trader.us.portfolio_profit_guard_store import (
+        preflight_guard_native_execution_prices, PortfolioGuardUnavailable,
+    )
+    with pytest.raises(PortfolioGuardUnavailable, match="EXCHANGE_UNVERIFIED"):
+        preflight_guard_native_execution_prices(
+            [{"symbol": "KO", "mark_bid_usd": "100"}], lambda sym: None,
+        )
+    with pytest.raises(PortfolioGuardUnavailable, match="EXECUTABLE_PRICE_INVALID"):
+        preflight_guard_native_execution_prices(
+            [{"symbol": "KO", "mark_bid_usd": "100"},
+             {"symbol": "ko", "mark_bid_usd": "100"}], lambda sym: "NYSE",
+        )
