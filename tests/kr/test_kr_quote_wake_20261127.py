@@ -627,3 +627,51 @@ def test_concurrent_protective_watcher_covers_long_entry_but_rejects_late_probe(
     finally:
         release.set()
         monitor.close()
+
+
+def test_reconcile_fenced_protective_wake_never_enables_entry(monkeypatch):
+    from trader.pb1_runner import _kr_reconcile_fenced_protective_wakes
+    monkeypatch.setenv("KR_PB1_PROTECTIVE_WAKE_ENABLED", "1")
+    monkeypatch.setenv("KR_PB1_FENCED_PROTECTIVE_WAKE_ENABLED", "1")
+    monkeypatch.setenv("PB1_PENDING_RECONCILE_ONLY", "0")
+    hints = [{"code": "251970", "is_order_authorization": False}]
+    metrics = {"tick_result_reason": "KR_POST_EXIT_BROKER_RECONCILE_UNVERIFIED",
+               "protective_fenced_zero_submit_proven": True,
+               "api_submitted": 0, "buy_orders": 0, "sell_orders": 0,
+               "protective_wake_targets": hints, "quote_wake_targets": [target()]}
+    args = dict(env="practice", strategy="pb1_pullback_close", session_kind="am",
+                status="BLOCKED_RECONCILE", metrics=metrics)
+    assert _kr_reconcile_fenced_protective_wakes(**args) == hints
+    for key, value in (
+        ("protective_fenced_zero_submit_proven", None), ("api_submitted", None),
+        ("buy_orders", 1), ("sell_orders", 1), ("sell_orders_ack", 1),
+        ("degraded", True), ("warning_counts", {"timeout_count": 1}),
+        ("tick_result_reason", "UNRELATED_RECONCILE_FAILURE"),
+    ):
+        assert not _kr_reconcile_fenced_protective_wakes(
+            **{**args, "metrics": {**metrics, key: value}})
+    for changes in ({"env": "real"}, {"strategy": "KR_INFINITE"},
+                    {"session_kind": "close"}, {"status": "OK_NO_TRADE"}):
+        assert not _kr_reconcile_fenced_protective_wakes(**{**args, **changes})
+    monkeypatch.setenv("PB1_PENDING_RECONCILE_ONLY", "1")
+    assert not _kr_reconcile_fenced_protective_wakes(**args)
+    monkeypatch.setenv("PB1_PENDING_RECONCILE_ONLY", "0")
+    monkeypatch.setenv("KR_PB1_FENCED_PROTECTIVE_WAKE_ENABLED", "0")
+    assert not _kr_reconcile_fenced_protective_wakes(**args)
+
+
+def test_reconcile_fenced_wake_only_dispatches_protective_targets():
+    import ast
+    from pathlib import Path
+    tree = ast.parse(Path("trader/pb1_runner.py").read_text(encoding="utf-8"))
+    loop = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_run_loop")
+    branches = [n for n in ast.walk(loop) if isinstance(n, ast.If)
+                and isinstance(n.test, ast.Name) and n.test.id == "_fenced_wakes"]
+    assert len(branches) == 1
+    calls = [n for n in ast.walk(branches[0]) if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Name) and n.func.id == "wait_for_quote_wake"]
+    assert len(calls) == 1
+    kw = {k.arg: k.value for k in calls[0].keywords}
+    assert isinstance(kw["targets"], ast.List) and not kw["targets"].elts
+    assert isinstance(kw["protective_targets"], ast.Name)
+    assert kw["protective_targets"].id == "_fenced_wakes"
