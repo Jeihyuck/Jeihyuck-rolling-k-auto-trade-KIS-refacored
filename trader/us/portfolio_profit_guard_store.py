@@ -76,6 +76,29 @@ def _action_key(
     return "US_PPG_" + hashlib.sha256(canonical(material)).hexdigest()[:32]
 
 
+def preflight_guard_native_execution_prices(native_valuations, exchange_resolver):
+    """Validate ALL order inputs before any durable stage/action reservation.
+
+    The caller must not leave PLANNED actions behind because an executable
+    price rounds to zero or exchange mapping fails after the DB transaction.
+    These prices remain advisory until the canonical per-order pre-HTTP
+    native quote, owner, pending and reservation checks succeed.
+    """
+    from decimal import ROUND_FLOOR
+    prepared = {}
+    for native in native_valuations:
+        symbol = str(native["symbol"]).upper()
+        bid = _decimal(native["mark_bid_usd"])
+        limit = (bid * Decimal("0.998")).quantize(Decimal("0.01"), rounding=ROUND_FLOOR)
+        if not symbol or symbol in prepared or not bid.is_finite() or bid <= 0 or limit <= 0:
+            raise PortfolioGuardUnavailable("PORT_GUARD_EXECUTABLE_PRICE_INVALID")
+        exchange = exchange_resolver(symbol)
+        if not isinstance(exchange, str) or not exchange.strip():
+            raise PortfolioGuardUnavailable("PORT_GUARD_EXCHANGE_UNVERIFIED")
+        prepared[symbol] = (exchange, bid, limit)
+    return prepared
+
+
 def reconcile_guard_native_order_actions(
     conn, *, policy: dict, account_hash: str, epoch: str, portfolio: str,
     episode: str,
@@ -966,6 +989,11 @@ def build_authorized_portfolio_guard_intents(
             economics["method"], pnl, economics.get("confirmed_net_pnl_usd"),
             economics.get("verified_fee_fill_count"),
         )
+        # Preflight order construction BEFORE the transactional stage reserve.
+        # Pre-HTTP always obtains fresh native authority; this cannot submit.
+        preflight_prices = preflight_guard_native_execution_prices(
+            native_valuations, resolve_quote_exchange,
+        )
         snapshot_id = hashlib.sha256(canonical({
             "accounting_method": economics["method"],
             "policy_sha256": manifest_digest, "epoch": epoch,
@@ -1002,10 +1030,7 @@ def build_authorized_portfolio_guard_intents(
                     or str(position.get("portfolio_epoch_id") or meta.get("portfolio_epoch_id") or "") != portfolio):
                 raise PortfolioGuardUnavailable("PORT_GUARD_ORIGINAL_POSITION_SCOPE_INVALID")
             native = next(v for v in native_valuations if v["symbol"] == p["symbol"])
-            bid = _decimal(native["mark_bid_usd"])
-            limit = (bid * Decimal("0.998")).quantize(Decimal("0.01"), rounding=ROUND_FLOOR)
-            if limit <= 0:
-                raise PortfolioGuardUnavailable("PORT_GUARD_EXECUTABLE_PRICE_INVALID")
+            exchange, bid, limit = preflight_prices[p["symbol"]]
             original_sha = str(meta.get("entry_exit_contract_sha256") or "")
             original_version = str(meta.get("entry_exit_contract_version") or "")
             if not original_sha or not original_version:
@@ -1027,7 +1052,7 @@ def build_authorized_portfolio_guard_intents(
                 "position_lifecycle_id": cycle,
             }
             output.append({
-                "symbol": p["symbol"], "exchange": resolve_quote_exchange(p["symbol"]),
+                "symbol": p["symbol"], "exchange": exchange,
                 "side": "SELL", "qty": p["qty"], "available_qty": p["qty"],
                 "limit_price": float(limit), "notional_usd": float(limit * p["qty"]),
                 "strategy": "us_portfolio_profit_guard",
