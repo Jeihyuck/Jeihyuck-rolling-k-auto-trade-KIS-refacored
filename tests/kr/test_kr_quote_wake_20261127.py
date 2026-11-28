@@ -470,3 +470,72 @@ def test_concurrent_protective_rejects_unknown_symbol_and_closing_race(monkeypat
     if monitor._thread is not None:
         monitor._thread.join(timeout=1)
     assert monitor.check(now=NOW,monotonic=0) is None
+
+
+def test_protective_checkpoint_precedes_expensive_entry_stages():
+    """Keep the existing serial SELL-first path responsive during BUY preparation."""
+    import ast
+    from pathlib import Path
+
+    source = Path("trader/pb1_engine.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    stages = {
+        "entry.minervini_report", "entry.open_orders_lookup",
+        "entry.today_buy_orders_lookup",
+    }
+    found = set()
+
+    def is_yield_guard(body, index):
+        if index < 2:
+            return False
+        assignment, guard = body[index-2:index]
+        return (
+            isinstance(assignment, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "_yield_result"
+                    for t in assignment.targets)
+            and isinstance(assignment.value, ast.Call)
+            and isinstance(assignment.value.func, ast.Name)
+            and assignment.value.func.id == "_yield_to_kr_protection"
+            and isinstance(guard, ast.If)
+            and isinstance(guard.test, ast.Compare)
+            and isinstance(guard.test.left, ast.Name)
+            and guard.test.left.id == "_yield_result"
+            and len(guard.test.ops) == 1
+            and isinstance(guard.test.ops[0], ast.IsNot)
+            and isinstance(guard.test.comparators[0], ast.Constant)
+            and guard.test.comparators[0].value is None
+            and len(guard.body) == 1
+            and isinstance(guard.body[0], ast.Return)
+            and isinstance(guard.body[0].value, ast.Name)
+            and guard.body[0].value.id == "_yield_result"
+        )
+
+    for parent in ast.walk(tree):
+        for _, body in ast.iter_fields(parent):
+            if not isinstance(body, list):
+                continue
+            for index, node in enumerate(body):
+                # Today's order lookup is nested in a try, so require the
+                # checkpoint before the try, not inside its exception handler.
+                candidate = node.body[0] if isinstance(node, ast.Try) and node.body else node
+                if isinstance(candidate, ast.With):
+                    for item in candidate.items:
+                        expr = item.context_expr
+                        if (isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute)
+                                and expr.func.attr == "_stage_timer" and expr.args
+                                and isinstance(expr.args[0], ast.Constant)
+                                and expr.args[0].value in stages):
+                            assert is_yield_guard(body, index), expr.args[0].value
+                            found.add(expr.args[0].value)
+                if isinstance(node, ast.For) and isinstance(node.iter, ast.Name):
+                    if node.iter.id == "ok_after_risk" and node.body:
+                        # Only the actual buyable gate loop sets current_code.
+                        if any(isinstance(stmt, ast.Assign)
+                               and any(isinstance(t, ast.Attribute) and t.attr == "current_code"
+                                       for t in stmt.targets) for stmt in node.body):
+                            assert is_yield_guard(node.body, 2)
+                            found.add("buyable_per_candidate")
+                    if node.iter.id == "emergency_ranked_codes":
+                        assert is_yield_guard(node.body, 2)
+                        found.add("emergency_per_candidate")
+    assert found == stages | {"buyable_per_candidate", "emergency_per_candidate"}
