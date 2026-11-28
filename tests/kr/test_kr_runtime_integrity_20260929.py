@@ -639,3 +639,53 @@ def test_cross_day_policy_recovery_refuses_symbol_only_ambiguity(monkeypatch):
     )
     assert result["recovered"] == []
     assert result["review_required"] == ["028050"]
+
+
+@pytest.mark.parametrize("prior_day", [False, True])
+def test_durable_pb1_uncertain_claim_never_terminalized_by_negative_observation(monkeypatch, prior_day):
+    engine = _db()
+    schema = schema_for_engine(engine)
+    now = datetime(2026, 11, 27, 10, 30, tzinfo=fix._KST)
+    order_id, cycle_id, epoch_id = str(uuid4()), str(uuid4()), str(uuid4())
+    key = "claimed-negative-buy"
+    action_key = "a" * 64
+    with engine.begin() as conn:
+        _portfolio_epoch(conn, schema, epoch_id)
+        conn.execute(schema.orders.insert().values(
+            order_id=order_id, position_cycle_id=cycle_id, portfolio_epoch_id=epoch_id,
+            env="practice", strategy=STRATEGY, sid=1, mode=1, code="012750",
+            market="KOSPI", side="BUY", ord_type="LIMIT", qty=19, stage="ENTRY",
+            client_order_key=key, status="UNRESOLVED_ACK",
+            request_json={"pre_order_holding_qty": 0},
+            response_json={"rt_cd": "UNRESOLVED_ACK"},
+            created_at=now-timedelta(days=int(prior_day), minutes=3)))
+        conn.execute(schema.execution_claims.insert().values(
+            action_key=action_key, env="practice", account_id="fixture", market="KR",
+            trading_epoch_id="epoch", strategy_owner="PB1", lifecycle_id="entry:012750",
+            action="BUY_ENTRY:PB1-AM", target_qty=19, cumulative_filled_qty=0,
+            remaining_target_qty=19, active_attempt_id="attempt",
+            action_state="UNCERTAIN", trade_date=(now-timedelta(days=int(prior_day))).date()))
+        conn.execute(schema.execution_attempts.insert().values(
+            attempt_id="attempt", action_key=action_key, attempt_no=1,
+            requested_qty=19, client_order_key=key, attempt_state="UNRESOLVED",
+            authoritative=False))
+    monkeypatch.setattr(fix, "_active_epoch", lambda *_a, **_kw: None)
+    kis = SimpleNamespace(_kr_20260929_daily_ccld_snapshot={
+        "captured_mono": fix.time.monotonic(), "start_date": now.strftime("%Y%m%d"),
+        "end_date": now.strftime("%Y%m%d"), "codes": [], "authoritative_complete": True})
+    for _ in range(2):
+        result = fix._terminalize_unresolved_orders(engine=engine, kis=kis,
+            env="practice", strategy=STRATEGY, holdings_rows=[], now=now)
+        assert result["terminalized"] == []
+        kis._kr_20260929_daily_ccld_snapshot["captured_mono"] -= .001
+    with engine.connect() as conn:
+        order = conn.execute(sa.select(schema.orders).where(
+            schema.orders.c.order_id == order_id)).mappings().one()
+        assert order["status"] == "UNRESOLVED_ACK"
+        claim = conn.execute(sa.select(schema.execution_claims)).mappings().one()
+        assert claim["action_state"] == "UNCERTAIN"
+        assert claim["active_attempt_id"] == "attempt"
+        if not prior_day:
+            response = fix._json_dict(order["response_json"])
+            assert response["negative_truth_claim_fenced"] is True
+            assert response.get("auto_terminalized") is not True
