@@ -1364,7 +1364,29 @@ def test_intraday_quote_age_is_measured_after_each_delayed_read(monkeypatch):
             return _live_quote(99, clock[0])
     result = overlay.read_us_live_intraday_returns(Provider(), _completed_prices(), [])
     assert result["quality"] == "OK"
-    assert all(q["age_sec"] == 0 for q in result["quotes"].values())
+    assert [result["quotes"][sym]["age_sec"] for sym in ("SPY", "QQQ", "SMH")] == [4, 2, 0]
+
+
+def test_intraday_quote_can_expire_while_a_later_index_is_read(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(overlay.time, "time", lambda: clock[0])
+
+    class Provider:
+        def get_current_price(self, symbol, exchange):
+            if symbol == "SMH":
+                clock[0] += 6
+            return _live_quote(99, clock[0])
+
+    warnings = []
+    result = overlay.read_us_live_intraday_returns(
+        Provider(), _completed_prices(), warnings, max_age_sec=5,
+    )
+    assert result["quality"] == "UNKNOWN"
+    assert result["returns"]["spy"] is None
+    assert result["returns"]["qqq"] is None
+    assert result["returns"]["smh"] == pytest.approx(-0.01)
+    assert result["quotes"]["SPY"]["age_sec"] == 6
+    assert "live_intraday_quote_unverified:SPY" in warnings
 
 
 @pytest.mark.parametrize("bad", [{"suspect": True}, {"asof_epoch": 0, "received_at": 1000.0},
