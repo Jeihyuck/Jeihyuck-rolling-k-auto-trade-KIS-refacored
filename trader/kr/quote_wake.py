@@ -387,9 +387,15 @@ class ConcurrentProtectiveYield:
                         and signal.get("is_order_authorization") is False
                         and signal.get("code") in {t["code"] for t in self.targets}
                         and not self._stop.is_set()):
-                    self.hit = {**signal, "observed_at": observed.isoformat()}
+                    # Refresh the latch while a DB or other owner operation
+                    # remains blocked. A one-shot signal would expire after
+                    # ten seconds and silently lose hard-stop observation.
+                    self.hit = {
+                        "code": signal["code"], "kind": "PROTECTIVE_HARD_STOP_HINT",
+                        "is_order_authorization": False,
+                        "observed_at": observed.isoformat(),
+                    }
                     self._ready.set()
-                    return
             except Exception:
                 # Optional transport observation must not affect SELL/BUY lanes.
                 pass
