@@ -16088,8 +16088,26 @@ class PB1Engine:
                         hit, time.monotonic()-t_start)
             return
         try:
-            engine = make_engine()
-            bulk_map = load_price_daily_bulk(engine, pending_codes, start_date, end_date)
+            # A private engine belongs to this optional SELECT only; an
+            # abandoned read cannot dispose the order/account engine.
+            def _load_private_daily():
+                engine = make_engine()
+                try:
+                    return load_price_daily_bulk(engine, pending_codes, start_date, end_date)
+                finally:
+                    engine.dispose()
+
+            if (getattr(self, "_kr_protective_yield_monitor", None) is not None
+                    and os.getenv("KR_PB1_PROTECTIVE_DAILY_READ_ENABLED", "1") == "1"):
+                from trader.kr.quote_wake import protective_daily_read
+                completed, bulk_map = protective_daily_read(
+                    _load_private_daily, checkpoint=self._kr_protection_checkpoint,
+                )
+                if not completed:
+                    logger.info("[KR][PB1][OHLCV][BATCH_PRELOAD][DEFERRED] action=NO_CACHE_WRITE")
+                    return
+            else:
+                bulk_map = _load_private_daily()
         except Exception as exc:
             logger.warning("[KR][PB1][OHLCV][BATCH_PRELOAD][ERROR] err=%s", exc)
             return
@@ -16631,6 +16649,8 @@ class PB1Engine:
             logger.info("[KR_LATENCY][ENTRY_DAILY_PRELOAD] requested=%s needed=%s",
                         len(codes or []), len(preload_codes))
             self._kr_pb1_batch_preload_ohlcv(preload_codes, days=60)
+            if self._kr_protection_checkpoint():
+                return []  # caller finalizes before BUY, not a missing-data verdict
 
         code_market = {
             str(m.get("code") or "").zfill(6): (m.get("market") or "")
