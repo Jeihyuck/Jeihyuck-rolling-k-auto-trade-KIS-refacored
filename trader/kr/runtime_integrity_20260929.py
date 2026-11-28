@@ -427,8 +427,11 @@ def _no_durable_fill_or_position(conn: Any, schema: Any, order: dict[str, Any]) 
 def _has_active_execution_claim(conn: Any, schema: Any, order: dict[str, Any]) -> bool:
     """Legacy negative observations cannot settle a durable execution claim.
 
-    Match the exact local order key in its environment/generation, never
-    symbol or quantity. A query error aborts the enclosing transaction.
+    Match the exact local order key in its environment, never symbol or
+    quantity. A conflicting epoch is also a fence: orders have a unique
+    (env, client_order_key), so an active claim with that same key but a
+    different generation is an identity conflict, not proof of absence.
+    No foreign claim is mutated. A query error aborts the transaction.
     """
     key = str(order.get("client_order_key") or "").strip()
     if not key:
@@ -441,14 +444,18 @@ def _has_active_execution_claim(conn: Any, schema: Any, order: dict[str, Any]) -
         claims.c.strategy_owner == "PB1",
         claims.c.action_state.in_(("IN_FLIGHT", "UNCERTAIN", "PARTIALLY_SATISFIED")),
     ]
-    if order.get("trading_epoch_id"):
-        filters.append(claims.c.trading_epoch_id == order["trading_epoch_id"])
     linked = claims.join(attempts, sa.and_(
         claims.c.action_key == attempts.c.action_key,
         claims.c.active_attempt_id == attempts.c.attempt_id,
     ))
-    return conn.execute(sa.select(claims.c.action_key).select_from(linked)
-                        .where(sa.and_(*filters)).limit(1)).scalar() is not None
+    row = conn.execute(sa.select(claims.c.action_key, claims.c.trading_epoch_id)
+                       .select_from(linked).where(sa.and_(*filters)).limit(1)).first()
+    if row is None:
+        return False
+    if not order.get("trading_epoch_id") or str(row.trading_epoch_id) != str(order["trading_epoch_id"]):
+        logger.warning("[KR_P0][NEGATIVE_TRUTH][CLAIM_SCOPE_CONFLICT] code=%s "
+                       "action=RETAIN_ORDER_AND_CLAIM", order.get("code"))
+    return True
 
 
 def _terminalize_unresolved_orders(
