@@ -298,3 +298,44 @@ def protective_daily_read(loader, *, checkpoint, poll_sec=.25):
         if not ok:
             raise result
         return True, result
+
+
+class ActiveEntryYield:
+    """One read-only READY hint per account/symbol/bar, shared with idle wakes.
+
+    A hint may defer untouched candidates only. It never carries a price,
+    position, quantity or order permission into the next canonical tick.
+    """
+    def __init__(self, state, *, probe=probe_wait_target, interval=1.0):
+        self.state = state
+        self.probe = probe
+        self.interval = max(1.0, float(interval))
+        self.next_poll = float("-inf")
+
+    def check(self, targets, *, now, monotonic):
+        started = monotonic()
+        if started < self.next_poll:
+            return None
+        self.next_poll = started + self.interval
+        for target in list(targets)[:3]:
+            try:
+                before = now()
+                if before.tzinfo is None or not time(9,30) <= before.astimezone(KST).time() < time(15,5):
+                    return None
+                result = self.probe(target, before)
+                after = now()
+                if monotonic() - started > 1.0 or not time(9,30) <= after.astimezone(KST).time() < time(15,5):
+                    return None
+                if (not isinstance(result, dict) or result.get("code") != target["code"]
+                        or result.get("is_order_authorization") is not False):
+                    continue
+                bar = datetime.fromisoformat(result["latest_bar_ts"])
+                if (bar.tzinfo is None or not 0 <= (after-bar).total_seconds() <= 180
+                        or after.astimezone(KST).date() != before.astimezone(KST).date()):
+                    continue
+                if self.state.accept(target, result["latest_bar_ts"]):
+                    return result
+            except Exception:
+                # Missing proof/IPC must leave normal submission policy intact.
+                continue
+        return None
