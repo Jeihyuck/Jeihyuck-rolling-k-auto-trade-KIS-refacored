@@ -8355,6 +8355,15 @@ def run_once(
                     }, phase_for_log, "PARTIAL_OK_EXIT_DONE_ENTRY_FAILED"
                 raise
             finally:
+                # A failed or timed-out entry must not leave a read-only WS
+                # watcher sampling a stale position after the engine exits.
+                _watch = getattr(engine_runner, "_kr_protective_yield_monitor", None)
+                _close = getattr(_watch, "close", None)
+                if callable(_close):
+                    try:
+                        _close()
+                    except Exception:
+                        logger.warning("[KR][PROTECTIVE_WATCH][CLOSE_FAILED] action=NO_ORDER")
                 _engine_end = time_mod.monotonic()
                 _sell_handoff = getattr(engine_runner, "_kr_sell_handoff_mono", None)
                 logger.info("[KR_LATENCY][ENGINE_BOUNDARIES] run_id=%s engine_ms=%.3f after_sell_handoff_ms=%s completed=%s",
