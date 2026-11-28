@@ -180,3 +180,25 @@ def test_historical_native_day_budget_prioritizes_active_uncertain_claims():
     ranked = sorted(audits + unresolved, key=_evidence_target_priority)
     assert {t["claim"]["action_key"] for t in ranked[:2]} == {"old-claim", "new-claim"}
     assert ranked[2]["claim"]["action_key"] is None
+
+
+@pytest.mark.parametrize("cancelled,rejected", [(174, 0), (0, 174)])
+def test_exact_original_zero_fill_terminal_evidence_does_not_authorize_retry(cancelled, rejected):
+    from datetime import date
+    from scripts.kr_historical_buy_native_evidence import exact_buy_evidence
+    day = date(2026, 10, 27)
+    row = {"pdno": "293490", "odno": "0000011280", "ord_dt": "20261027",
+           "sll_buy_dvsn_cd": "02", "ord_qty": "174", "tot_ccld_qty": "0",
+           "tot_ccld_amt": "0", "avg_prvs": "0", "rmn_qty": "0",
+           "cncl_cfrm_qty": str(cancelled), "rjct_qty": str(rejected)}
+    payload = {"rt_cd": "0", "_sep29_complete": True, "output1": [row]}
+    def proof(data):
+        return exact_buy_evidence(data, day=day, code="293490", odno="0000011280", qty=174)
+    result = proof(payload)
+    assert result["state"] == "ORIGINAL_ZERO_FILL_TERMINAL_PROVEN"
+    assert result["recovery_authorized"] is False
+    for changes in ({"rmn_qty": "174"}, {"sll_buy_dvsn_cd": "01"},
+                    {"tot_ccld_amt": "100"}, {"cncl_cfrm_qty": "175"},
+                    {"rjct_qty": "bad"}, {"ord_qty": "173"}):
+        assert proof({**payload, "output1": [{**row, **changes}]})["state"] != result["state"]
+    assert proof({**payload, "_stub": True})["state"] == "NATIVE_HISTORY_UNVERIFIED"
