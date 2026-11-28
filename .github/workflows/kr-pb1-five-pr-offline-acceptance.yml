@@ -76,8 +76,9 @@ jobs:
             tests/test_kis_ws_price.py
       - name: Existing KR and shared contract regressions
         run: |
-          python -m pytest -q tests/kr \
+          python -m pytest -q -rs --junitxml="$RUNNER_TEMP/kr-pb1-full.xml" tests/kr \
             tests/test_reconcile_entry_exit_plan_restore.py \
             tests/test_pb1_exit_signature.py \
             tests/test_position_cycle_lifecycle.py \
             tests/test_kr_final30_contract.py
+          python scripts/kr_assert_no_skips.py "$RUNNER_TEMP/kr-pb1-full.xml"

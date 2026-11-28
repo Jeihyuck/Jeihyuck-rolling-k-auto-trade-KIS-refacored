@@ -132,3 +132,32 @@ def test_requests_session_integration_captures_transport_failure(monkeypatch):
                      json={"appsecret":"fake-test-secret"}, timeout=1)
     assert calls == ["POST"]
     assert guard.transport_failures == [{"scope":"OAUTH","state":"READ_TIMEOUT"}]
+
+
+def test_missing_ack_native_candidates_never_authorize_recovery():
+    from datetime import date
+    from scripts.kr_historical_buy_native_evidence import missing_order_id_evidence
+    day = date(2026,11,27)
+    row = {"pdno":"012750","odno":"0000000123","ord_dt":"20261127",
+           "sll_buy_dvsn_cd":"02","ord_qty":"19","ord_unpr":"101500",
+           "rmn_qty":"0"}
+    payload = {"rt_cd":"0","_sep29_complete":True,"output1":[row]}
+    def evidence(data):
+        return missing_order_id_evidence(data,day=day,code="012750",
+                                         qty=19,limit_price=101500)
+    result = evidence(payload)
+    assert result["state"] == "MISSING_ORDER_ID_MATCH_REVIEW_REQUIRED"
+    assert result["candidate_order_numbers"] == ["0000000123"]
+    assert result["recovery_authorized"] is False
+    result = evidence({**payload,"output1":[row,{**row,"odno":"0000000124"}]})
+    assert result["candidate_count"] == 2
+    assert result["recovery_authorized"] is False
+    result = evidence({**payload,"output1":[]})
+    assert result["state"] == "MISSING_ORDER_ID_NO_MATCH_NOT_ABSENCE_PROOF"
+    assert result["recovery_authorized"] is False
+    for data in ({**payload,"_sep29_complete":False},
+                 {**payload,"output1":[row,row]},
+                 {**payload,"output1":[{**row,"ord_qty":"bad"}]}):
+        result = evidence(data)
+        assert result["state"] == "MISSING_ORDER_ID_NATIVE_HISTORY_UNVERIFIED"
+        assert result["recovery_authorized"] is False

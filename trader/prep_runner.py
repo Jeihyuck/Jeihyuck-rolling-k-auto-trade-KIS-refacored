@@ -3586,6 +3586,18 @@ def main() -> int:
         len(bundle_final30),
         int(final30_gate_decision["trade_can_proceed"]),
     )
+    if (env == "practice" and final_exit_code == 0 and prep_core.get("core_ok")
+            and os.getenv("KR_PREP_COLLECTION_PRIORITY_ENABLED", "1") == "1"):
+        try:
+            from trader.account_state import get_account_key
+            from trader.kr.entry_priority_queue import publish_prep_collection
+            observation = publish_prep_collection(
+                date=trade_date.isoformat(), account_scope=get_account_key(env=env),
+                now=now_kst())
+            logger.info("[PREP][COLLECTION_PRIORITY] state=%s hot=%s warm=%s order_authorization=0",
+                        observation["state"], observation.get("hot", []), observation.get("warm", []))
+        except Exception:
+            logger.exception("[PREP][COLLECTION_PRIORITY][FAIL] action=KEEP_EXISTING_EXECUTION_GATE")
     logger.info("[PREP][EXIT] status=%s", final_status)
     return final_exit_code
 

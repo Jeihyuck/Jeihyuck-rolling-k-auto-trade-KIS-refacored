@@ -791,3 +791,86 @@ def test_live_pb1_price_and_retry_notional_reach_overlay_without_old_feature():
     assert overlay.index("**(cf.features or {})") < overlay.index(
         '"planned_value": float(record_price or 0.0) * float(qty or 0)'
     )
+
+
+@pytest.mark.parametrize("reason,post_ok", [
+    ("historical_recovery_unverified", True),
+    ("ok", False),
+])
+def test_actual_reconcile_fence_branch_skips_final30_only_after_exit_handoff(
+    monkeypatch, reason, post_ok
+):
+    # Execute the exact production branch with instrumented surrounding
+    # callbacks. This is a focused control-flow test, not a KIS execution.
+    import ast
+    import inspect
+    import logging
+    import os
+    import textwrap
+    from collections import Counter
+    from trader.pb1_engine import PB1Engine
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(PB1Engine.run)))
+    body = tree.body[0].body
+    fence_index = next(i for i, node in enumerate(body)
+                       if isinstance(node, ast.Assign)
+                       and any(isinstance(t, ast.Name) and t.id == "_reconcile_fence"
+                               for t in node.targets))
+    assert isinstance(body[fence_index + 1], ast.If)
+    # Guard placement is part of the regression: after actual protective
+    # evaluation/handoff, before deferred scanner and candidate computation.
+    assert "_after_exit()" in ast.unparse(ast.Module(body=body[:fence_index], type_ignores=[]))
+    later = ast.unparse(ast.Module(body=body[fence_index + 2:], type_ignores=[]))
+    assert "_deferred_entry_scan()" in later
+    assert "_compute_candidates_from_codes(" in later
+    fragment = ast.unparse(ast.Module(body=body[fence_index:fence_index+2], type_ignores=[]))
+    calls = []
+    eng = SimpleNamespace(env="practice", STRATEGY_NAME="pb1_pullback_close",
+                          phase="entry", trading_day=True, intended_live=True,
+                          dry_run=False, force_block_live=False,
+                          _kr_post_exit_reconcile_ok=post_ok,
+                          _log_tick_price_cache_summary=lambda: calls.append("cache"),
+                          _finalize_run_result=lambda **kw: kw)
+    source = ("def evaluate(self, entry_reason, entry_allowed=False, order_allowed=False, "
+              "engine_compute_only=False, compute_only_full_run=False, "
+              "diag_compute_only=False, diag_full_exec=False, minervini_only=False, "
+              "exit_pass_ok=True):\n" + textwrap.indent(fragment, "    ")
+              + "\n    return 'CONTINUE'\n")
+    scope = dict(os=os, Counter=Counter, logger=logging.getLogger(__name__),
+                 _emit_entry_summary=lambda *a: calls.append("summary"),
+                 _emit_entry_decision=lambda *a, **kw: calls.append(kw),
+                 _set_run_summary_payload=lambda **kw: calls.append(kw))
+    exec(compile(source, "<production-fence-branch>", "exec"), scope)
+    evaluate = scope["evaluate"]
+    monkeypatch.setenv("KR_SKIP_FENCED_ENTRY_SCAN", "1")
+    result = evaluate(eng, reason)
+    expected = reason if post_ok else "KR_POST_EXIT_BROKER_RECONCILE_UNVERIFIED"
+    assert result == {"status":"BLOCKED_RECONCILE","notes":expected}
+    assert calls[-2]["scanned"] == calls[-2]["api_submitted"] == 0
+    assert eng.order_allowed is False
+    assert evaluate(eng, reason, diag_compute_only=True) == "CONTINUE"
+    assert evaluate(eng, reason, entry_allowed=True) == "CONTINUE"
+    eng.env = "real"
+    assert evaluate(eng, reason) == "CONTINUE"
+    eng.env = "practice"
+    monkeypatch.setenv("KR_SKIP_FENCED_ENTRY_SCAN", "0")
+    assert evaluate(eng, reason) == "CONTINUE"
+
+
+def test_kr_daily_preload_only_missing_features_and_unknown_rows(monkeypatch):
+    from trader.pb1_engine import PB1Engine
+    eng = PB1Engine.__new__(PB1Engine)
+    complete = dict.fromkeys(("ma20_slope","vol_contraction","volu_contraction",
+                             "high20","tr_range_pct","trend_strength","ma10","value20"), 1.0)
+    rows = {"000001": (complete, True),
+            "000002": ({**complete,"high20":None}, True),
+            "000003": (complete, False),
+            "000004": ({**complete,"ma20_slope":0.0}, True)}
+    def mapped(code):
+        row, ok = rows[code]
+        return dict(row), {}, [], True, ok
+    monkeypatch.setattr(eng,"_map_precomputed_candidate_row",mapped)
+    needed = eng._kr_select_short_ohlcv_preload(list(rows)+["000005"])
+    assert needed == ["000002","000003","000005"]
+    assert not eng._kr_needs_short_ohlcv_fill(complete,True)
+    assert eng._kr_needs_short_ohlcv_fill(complete,False)

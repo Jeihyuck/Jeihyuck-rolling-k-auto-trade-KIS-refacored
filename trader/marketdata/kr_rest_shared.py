@@ -56,6 +56,8 @@ def _open_private(path, flags):
 def _valid(row, code, now):
     return (isinstance(row, dict)
             and row.get("source") == "KIS_REST_INQUIRE_PRICE"
+            and row.get("native_market_division") == "J"
+            and row.get("native_requested_code") == code
             and verified_price(row, code, now=now, max_age_sec=5.0))
 
 
@@ -70,7 +72,8 @@ def _read(path, code):
         if not _valid(data, code, now):
             return None
         # Receipt identity is immutable; only its derived age changes.
-        return {**data, "age_sec": now - float(data["received_at"])}
+        return {**data, "age_sec": now - float(data["received_at"]),
+                "shared_transport": "KR_REST_FILE_CACHE"}
     except (OSError, ValueError, TypeError, OverflowError):
         return None
 
@@ -99,6 +102,15 @@ def _publish(path, row, code):
                 tmp.unlink(missing_ok=True)
             except OSError:
                 log.warning("[KR_REST_SHARED][CLEANUP_FAIL] code=%s", code)
+
+
+def read_cached(*, appkey, code):
+    """Nonblocking read of the same immutable native snapshot; no fetch or lock."""
+    try:
+        _, cache_path = _paths(appkey, code)
+        return _read(cache_path, code)
+    except (OSError, ValueError, TypeError):
+        return None
 
 
 def read_or_fetch(*, appkey, code, fetch, max_join_sec=0.15, defer_on_busy=False):

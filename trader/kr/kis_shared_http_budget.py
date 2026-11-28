@@ -113,6 +113,12 @@ def acquire(*, environment: str, appkey: str, priority: bool,
                     if observer and not priority and state["priority_until"] > now:
                         return False, "PRIORITY_TRAFFIC", time.monotonic()-start
                     earliest = max(state["next_at"], state["cooldown_until"])
+                    # Ordinary entry/scanner quote and OHLCV requests are
+                    # also contenders, not just the observer. Honor the same
+                    # short critical lease without bypassing the aggregate
+                    # gap/cooldown or holding the file lock while waiting.
+                    if not priority:
+                        earliest = max(earliest, state["priority_until"])
                     if earliest <= now:
                         state["next_at"] = now + 1.0 / rate
                         _write(file, state)

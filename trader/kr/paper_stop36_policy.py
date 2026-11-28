@@ -140,3 +140,26 @@ def evaluate_kr_pb1_paper_stop36(
         soft_breach_count=count, effective_hard_stop=hard_stop,
         update_meta=updates,
     )
+
+
+def paper_stop36_evidence(decision: PaperStop36Decision, *, entry_price: float, mark: float) -> dict[str, Any]:
+    """Diagnostics for the existing routed policy, not new exit authority."""
+    eligible = bool(decision.eligible)
+    return {
+        "policy_version": POLICY_VERSION,
+        "eligible": eligible,
+        "reason": decision.reason,
+        "soft_threshold": -SOFT_PCT / 100.0,
+        "hard_policy_threshold": -HARD_PCT / 100.0,
+        "effective_hard_stop": decision.effective_hard_stop,
+        "effective_hard_threshold": ((decision.effective_hard_stop - entry_price) / entry_price
+                                     if eligible and decision.effective_hard_stop and entry_price > 0 else None),
+        "actual": ((mark-entry_price)/entry_price if entry_price > 0 else None),
+        "soft_confirm_ticks_required": SOFT_CONFIRM_TICKS,
+        "soft_breach_count": decision.soft_breach_count,
+        "soft_confirmed": decision.soft_confirmed,
+        "hard_touched": decision.hard_touched,
+        "proposed_sell_qty": decision.sell_qty,
+        "soft_sell_fraction": SOFT_SELL_FRACTION,
+        "is_order_authorization": False,
+    }

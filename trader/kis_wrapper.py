@@ -1968,6 +1968,7 @@ class KisAPI:
                     # logs. The ordinary 5xx path previously never inspected
                     # the body, so it missed account quota evidence.
                     rate_limited_500 = False
+                    error_body = None
                     if status == 500:
                         try:
                             error_body = resp.json()
@@ -1986,6 +1987,29 @@ class KisAPI:
                         )
                         logger.warning("[KR_SHARED_HTTP][EGW002_HTTP_500] endpoint=%s attempt=%s",
                                        endpoint_name, i)
+                    # An authenticated domestic practice response with an
+                    # exact gateway reject code and no order output is the
+                    # same explicit rejection as the HTTP-200 EGW002 path.
+                    # Generic/malformed 500, contradictory success and any
+                    # possible broker order identity stay UNCERTAIN.
+                    if (status == 500 and self.env == "practice"
+                            and method.upper() == "POST"
+                            and path_lower.endswith("/trading/order-cash")
+                            and isinstance(error_body, dict)
+                            and error_body.get("rt_cd") == "1"
+                            and error_body.get("msg_cd") == "EGW00201"
+                            and rate_limited_500
+                            and error_body.get("output") in (None, {})
+                            and not any(error_body.get(k) for k in
+                                        ("odno", "ODNO", "broker_order_id", "output1", "output2"))
+                            and not any(error_body.get(k) for k in
+                                        ("_diag_stub", "_stub", "_kis_disabled"))):
+                        logger.warning(
+                            "[KR][ORDER][HTTP_500_EXPLICIT_QUOTA_REJECT] "
+                            "endpoint=%s rid=%s action=RETURN_NO_RESUBMIT",
+                            endpoint_name, native_request_id,
+                        )
+                        return resp
                     if status == 429:
                         gate.set_global_cooldown(
                             str(self.env or "practice"),
@@ -2869,7 +2893,27 @@ class KisAPI:
         cache_key = ("inquire-price", c)
         cached = price_cache.get(cache_key) if not native_rest_only else None
         if cached:
-            return cached
+            # A generic J/U fallback result is not proof of a canonical
+            # domestic J request. Preserve generic callers, but do not
+            # publish/reuse ambiguous origin through the KR scoped path.
+            if not (retry_cap is not None and len(c) == 6 and c.isascii() and c.isdigit()
+                    and getattr(self, "env", None) == "practice"
+                    and os.getenv("KR_WS_SHARED_QUOTE_ENABLED") == "1") or (
+                        cached.get("native_market_division") == "J"
+                        and cached.get("native_requested_code") == c):
+                return cached
+
+        # Reuse the exact canonical native price cache across processes.
+        # Explicit source probes and selected order-bound refreshes remain independent.
+        if (not native_rest_only and retry_cap is not None
+                and len(c) == 6 and c.isascii() and c.isdigit() and c != "122630"):
+            from trader.marketdata import kr_rest_shared
+            if kr_rest_shared.enabled(getattr(self, "env", None)):
+                shared = kr_rest_shared.read_cached(appkey=str(APP_KEY or ""), code=c)
+                if shared is not None:
+                    logger.info("[KR_REST_SHARED][DIRECT_QUOTE_HIT] code=%s age_sec=%.3f",
+                                c, shared["age_sec"])
+                    return shared
 
         # Legacy endpoint gate: wait within a bounded budget instead of
         # converting a local throttle/cooldown directly into price_unavailable.
@@ -2895,6 +2939,9 @@ class KisAPI:
         url = f"{base}/uapi/domestic-stock/v1/quotations/inquire-price"
         last_error: Exception | None = None
         raw_output: dict | None = None
+        native_market_division = None
+        native_requested_code = None
+        native_received_at = None
 
         def _to_float(val: Any) -> float | None:
             try:
@@ -2965,6 +3012,9 @@ class KisAPI:
                                 continue
                             if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
                                 raw_output = dict(data["output"])
+                                native_market_division = market_div
+                                native_requested_code = code_fmt
+                                native_received_at = time.time()
                                 break
                             else:
                                 if entry_refresh:
@@ -2986,9 +3036,6 @@ class KisAPI:
                 sleep_time, stage_deadline=getattr(self, "_kr_stage_deadline", None)
             ):
                 raise KisTemporaryError("KR_TICK_DEADLINE_EXHAUSTED_BEFORE_QUOTE_RETRY")
-
-        elapsed_ms = (time.time() - start_time) * 1000
-        self._log_kis_resp("QUOTE", code, {"attempts": attempts}, raw_output and {"rt_cd": "0", "output": raw_output} or None, elapsed_ms)
 
         elapsed_ms = (time.time() - start_time) * 1000
         self._log_kis_resp("QUOTE", code, {"attempts": attempts}, raw_output and {"rt_cd": "0", "output": raw_output} or None, elapsed_ms)
@@ -3017,7 +3064,9 @@ class KisAPI:
             "raw": raw_output, "source": "KIS_REST_INQUIRE_PRICE",
             "source_identity": "AUTHENTICATED_REST_REQUEST_BOUND",
             "requested_symbol": c, "market": "KR",
-            "received_at": time.time(),  # local receipt metadata, not exchange clock
+            "native_market_division": native_market_division,
+            "native_requested_code": native_requested_code,
+            "received_at": native_received_at,  # receipt at successful native response
         })
         # A one-shot native REST probe must not modify normal WS/REST caches.
         if not native_rest_only:

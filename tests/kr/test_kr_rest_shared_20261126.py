@@ -11,6 +11,7 @@ def _quote(code="003490", receipt=None):
     return {"source":"KIS_REST_INQUIRE_PRICE",
             "source_identity":"AUTHENTICATED_REST_REQUEST_BOUND",
             "market":"KR", "requested_symbol":code, "last":29250,
+            "native_market_division":"J", "native_requested_code":code,
             "bid":29200, "ask":29250, "received_at":time.time() if receipt is None else receipt}
 
 
@@ -60,7 +61,10 @@ def test_cross_process_busy_then_hit_same_native_receipt():
 
 @pytest.mark.parametrize("invalid", [{}, {"source":"KIS_WEBSOCKET"},
                                      {"requested_symbol":"012750"},
-                                     {"received_at":1.0}, {"last":float("nan")}])
+                                     {"received_at":1.0}, {"last":float("nan")},
+                                     {"native_market_division":"U"},
+                                     {"native_requested_code":"A003490"},
+                                     {"native_market_division":None}])
 def test_invalid_response_not_reused(invalid):
     key = "fixture-" + uuid.uuid4().hex
     calls = []
@@ -97,3 +101,25 @@ def test_disabled_by_default_and_real_is_not_enabled(monkeypatch):
     monkeypatch.setenv("KR_WS_SHARED_QUOTE_ENABLED", "1")
     assert shared.enabled("practice")
     assert not shared.enabled("real")
+
+
+def test_nonblocking_native_cache_read_preserves_receipt_and_expiry(monkeypatch):
+    key = "fixture-" + uuid.uuid4().hex
+    now = time.time()
+    monkeypatch.setattr(shared.time, "time", lambda: now)
+    try:
+        assert shared.read_cached(appkey=key, code="003490") is None
+        status, original = shared.read_or_fetch(
+            appkey=key, code="003490", fetch=lambda: _quote(receipt=now))
+        assert status == "FETCH"
+        monkeypatch.setattr(shared.time, "time", lambda: now + 2)
+        row = shared.read_cached(appkey=key, code="003490")
+        assert row["received_at"] == original["received_at"]
+        assert row["age_sec"] == 2
+        assert row["shared_transport"] == "KR_REST_FILE_CACHE"
+        assert shared.read_cached(appkey=key + "-other", code="003490") is None
+        monkeypatch.setattr(shared.time, "time", lambda: now + 6)
+        assert shared.read_cached(appkey=key, code="003490") is None
+    finally:
+        _cleanup(key)
+        _cleanup(key + "-other")
