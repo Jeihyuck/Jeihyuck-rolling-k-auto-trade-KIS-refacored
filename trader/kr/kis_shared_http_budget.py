@@ -104,7 +104,16 @@ def acquire(*, environment: str, appkey: str, priority: bool,
                 except BlockingIOError:
                     pass
                 else:
+                    # File opening and scheduler preemption may consume the
+                    # caller's entire budget. Recheck under the actual lease
+                    # before reading or reserving an HTTP attempt.
+                    now = time.monotonic()
+                    if now >= deadline:
+                        return False, "DEADLINE", now-start
                     state = _read(file, now, rate)
+                    now = time.monotonic()
+                    if now >= deadline:
+                        return False, "DEADLINE", now-start
                     if priority:
                         # Never reserve a long queue; allow only one
                         # short-lived notification of imminent critical work.
@@ -120,6 +129,9 @@ def acquire(*, environment: str, appkey: str, priority: bool,
                     if not priority:
                         earliest = max(earliest, state["priority_until"])
                     if earliest <= now:
+                        now = time.monotonic()
+                        if now >= deadline:
+                            return False, "DEADLINE", now-start
                         state["next_at"] = now + 1.0 / rate
                         _write(file, state)
                         return True, "GRANTED", time.monotonic()-start
