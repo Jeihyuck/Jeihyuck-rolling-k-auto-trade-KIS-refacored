@@ -906,6 +906,15 @@ def _build_reconcile_convergence_guard(original: Callable[..., Any]) -> Callable
         result = original(*args, **kwargs)
         if not isinstance(result, dict):
             return result
+        # The canonical CURRENT_ONLY path already reconciles today's native
+        # orders/fills and validates the active account, claims and balance.
+        # Do not re-enter legacy cross-day recovery or replace its scoped
+        # activity verdict with an all-dates count. This wrapper cannot turn
+        # a failed current proof into a permit (return the result unchanged).
+        if (kwargs.get("historical_recovery") is False
+                or result.get("historical_recovery_executed") is False):
+            logger.info("[KR_P0][LEGACY_CONVERGENCE][SKIP] reason=CURRENT_ORDERS_ONLY")
+            return result
         engine = kwargs.get("engine")
         kis = kwargs.get("kis")
         env = str(
