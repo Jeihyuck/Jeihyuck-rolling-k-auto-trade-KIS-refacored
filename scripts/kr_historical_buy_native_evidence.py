@@ -165,6 +165,19 @@ def fresh_original_balance_quantities(kis):
         return False, {}
 
 
+def _evidence_target_priority(target):
+    """Active execution uncertainty must precede optional historical audits.
+
+    The read-only collector has a three-day native-query budget. Never let
+    an older imported-position audit consume all days ahead of live claims.
+    """
+    claim, order = target["claim"], target["order"]
+    exact_cycle = any(str(p.get("position_cycle_id")) == str(order.get("position_cycle_id"))
+                      for p in target["positions"])
+    return (claim.get("action_key") is None, exact_cycle,
+            str(claim["trade_date"]), str(order["order_id"]))
+
+
 def collect(*, engine, kis, now, code=None, trade_date=None):
     if getattr(kis, "env", None) != "practice":
         raise RuntimeError("PRACTICE_BROKER_REQUIRED")
@@ -327,10 +340,7 @@ def collect(*, engine, kis, now, code=None, trade_date=None):
                             "order": order, "db_fill_qty": sum(int(f.get("qty") or 0) for f in native),
                             "positions": positions})
             seen.add(identity)
-    targets.sort(key=lambda t: (
-        any(str(p.get("position_cycle_id")) == str(t["order"].get("position_cycle_id"))
-            for p in t["positions"]),
-        str(t["claim"]["trade_date"]), str(t["order"]["order_id"])))
+    targets.sort(key=_evidence_target_priority)
     proofs = []
     daily = {}
     failures = {}
@@ -341,12 +351,16 @@ def collect(*, engine, kis, now, code=None, trade_date=None):
             day = date.fromisoformat(day)
         symbol = str(order["code"])
         odno = str(order.get("kis_odno") or "")
+        identity = {"code": symbol, "odno": odno, "trade_date": day.isoformat(),
+                    "claim_action_key": claim["action_key"], "source_order_id": str(order["order_id"]),
+                    "source_cycle": str(order["position_cycle_id"]),
+                    "db_fill_qty": target["db_fill_qty"], "positions": target["positions"]}
         try:
             if day in failures:
                 raise RuntimeError("ORIGINAL_DAY_QUERY_ALREADY_FAILED")
             if day not in daily:
                 if len(daily) + len(failures) >= 3:
-                    proofs.append({"code": symbol, "odno": odno, "source_order_id": str(order["order_id"]), "state": "DEFERRED_DAY_BUDGET"})
+                    proofs.append({**identity, "state": "DEFERRED_DAY_BUDGET"})
                     continue
                 try:
                     daily[day] = _daily_ccld_all_pages_for_date(kis, day)
@@ -362,10 +376,7 @@ def collect(*, engine, kis, now, code=None, trade_date=None):
                     limit_price=order.get("limit_price"))
         except Exception as exc:
             proof = {"state": "NATIVE_QUERY_FAILED", "error_type": type(exc).__name__}
-        proofs.append({**proof, "code": symbol, "odno": odno,
-                       "claim_action_key": claim["action_key"], "source_order_id": str(order["order_id"]),
-                       "source_cycle": str(order["position_cycle_id"]),
-                       "db_fill_qty": target["db_fill_qty"], "positions": target["positions"]})
+        proofs.append({**proof, **identity})
     balance_ok, quantities = fresh_original_balance_quantities(kis)
     # Query today's all-page broker orders separately from the historical
     # three-day budget. An API failure must not be represented as zero orders.
