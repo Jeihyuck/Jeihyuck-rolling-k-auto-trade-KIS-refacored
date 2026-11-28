@@ -138,3 +138,39 @@ def test_ordinary_market_read_honors_critical_lease_without_bypass(monkeypatch):
                               observer=False,max_wait_sec=1.5)[0]
     finally:
         budget._path("practice",key).unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("delay_stage", ["open", "read"])
+def test_admission_deadline_rechecked_after_file_open_or_state_read(monkeypatch, delay_stage):
+    from contextlib import contextmanager
+    monkeypatch.setenv("KR_SHARED_HTTP_RPS_PRACTICE", "2")
+    key = "test-" + uuid.uuid4().hex
+    path = budget._path("practice", key)
+    clock = [100.0]
+    original_open, original_read = budget._locked_file, budget._read
+
+    @contextmanager
+    def delayed_open(path):
+        with original_open(path) as file:
+            if delay_stage == "open":
+                clock[0] += 0.2
+            yield file
+
+    def delayed_read(file, now, rate):
+        state = original_read(file, now, rate)
+        if delay_stage == "read":
+            clock[0] += 0.2
+        return state
+
+    monkeypatch.setattr(budget, "_locked_file", delayed_open)
+    monkeypatch.setattr(budget, "_read", delayed_read)
+    monkeypatch.setattr(budget.time, "monotonic", lambda: clock[0])
+    try:
+        granted, reason, _ = budget.acquire(
+            environment="practice", appkey=key, priority=True,
+            observer=False, max_wait_sec=0.1,
+        )
+        assert not granted and reason == "DEADLINE"
+        assert path.read_text() == ""  # no stale priority or HTTP reservation
+    finally:
+        path.unlink(missing_ok=True)
